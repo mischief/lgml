@@ -12,17 +12,23 @@ local getopt = require("lgml.getopt")
 
 local USAGE = "usage: lgml-worker --fd n (-m model | --fake) [-b backend] [-c n_ctx] [--no-fa]\n" ..
     "                   [--ctk type] [--ctv type] [--alias id] [--stt] [--engine module]\n" ..
-    "                   [--recipe file] [--cache-ram MiB] [--ctx-checkpoints n]\n"
+    "                   [--recipe file] [--cache-ram MiB] [--ctx-checkpoints n]\n" ..
+    "                   [--lora file[:scale]]...\n"
 
 local opts, rest = getopt.parse(arg, "m:b:c:", {
 	model = "m", backend = "b", ctx = "c", ["fd="] = false,
 	["no-fa"] = false, ["alias="] = false, fake = false, stt = false,
 	["engine="] = false, ["ctk="] = false, ["ctv="] = false, ["recipe="] = false,
-	["cache-ram="] = false, ["ctx-checkpoints="] = false,
-})
+	["cache-ram="] = false, ["ctx-checkpoints="] = false, ["lora="] = false,
+}, { lora = true })
 if not opts or #rest > 0 or not (opts.m or opts.fake) or not tonumber(opts.fd) then
 	io.stderr:write("lgml-worker: ", tostring(rest), "\n", USAGE)
 	os.exit(2)
+end
+local lora = {}
+for i, spec in ipairs(opts.lora or {}) do
+	local path, scale = require("lgml.lora").parse_spec(spec)
+	lora[i] = { path = path, scale = scale }
 end
 local engine
 if opts.fake then
@@ -42,6 +48,7 @@ else
 		recipe = opts.recipe,
 		cache_ram = tonumber(opts["cache-ram"]),
 		ctx_checkpoints = math.tointeger(tonumber(opts["ctx-checkpoints"])),
+		lora = lora,
 	})
 end
 require("lgml.worker").serve(math.tointeger(tonumber(opts.fd)), engine)

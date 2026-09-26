@@ -55,7 +55,7 @@ local function find_long(lt, name)
 	return hit
 end
 
-local function parse_long(lt, args, i, opts)
+local function parse_long(lt, args, i, opts, set)
 	local name, val = args[i]:match("^%-%-([^=]+)=(.*)$")
 	name = name or args[i]:sub(3)
 	local o, err = find_long(lt, name)
@@ -76,11 +76,11 @@ local function parse_long(lt, args, i, opts)
 			return nil, "option --" .. name .. " needs an argument"
 		end
 	end
-	opts[o.key] = val
+	set(opts, o.key, val)
 	return i + 1
 end
 
-local function parse_short(sh, args, i, opts)
+local function parse_short(sh, args, i, opts, set)
 	local s = args[i]
 	local j = 2
 	while j <= #s do
@@ -102,7 +102,7 @@ local function parse_short(sh, args, i, opts)
 					    " needs an argument"
 				end
 			end
-			opts[c] = val
+			set(opts, c, val)
 			return i + 1
 		end
 	end
@@ -116,15 +116,25 @@ end
 -- @tparam {string,...} args a list such as the global arg
 -- @tparam[opt] string optstring short options, such as "hn:"
 -- @tparam[opt] table long long options, such as `{ help = "h", ["seed="] = false }`
+-- @tparam[opt] table multi keys of options with an argument that may
+-- repeat, such as `{ lora = true }`; each gets a list of its arguments
 -- @treturn table the options, keyed by short letter or long name
 -- @treturn {string,...} the operands
 -- @return[2] nil on an unknown, ambiguous, or incomplete option
 -- @treturn[2] string the error message
 -- @raise when a long option maps to a letter not in optstring
-function M.parse(args, optstring, long)
+function M.parse(args, optstring, long, multi)
 	local sh = shorts(optstring or "")
 	local lt = longs(long, sh)
 	local opts, rest = {}, {}
+	local function set(t, key, val)
+		if multi and multi[key] then
+			t[key] = t[key] or {}
+			t[key][#t[key] + 1] = val
+		else
+			t[key] = val
+		end
+	end
 	local i, err = 1, nil
 	while i <= #args do
 		local a = args[i]
@@ -132,9 +142,9 @@ function M.parse(args, optstring, long)
 			i = i + 1
 			break
 		elseif a:sub(1, 2) == "--" then
-			i, err = parse_long(lt, args, i, opts)
+			i, err = parse_long(lt, args, i, opts, set)
 		elseif a:sub(1, 1) == "-" and #a > 1 then
-			i, err = parse_short(sh, args, i, opts)
+			i, err = parse_short(sh, args, i, opts, set)
 		else
 			break
 		end

@@ -12,17 +12,18 @@ local getopt = require("lgml.getopt")
 local server = require("lgml.server.httpd")
 local openai = require("lgml.server.openai")
 
-local USAGE = [[
+local USAGE = [=[
 usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b backend]
                    [-c n_ctx] [--no-fa] [--ctk type] [--ctv type] [--alias id]
                    [--recipe file] [--cache-ram MiB] [--ctx-checkpoints n]
-                   [--inproc] [--stt] [--engine module]
+                   [--lora file[:scale]]... [--inproc] [--stt] [--engine module]
   -l, --listen addr   address to listen on (default 127.0.0.1)
   -p, --port port     port to listen on (default 8080)
   -C, --config file   Lua file returning { listen, port, models = { spec, ... } };
                       spec: { model = path, id, backend, ctx, flash_attn, stt,
                       cache_type_k, cache_type_v, recipe, cache_ram,
-                      ctx_checkpoints,
+                      ctx_checkpoints, lora = "file[:scale]" or a list of
+                      them or of { path, scale },
                       engine = Lua module with new(opts), such as a TTS engine }
   -m, --model file    gguf model file, or a Whisper model directory
   -b, --backend name  ggml backend, for example Vulkan0 or CPU (default best)
@@ -41,6 +42,12 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
       --ctx-checkpoints n
                       state checkpoints per slot for hybrid and sliding
                       window models (default 8; 0 turns them off)
+      --lora file[:scale]
+                      apply a LoRA adapter (llama.cpp gguf or PEFT
+                      directory) with this scale (default 1); repeat for
+                      more; a request can change scales with "lora":
+                      [{"id": 0, "scale": 0.5}]; GET /lora-adapters
+                      lists them
       --inproc        run the model in this process, not in a worker
       --stt           the model is speech-to-text (found from config.json
                       when not given)
@@ -48,11 +55,35 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       lgml.image.engine with -m a Z-Image directory
       --fake          serve the fake test engine
   -h, --help          show this help
-]]
+]=]
 
 local function die(msg)
 	io.stderr:write("lgml-server: ", msg, "\n")
 	os.exit(1)
+end
+
+-- Adapters of a spec as { path, scale } entries. spec.lora is
+-- "file[:scale]", or a list of those or of { path, scale }.
+local function adapters(spec)
+	local list = type(spec.lora) == "table" and spec.lora or { spec.lora }
+	local out = {}
+	for i, a in ipairs(list) do
+		local path, scale
+		if type(a) == "table" then
+			path, scale = a.path or a[1], a.scale or a[2] or 1
+		elseif type(a) == "string" then
+			path, scale = a:match("^(.*):([^:/]+)$")
+			if not (path and tonumber(scale)) then
+				path, scale = a, 1
+			end
+		end
+		scale = tonumber(scale)
+		if type(path) ~= "string" or not scale then
+			die(("bad lora entry %d: %s"):format(i, tostring(a)))
+		end
+		out[i] = { path = path, scale = scale }
+	end
+	return out
 end
 
 -- One engine from a model spec: { model, id, backend, ctx, flash_attn,
@@ -71,6 +102,10 @@ local function model_engine(spec)
 		die("bad checkpoint count " .. tostring(spec.ctx_checkpoints))
 	end
 	local stt = not spec.engine and (spec.stt or require("lgml.detect").is_whisper(spec.model))
+	local lora = adapters(spec)
+	if #lora > 0 and (stt or spec.engine) then
+		die("lora needs a chat model")
+	end
 	if spec.inproc and spec.engine then
 		return require(spec.engine).new({
 			model = spec.model, backend = spec.backend, id = spec.id, n_ctx = n_ctx,
@@ -84,7 +119,7 @@ local function model_engine(spec)
 			model = spec.model, backend = spec.backend, n_ctx = n_ctx,
 			flash_attn = spec.flash_attn ~= false, id = spec.id,
 			cache_type_k = spec.cache_type_k, cache_type_v = spec.cache_type_v,
-			recipe = spec.recipe, cache_ram = ram, ctx_checkpoints = ckpt,
+			recipe = spec.recipe, cache_ram = ram, ctx_checkpoints = ckpt, lora = lora,
 		})
 	end
 	local wargs = { "-m", spec.model }
@@ -98,6 +133,9 @@ local function model_engine(spec)
 	end
 	if spec.flash_attn == false then
 		wargs[#wargs + 1] = "--no-fa"
+	end
+	for _, a in ipairs(lora) do
+		table.move({ "--lora", ("%s:%.17g"):format(a.path, a.scale) }, 1, 2, #wargs + 1, wargs)
 	end
 	if stt then
 		wargs[#wargs + 1] = "--stt"
@@ -144,7 +182,7 @@ local function make_engine(opts)
 			flash_attn = not opts["no-fa"], stt = opts.stt, inproc = opts.inproc,
 			cache_type_k = opts.ctk, cache_type_v = opts.ctv, recipe = opts.recipe,
 			cache_ram = opts["cache-ram"], ctx_checkpoints = opts["ctx-checkpoints"],
-			engine = opts.engine,
+			engine = opts.engine, lora = opts.lora,
 		})
 	end
 	die("no engine: give -m model, -C config or --fake")
@@ -156,7 +194,8 @@ local function main(args)
 		ctx = "c", fake = false, ["no-fa"] = false, ["alias="] = false,
 		inproc = false, stt = false, ["ctk="] = false, ["ctv="] = false, ["engine="] = false,
 		["recipe="] = false, ["cache-ram="] = false, ["ctx-checkpoints="] = false,
-	})
+		["lora="] = false,
+	}, { lora = true })
 	if not opts then
 		io.stderr:write("lgml-server: ", rest, "\n", USAGE)
 		os.exit(2)

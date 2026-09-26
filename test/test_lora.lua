@@ -298,6 +298,82 @@ do
 	m:close()
 end
 
+-- The chat engine with adapters: requests change scales, and the prompt
+-- store keeps each adapter set apart.
+do
+	local engine = require("lgml.engine")
+	local getopt = require("lgml.getopt")
+	local path = tmp(".gguf")
+	tiny.write(path, "qwen3")
+	local m = transformer.load(be, path)
+	local ad = lora.new(m, { rank = 4, alpha = 8 })
+	for i, name in ipairs(ad.names) do
+		ad.pairs[name].b:fill("normal", 0, 0.3, 400 + i)
+	end
+	local apath = tmp(".gguf")
+	assert(ad:save(apath))
+	m:close()
+
+	local function req(e, msgs, extra)
+		local parts, r = {}, {}
+		local sink = {}
+		function sink.content(_, t)
+			parts[#parts + 1] = t
+			return true
+		end
+		sink.reasoning, sink.tool_arguments = sink.content, sink.content
+		function sink.tool_call()
+			return 0
+		end
+		function sink.finish(_, reason, usage, timings)
+			r.reason, r.usage, r.timings = reason, usage, timings
+		end
+		function sink.cancelled()
+			return false
+		end
+		local body = { messages = msgs, max_tokens = 6, top_k = 1,
+		    chat_template_kwargs = { enable_thinking = false } }
+		for k, v in pairs(extra or {}) do
+			body[k] = v
+		end
+		local done
+		coroutine.wrap(function()
+			r.res, r.err, r.status = e:chat(body, sink)
+			done = true
+		end)()
+		while not done do
+			require("luv").run("once")
+		end
+		r.text = table.concat(parts)
+		return r
+	end
+	local sys = { role = "system", content = ("You are a small test model. "):rep(3) }
+	local msgs = { sys, { role = "user", content = "Say something." } }
+	local plain = engine.new({ model = path, backend = "CPU", n_ctx = 256, flash_attn = false })
+	local e = engine.new({ model = path, backend = "CPU", n_ctx = 256, flash_attn = false,
+	    lora = { { path = apath, scale = 1 } } })
+	local p = e:props().lora
+	ok(#p == 1 and p[1].id == 0 and p[1].path == apath and p[1].scale == 1, "props list the adapter")
+	local base = req(plain, msgs).text
+	local a1 = req(e, msgs)
+	ok(a1.text ~= base, ("the adapter changes the answer: %q -> %q"):format(base, a1.text))
+	local off = req(e, msgs, { lora = { { id = 0, scale = 0 } } })
+	ok(off.text == base and off.timings.cache_n == 0,
+	    "scale 0 gives the base answer and does not reuse the adapter cache")
+	local a2 = req(e, msgs)
+	ok(a2.text == a1.text and a2.timings.restored_n > 0,
+	    ("back to the adapter restores its store entry (%d tokens)"):format(a2.timings.restored_n))
+	local bad = req(e, msgs, { lora = { { id = 3, scale = 1 } } })
+	ok(bad.res == nil and bad.status == 400, "a bad adapter id gives 400")
+	local o = getopt.parse({ "--lora", "a.gguf:0.5", "--lora=b" }, "", { ["lora="] = false },
+	    { lora = true })
+	ok(o and #o.lora == 2 and o.lora[1] == "a.gguf:0.5" and o.lora[2] == "b",
+	    "getopt collects repeated options")
+	local f, s = lora.parse_spec("dir/a.gguf:0.5")
+	local f2, s2 = lora.parse_spec("dir/b.gguf")
+	ok(f == "dir/a.gguf" and s == 0.5 and f2 == "dir/b.gguf" and s2 == 1, "parse file[:scale]")
+end
+
 for _, p in ipairs(files) do
 	os.remove(p)
 end

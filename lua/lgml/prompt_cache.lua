@@ -6,6 +6,8 @@
 -- The store keeps whole slots (tokens, full snapshot, checkpoints) in
 -- host RAM under a byte budget, and gives back the one that shares the
 -- most with a new prompt. It evicts the least recently used slot.
+-- Each entry has the key of the engine state it came from, such as the
+-- adapter set; a slot only takes entries with its current key.
 -- @module lgml.prompt_cache
 
 local M = {}
@@ -26,6 +28,8 @@ local TURN_NAMES = { "<|im_start|>", "<|turn>", "<start_of_turn>" }
 -- - `ram`: store budget in bytes (0 turns the store off)
 -- - `checkpoints`: the most checkpoints per slot (0 turns them off)
 -- - `special`: special token ids by name, from `tokenizer:special().tokens`
+-- - `key`: the key of the current state (default ""); set the `key`
+--   field when the state changes
 -- @treturn PromptCache the cache
 function M.new(model, cache, opts)
 	local turn = {}
@@ -38,7 +42,7 @@ function M.new(model, cache, opts)
 	return setmetatable({
 		model = model, cache = cache,
 		fixed = (model.recurrent or cache.ring and cache.ring < cache.n_ctx) and true or false,
-		ram = opts.ram or 0, max_ckpt = opts.checkpoints or 0, turn = turn,
+		ram = opts.ram or 0, max_ckpt = opts.checkpoints or 0, turn = turn, key = opts.key or "",
 		ckpts = {}, store = {}, bytes = 0, tick = 0, restored = 0,
 		stats = { restored = 0, checkpoints = 0, saved = 0, loaded = 0, evicted = 0 },
 	}, P)
@@ -46,7 +50,7 @@ end
 
 --- The prompt cache of an engine slot, from `new`.
 -- Fields: `ckpts` (the slot's checkpoints by position), `store` (the
--- entries), `bytes` (store bytes), `restored` (tokens the last `reuse`
+-- entries), `key`, `bytes` (store bytes), `restored` (tokens the last `reuse`
 -- restored from host memory) and `stats` (totals: restored tokens,
 -- checkpoints, saved, loaded and evicted entries).
 -- @type PromptCache
@@ -136,7 +140,7 @@ function P:save(eng)
 	end
 	self.tick = self.tick + 1
 	for _, e in ipairs(self.store) do
-		if #e.tokens == #toks and common(e.tokens, toks, #toks) == #toks then
+		if e.key == self.key and #e.tokens == #toks and common(e.tokens, toks, #toks) == #toks then
 			e.used = self.tick
 			return
 		end
@@ -157,7 +161,7 @@ function P:save(eng)
 	end
 	self.store[#self.store + 1] = {
 		tokens = table.move(toks, 1, #toks, 1, {}), ckpts = ckpts, bytes = bytes,
-		snap = hold(self.model:snapshot(self.cache, true)), used = self.tick,
+		snap = hold(self.model:snapshot(self.cache, true)), used = self.tick, key = self.key,
 	}
 	self.bytes = self.bytes + bytes
 	self.stats.saved = self.stats.saved + 1
@@ -203,7 +207,10 @@ function P:reuse(eng, prompt, n)
 	local keep = self:slot_keep(eng, n)
 	local best, bu, bck = nil, keep, nil
 	for _, e in ipairs(self.store) do
-		local u, ck = self:entry_keep(e, common(e.tokens, prompt, #prompt - 1))
+		local u, ck = 0, nil
+		if e.key == self.key then
+			u, ck = self:entry_keep(e, common(e.tokens, prompt, #prompt - 1))
+		end
 		if u > bu then
 			best, bu, bck = e, u, ck
 		end

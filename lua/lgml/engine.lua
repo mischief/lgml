@@ -14,6 +14,7 @@ local transformer = require("lgml.transformer")
 local decide = require("lgml.decide")
 local prompt_cache = require("lgml.prompt_cache")
 local grammar = require("lgml.grammar")
+local lora = require("lgml.lora")
 
 local M = {}
 local E = {}
@@ -72,9 +73,12 @@ end
 --   turns it off, -1 means no limit); see `lgml.prompt_cache`
 -- - `ctx_checkpoints`: the most state checkpoints per slot, for models
 --   with recurrent layers or a sliding ring (default 8; 0 turns them off)
+-- - `lora`: LoRA adapters, a list of { path, scale } (scale default 1);
+--   see `lgml.lora.load`. A request can change the scales with
+--   `lora = { { id, scale }, ... }`, ids from 0, as llama-server takes.
 -- @treturn Engine the engine
 -- @raise when the backend, the model or its tokenizer does not load,
--- or when no chat template fits the model
+-- when no chat template fits the model, or an adapter does not fit it
 function M.new(opts)
 	local be = assert(lgml.backend(opts.backend))
 	local info = assert(lgml.gguf(opts.model))
@@ -96,6 +100,11 @@ function M.new(opts)
 			    n_ctx, model.hp.n_ctx))
 		end
 	end
+	local adapters = {}
+	for i, spec in ipairs(opts.lora or {}) do
+		local path, scale = spec.path or spec[1], spec.scale or spec[2] or 1
+		adapters[i] = { ad = lora.load(model, path, { scale = scale }), path = path, scale = scale }
+	end
 	local cache = model:cache(n_ctx, copts)
 	local e = setmetatable({
 		be = be, model = model, family = family, family_name = family_name,
@@ -103,7 +112,7 @@ function M.new(opts)
 		n_ctx = n_ctx, flash_attn = fa,
 		id = opts.id or info.meta["general.name"] or "lgml",
 		cache = cache, tokens = {},
-		busy = false, waiting = {},
+		busy = false, waiting = {}, adapters = adapters,
 	}, E)
 	if type(opts.recipe) == "string" then
 		e.recipe = assert(decide.load_recipe(opts.recipe))
@@ -114,9 +123,11 @@ function M.new(opts)
 	for _, id in ipairs(e.tk:special().eog or {}) do
 		e.eog[id] = true
 	end
+	e:set_lora()
 	if model.snapshot then
 		local ram = opts.cache_ram or 8192
 		e.pc = prompt_cache.new(model, cache, {
+			key = e.lora_key,
 			ram = ram < 0 and math.huge or math.floor(ram * 1048576),
 			checkpoints = opts.ctx_checkpoints or 8,
 			special = e.tk:special().tokens,
@@ -134,10 +145,63 @@ function E:models()
 	return { { id = self.id, context_length = self.n_ctx } }
 end
 
---- Returns the properties: `{ n_ctx, total_slots = 1 }`.
+--- Returns the properties: `{ n_ctx, total_slots = 1, lora }`.
+-- lora lists the adapters as llama-server does: `{ id, path, scale }`.
 -- @treturn table the properties
 function E:props()
-	return { n_ctx = self.n_ctx, total_slots = 1 }
+	local list = {}
+	for i, a in ipairs(self.adapters) do
+		list[i] = { id = i - 1, path = a.path, scale = a.scale }
+	end
+	return { n_ctx = self.n_ctx, total_slots = 1, lora = list }
+end
+
+--- Set the adapter scales for a request.
+-- Scales not in the list are the ones the engine loaded with. A new
+-- adapter set empties the slot: its cache holds keys and values of the
+-- old set. The prompt store keeps entries of each set apart.
+-- @tparam[opt] {table,...} list `{ id, scale }` entries, ids from 0
+-- @treturn[1] nil
+-- @treturn[2] string an error message for a bad list
+function E:set_lora(list)
+	if list ~= nil and type(list) ~= "table" then
+		return "lora must be an array of { id, scale }"
+	end
+	local scales = {}
+	for i, a in ipairs(self.adapters) do
+		scales[i] = a.scale
+	end
+	for _, x in ipairs(list or {}) do
+		local id = type(x) == "table" and math.tointeger(x.id)
+		if not id or not self.adapters[id + 1] or type(x.scale) ~= "number" then
+			return ("lora: need { id, scale } with id from 0 to %d"):format(#self.adapters - 1)
+		end
+		scales[id + 1] = x.scale
+	end
+	local key = table.concat(scales, ",")
+	if key == self.lora_key then
+		return nil
+	end
+	if self.pc then
+		self.pc:save(self)
+		self.pc:trim(-1)
+		self.pc.key = key
+	end
+	local on = {}
+	for i, a in ipairs(self.adapters) do
+		a.ad.scale = scales[i]
+		if scales[i] ~= 0 then
+			on[#on + 1] = a.ad
+		end
+	end
+	if self.model.set_adapters then
+		self.model:set_adapters(on)
+	elseif #on > 0 then
+		error(self.model.hp.arch .. ": this model takes no adapters")
+	end
+	self.lora_key = key
+	self.tokens, self.cache.n_past = {}, 0
+	return nil
 end
 
 -- Wait for the slot. Requests queue in arrival order.
@@ -292,6 +356,11 @@ function E:chat(req, sink)
 		return nil, "messages must be a non-empty array", 400
 	end
 	self:acquire()
+	local lerr = self:set_lora(req.lora)
+	if lerr then
+		self:release()
+		return nil, lerr, 400
+	end
 	local ok, a, b, c = pcall(self.run, self, req, sink)
 	if not ok then
 		-- The cache may not match the token list now.
@@ -316,6 +385,11 @@ end
 -- @treturn[2] int an HTTP status
 function E:decide(req, ctl)
 	self:acquire()
+	local lerr = self:set_lora(req.lora)
+	if lerr then
+		self:release()
+		return nil, lerr, 400
+	end
 	local ok, a, b, c = pcall(decide.run, self, req, ctl)
 	if not ok then
 		self.tokens, self.cache.n_past = {}, 0

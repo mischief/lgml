@@ -846,7 +846,8 @@ end
 
 --- Adds the OpenAI routes for eng to srv.
 -- The routes are `/health`, `/v1/health`, `/models`, `/v1/models`,
--- `/props`, `/chat/completions`, `/audio/speech`,
+-- `/props`, `/lora-adapters` (the adapters from the `lora` field of
+-- the engine props, as llama-server lists them), `/chat/completions`, `/audio/speech`,
 -- `/audio/transcriptions`, `/systemone`, `/images/generations` and
 -- `/images/edits`, the last six also under `/v1`. A route for a method that eng does not have gives 404.
 -- `/v1/systemone` is Jev's System One API (see `lgml.systemone`): a
@@ -876,6 +877,10 @@ function M.install(srv, eng)
 	srv:route("GET", "/models", list)
 	srv:route("GET", "/props", function(_, res)
 		return props(eng, res)
+	end)
+	srv:route("GET", "/lora-adapters", function(_, res)
+		local lora = eng:props().lora or {}
+		return res:json(200, #lora > 0 and lora or json.array())
 	end)
 	srv:route("POST", "/v1/chat/completions", completions)
 	srv:route("POST", "/chat/completions", completions)
