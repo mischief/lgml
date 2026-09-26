@@ -874,7 +874,7 @@ local function engine_check(path)
 end
 
 -- Weight placement: experts or the first layers on a second CPU backend
--- give the same logits as one backend.
+-- give the same logits as one backend, and replay keeps its graphs.
 local function offload_check(kind, path, m, ref, long)
 	local placement = require("lgml.placement")
 	local sb <close> = assert(lgml.backend(os.getenv("LGML_DEVICE") or "CPU", { cpu = true }))
@@ -900,6 +900,8 @@ local function offload_check(kind, path, m, ref, long)
 		end
 		ok(#got == #want and d < (GPU and TOL or 1e-4),
 		    ("%slogits equal one backend (max error %.3g)"):format(tag, d))
+		rc.decode(ok, tag, s, { n_ctx = 320, cache = { ubatch = 8 }, ubatch = 8,
+		    prompt = long, n = 12, flash_attn = true, builds = 4 })
 		s:close()
 	end
 end

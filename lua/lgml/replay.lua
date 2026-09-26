@@ -5,8 +5,12 @@
 -- key while the attention span stays inside one padding block.
 -- The cache holds the last graph; its output nodes stay valid until
 -- the next pass on that cache.
+-- A model with weights on a device and its CPU (see `lgml.placement`)
+-- runs through the ggml scheduler; a replay reuses its splits and
+-- buffers as well.
 -- At trace level each pass logs its key and whether it built a graph or
--- replayed one (see `lgml.log`).
+-- replayed one, and a new graph logs its scheduler splits (see
+-- `lgml.log`).
 -- @module lgml.replay
 local log = require("lgml.log")
 
@@ -68,6 +72,10 @@ function M.run(model, cache, ids, opts, finish)
 		cache.replay = r
 	end
 	r.g:compute(table.unpack(r.outs))
+	if not hit and log.level >= log.TRACE then
+		local dev, host = r.g:buffer_size()
+		L:trace("graph planned", "splits", r.g:splits(), "buffer", dev, "buffer_cpu", host)
+	end
 	cache.n_past = r.inp.n_kv
 	return table.unpack(r.outs)
 end

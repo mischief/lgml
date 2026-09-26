@@ -707,7 +707,8 @@ local function grammar_engine_check(arch, path)
 end
 
 -- Weight placement: parts of the model on a second CPU backend give
--- the same logits as one backend, through the scheduler.
+-- the same logits as one backend, through the scheduler, and replay
+-- keeps one graph per shape.
 local function offload_check(arch, path, m, ref, long)
 	local placement = require("lgml.placement")
 	local transformer = require("lgml.transformer")
@@ -749,6 +750,7 @@ local function offload_check(arch, path, m, ref, long)
 			d = math.max(d, maxdiff(got[i] or {}, want[i]))
 		end
 		ok(#got == #want and d < ((os.getenv("LGML_DEVICE") or "CPU") == "CPU" and 1e-4 or LOOSE), ("%slogits equal one backend (max error %.3g)"):format(tag, d))
+		rc.decode(ok, tag, s, { n_ctx = 320, prompt = long, n = 12, flash_attn = true, builds = 3 })
 		s:close()
 	end
 end

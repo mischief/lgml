@@ -2119,6 +2119,27 @@ graph_buffer_size(lua_State *L)
 	return 2;
 }
 
+/*** Get the count of scheduler splits.
+ * A graph with leaves on a backend and its CPU backend runs in splits,
+ * each on one of the two; between splits the scheduler copies inputs.
+ * @treturn int splits of the last plan; 1 for a graph on one backend,
+ * 0 before the first `graph:compute`
+ * @function graph:splits
+ */
+static int
+graph_splits(lua_State *L)
+{
+	struct graph *g = check_graph(L, 1);
+
+	if (g->plan_nodes < 0)
+		lua_pushinteger(L, 0);
+	else if (g->use_sched)
+		lua_pushinteger(L, ggml_backend_sched_get_n_splits(g->sched));
+	else
+		lua_pushinteger(L, 1);
+	return 1;
+}
+
 /* tensor */
 
 /*** A leaf with storage, or a node of a graph.
@@ -3165,6 +3186,7 @@ static const luaL_Reg graph_methods[] = {
 	{ "top_k", graph_top_k },
 	{ "compute", graph_compute },
 	{ "buffer_size", graph_buffer_size },
+	{ "splits", graph_splits },
 	{ NULL, NULL }
 };
 
