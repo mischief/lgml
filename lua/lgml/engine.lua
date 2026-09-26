@@ -18,12 +18,40 @@ E.__index = E
 
 local UBATCH = 512
 
+-- Device memory kept free for compute buffers when the engine sizes the
+-- context to fit.
+local RESERVE = 1536 << 20
+
+-- The largest context, in steps of 256, whose cache fits in the free
+-- memory of the model's device. nil when the device does not report it.
+local function fit_ctx(be, model, max, copts)
+	if not model.cache_size then
+		return nil
+	end
+	local free
+	for _, d in ipairs(lgml.devices()) do
+		if d.name == be:name() then
+			free = d.free
+		end
+	end
+	if not free then
+		return nil
+	end
+	local per, fixed = model:cache_size(copts)
+	if per == 0 then
+		return max
+	end
+	local n = (free - RESERVE - fixed) // per // 256 * 256
+	return math.min(max, math.max(n, 256))
+end
+
 --- Loads a model and makes an engine.
 -- @tparam table opts the options:
 --
 -- - `model`: gguf path
 -- - `backend`: backend name (default: the best one)
--- - `n_ctx`: context size (default and maximum: the model's)
+-- - `n_ctx`: context size (default: the model's, or less so the cache
+--   fits in free device memory; at most the model's)
 -- - `flash_attn`: false to use soft_max attention (default true)
 -- - `cache_type_k`, `cache_type_v`: KV cache types from `lgml.kv`
 --   (default q8_0 with flash attention when the head size fits, else f16)
@@ -38,16 +66,21 @@ function M.new(opts)
 	local arch = info.meta["general.architecture"]
 	local model = (transformer.supports(arch) and transformer or require("lgml." .. arch))
 	    .load(be, opts.model)
-	local n_ctx = math.min(opts.n_ctx or model.hp.n_ctx, model.hp.n_ctx)
 	local fa = opts.flash_attn ~= false
-	local cache
-	if fa and not opts.cache_type_k and not opts.cache_type_v then
-		local good, c = pcall(model.cache, model, n_ctx, { type = "q8_0" })
-		cache = good and c or nil
+	local copts = { type_k = opts.cache_type_k or "f16", type_v = opts.cache_type_v or "f16" }
+	if fa and not opts.cache_type_k and not opts.cache_type_v and
+	    pcall(model.cache_size, model, { type = "q8_0" }) then
+		copts = { type = "q8_0" }
 	end
-	cache = cache or model:cache(n_ctx, {
-		type_k = opts.cache_type_k or "f16", type_v = opts.cache_type_v or "f16",
-	})
+	local n_ctx = math.min(opts.n_ctx or model.hp.n_ctx, model.hp.n_ctx)
+	if not opts.n_ctx then
+		n_ctx = fit_ctx(be, model, n_ctx, copts) or n_ctx
+		if n_ctx < model.hp.n_ctx then
+			io.stderr:write(("lgml: context %d of %d, to fit free device memory\n"):format(
+			    n_ctx, model.hp.n_ctx))
+		end
+	end
+	local cache = model:cache(n_ctx, copts)
 	local e = setmetatable({
 		be = be, model = model, family = family,
 		tk = assert(tokenizer.open(opts.model)),

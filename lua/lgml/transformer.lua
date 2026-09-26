@@ -401,6 +401,38 @@ function M:cache(n_ctx, opts)
 	return c
 end
 
+--- Bytes a cache from `cache` takes on the device.
+-- @tparam[opt] table opts the cache options, as for `cache`
+-- @treturn integer bytes per position (full-attention layers)
+-- @treturn integer bytes that do not grow with n_ctx (rings, recurrent
+-- states)
+function M:cache_size(opts)
+	opts = opts or {}
+	local hp = self.hp
+	local dims = {}
+	for _, L in ipairs(self.layers) do
+		if not L.recr then
+			dims[#dims + 1] = L.D
+		end
+	end
+	local tk, tv = kv.types_of(opts, dims)
+	local ring = hp.n_swa and hp.n_swa - 1 + (opts.ubatch or UBATCH)
+	local per, fixed = 0, 0
+	for _, L in ipairs(self.layers) do
+		if L.recr then
+			fixed = fixed + 4 * (conv_dim(hp) * (hp.d_conv - 1) + hp.n_v_heads * hp.head_v * hp.head_v)
+		elseif not L.kv_src then
+			local row = lgml.row_size(tk, L.Hkv * L.D) + lgml.row_size(tv, L.Hkv * L.D)
+			if L.swa then
+				fixed = fixed + ring * row
+			else
+				per = per + row
+			end
+		end
+	end
+	return per, fixed
+end
+
 --- Find how many cached positions stay valid after a rewind.
 -- The engine calls this before it sets cache.n_past to a smaller value.
 -- A ring must still hold the n_swa - 1 positions before n. Other
