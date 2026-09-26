@@ -1,12 +1,14 @@
 --- Z-Image text-to-image and image-to-image.
 -- The text encoder (`lgml.image.text_encoder`), the DiT
 -- (`lgml.image.zimage`) and the FLUX autoencoder (`lgml.image.vae`)
--- share one backend. The noise is the Philox "cuda" RNG of
--- stable-diffusion.cpp, so a seed gives the same start latent. The
--- latent stays on the device: each step runs the DiT graph once for
--- each condition, then a small graph adds (sigma_next - sigma) * v to
--- the latent. The DiT graphs are built once per request and run again
--- for every step with new timestep features.
+-- share one backend, or the text encoder runs on a second one, such as
+-- the CPU. The encoder output goes through host memory to the DiT. The
+-- noise is the Philox "cuda" RNG of stable-diffusion.cpp, so a seed
+-- gives the same start latent. The latent stays on the device: each
+-- step runs the DiT graph once for each condition, then a small graph
+-- adds (sigma_next - sigma) * v to the latent. The DiT graphs are built
+-- once per request and run again for every step with new timestep
+-- features.
 -- @module lgml.image.pipeline
 local lgml = require("lgml")
 local zimage = require("lgml.image.zimage")
@@ -32,21 +34,28 @@ M.MAX_SIDE = 2048
 -- - `llm`: the Qwen3-4B gguf
 -- - `vae`: the FLUX ae.safetensors
 -- - `backend`: backend name (default: the best one)
+-- - `text_backend`: backend name for the text encoder (default: the
+--   backend of the DiT)
 -- - `threads`: CPU thread count (default: `lgml.threads()`)
 -- @treturn Pipeline the pipeline
 -- @raise when a model does not load
 function M.load(opts)
-	local be = assert(lgml.backend(opts.backend, { threads = opts.threads }))
+	local bo = { threads = opts.threads }
+	local be = assert(lgml.backend(opts.backend, bo))
+	local tbe = be
+	if opts.text_backend and opts.text_backend ~= be:name() then
+		tbe = assert(lgml.backend(opts.text_backend, bo))
+	end
 	local vae = require("lgml.image.vae")
 	local p = setmetatable({ be = be, vae_mod = vae }, M)
-	p.te = text_encoder.load(be, opts.llm)
+	p.te = text_encoder.load(tbe, opts.llm)
 	p.dit = zimage.load(be, opts.dit)
 	p.vae = vae.load(be, opts.vae)
 	return p
 end
 
 --- A loaded pipeline, from `load`.
--- Fields: be, te, dit and vae.
+-- Fields: be (the backend of the DiT and the VAE), te, dit and vae.
 -- @type Pipeline
 
 --- Close the models.

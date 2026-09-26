@@ -26,6 +26,36 @@ function M.is_whisper(dir)
 	return type(cfg) == "table" and cfg.model_type == "whisper"
 end
 
+--- The files of a Z-Image model directory.
+-- The DiT is a gguf with "image" in its name, the text encoder a gguf
+-- with "qwen", and the VAE a safetensors file whose name starts with
+-- "ae" or has "vae". Case does not matter.
+-- @tparam string dir the model directory
+-- @treturn ?string the DiT path
+-- @treturn ?string the text encoder path
+-- @treturn ?string the VAE path
+function M.image_files(dir)
+	local uv = require("luv")
+	dir = dir:gsub("/+$", "")
+	local dit, llm, vae
+	local h = uv.fs_scandir(dir)
+	while h do
+		local name = uv.fs_scandir_next(h)
+		if not name then
+			break
+		end
+		local low = name:lower()
+		if low:match("%.gguf$") and low:find("qwen") then
+			llm = dir .. "/" .. name
+		elseif low:match("%.gguf$") and low:find("image") then
+			dit = dir .. "/" .. name
+		elseif low:match("%.safetensors$") and (low:find("^ae") or low:find("vae")) then
+			vae = dir .. "/" .. name
+		end
+	end
+	return dit, llm, vae
+end
+
 --- The mode names, in the order that lists use.
 -- A mode is a kind of request that a model serves. `/v1/models` gives
 -- them as `capabilities`:

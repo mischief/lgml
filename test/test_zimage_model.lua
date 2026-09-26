@@ -1,7 +1,9 @@
 -- Z-Image with real weights. Output is TAP. LGML_ZIMAGE names a
 -- directory with z_image_turbo-Q8_0.gguf, Qwen3-4B-Instruct-2507-Q8_0.gguf
--- and ae.safetensors; the test skips without it. The expected values
--- come from stable-diffusion.cpp on Vulkan with the same files.
+-- and ae.safetensors; the test skips without it. LGML_BACKEND and
+-- LGML_TEXT_BACKEND pick the backends of the DiT and the text encoder.
+-- The expected values come from stable-diffusion.cpp on Vulkan with the
+-- same files.
 local lgml = require("lgml")
 
 local dir = os.getenv("LGML_ZIMAGE")
@@ -22,9 +24,11 @@ local function ok(cond, name)
 	end
 end
 
+local tb = os.getenv("LGML_TEXT_BACKEND")
 local p = pipeline.load({
 	dit = dir .. "/z_image_turbo-Q8_0.gguf", llm = dir .. "/Qwen3-4B-Instruct-2507-Q8_0.gguf",
 	vae = dir .. "/ae.safetensors", backend = os.getenv("LGML_BACKEND"),
+	text_backend = tb ~= "" and tb or nil,
 })
 local prompt = "a red fox sitting in a snowy forest at sunrise, detailed fur, soft golden light"
 

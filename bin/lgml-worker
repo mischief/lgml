@@ -13,7 +13,7 @@ local getopt = require("lgml.getopt")
 
 local USAGE = "usage: lgml-worker --fd n (-m model | --fake) [-b backend] [-t threads] [-c n_ctx]\n" ..
     "                   [--no-fa] [--ctk type] [--ctv type] [--alias id] [--stt]\n" ..
-    "                   [--engine module]\n" ..
+    "                   [--engine module] [--text-backend name]\n" ..
     "                   [--recipe file] [--cache-ram MiB] [--ctx-checkpoints n]\n" ..
     "                   [--lora file[:scale]]...\n" ..
     "                   [--mmproj file] [--image-min-tokens n] [--image-max-tokens n]\n" ..
@@ -23,8 +23,8 @@ local USAGE = "usage: lgml-worker --fd n (-m model | --fake) [-b backend] [-t th
 local opts, rest = getopt.parse(arg, "m:b:t:c:", {
 	model = "m", backend = "b", threads = "t", ctx = "c", ["fd="] = false,
 	["no-fa"] = false, ["alias="] = false, fake = false, stt = false,
-	["engine="] = false, ["ctk="] = false, ["ctv="] = false, ["recipe="] = false,
-	["cache-ram="] = false, ["ctx-checkpoints="] = false, ["lora="] = false,
+	["engine="] = false, ["text-backend="] = false, ["ctk="] = false, ["ctv="] = false,
+	["recipe="] = false, ["cache-ram="] = false, ["ctx-checkpoints="] = false, ["lora="] = false,
 	["mmproj="] = false, ["image-min-tokens="] = false, ["image-max-tokens="] = false,
 	["fake-size="] = false, ["fake-load-ms="] = false, ["fake-delay="] = false,
 	["fake-fail"] = false, devices = false,
@@ -71,8 +71,8 @@ local function load()
 	end
 	if opts.engine then
 		return require(opts.engine).new({
-			model = opts.m, backend = opts.b, threads = threads, id = opts.alias,
-			n_ctx = opts.c and tonumber(opts.c),
+			model = opts.m, backend = opts.b, text_backend = opts["text-backend"],
+			threads = threads, id = opts.alias, n_ctx = opts.c and tonumber(opts.c),
 		})
 	elseif opts.stt or require("lgml.detect").is_whisper(opts.m) then
 		return require("lgml.stt_engine").new({

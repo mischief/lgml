@@ -5,35 +5,13 @@
 -- messages while it runs.
 -- @module lgml.image.engine
 local lgml = require("lgml")
-local uv = require("luv")
+local detect = require("lgml.detect")
 local pipeline = require("lgml.image.pipeline")
 local stream = require("lgml.server.stream")
 
 local M = {}
 local E = {}
 E.__index = E
-
--- The files of a model directory: the DiT, the text encoder and the VAE.
-local function find(dir)
-	local dit, llm, vae
-	local h = assert(uv.fs_scandir(dir))
-	while true do
-		local name = uv.fs_scandir_next(h)
-		if not name then
-			break
-		end
-		local low = name:lower()
-		if low:match("%.gguf$") and low:find("qwen") then
-			llm = dir .. "/" .. name
-		elseif low:match("%.gguf$") and low:find("image") then
-			dit = dir .. "/" .. name
-		elseif low:match("%.safetensors$") and (low:find("^ae") or low:find("vae")) then
-			vae = dir .. "/" .. name
-		end
-	end
-	assert(dit and llm and vae, dir .. ": need a z_image gguf, a Qwen3 gguf and ae.safetensors")
-	return dit, llm, vae
-end
 
 --- Load the models and make an engine.
 -- @tparam table opts the options:
@@ -42,6 +20,8 @@ end
 --   Qwen3 gguf (a name with "qwen") and the VAE (ae.safetensors)
 -- - `dit`, `llm`, `vae`: file paths in place of the directory scan
 -- - `backend`: backend name (default: the best one)
+-- - `text_backend`: backend name for the text encoder (default:
+--   `backend`), such as "CPU" to keep its weights out of GPU memory
 -- - `threads`: CPU thread count (default: `lgml.threads()`)
 -- - `id`: model id (default: the DiT file name without .gguf)
 -- @treturn Engine the engine
@@ -49,10 +29,13 @@ end
 function M.new(opts)
 	local dit, llm, vae = opts.dit, opts.llm, opts.vae
 	if not (dit and llm and vae) then
-		dit, llm, vae = find((opts.model:gsub("/+$", "")))
+		dit, llm, vae = detect.image_files(opts.model)
+		assert(dit and llm and vae,
+		    opts.model .. ": need a z_image gguf, a Qwen3 gguf and ae.safetensors")
 	end
 	local p = pipeline.load({
-		dit = dit, llm = llm, vae = vae, backend = opts.backend, threads = opts.threads,
+		dit = dit, llm = llm, vae = vae, backend = opts.backend, text_backend = opts.text_backend,
+		threads = opts.threads,
 	})
 	return setmetatable({
 		p = p, id = opts.id or dit:match("([^/]+)%.gguf$"), busy = false, waiting = {},

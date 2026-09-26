@@ -19,7 +19,7 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                    [--recipe file] [--cache-ram MiB] [--ctx-checkpoints n]
                    [--lora file[:scale]]... [--mmproj file] [--image-min-tokens n]
                    [--image-max-tokens n] [--inproc] [--stt] [--engine module]
-                   [--cors origin] [--vram MiB] [--idle seconds]
+                   [--text-backend name] [--cors origin] [--vram MiB] [--idle seconds]
   -l, --listen addr   address to listen on (default 127.0.0.1)
   -p, --port port     port to listen on (default 8080)
   -C, --config file   Lua file returning { listen, port, cors, vram, ram, idle,
@@ -40,6 +40,8 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       cache_ram, ctx_checkpoints, lora = "file[:scale]" or a
                       list of them or of { path, scale }, mmproj,
                       image_min_tokens, image_max_tokens,
+                      text_backend = backend of the text encoder of
+                      lgml.image.engine, such as CPU,
                       engine = Lua module with new(opts), such as a TTS engine,
                       modes = list of completion, multimodal, decide,
                       transcription, speech, image_generation (default: from
@@ -84,6 +86,9 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       when not given)
       --engine module Lua engine module for the model, such as
                       lgml.image.engine with -m a Z-Image directory
+      --text-backend name
+                      with --engine lgml.image.engine: the backend of the
+                      text encoder, such as CPU (default: the -b backend)
       --cors origin   allow cross-origin requests from origin, such as
                       http://localhost:8000 or * (default: none)
       --vram MiB      with -C: the GPU memory budget (overrides vram)
@@ -159,10 +164,13 @@ local function model_engine(spec, managed)
 	    (spec.image_max_tokens and not (imax and imax >= (imin or 1))) then
 		die("bad image token range")
 	end
+	if spec.text_backend and spec.engine ~= "lgml.image.engine" then
+		die("text_backend needs engine lgml.image.engine")
+	end
 	if spec.inproc and spec.engine then
 		return require(spec.engine).new({
-			model = spec.model, backend = spec.backend, threads = threads, id = spec.id,
-			n_ctx = n_ctx,
+			model = spec.model, backend = spec.backend, text_backend = spec.text_backend,
+			threads = threads, id = spec.id, n_ctx = n_ctx,
 		})
 	elseif spec.inproc and stt then
 		return require("lgml.stt_engine").new({
@@ -180,6 +188,7 @@ local function model_engine(spec, managed)
 	local wargs = { "-m", spec.model }
 	for flag, v in pairs({
 		["-b"] = spec.backend, ["-t"] = threads, ["-c"] = spec.ctx, ["--alias"] = spec.id,
+		["--text-backend"] = spec.text_backend,
 		["--ctk"] = spec.cache_type_k, ["--ctv"] = spec.cache_type_v,
 		["--recipe"] = spec.recipe, ["--cache-ram"] = spec.cache_ram,
 		["--ctx-checkpoints"] = spec.ctx_checkpoints, ["--mmproj"] = spec.mmproj,
@@ -359,6 +368,7 @@ local function make_engine(opts)
 	if opts.m then
 		return model_engine({
 			model = opts.m, id = opts.alias, backend = opts.b, threads = opts.t, ctx = opts.c,
+			text_backend = opts["text-backend"],
 			flash_attn = not opts["no-fa"], stt = opts.stt, inproc = opts.inproc,
 			cache_type_k = opts.ctk, cache_type_v = opts.ctv, recipe = opts.recipe,
 			cache_ram = opts["cache-ram"], ctx_checkpoints = opts["ctx-checkpoints"],
@@ -378,6 +388,7 @@ local function main(args)
 		["recipe="] = false, ["cache-ram="] = false, ["ctx-checkpoints="] = false,
 		["lora="] = false, ["cors="] = false, ["vram="] = false, ["idle="] = false,
 		["mmproj="] = false, ["image-min-tokens="] = false, ["image-max-tokens="] = false,
+		["text-backend="] = false,
 	}, { lora = true })
 	if not opts then
 		io.stderr:write("lgml-server: ", rest, "\n", USAGE)
