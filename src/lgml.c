@@ -627,9 +627,16 @@ operand(lua_State *L, struct graph *g, int idx)
 		luaL_argerror(L, idx, "tensor on another backend");
 	lua_getiuservalue(L, 1, UV_EXTRA);
 	lua_pushvalue(L, idx);
-	lua_pushboolean(L, 1);
-	lua_rawset(L, -3);
-	lua_pop(L, 1);
+	if (lua_rawget(L, -2) == LUA_TNIL) {
+		/* A leaf takes a graph slot as a leaf, or as a node if trainable. */
+		if (g->ntensors + g->nleaves + 1 > g->size)
+			luaL_error(L, "graph full (%d tensors)", g->size);
+		g->nleaves++;
+		lua_pushvalue(L, idx);
+		lua_pushboolean(L, 1);
+		lua_rawset(L, -4);
+	}
+	lua_pop(L, 2);
 	return t;
 }
 
@@ -643,7 +650,7 @@ opt_operand(lua_State *L, struct graph *g, int idx)
 static void
 reserve(lua_State *L, struct graph *g, int n)
 {
-	if (g->ntensors + n > g->size)
+	if (g->ntensors + g->nleaves + n > g->size)
 		luaL_error(L, "graph full (%d tensors)", g->size);
 	g->ntensors += n;
 }

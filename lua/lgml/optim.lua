@@ -68,7 +68,8 @@ end
 -- The step graph: one update node per parameter, and the moments.
 function Opt:build()
 	local be = self.params[1]:backend()
-	local g = be:graph(math.max(64, #self.params + 16))
+	-- Each parameter has a step node, a gradient and two moments.
+	local g = be:graph(4 * #self.params + 64)
 	local nodes = {}
 	if self.kind == "adamw" then
 		self.hp = be:tensor("f32", { 7 })

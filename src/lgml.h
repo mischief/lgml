@@ -44,6 +44,7 @@ struct graph {
 	ggml_gallocr_t		 galloc;
 	int			 size;		/* the most ggml tensors */
 	int			 ntensors;
+	int			 nleaves;	/* leaf operands from other stores */
 	int			 plan_nodes;	/* nodes at the last plan; -1 before */
 	int			 plan_tensors;	/* ntensors at the last plan */
 	int			 backward;	/* 1 after tensor:backward */

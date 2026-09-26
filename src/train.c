@@ -550,9 +550,9 @@ tensor_backward(lua_State *L)
 	ggml_set_output(t->t);
 	ggml_build_forward_expand(g->gf, t->t);
 	need = check_backward(L, g->gf, t->t) * BACK_PER_NODE + 64;
-	if (g->ntensors + need > g->size)
+	if (g->ntensors + g->nleaves + need > g->size)
 		return luaL_error(L, "backward: graph too small; need about %d tensors, "
-		    "make it with backend:graph(n)", g->ntensors + need);
+		    "make it with backend:graph(n)", g->ntensors + g->nleaves + need);
 
 	n = ggml_graph_n_nodes(g->gf);
 	accs = lua_newuserdatauv(L, (size_t)n * sizeof(*accs), 0);
