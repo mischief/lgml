@@ -460,7 +460,7 @@ end
 for _, arch in ipairs({ "llama", "qwen3", "qwen3moe", "qwen3next", "qwen35moe", "qwen35" }) do
 	local path = os.tmpname()
 	gguf.write(path, build(arch))
-	local model = require("lgml." .. arch)
+	local model = require("lgml.transformer")
 	local m = model.load(be, path)
 	local ref
 	if bin and bin ~= "" then
@@ -524,7 +524,7 @@ for _, r in ipairs(real) do
 		local tag = arch .. " " .. dev .. ": "
 		local info = assert(lgml.gguf(path))
 		ok(info.meta["general.architecture"] == arch, tag .. "architecture")
-		local m = require("lgml." .. arch).load(rb, path)
+		local m = require("lgml.transformer").load(rb, path)
 		local tk <close> = assert(lgml.tokenizer(path))
 		local prompt = tk:encode("The capital of France is", { add_bos = false })
 		local t0 = lgml.clock()

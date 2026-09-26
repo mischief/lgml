@@ -87,12 +87,12 @@ end
 if path == nil or path == "" then
 	skip("LGML_MODEL not set")
 else
-	local qwen3 = require("lgml.qwen3")
+	local transformer = require("lgml.transformer")
 	local gen = require("lgml.generate")
 	for _, dev in ipairs(devs) do
 		local be <close> = assert(lgml.backend(dev))
 		local tag = dev .. ": "
-		local m = qwen3.load(be, path)
+		local m = transformer.load(be, path)
 
 		local c = m:cache(64)
 		local ids = gen.greedy(m, c, prompt, 32)

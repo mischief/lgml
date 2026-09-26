@@ -4,7 +4,7 @@
 -- lgml.server.engine.
 -- @module lgml.tts.orpheus
 local lgml = require("lgml")
-local llama = require("lgml.llama")
+local transformer = require("lgml.transformer")
 local replay = require("lgml.replay")
 local snac = require("lgml.snac")
 local stream = require("lgml.server.stream")
@@ -97,8 +97,8 @@ function M.new(opts)
 	local be = assert(lgml.backend(opts.backend))
 	local lm, codec = find_models(opts.model, opts.codec)
 	local e = setmetatable({
-		be = be, lm = llama.load(be, lm), codec = snac.load(be, codec),
-		tk = assert(llama.tokenizer(lm)),
+		be = be, lm = transformer.load(be, lm), codec = snac.load(be, codec),
+		tk = assert(lgml.tokenizer(lm)),
 		id = opts.id or "orpheus",
 		busy = false, waiting = {},
 	}, E)
@@ -200,8 +200,8 @@ end
 -- @tparam string text the text
 -- @treturn {int,...} prompt token ids
 function E:prompt(voice, text)
-	local ids = { AUDIO_START, self.tk.bos }
-	local body = self.tk:encode(voice .. ": " .. text)
+	local ids = { AUDIO_START, self.tk:special().bos }
+	local body = self.tk:encode(voice .. ": " .. text, { special = false, add_bos = false })
 	table.move(body, 1, #body, 3, ids)
 	return table.move(PROMPT_END, 1, #PROMPT_END, #ids + 1, ids)
 end

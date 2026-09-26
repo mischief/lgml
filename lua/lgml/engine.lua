@@ -10,6 +10,7 @@ local sampler = require("lgml.sampler")
 local tokenizer = require("lgml.tokenizer")
 local stream = require("lgml.server.stream")
 local replay = require("lgml.replay")
+local transformer = require("lgml.transformer")
 
 local M = {}
 local E = {}
@@ -34,8 +35,9 @@ function M.new(opts)
 	local be = assert(lgml.backend(opts.backend))
 	local info = assert(lgml.gguf(opts.model))
 	local family = chat.load(info.meta)
-	local arch = require("lgml." .. info.meta["general.architecture"])
-	local model = arch.load(be, opts.model)
+	local arch = info.meta["general.architecture"]
+	local model = (transformer.supports(arch) and transformer or require("lgml." .. arch))
+	    .load(be, opts.model)
 	local n_ctx = math.min(opts.n_ctx or model.hp.n_ctx, model.hp.n_ctx)
 	local fa = opts.flash_attn ~= false
 	local cache

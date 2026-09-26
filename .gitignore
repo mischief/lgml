@@ -6,3 +6,5 @@ etc/lgml.lua
 subprojects/*/
 !subprojects/packagefiles/
 subprojects/packagecache/
+*.swp
+*~

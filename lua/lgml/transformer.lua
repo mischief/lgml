@@ -50,6 +50,14 @@ local function check_sections(a, sec, n_rot)
 	end
 end
 
+--- Tell if the transformer handles a gguf architecture.
+-- @tparam string arch the `general.architecture` value
+-- @treturn boolean true for llama, qwen3, qwen3moe, qwen3next, qwen35,
+-- qwen35moe and gemma4
+function M.supports(arch)
+	return family[arch] ~= nil
+end
+
 --- Read the model config from gguf metadata.
 -- Keys have the prefix `general.architecture`. The table is the `hp`
 -- field of a model. It holds arch, n_layer (without nextn layers),

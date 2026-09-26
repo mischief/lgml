@@ -1,4 +1,4 @@
--- Gemma 4 (lgml.gemma4) on tiny random-weight ggufs made here, against
+-- Gemma 4 (lgml.transformer) on tiny random-weight ggufs made here, against
 -- llama.cpp logits, and replay against a new graph per pass. Output is TAP. Set LGML_LLAMA_LOGITS to a
 -- scripts/llama_logits.c binary to compare every logit live;
 -- LGML_REF_DUMP=1 prints new reference rows. LGML_GEMMA4 names a real
@@ -10,7 +10,7 @@ package.path = here .. "?.lua;" .. package.path
 local gguf = require("gguf")
 local bpe_vocab = require("bpe_vocab")
 local rc = require("replay_check")
-local gemma4 = require("lgml.gemma4")
+local transformer = require("lgml.transformer")
 
 local n = 0
 local failed = false
@@ -456,7 +456,7 @@ for _, kind in ipairs({ "dense", "moe" }) do
 	local path = os.tmpname()
 	local kv, ts = build(kind)
 	gguf.write(path, kv, ts)
-	local m = gemma4.load(be, path)
+	local m = transformer.load(be, path)
 	local ref
 	if bin and bin ~= "" then
 		ref = llama_rows(bin, path)
@@ -522,7 +522,7 @@ else
 	local info = assert(lgml.gguf(path))
 	ok(info.meta["general.architecture"] == "gemma4", tag .. "architecture")
 	local t0 = lgml.clock()
-	local m = gemma4.load(rb, path)
+	local m = transformer.load(rb, path)
 	local tk = assert(tokenizer.open(path))
 	local text = chat.load(info.meta).render({ { role = "user",
 		content = "What is the capital of France? Answer in one sentence." } },
