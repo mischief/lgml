@@ -95,11 +95,29 @@ local function thinking(req)
 	return req.reasoning_effort ~= "none"
 end
 
+-- Request fields that the denoiser cannot use, with the value that
+-- changes nothing, if any.
+local NEUTRAL = {
+	{ "temperature" }, { "top_p" }, { "top_k" }, { "min_p" }, { "grammar" }, { "lora" },
+	{ "presence_penalty", 0 }, { "frequency_penalty", 0 }, { "repeat_penalty", 1 },
+	{ "logprobs", false },
+}
+
 -- The first field of req that the engine cannot do, or nil.
 local function unsupported(req)
-	if req.logprobs == true then
-		return "logprobs"
-	elseif type(req.logit_bias) == "table" and next(req.logit_bias) ~= nil then
+	for _, f in ipairs(NEUTRAL) do
+		local v = req[f[1]]
+		if v ~= nil and v ~= f[2] then
+			return f[1]
+		end
+	end
+	local kw = req.chat_template_kwargs
+	for k in pairs(type(kw) == "table" and kw or {}) do
+		if k ~= "enable_thinking" then
+			return "chat_template_kwargs." .. tostring(k)
+		end
+	end
+	if type(req.logit_bias) == "table" and next(req.logit_bias) ~= nil then
 		return "logit_bias"
 	elseif req.tool_choice == "required" or type(req.tool_choice) == "table" then
 		return "tool_choice"
@@ -112,8 +130,11 @@ end
 -- at an end token, at the token limit, at the context end, or after 3
 -- blocks in a row that end in a loop. The request can set `seed`,
 -- `max_tokens`, `max_completion_tokens`, `stop`, `tools`, `reasoning_effort =
--- "none"` and `chat_template_kwargs.enable_thinking`. `logprobs`,
--- `logit_bias` and a `tool_choice` that forces a call give status 400. A Lua error resets the cache and returns
+-- "none"` and `chat_template_kwargs.enable_thinking`. The sampler
+-- fields (temperature, `top_p`, `top_k`, `min_p`, the penalties,
+-- `logit_bias` and `logprobs`), a grammar or JSON schema, `lora`, other
+-- template kwargs and a `tool_choice` that forces a call give status
+-- 400. A Lua error resets the cache and returns
 -- status 500.
 -- @tparam table req the chat request
 -- @tparam lgml.server.engine.Sink sink the reply

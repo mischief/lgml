@@ -370,6 +370,19 @@ reply with only tool calls has no content to format.
 The diffusion engine cannot force a call; there `required` and a named
 function give 400.
 
+### Diffusion models
+
+A diffusion model (such as diffusion-gemma) makes blocks of tokens at
+once, with no sampler chain. It takes `seed`, `max_tokens`,
+`max_completion_tokens`, `stop`, `n`, `tools`, `tool_choice` `none` and
+`auto`, `parallel_tool_calls`, `reasoning_effort` and
+`chat_template_kwargs.enable_thinking`. These fields give 400 there:
+`temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty` and
+`frequency_penalty` (except 0), `repeat_penalty` (except 1),
+`logit_bias`, `logprobs: true`, `response_format` with a schema,
+`json_schema`, `grammar`, `lora`, other `chat_template_kwargs`, and
+`tool_choice` `required` or a named function.
+
 ### Constrained output
 
 - `response_format: {"type": "text"}`: no constraint.

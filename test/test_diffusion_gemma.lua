@@ -280,17 +280,35 @@ do
 	function r.cancelled()
 		return false
 	end
-	local done, res, err
-	coroutine.wrap(function()
-		res, err = e:chat({ messages = { { role = "user", content = "hi" } }, max_tokens = 20 }, r)
-		done = true
-	end)()
-	while not done do
-		uv.run("once")
+	local function chat(extra)
+		local req = { messages = { { role = "user", content = "hi" } }, max_tokens = 20 }
+		for k, v in pairs(extra or {}) do
+			req[k] = v
+		end
+		local done, res, err, status
+		coroutine.wrap(function()
+			res, err, status = e:chat(req, r)
+			done = true
+		end)()
+		while not done do
+			uv.run("once")
+		end
+		return res, err, status
 	end
+	local res, err = chat()
 	ok(res == true, "engine chat returns true " .. tostring(err))
 	ok((r.reason == "stop" or r.reason == "length") and r.usage.completion_tokens <= 20 and
 	    r.usage.completion_tokens >= 1, "engine finishes within max_tokens")
+	for _, x in ipairs({ { temperature = 0.5 }, { top_k = 5 }, { logprobs = true },
+		{ grammar = 'root ::= "x"' }, { logit_bias = { ["1"] = 5 } },
+		{ tool_choice = "required", tools = { { type = "function", ["function"] = { name = "f" } } } },
+		{ chat_template_kwargs = { preserve_thinking = false } } }) do
+		local k = x.tool_choice and "tool_choice" or next(x)
+		local _, msg, status = chat(x)
+		ok(status == 400 and msg:find(k, 1, true), "diffusion rejects " .. k)
+	end
+	res = chat({ presence_penalty = 0, logprobs = false, chat_template_kwargs = { enable_thinking = false } })
+	ok(res == true, "neutral values pass")
 end
 
 os.remove(path)
