@@ -96,7 +96,7 @@ end
 -- One chat turn with the image and a question. Greedy, short answer.
 local function ask1(url, png, question, tmp)
 	local r = post(url .. "/v1/chat/completions", {
-		temperature = 0, max_tokens = 64,
+		temperature = 0, max_tokens = 2048,
 		messages = { { role = "user", content = {
 			{ type = "image_url", image_url = { url = "data:image/png;base64," .. png } },
 			{ type = "text", text = question },
