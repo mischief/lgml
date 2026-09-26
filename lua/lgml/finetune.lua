@@ -27,11 +27,11 @@ function M.check(model)
 	local hp = model.hp
 	if model.recurrent then
 		error(hp.arch .. ": gated delta net layers have no gradient in ggml; " ..
-		    "training needs a dense attention model such as llama or qwen3")
+		    "training needs a dense attention model such as llama or qwen3", 0)
 	elseif hp.n_expert then
-		error(hp.arch .. ": routed experts (mul_mat_id) have no gradient in ggml")
+		error(hp.arch .. ": routed experts (mul_mat_id) have no gradient in ggml", 0)
 	elseif hp.gemma or hp.n_swa then
-		error(hp.arch .. ": gelu, soft capping and sliding windows have no gradient in ggml")
+		error(hp.arch .. ": gelu, soft capping and sliding windows have no gradient in ggml", 0)
 	end
 end
 

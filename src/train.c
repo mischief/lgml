@@ -381,23 +381,35 @@ as_f32(struct ggml_context *ctx, struct ggml_tensor *a, struct ggml_tensor *ids)
 	return ggml_get_rows(ctx, a, ggml_view_1d(ctx, ids, a->ne[1], 0));
 }
 
+/* Largest f32 copy of a quantized weight to make for one out_prod. */
+#define DEQUANT_MAX	((int64_t)1 << 30)
+
 /*
  * The ggml gradient of mul_mat uses out_prod on quantized, transposed
- * or permuted operands. Give a backend without those forms contiguous
+ * or permuted operands. The CPU out_prod dequantizes a quantized weight
+ * once for each gradient row; an f32 copy made once is about twice as
+ * fast for a whole step. Weights with a copy over DEQUANT_MAX bytes,
+ * such as a large output projection, keep the slow form where the
+ * backend has it. A backend without the other forms gets contiguous
  * f32 operands. Return nonzero if a node changed.
  */
 static int
 lower_out_prod(struct graph *g, struct ggml_cgraph *gf, struct ggml_tensor *ids, int all)
 {
 	struct ggml_tensor *t, *a, *b;
-	int i, changed = 0;
+	int i, lack, changed = 0;
 
 	for (i = 0; i < ggml_graph_n_nodes(gf); i++) {
 		t = ggml_graph_node(gf, i);
-		if (t->op != GGML_OP_OUT_PROD || (!all && ggml_backend_supports_op(g->b->be, t)))
+		if (t->op != GGML_OP_OUT_PROD)
 			continue;
-		a = as_f32(g->ctx, t->src[0], ids);
-		b = as_f32(g->ctx, t->src[1], NULL);
+		a = t->src[0];
+		b = t->src[1];
+		lack = all || !ggml_backend_supports_op(g->b->be, t);
+		if (lack || (ggml_is_quantized(a->type) && 4 * ggml_nelements(a) <= DEQUANT_MAX))
+			a = as_f32(g->ctx, a, ids);
+		if (lack)
+			b = as_f32(g->ctx, b, NULL);
 		if (a != t->src[0] || b != t->src[1]) {
 			t->src[0] = a;
 			t->src[1] = b;
@@ -407,9 +419,9 @@ lower_out_prod(struct graph *g, struct ggml_cgraph *gf, struct ggml_tensor *ids,
 	return changed;
 }
 
-/* Rows of the largest quantized out_prod operand the backend lacks. */
+/* Rows of the largest quantized out_prod operand. */
 static int64_t
-lower_rows(struct graph *g, struct ggml_cgraph *gf, int all)
+lower_rows(struct ggml_cgraph *gf)
 {
 	struct ggml_tensor *t;
 	int64_t rows = 0;
@@ -418,51 +430,45 @@ lower_rows(struct graph *g, struct ggml_cgraph *gf, int all)
 	for (i = 0; i < ggml_graph_n_nodes(gf); i++) {
 		t = ggml_graph_node(gf, i);
 		if (t->op == GGML_OP_OUT_PROD && ggml_is_quantized(t->src[0]->type) &&
-		    (all || !ggml_backend_supports_op(g->b->be, t)) && t->src[0]->ne[1] > rows)
+		    t->src[0]->ne[1] > rows)
 			rows = t->src[0]->ne[1];
 	}
 	return rows;
 }
 
 /*
- * Push a store on the backend at bidx with the loss seed (f32 1) and,
- * when rows > 0, i32 ids 0 to rows - 1.
+ * Make a 1-D leaf of n elements with the given data, in a store on the
+ * backend of the graph at gidx. The graph holds the store until it is
+ * collected.
  */
-static void
-push_seed(lua_State *L, int bidx, int64_t rows, struct ggml_tensor **seed,
-    struct ggml_tensor **ids)
+static struct ggml_tensor *
+graph_const(lua_State *L, int gidx, enum ggml_type type, int64_t n, const void *data)
 {
-	struct ggml_init_params ip = { 2 * ggml_tensor_overhead(), NULL, true };
-	struct backend *b = lua_touserdata(L, bidx);
+	struct ggml_init_params ip = { ggml_tensor_overhead(), NULL, true };
 	struct ggml_context *ctx;
+	struct ggml_tensor *t;
 	ggml_backend_buffer_t buf;
-	const float one = 1.0f;
-	int32_t *v;
-	int64_t i;
+	struct backend *b;
 
+	lua_getiuservalue(L, gidx, UV_PARENT);
+	b = lgml_check_backend(L, -1);
 	ctx = ggml_init(ip);
 	if (ctx == NULL)
 		luaL_error(L, "ggml_init failed");
-	*seed = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-	ggml_set_name(*seed, "loss seed");
-	*ids = rows > 0 ? ggml_new_tensor_1d(ctx, GGML_TYPE_I32, rows) : NULL;
+	t = ggml_new_tensor_1d(ctx, type, n);
 	buf = ggml_backend_alloc_ctx_tensors(ctx, b->be);
 	if (buf == NULL) {
 		ggml_free(ctx);
 		luaL_error(L, "out of device memory");
 	}
-	/* The graph holds the store until it is collected. */
-	lgml_push_store(L, bidx, ctx, buf);
-	ggml_backend_tensor_set(*seed, &one, 0, sizeof(one));
-	if (*ids == NULL)
-		return;
-	v = malloc((size_t)rows * sizeof(*v));
-	if (v == NULL)
-		luaL_error(L, "out of memory");
-	for (i = 0; i < rows; i++)
-		v[i] = (int32_t)i;
-	ggml_backend_tensor_set(*ids, v, 0, (size_t)rows * sizeof(*v));
-	free(v);
+	lgml_push_store(L, -1, ctx, buf);
+	ggml_backend_tensor_set(t, data, 0, ggml_nbytes(t));
+	lua_getiuservalue(L, gidx, UV_EXTRA);
+	lua_pushvalue(L, -2);
+	lua_pushboolean(L, 1);
+	lua_rawset(L, -3);
+	lua_pop(L, 3);
+	return t;
 }
 
 /* Gradient leaves of the trainable leaves of the graph at gidx, by node index. */
@@ -530,7 +536,10 @@ tensor_backward(lua_State *L)
 	struct tensor *t = lgml_check_tensor(L, 1);
 	struct graph *g = t->g;
 	struct ggml_cgraph *gb, *gn;
-	struct ggml_tensor *seed, *ids, **accs;
+	struct ggml_tensor *seed, *ids = NULL, **accs;
+	const float one = 1.0f;
+	int64_t rows;
+	int32_t *v;
 	int i, n, need, gidx, before, all = 0;
 
 	if (g == NULL)
@@ -548,8 +557,6 @@ tensor_backward(lua_State *L)
 	lua_settop(L, 1);
 	lua_getiuservalue(L, 1, UV_PARENT);
 	gidx = lua_gettop(L);
-	lua_getiuservalue(L, gidx, UV_PARENT);
-
 	ggml_set_output(t->t);
 	ggml_build_forward_expand(g->gf, t->t);
 	/* ggml aborts when a context or cgraph is full, so grow both first. */
@@ -560,12 +567,7 @@ tensor_backward(lua_State *L)
 	accs = lua_newuserdatauv(L, (size_t)n * sizeof(*accs), 0);
 	memset(accs, 0, (size_t)n * sizeof(*accs));
 	grad_accs(L, gidx, g->gf, accs);
-	push_seed(L, gidx + 1, lower_rows(g, g->gf, all), &seed, &ids);
-	lua_getiuservalue(L, gidx, UV_EXTRA);
-	lua_pushvalue(L, -2);
-	lua_pushboolean(L, 1);
-	lua_rawset(L, -3);
-	lua_pop(L, 2);
+	seed = graph_const(L, gidx, GGML_TYPE_F32, 1, &one);
 	for (i = 0; i < n; i++)
 		if (ggml_graph_node(g->gf, i) == t->t)
 			accs[i] = seed;
@@ -577,6 +579,13 @@ tensor_backward(lua_State *L)
 	g->grads = 1;
 	before = count_tensors(g->ctx);
 	ggml_build_backward_expand(g->ctx, gb, accs);
+	rows = lower_rows(gb);
+	if (rows > 0) {
+		v = lua_newuserdatauv(L, (size_t)rows * sizeof(*v), 0);
+		for (i = 0; i < rows; i++)
+			v[i] = i;
+		ids = graph_const(L, gidx, GGML_TYPE_I32, rows, v);
+	}
 	if (lower_out_prod(g, gb, ids, all)) {
 		/* Order the new operands before their users. */
 		gn = lgml_new_cgraph(L, g, g->size, 0);
