@@ -137,11 +137,14 @@ image_close(lua_State *L)
 
 /*** Make an f32 tensor of shape (1, 3, H, W) with values in [-1, 1].
  * Gray becomes three equal channels. Alpha blends over a gray
- * background level.
+ * background level. With mean and std, channel k gets
+ * (v - mean[k]) / std[k] for v in [0, 1], in place of [-1, 1].
  * @tparam backend be the backend for the tensor
  * @tparam[opt=1] number background background level, 0 (black) to 1 (white)
+ * @tparam[opt] {number,number,number} mean the channel means
+ * @tparam[opt] {number,number,number} std the channel deviations, not 0
  * @treturn tensor a new leaf
- * @raise on a bad backend or background, or out of memory
+ * @raise on a bad backend, background, mean or std, or out of memory
  * @function image:tensor
  */
 static int
@@ -152,11 +155,21 @@ image_tensor(lua_State *L)
 	size_t plane = (size_t)im->w * (size_t)im->h, i, c = (size_t)im->c;
 	struct tensor *t;
 	const unsigned char *p;
-	float *x, a;
-	int k;
+	float *x, a, mean[3], sd[3];
+	int k, norm = !lua_isnoneornil(L, 4);
 
 	lgml_check_backend(L, 2);
 	luaL_argcheck(L, bg >= 0 && bg <= 1, 3, "background out of range");
+	for (k = 0; norm && k < 3; k++) {
+		luaL_checktype(L, 4, LUA_TTABLE);
+		luaL_checktype(L, 5, LUA_TTABLE);
+		lua_geti(L, 4, k + 1);
+		lua_geti(L, 5, k + 1);
+		mean[k] = (float)luaL_checknumber(L, -2);
+		sd[k] = (float)luaL_checknumber(L, -1);
+		luaL_argcheck(L, sd[k] != 0, 5, "std must not be 0");
+		lua_pop(L, 2);
+	}
 	lua_getfield(L, 2, "tensor");
 	lua_pushvalue(L, 2);
 	lua_pushstring(L, "f32");
@@ -181,7 +194,7 @@ image_tensor(lua_State *L)
 			    (float)bg * (1 - a);
 	}
 	for (i = 0; i < plane * 3; i++)
-		x[i] = x[i] * 2 - 1;
+		x[i] = norm ? (x[i] - mean[i / plane]) / sd[i / plane] : x[i] * 2 - 1;
 	ggml_backend_tensor_set(t->t, x, 0, plane * 3 * sizeof(*x));
 	free(x);
 	return 1;
@@ -231,10 +244,13 @@ image_jpeg(lua_State *L)
 }
 
 /*** Resize to a new width and height.
- * The filter is a triangle, widened to average over the area when the
- * image shrinks.
+ * The "area" filter is a triangle, widened to average over the area
+ * when the image shrinks. The "bilinear" filter is the one of llama.cpp
+ * clip: it maps corner pixels to corner pixels, reads 4 pixels, and
+ * rounds toward zero.
  * @tparam int w new width, 1 to 32768
  * @tparam int h new height, 1 to 32768
+ * @tparam[opt="area"] string filter "area" or "bilinear"
  * @treturn image new image
  * @raise if a size is out of range or memory runs out
  * @function image:resize
@@ -242,14 +258,17 @@ image_jpeg(lua_State *L)
 static int
 image_resize_l(lua_State *L)
 {
+	static const char *const filters[] = { "area", "bilinear", NULL };
 	struct image *im = check_image(L, 1);
 	lua_Integer w = luaL_checkinteger(L, 2), h = luaL_checkinteger(L, 3);
+	int f = luaL_checkoption(L, 4, "area", filters);
 	struct image tmp, *r;
 
 	luaL_argcheck(L, w >= 1 && w <= IMAGE_MAX_SIDE, 2, "width out of range");
 	luaL_argcheck(L, h >= 1 && h <= IMAGE_MAX_SIDE, 3, "height out of range");
 	r = new_image(L);
-	if (image_resize(im, (int)w, (int)h, &tmp) != 0)
+	if ((f == 0 ? image_resize(im, (int)w, (int)h, &tmp) :
+	    image_resize_bilinear(im, (int)w, (int)h, &tmp)) != 0)
 		return luaL_error(L, "resize: image too large or out of memory");
 	*r = tmp;
 	return 1;
@@ -284,6 +303,71 @@ image_crop(lua_State *L)
 	return 1;
 }
 
+/*** Convert to 3 channels.
+ * Gray becomes three equal channels. Alpha is dropped, not blended.
+ * @treturn image new RGB image
+ * @raise if memory runs out
+ * @function image:rgb
+ */
+static int
+image_rgb(lua_State *L)
+{
+	struct image *im = check_image(L, 1);
+	size_t n = (size_t)im->w * (size_t)im->h, c = (size_t)im->c, i;
+	const unsigned char *p;
+	struct image *r;
+	int k;
+
+	r = new_image(L);
+	if (image_alloc(r, im->w, im->h, 3) != 0)
+		return luaL_error(L, "out of memory");
+	for (i = 0; i < n; i++) {
+		p = im->p + i * c;
+		for (k = 0; k < 3; k++)
+			r->p[i * 3 + (size_t)k] = c < 3 ? p[0] : p[k];
+	}
+	return 1;
+}
+
+/*** Place the image on a new canvas of one color.
+ * Parts outside the canvas are cut off.
+ * @tparam int w canvas width, 1 to 32768
+ * @tparam int h canvas height, 1 to 32768
+ * @tparam int x column of the left edge on the canvas
+ * @tparam int y row of the top edge on the canvas
+ * @tparam[opt=0] int fill canvas byte for each channel, 0 to 255
+ * @treturn image new image with the channels of this one
+ * @raise if a value is out of range or memory runs out
+ * @function image:place
+ */
+static int
+image_place(lua_State *L)
+{
+	struct image *im = check_image(L, 1);
+	lua_Integer w = luaL_checkinteger(L, 2), h = luaL_checkinteger(L, 3);
+	lua_Integer x = luaL_checkinteger(L, 4), y = luaL_checkinteger(L, 5);
+	lua_Integer fill = luaL_optinteger(L, 6, 0), row, x0, x1;
+	size_t c = (size_t)im->c;
+	struct image *r;
+
+	luaL_argcheck(L, w >= 1 && w <= IMAGE_MAX_SIDE, 2, "width out of range");
+	luaL_argcheck(L, h >= 1 && h <= IMAGE_MAX_SIDE, 3, "height out of range");
+	luaL_argcheck(L, x > -IMAGE_MAX_SIDE && x < IMAGE_MAX_SIDE, 4, "x out of range");
+	luaL_argcheck(L, y > -IMAGE_MAX_SIDE && y < IMAGE_MAX_SIDE, 5, "y out of range");
+	luaL_argcheck(L, fill >= 0 && fill <= 255, 6, "fill out of range");
+	r = new_image(L);
+	if (image_alloc(r, (int)w, (int)h, im->c) != 0)
+		return luaL_error(L, "out of memory");
+	memset(r->p, (int)fill, (size_t)w * (size_t)h * c);
+	x0 = x < 0 ? 0 : x;
+	x1 = x + im->w < w ? x + im->w : w;
+	for (row = y < 0 ? 0 : y; row < h && row < y + im->h && x0 < x1; row++)
+		memcpy(r->p + ((size_t)row * (size_t)w + (size_t)x0) * c,
+		    im->p + ((size_t)(row - y) * (size_t)im->w + (size_t)(x0 - x)) * c,
+		    (size_t)(x1 - x0) * c);
+	return 1;
+}
+
 static int
 image_index(lua_State *L)
 {
@@ -314,6 +398,8 @@ static const luaL_Reg image_methods[] = {
 	{ "jpeg", image_jpeg },
 	{ "resize", image_resize_l },
 	{ "crop", image_crop },
+	{ "rgb", image_rgb },
+	{ "place", image_place },
 	{ NULL, NULL }
 };
 

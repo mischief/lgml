@@ -15,8 +15,9 @@ bug: the harness aborts. Targets catch expected errors themselves.
   grammar      GBNF parse and match, token masks on a tiny vocab, and
                JSON schema conversion
   image        PNG and JPEG decode (libpng, libjpeg-turbo), then
-               encode, resize, crop and tensors; a mode byte can fix
-               PNG CRCs or wrap raw zlib data
+               encode, resize, crop, place, RGB, tensors and the
+               vision preprocess; a mode byte can fix PNG CRCs or
+               wrap raw zlib data
 
 Run all targets for 10 minutes (needs afl-clang-fast and luarocks):
 

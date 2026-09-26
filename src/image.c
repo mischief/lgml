@@ -511,3 +511,45 @@ image_resize(const struct image *src, int w, int h, struct image *dst)
 	free(tmp);
 	return 0;
 }
+
+/*
+ * Bilinear resize as llama.cpp clip: the corners map to the corners,
+ * and each result truncates toward zero.
+ */
+int
+image_resize_bilinear(const struct image *src, int w, int h, struct image *dst)
+{
+	float xr, yr, px, py, xf, yf, top, bot;
+	size_t c = (size_t)src->c, k;
+	const unsigned char *p00, *p10, *p01, *p11;
+	int x, y, x0, y0, x1, y1;
+
+	memset(dst, 0, sizeof(*dst));
+	if (image_alloc(dst, w, h, src->c) != 0)
+		return -1;
+	xr = w > 1 ? (float)(src->w - 1) / (float)(w - 1) : 0.0f;
+	yr = h > 1 ? (float)(src->h - 1) / (float)(h - 1) : 0.0f;
+	for (y = 0; y < h; y++) {
+		py = (float)y * yr;
+		y0 = (int)py < src->h - 1 ? (int)py : src->h - 1;
+		y1 = y0 + 1 < src->h - 1 ? y0 + 1 : src->h - 1;
+		yf = py - (float)y0;
+		for (x = 0; x < w; x++) {
+			px = (float)x * xr;
+			x0 = (int)px < src->w - 1 ? (int)px : src->w - 1;
+			x1 = x0 + 1 < src->w - 1 ? x0 + 1 : src->w - 1;
+			xf = px - (float)x0;
+			p00 = src->p + ((size_t)y0 * (size_t)src->w + (size_t)x0) * c;
+			p10 = src->p + ((size_t)y0 * (size_t)src->w + (size_t)x1) * c;
+			p01 = src->p + ((size_t)y1 * (size_t)src->w + (size_t)x0) * c;
+			p11 = src->p + ((size_t)y1 * (size_t)src->w + (size_t)x1) * c;
+			for (k = 0; k < c; k++) {
+				top = (float)p00[k] + ((float)p10[k] - (float)p00[k]) * xf;
+				bot = (float)p01[k] + ((float)p11[k] - (float)p01[k]) * xf;
+				dst->p[((size_t)y * (size_t)w + (size_t)x) * c + k] =
+				    (unsigned char)(top + (bot - top) * yf);
+			}
+		}
+	}
+	return 0;
+}

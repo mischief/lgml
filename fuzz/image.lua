@@ -1,4 +1,5 @@
--- PNG and JPEG decode, then encode, resize, crop and tensors. The
+-- PNG and JPEG decode, then encode, resize, crop, place, RGB and
+-- tensors, and the vision preprocess. The
 -- first byte picks how the rest becomes a file: 0 as is (PNG or JPEG);
 -- 1 a PNG with chunk CRCs fixed; 2 and 3 wrap zlib data in a PNG after
 -- a 5-byte header (width - 1, height - 1, bit depth, color type,
@@ -7,6 +8,7 @@ local here = debug.getinfo(1, "S").source:match("^@(.*/)") or "./"
 package.path = here .. "../test/?.lua;" .. package.path
 local lgml = require("lgml")
 local png = require("png")
+local preprocess = require("lgml.vision.preprocess")
 
 local be = assert(lgml.backend("CPU"))
 
@@ -54,6 +56,20 @@ return function(s)
 		local again = lgml.image_from(t)
 		assert(again.width == im.width and again.channels == 3, "image_from shape")
 		local r = im:resize(1 + #s % 37, 1 + #s % 23)
+		local b = im:resize(1 + #s % 29, 1 + #s % 31, "bilinear")
+		local rgb = im:rgb()
+		assert(rgb.channels == 3 and rgb.width == im.width, "rgb shape")
+		local p = im:place(1 + #s % 41, 1 + #s % 19, #s % 11 - 5, #s % 7 - 3, #s % 256)
+		assert(p.channels == im.channels, "place keeps the channels")
+		local n = rgb:tensor(be, 1, { 0.5, 0.5, 0.5 }, { 0.5, 0.25, 1 })
+		local v = assert(preprocess.prepare(im, { align = 8, min_pixels = 64, max_pixels = 4096 }))
+		assert(v.width % 8 == 0 and v.height % 8 == 0 and v.width * v.height <= 4096,
+		    "prepare size")
+		v:close()
+		n:close()
+		p:close()
+		rgb:close()
+		b:close()
 		local c = im:crop(im.width // 3, im.height // 3, (im.width + 1) // 2, (im.height + 1) // 2)
 		local j = assert(lgml.image(im:jpeg(1 + #s % 100)), "own JPEG does not decode")
 		assert(j.width == im.width and j.height == im.height, "JPEG round trip changes the size")
