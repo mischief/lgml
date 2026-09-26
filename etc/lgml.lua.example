@@ -1,23 +1,41 @@
 -- lgml-server -C etc/lgml.lua
--- Each model runs in its own worker process. Requests pick a model by
--- the "model" field; an unknown or missing model goes to the first one
--- that can serve the request.
+-- Each model runs in its own worker process. A worker starts on the
+-- first request for its model, or at startup with preload = true.
+-- Requests pick a model by the "model" field; an unknown or missing
+-- model goes to the first one that can serve the request.
 return {
 	listen = "127.0.0.1",
 	port = 8091,
+	-- GPU memory for models, in MiB (default: the free GPU memory at
+	-- startup minus 1024). A load that does not fit unloads idle models,
+	-- least recently used first.
+	vram = 20000,
+	-- Unload a model after this many seconds without requests (default
+	-- 0: never).
+	idle = 300,
+	-- The most seconds a load waits for requests of other models to end,
+	-- when it needs their memory (default 60).
+	load_wait = 60,
 	models = {
 		-- lora adds LoRA adapters, "file[:scale]", from lgml-finetune or
 		-- llama.cpp; a request can change their scales.
 		{ id = "qwen3-14b", model = "/home/you/models/Qwen3-14B-Q4_K_M.gguf", backend = "Vulkan0",
-		    -- lora = { "/home/you/adapters/tuned.gguf:1.0" },
+			preload = true, ctx = 16384,
+			-- lora = { "/home/you/adapters/tuned.gguf:1.0" },
 		},
 		-- mmproj adds image input: image_url parts with data URLs.
 		{ id = "gemma-4-26b", model = "/home/you/models/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
 			mmproj = "/home/you/models/gemma-4-26B-A4B-it-mmproj-F16.gguf", backend = "Vulkan0",
 			ctx = 16384 },
-		{ id = "whisper", model = "/home/you/models/whisper-large-v3-turbo", backend = "Vulkan0" },
+		-- idle = 0 keeps this model loaded until another load needs room.
+		{ id = "whisper", model = "/home/you/models/whisper-large-v3-turbo", backend = "Vulkan0",
+			idle = 0 },
+		-- mem sets the MiB a model takes, in place of the estimate.
+		{ id = "zimage", model = "/home/you/models/zimage", engine = "lgml.image.engine", mem = 12000 },
 		{ id = "orpheus", model = "/home/you/models/orpheus", engine = "lgml.tts.orpheus" },
 		{ id = "qwen3-tts", model = "/home/you/models/qwen3-tts", engine = "lgml.tts.qwen3tts" },
-		{ id = "vibevoice", model = "/home/you/models/vibevoice-realtime-0.5b", engine = "lgml.tts.vibevoice" },
+		-- Models on the CPU do not count against vram.
+		{ id = "vibevoice", model = "/home/you/models/vibevoice-realtime-0.5b", engine = "lgml.tts.vibevoice",
+			backend = "CPU" },
 	},
 }

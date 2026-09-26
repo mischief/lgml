@@ -19,10 +19,22 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                    [--recipe file] [--cache-ram MiB] [--ctx-checkpoints n]
                    [--lora file[:scale]]... [--mmproj file] [--image-min-tokens n]
                    [--image-max-tokens n] [--inproc] [--stt] [--engine module]
-                   [--cors origin]
+                   [--cors origin] [--vram MiB] [--idle seconds]
   -l, --listen addr   address to listen on (default 127.0.0.1)
   -p, --port port     port to listen on (default 8080)
-  -C, --config file   Lua file returning { listen, port, cors, models = { spec, ... } };
+  -C, --config file   Lua file returning { listen, port, cors, vram, ram, idle,
+                      load_wait, models = { spec, ... } };
+                      each model runs in its own worker, which starts on the
+                      first request for the model; when a load does not fit
+                      the budget, idle models unload, least recently used
+                      first; vram and ram are MiB budgets for GPU and CPU
+                      models (default vram: free GPU memory at startup minus
+                      1024; ram: no limit); idle unloads a model after that
+                      many seconds without requests (default 0: off);
+                      load_wait is the most seconds a load waits for other
+                      models' requests to end (default 60), then it fails
+                      with 503; POST /models/load and /models/unload with
+                      {"model": id} load and unload a model now;
                       spec: { model = path, id, backend, ctx, flash_attn, stt,
                       cache_type_k, cache_type_v, recipe, cache_ram,
                       ctx_checkpoints, lora = "file[:scale]" or a list of
@@ -31,7 +43,11 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       engine = Lua module with new(opts), such as a TTS engine,
                       modes = list of completion, multimodal, decide,
                       transcription, speech, image_generation (default: from
-                      the engine and files; needed for other engine modules) }
+                      the engine and files; needed for other engine modules),
+                      preload = true to load at startup, idle = seconds for
+                      this model, mem = MiB the model takes (default: an
+                      estimate from its files and KV cache plus 1024, then
+                      the measure of its worker) }
   -m, --model file    gguf model file, or a Whisper model directory
   -b, --backend name  ggml backend, for example Vulkan0 or CPU (default best)
   -c, --ctx n         context size in tokens (default: the model's)
@@ -67,6 +83,9 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       lgml.image.engine with -m a Z-Image directory
       --cors origin   allow cross-origin requests from origin, such as
                       http://localhost:8000 or * (default: none)
+      --vram MiB      with -C: the GPU memory budget (overrides vram)
+      --idle seconds  with -C: unload a model after this many seconds
+                      without requests (overrides idle)
       --fake          serve the fake test engine
   -h, --help          show this help
 ]=]
@@ -101,8 +120,10 @@ local function adapters(spec)
 end
 
 -- One engine from a model spec: { model, id, backend, ctx, flash_attn,
--- stt, inproc }.
-local function model_engine(spec)
+-- stt, inproc }. With managed, the spec becomes a model of the pool
+-- that loads on demand: managed(spec, modes, start) adds it, and start
+-- (options) starts its worker.
+local function model_engine(spec, managed)
 	local n_ctx = spec.ctx and tonumber(spec.ctx)
 	if spec.ctx and not n_ctx then
 		die("bad context size " .. tostring(spec.ctx))
@@ -170,14 +191,127 @@ local function model_engine(spec)
 	if spec.engine then
 		table.move({ "--engine", spec.engine }, 1, 2, #wargs + 1, wargs)
 	end
-	return require("lgml.server.remote_engine").new({
-		lua = arg[-1] or "lua5.4", script = root .. "/bin/lgml-worker", args = wargs,
-		modes = modes,
-	})
+	local function start(o)
+		return require("lgml.server.remote_engine").new({
+			lua = arg[-1] or "lua5.4", script = root .. "/bin/lgml-worker", args = wargs,
+			modes = modes, restart = o.restart, on_exit = o.on_exit,
+		})
+	end
+	if managed then
+		return managed(spec, modes, lora, start)
+	end
+	return start({})
+end
+
+local MiB = 1048576
+-- Device memory kept out of the default budget.
+local VRAM_RESERVE = 1024 * MiB
+
+local function shell_quote(s)
+	return "'" .. s:gsub("'", "'\\''") .. "'"
+end
+
+-- The ggml devices, from a worker process, so this process does not
+-- start the Vulkan backend.
+local function devices()
+	local p = io.popen(("%s %s --devices 2>/dev/null"):format(shell_quote(arg[-1] or "lua5.4"),
+	    shell_quote(root .. "/bin/lgml-worker")))
+	local out = p and p:read("a")
+	if p then
+		p:close()
+	end
+	local list = out and require("lgml.json").decode(out)
+	return type(list) == "table" and list or {}
+end
+
+local function number_key(cfg, key, flag)
+	local v = flag or cfg[key]
+	if v ~= nil and not tonumber(v) then
+		die(("bad %s %s"):format(key, tostring(v)))
+	end
+	return v and tonumber(v)
+end
+
+-- A pool of models that load on demand. The gpu budget is vram, else
+-- the free memory of the first GPU at startup minus VRAM_RESERVE.
+local function managed_engines(path, cfg, opts)
+	local estimate = require("lgml.estimate")
+	local seen = {}
+	for _, spec in ipairs(cfg.models) do
+		spec.id = estimate.id(spec)
+		if seen[spec.id] then
+			die(("%s: two models have the id %s"):format(path, spec.id))
+		end
+		seen[spec.id] = true
+	end
+	local vram = number_key(cfg, "vram", opts.vram)
+	local ram = number_key(cfg, "ram")
+	local idle = number_key(cfg, "idle", opts.idle)
+	local wait = number_key(cfg, "load_wait")
+	local gpu
+	for _, d in ipairs(devices()) do
+		if not gpu and (d.type == "gpu" or d.type == "igpu") then
+			gpu = d
+		end
+	end
+	local budget = {
+		gpu = vram and vram * MiB or (gpu and math.max(gpu.free - VRAM_RESERVE, 0)) or math.huge,
+		cpu = ram and ram * MiB or math.huge,
+	}
+	local pool = require("lgml.server.pool").new({ budget = budget, idle = idle, load_wait = wait })
+	io.stderr:write(("lgml-server: gpu budget %s, cpu budget %s, idle unload %s\n"):format(
+	    budget.gpu < math.huge and ("%d MiB"):format(budget.gpu // MiB) or "none",
+	    budget.cpu < math.huge and ("%d MiB"):format(budget.cpu // MiB) or "none",
+	    (idle or 0) > 0 and ("after %g s"):format(idle) or "off"))
+	local preload = {}
+	local kinds, ests = {}, {}
+	local function managed(spec, modes, lora, start)
+		local kind, est = kinds[spec], ests[spec]
+		local mem = number_key(spec, "mem")
+		local list = {}
+		for i, a in ipairs(lora) do
+			list[i] = { id = i - 1, path = a.path, scale = a.scale }
+		end
+		local m = pool:add({
+			id = spec.id, modes = modes, kind = kind,
+			size = mem and mem * MiB or est.bytes, fixed = mem ~= nil,
+			files = est.files, margin = est.margin, context_length = est.n_ctx,
+			idle = number_key(spec, "idle"),
+			props = { n_ctx = est.n_ctx or 0, total_slots = 1, lora = list,
+			    modalities = { vision = spec.mmproj ~= nil } },
+			start = function(on_exit)
+				return start({ restart = false, on_exit = on_exit })
+			end,
+		})
+		io.stderr:write(("lgml-server: model %s: %s, %d MiB%s%s\n"):format(m.id, kind,
+		    m.size // MiB, mem and " (mem)" or " (estimate)", spec.preload and ", preload" or ""))
+		if spec.preload then
+			preload[#preload + 1] = m
+		end
+		return m
+	end
+	local engines = {}
+	for i, spec in ipairs(cfg.models) do
+		local kind = "gpu"
+		if (spec.backend and spec.backend:upper():match("^CPU")) or (not spec.backend and not gpu) then
+			kind = "cpu"
+		end
+		local est = estimate.model(spec, budget[kind])
+		-- Under a budget, the worker gets the context of the estimate, not
+		-- one that fits the free memory at its load.
+		if not spec.ctx and est.n_ctx and budget[kind] < math.huge then
+			spec.ctx = est.n_ctx
+		end
+		kinds[spec], ests[spec] = kind, est
+		engines[i] = model_engine(spec, managed)
+	end
+	pool:preload(preload)
+	return engines
 end
 
 -- A config file is Lua that returns { models = { spec, ... } }.
-local function config_engine(path, inproc)
+local function config_engine(path, opts)
+	local inproc = opts.inproc
 	local chunk, err = loadfile(path, "t", {})
 	if not chunk then
 		die(err)
@@ -186,13 +320,19 @@ local function config_engine(path, inproc)
 	if not ok or type(cfg) ~= "table" or type(cfg.models) ~= "table" or #cfg.models == 0 then
 		die(path .. ": must return { models = { ... } }")
 	end
-	local engines = {}
 	for i, spec in ipairs(cfg.models) do
 		if type(spec.model) ~= "string" then
 			die(("%s: models[%d].model must be a path"):format(path, i))
 		end
-		spec.inproc = spec.inproc or inproc
-		engines[i] = model_engine(spec)
+	end
+	local engines = {}
+	if inproc then
+		for i, spec in ipairs(cfg.models) do
+			spec.inproc = true
+			engines[i] = model_engine(spec)
+		end
+	else
+		engines = managed_engines(path, cfg, opts)
 	end
 	return require("lgml.server.router").new(engines), cfg
 end
@@ -202,7 +342,7 @@ local function make_engine(opts)
 		return require("lgml.server.fake_engine").new({ delay = 30 })
 	end
 	if opts.C then
-		return config_engine(opts.C, opts.inproc)
+		return config_engine(opts.C, opts)
 	end
 	if opts.m then
 		return model_engine({
@@ -224,7 +364,7 @@ local function main(args)
 		ctx = "c", fake = false, ["no-fa"] = false, ["alias="] = false,
 		inproc = false, stt = false, ["ctk="] = false, ["ctv="] = false, ["engine="] = false,
 		["recipe="] = false, ["cache-ram="] = false, ["ctx-checkpoints="] = false,
-		["lora="] = false, ["cors="] = false,
+		["lora="] = false, ["cors="] = false, ["vram="] = false, ["idle="] = false,
 		["mmproj="] = false, ["image-min-tokens="] = false, ["image-max-tokens="] = false,
 	}, { lora = true })
 	if not opts then
