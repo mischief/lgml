@@ -253,6 +253,12 @@ local function header_block(res, status, headers)
 	for k, v in pairs(headers or {}) do
 		out[#out + 1] = k .. ": " .. tostring(v) .. "\r\n"
 	end
+	-- Headers for every response, such as CORS headers.
+	for k, v in pairs(res.extra or {}) do
+		if not (headers and headers[k]) then
+			out[#out + 1] = k .. ": " .. tostring(v) .. "\r\n"
+		end
+	end
 	if res.close then
 		out[#out + 1] = "Connection: close\r\n"
 	elseif res.req and res.req.version == "1.0" then

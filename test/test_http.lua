@@ -546,6 +546,34 @@ local function test_images(port, bare_port)
 	    "metrics count image requests")
 end
 
+-- CORS: headers on every response and preflight answers, only when the
+-- server has an origin.
+local function test_cors(eng, plain_port)
+	local srv = server.new({ cors = "*", log = function() end })
+	openai.install(srv, eng)
+	local port = assert(srv:listen("127.0.0.1", 0))
+	local r = roundtrip(port, request("OPTIONS", "/v1/chat/completions", nil, {
+		Origin = "http://ui.test", ["Access-Control-Request-Method"] = "POST",
+		["Access-Control-Request-Headers"] = "content-type",
+	}))
+	ok(r.status == 204 and r.headers["access-control-allow-origin"] == "*" and
+	    r.headers["access-control-allow-methods"]:find("POST") and
+	    r.headers["access-control-allow-headers"] == "content-type", "preflight answered")
+	r = roundtrip(port, request("OPTIONS", "/nope", nil, { Origin = "http://ui.test" }))
+	ok(r.status == 404, "preflight on an unknown path gives 404")
+	r = roundtrip(port, request("POST", "/v1/chat/completions", chat_body(), { Origin = "http://ui.test" }))
+	ok(r.status == 200 and r.headers["access-control-allow-origin"] == "*" and
+	    r.headers["access-control-expose-headers"] == "*", "response has CORS headers")
+	r = roundtrip(port, request("POST", "/v1/chat/completions", chat_body({ stream = true }),
+	    { Origin = "http://ui.test" }))
+	ok(r.headers["access-control-allow-origin"] == "*", "stream has CORS headers")
+	r = roundtrip(port, request("GET", "/nope"))
+	ok(r.status == 404 and r.headers["access-control-allow-origin"] == "*", "error has CORS headers")
+	srv:close()
+	r = roundtrip(plain_port, request("OPTIONS", "/v1/models", nil, { Origin = "http://ui.test" }))
+	ok(r.status == 405 and r.headers["access-control-allow-origin"] == nil, "no CORS by default")
+end
+
 local function main()
 	local eng = fake.new({ delay = 2 })
 	local srv = server.new({ limits = { max_body = 1 << 20, idle_ms = 500 },
@@ -567,6 +595,7 @@ local function main()
 	local bare_port = assert(srv2:listen("127.0.0.1", 0))
 	test_transcribe(port, bare_port)
 	test_images(port, bare_port)
+	test_cors(eng, port)
 	srv2:close()
 	srv:close()
 	print("1.." .. n)

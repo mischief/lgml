@@ -17,9 +17,10 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                    [-c n_ctx] [--no-fa] [--ctk type] [--ctv type] [--alias id]
                    [--recipe file] [--cache-ram MiB] [--ctx-checkpoints n]
                    [--lora file[:scale]]... [--inproc] [--stt] [--engine module]
+                   [--cors origin]
   -l, --listen addr   address to listen on (default 127.0.0.1)
   -p, --port port     port to listen on (default 8080)
-  -C, --config file   Lua file returning { listen, port, models = { spec, ... } };
+  -C, --config file   Lua file returning { listen, port, cors, models = { spec, ... } };
                       spec: { model = path, id, backend, ctx, flash_attn, stt,
                       cache_type_k, cache_type_v, recipe, cache_ram,
                       ctx_checkpoints, lora = "file[:scale]" or a list of
@@ -53,6 +54,8 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       when not given)
       --engine module Lua engine module for the model, such as
                       lgml.image.engine with -m a Z-Image directory
+      --cors origin   allow cross-origin requests from origin, such as
+                      http://localhost:8000 or * (default: none)
       --fake          serve the fake test engine
   -h, --help          show this help
 ]=]
@@ -194,7 +197,7 @@ local function main(args)
 		ctx = "c", fake = false, ["no-fa"] = false, ["alias="] = false,
 		inproc = false, stt = false, ["ctk="] = false, ["ctv="] = false, ["engine="] = false,
 		["recipe="] = false, ["cache-ram="] = false, ["ctx-checkpoints="] = false,
-		["lora="] = false,
+		["lora="] = false, ["cors="] = false,
 	}, { lora = true })
 	if not opts then
 		io.stderr:write("lgml-server: ", rest, "\n", USAGE)
@@ -214,7 +217,7 @@ local function main(args)
 	if not port or port < 0 or port > 65535 then
 		die("bad port " .. tostring(opts.p or cfg.port))
 	end
-	local srv = server.new()
+	local srv = server.new({ cors = opts.cors or cfg.cors })
 	openai.install(srv, engine)
 	local bound, err = srv:listen(opts.l or cfg.listen or "127.0.0.1", port)
 	if not bound then

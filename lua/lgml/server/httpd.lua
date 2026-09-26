@@ -21,6 +21,9 @@ end
 --
 -- - `limits`: limits to change (see `lgml.server.http.limits`)
 -- - `log`: a printf-style function (default: write to stderr)
+-- - `cors`: an origin, such as `"*"`, to allow cross-origin requests
+--   from; every response then has CORS headers, and OPTIONS on a known
+--   path answers the preflight (default: no CORS)
 -- @treturn Server the server
 function M.new(opts)
 	opts = opts or {}
@@ -28,8 +31,18 @@ function M.new(opts)
 	for k, v in pairs(http.limits) do
 		lim[k] = (opts.limits and opts.limits[k]) or v
 	end
+	local extra
+	if opts.cors then
+		extra = {
+			["Access-Control-Allow-Origin"] = opts.cors,
+			["Access-Control-Expose-Headers"] = "*",
+		}
+		if opts.cors ~= "*" then
+			extra.Vary = "Origin"
+		end
+	end
 	return setmetatable({
-		routes = {}, limits = lim, conns = {},
+		routes = {}, limits = lim, conns = {}, extra = extra,
 		log = opts.log or log, closing = false,
 	}, Srv)
 end
@@ -72,6 +85,14 @@ function Srv:dispatch(req, res)
 	if not fn and req.method == "HEAD" then
 		fn = methods.GET
 	end
+	if not fn and req.method == "OPTIONS" and self.extra then
+		local m = allowed(methods)
+		return res:send(204, "", {
+			["Access-Control-Allow-Methods"] = methods.GET and m .. ", HEAD, OPTIONS" or m .. ", OPTIONS",
+			["Access-Control-Allow-Headers"] = req.headers["access-control-request-headers"] or "*",
+			["Access-Control-Max-Age"] = 600,
+		})
+	end
 	if not fn then
 		return res:json(405, http.error_object(405, req.method ..
 		    " not allowed on " .. req.path), { Allow = allowed(methods) })
@@ -97,6 +118,7 @@ local function serve_one(self, conn)
 		return false
 	end
 	local res = http.response(conn, req)
+	res.extra = self.extra
 	if self.closing then
 		res.close = true
 	end
