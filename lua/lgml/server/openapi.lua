@@ -304,6 +304,12 @@ local function messages_schemas(c)
 		stop_sequence = { type = { "string", "null" } }, stop_details = { type = "null" },
 		usage = ref("AnthropicUsage"),
 	})
+	c.MessageStreamEvent = obj({
+		type = { type = "string", enum = json.array({ "message_start", "content_block_start",
+			"content_block_delta", "content_block_stop", "message_delta", "message_stop", "ping", "error" }) },
+		message = ref("Message"), index = int(), content_block = { type = "object" },
+		delta = { type = "object" }, usage = ref("AnthropicUsage"),
+	}, { "type" }, "The data of one event; the `event:` line has the same name. No `[DONE]`.")
 	c.AnthropicError = obj({
 		type = { const = "error" },
 		error = obj({ type = str(), message = str() }, { "type", "message" }),
@@ -551,8 +557,11 @@ local function operations()
 			tag = "anthropic", summary = "Anthropic Messages",
 			requestBody = json_body(ref("MessagesRequest")),
 			responses = anthropic_errors({ ["200"] = {
-				description = "The message.",
-				content = { ["application/json"] = { schema = ref("Message") } },
+				description = "The message, or with stream an event stream of named events.",
+				content = {
+					["application/json"] = { schema = ref("Message") },
+					["text/event-stream"] = { schema = ref("MessageStreamEvent") },
+				},
 				headers = anthropic_headers(),
 			} }),
 		} },

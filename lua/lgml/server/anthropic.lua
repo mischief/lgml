@@ -9,6 +9,7 @@ local json = require("lgml.json")
 local chat_request = require("lgml.server.chat_request")
 local translate = require("lgml.server.translate")
 local media = require("lgml.chat.media")
+local sse = require("lgml.server.sse")
 local log = require("lgml.log")
 
 local L = log.new("anthropic")
@@ -950,13 +951,136 @@ local function prepare(eng, opts, req, res, count)
 	return r, chat
 end
 
+-- streaming
+
+local function event(name, value)
+	value.type = name
+	return sse.event(name, value)
+end
+
+-- The message_start event, with the prompt size when the engine gave it.
+local function start_event(r, sink)
+	local n, cached = sink.prompt_n or 0, sink.cached_n or 0
+	local u = M.usage({ prompt = n, cached = cached, output = 0, reasoning = 0 })
+	u.output_tokens_details = nil
+	return event("message_start", { message = {
+		id = r.id, type = "message", role = "assistant", model = r.model, content = json.array(),
+		stop_reason = json.null, stop_sequence = json.null, stop_details = json.null, usage = u,
+	} })
+end
+
+-- The handler of the block sink for a stream: each block goes out as
+-- content_block_start, deltas and content_block_stop.
+local function stream_handler(r, w)
+	local h, sink = {}, nil
+	local function first()
+		return start_event(r, sink)
+	end
+	local function send(text)
+		return w:send(text, first, headers_of(r))
+	end
+	function h.bind(_, s)
+		sink = s
+	end
+	function h.prompt()
+		return send("")
+	end
+	function h.open(_, b)
+		local cb
+		if b.kind == "reasoning" then
+			cb = { type = "thinking", thinking = "", signature = "" }
+		elseif b.kind == "tool" then
+			cb = { type = "tool_use", id = b.id, name = b.name, input = json.object() }
+		else
+			cb = { type = "text", text = "" }
+		end
+		return send(event("content_block_start", { index = b.index, content_block = cb }))
+	end
+	function h.delta(_, b, text)
+		local d
+		if b.kind == "reasoning" then
+			if r.ctx.display == "omitted" then
+				return true
+			end
+			d = { type = "thinking_delta", thinking = text }
+		elseif b.kind == "tool" then
+			d = { type = "input_json_delta", partial_json = text }
+		else
+			d = { type = "text_delta", text = text }
+		end
+		return send(event("content_block_delta", { index = b.index, delta = d }))
+	end
+	function h.close(_, b)
+		local t = {}
+		if b.kind == "reasoning" then
+			local omitted = r.ctx.display == "omitted"
+			if omitted then
+				t[#t + 1] = event("content_block_delta", { index = b.index,
+					delta = { type = "thinking_delta", thinking = "" } })
+			end
+			t[#t + 1] = event("content_block_delta", { index = b.index, delta = { type = "signature_delta",
+				signature = translate.sign(r.key, r.model, translate.text(b), omitted) } })
+		end
+		t[#t + 1] = event("content_block_stop", { index = b.index })
+		return send(table.concat(t))
+	end
+	function h.ping()
+		return send(event("ping", {}))
+	end
+	function h.finish()
+		local reason, seq = stop_of(r, sink)
+		local u = M.usage(translate.counts(sink.finished.usage))
+		u.cache_creation, u.service_tier = nil, nil
+		return send(event("message_delta", { delta = { stop_reason = reason, stop_sequence = seq }, usage = u }) ..
+		    event("message_stop", {}))
+	end
+	function h.fail(_, status, msg)
+		local e = M.error_body(status, msg, r.rid)
+		return send(event("error", { error = e.error, request_id = e.request_id }))
+	end
+	return h
+end
+
+-- Runs a streamed request. The stream starts when the engine tells the
+-- prompt size, at the first block, or at the first keepalive ping.
+local function run_stream(eng, r, chat)
+	local w = translate.writer(r.res)
+	local h = stream_handler(r, w)
+	local sink = translate.blocks(r.res, h, { tool_id = "toolu_" })
+	h:bind(sink)
+	w:keepalive(function()
+		h:ping()
+	end, M.PING_MS)
+	local ok, msg, status = translate.run(eng, chat, sink, r.model)
+	w:stop()
+	if sink:cancelled() then
+		r.res.close = true
+		return
+	elseif not ok and not w.started then
+		return send_error(r, status or 500, msg or "engine failed")
+	end
+	r.res.err = not ok and (msg or "engine failed") or nil
+	local sent
+	if ok then
+		sent = h:finish()
+	else
+		sent = h:fail(status or 500, msg or "engine failed")
+	end
+	if not sent or not w:finish() then
+		r.res.close = true
+	end
+end
+
+--- Milliseconds without bytes out before a `ping` event in a stream.
+M.PING_MS = 10000
+
 local function messages(eng, opts, req, res)
 	local r, chat = prepare(eng, opts, req, res, false)
 	if not r then
 		return
 	end
 	if r.stream then
-		return send_error(r, 400, "stream: not supported by this server yet")
+		return run_stream(eng, r, chat)
 	end
 	local sink = translate.blocks(res, nil, { tool_id = "toolu_" })
 	local ok, msg, status = translate.run(eng, chat, sink, r.model)

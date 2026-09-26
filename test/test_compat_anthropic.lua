@@ -325,8 +325,183 @@ local function test_errors()
 	    h["x-lgml-ignored"] == "messages.0.content.0.zap,nope"), "ignore: unknown fields are named")
 end
 
+-- Checks the event rules of a Messages stream: message_start first,
+-- then blocks with dense indexes, each started, grown and stopped in
+-- turn, then message_delta and message_stop last. Pings can come
+-- anywhere. Returns the message that the events build.
+local function check_stream(text, name)
+	local list, framed = inproc.events(text)
+	ok(framed and #list > 0, name .. ": each event is an event line, a data line and a blank line")
+	local msg, open, good, why, pings = nil, nil, true, "", 0
+	local function bad(s)
+		if good then
+			good, why = false, s
+		end
+	end
+	local stopped = false
+	for i, ev in ipairs(list) do
+		local d = ev.data
+		if d.type ~= ev.name then
+			bad("the data type is not the event name at " .. i)
+		end
+		if stopped then
+			bad("an event after message_stop")
+		end
+		if ev.name == "ping" then
+			pings = pings + 1
+		elseif ev.name == "message_start" then
+			if i ~= 1 and not (i == pings + 1) then
+				bad("message_start is not first")
+			end
+			msg = d.message
+			msg.content, msg.start_reason = {}, msg.stop_reason
+		elseif not msg then
+			bad(ev.name .. " before message_start")
+		elseif ev.name == "content_block_start" then
+			if open or d.index ~= #msg.content then
+				bad("a block starts out of order at " .. i)
+			end
+			local cb = d.content_block
+			msg.content[#msg.content + 1] = cb
+			cb.json = {}
+			open = d.index
+		elseif ev.name == "content_block_delta" then
+			local cb = msg.content[d.index + 1]
+			if d.index ~= open then
+				bad("a delta for a block that is not open at " .. i)
+			elseif d.delta.type == "text_delta" then
+				cb.text = cb.text .. d.delta.text
+			elseif d.delta.type == "thinking_delta" then
+				cb.thinking = cb.thinking .. d.delta.thinking
+			elseif d.delta.type == "signature_delta" then
+				cb.signature = cb.signature .. d.delta.signature
+			elseif d.delta.type == "input_json_delta" then
+				cb.json[#cb.json + 1] = d.delta.partial_json
+			end
+		elseif ev.name == "content_block_stop" then
+			if d.index ~= open then
+				bad("a stop for a block that is not open at " .. i)
+			end
+			local cb = msg.content[d.index + 1]
+			if cb.type == "tool_use" then
+				cb.input = json.decode(table.concat(cb.json))
+			end
+			cb.json = nil
+			open = nil
+		elseif ev.name == "message_delta" then
+			if open then
+				bad("message_delta while a block is open")
+			end
+			msg.stop_reason, msg.stop_sequence = d.delta.stop_reason, d.delta.stop_sequence
+			msg.usage.output_tokens = d.usage.output_tokens
+			msg.final_usage = d.usage
+		elseif ev.name == "message_stop" then
+			stopped = true
+		elseif ev.name == "error" then
+			msg.error = d.error
+			stopped = true
+		end
+	end
+	ok(good and (stopped or msg.error), name .. ": the event order" .. (good and "" or ": " .. why))
+	return msg, list, pings
+end
+
+local function stream_post(b, headers)
+	b.stream = true
+	return inproc.request(srv, "POST", "/v1/messages", b, headers or HEADERS)
+end
+
+local function test_stream()
+	local status, h, text = stream_post(example("plain_text"))
+	ok(status == 200 and h["content-type"] == "text/event-stream" and h["request-id"] == "req_0000abcd",
+	    "stream: 200 with an event stream and request-id")
+	ok(not text:find("[DONE]", 1, true), "stream: no [DONE]")
+	local msg = check_stream(text, "plain text stream")
+	ok(msg.id:match("^msg_%w+$") and msg.start_reason == json.null and
+	    msg.usage.input_tokens == 7 and msg.usage.output_tokens == 4,
+	    "message_start has the id and the prompt size; message_delta the output")
+	ok(msg.content[1].type == "thinking" and msg.content[1].thinking == "The user asks about Paris." and
+	    translate.ours(msg.content[1].signature) and msg.content[2].text == "Let me check the weather." and
+	    msg.stop_reason == "end_turn", "thinking and text blocks with their deltas")
+	local ref = inproc.events(text)
+	ok(ref[1].name == "message_start" and ref[#ref].name == "message_stop" and
+	    ref[#ref - 1].name == "message_delta", "message_start first; message_delta and message_stop last")
+
+	local _, _, ttext = stream_post(example("tool_request_1"))
+	msg = check_stream(ttext, "tool stream")
+	local call = msg.content[3]
+	ok(call.type == "tool_use" and call.id:match("^toolu_%w+$") and call.name == "get_weather" and
+	    call.input.city == "Paris" and msg.stop_reason == "tool_use",
+	    "a tool_use block starts with its id and name; input_json_delta joins to the input")
+	local starts = 0
+	for _, ev in ipairs(inproc.events(ttext)) do
+		if ev.name == "content_block_start" and ev.data.content_block.type == "tool_use" then
+			starts = starts + 1
+			ok(next(ev.data.content_block.input) == nil, "content_block_start has an empty input")
+		end
+	end
+	ok(starts == 1, "one tool_use block")
+
+	_, _, text = stream_post(body({ thinking = { type = "adaptive", display = "omitted" } }))
+	msg = check_stream(text, "omitted thinking stream")
+	ok(msg.content[1].thinking == "" and
+	    translate.verify(KEY, "fake", msg.content[1].signature, "") == "The user asks about Paris.",
+	    "omitted: one empty thinking_delta and the signature")
+
+	_, _, text = stream_post(body({ stop_sequences = { "weather" } }))
+	msg = check_stream(text, "stop sequence stream")
+	ok(msg.stop_reason == "stop_sequence" and msg.stop_sequence == "weather", "stop_sequence in message_delta")
+	local st, _, etext = stream_post(body({ messages = { { role = "user", content = "fail" } } }))
+	ok(st == 500 and json.decode(etext).error.type == "api_error", "a failure before the stream is plain JSON")
+end
+
+-- A server whose engine waits, fails or works as the test says.
+local function scripted(fn)
+	local s = httpd.new()
+	openai.install(s, {
+		models = function() return { { id = "script" } } end,
+		props = function() return {} end,
+		chat = function(_, req, sink)
+			return fn(req, sink)
+		end,
+	}, { key = KEY })
+	return s
+end
+
+local function test_stream_events()
+	local sleep = require("lgml.server.stream").sleep
+	local s = scripted(function(_, sink)
+		sink:prompt(50, 10)
+		sink:content("Hi")
+		return nil, "boom", 500
+	end)
+	local _, _, text = inproc.request(s, "POST", "/v1/messages", body({ stream = true }), HEADERS)
+	local msg = check_stream(text, "error stream")
+	ok(msg.error and msg.error.type == "api_error" and msg.error.message == "boom" and
+	    msg.usage.input_tokens == 40 and msg.usage.cache_read_input_tokens == 10,
+	    "an error after the start is an error event")
+	local keep = anthropic.PING_MS
+	anthropic.PING_MS = 20
+	s = scripted(function(_, sink)
+		sleep(120)
+		sink:prompt(50, 0)
+		sleep(120)
+		sink:content("Hi")
+		sink:finish("stop", { prompt_tokens = 50, completion_tokens = 1 })
+		return true
+	end)
+	local pings
+	_, _, text = inproc.request(s, "POST", "/v1/messages", body({ stream = true }), HEADERS)
+	msg, _, pings = check_stream(text, "ping stream")
+	anthropic.PING_MS = keep
+	ok(pings >= 2 and msg.content[1].text == "Hi" and msg.final_usage.input_tokens == 50,
+	    ("pings keep a slow stream alive (%d pings); message_delta has the input tokens"):format(pings))
+end
+
 test_field_table()
 test_examples()
+test_stream()
+test_stream_events()
 test_requests()
 test_tool_choice()
 test_thinking_blocks()

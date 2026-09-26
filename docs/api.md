@@ -687,6 +687,46 @@ Reply headers: `request-id` (`req_` and the `x-lgml-request-id`), and
 when they apply `x-lgml-ignored`, `x-lgml-ignored-betas` and
 `x-lgml-thinking-dropped`.
 
+### Messages streaming
+
+With `stream: true`, the reply is `text/event-stream`. Each event is an
+`event:` line with the event name, one `data:` line with one-line JSON
+whose `type` is the name, and a blank line. There is no `[DONE]`.
+
+1. `message_start`: the message with `content: []`, `stop_reason: null`
+   and `usage` with the prompt size (`input_tokens`,
+   `cache_read_input_tokens`) and `output_tokens: 0`.
+2. For each block, in order, with `index` from 0:
+   `content_block_start` (an empty block: `{"type": "text", "text":
+   ""}`, `{"type": "thinking", "thinking": "", "signature": ""}` or
+   `{"type": "tool_use", "id", "name", "input": {}}`), then
+   `content_block_delta` events (`text_delta`, `thinking_delta`,
+   `input_json_delta` with `partial_json` pieces that join to the
+   input, and one `signature_delta` at the end of a thinking block),
+   then `content_block_stop`. With `display: "omitted"`, a thinking
+   block has one empty `thinking_delta`.
+3. `message_delta` with `delta: {"stop_reason", "stop_sequence"}` and
+   the whole `usage`: `output_tokens` and the input counts.
+4. `message_stop`.
+
+The stream starts when the engine knows the prompt size, before the
+prefill, so a long prompt does not delay the headers. While no bytes go
+out for 10 seconds (a long prefill, a model load, long reasoning with
+`display: "omitted"`), the server sends `ping` events (`{"type":
+"ping"}`); Claude Code aborts a stream after 300 silent seconds. When a
+ping starts the stream before the engine knows the prompt size,
+`message_start` has 0 input tokens and `message_delta` has the real
+counts.
+
+An error before the stream starts is a plain JSON error with its
+status. An error after it is an `error` event with the error object,
+and the stream ends:
+
+```
+event: error
+data: {"type": "error", "error": {"type": "api_error", "message": "..."}, "request_id": "req_..."}
+```
+
 ### Messages errors
 
 ```json
@@ -705,7 +745,16 @@ when they apply `x-lgml-ignored`, `x-lgml-ignored-betas` and
 curl -s localhost:8080/v1/messages -H 'anthropic-version: 2023-06-01' -d '{
   "model": "qwen3-14b", "max_tokens": 1024,
   "messages": [{"role": "user", "content": "Name the capital of France."}]}'
+
+curl -sN localhost:8080/v1/messages -H 'anthropic-version: 2023-06-01' -d '{
+  "model": "qwen3-14b", "max_tokens": 1024, "stream": true,
+  "thinking": {"type": "disabled"},
+  "messages": [{"role": "user", "content": "Count to 3."}]}'
 ```
+
+Claude Code: `ANTHROPIC_BASE_URL=http://localhost:8080
+ANTHROPIC_MODEL=qwen3-14b claude`. `CLAUDE_CODE_ATTRIBUTION_HEADER=0`
+keeps its attribution block out of the prompt.
 
 ## Images
 
