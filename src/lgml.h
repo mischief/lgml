@@ -21,6 +21,7 @@
 /* Uservalue slots. */
 #define UV_PARENT	1	/* tensor: store or graph; store, graph: backend */
 #define UV_EXTRA	2	/* store: name -> tensor; graph: set of leaves */
+#define UV_GRAD		2	/* leaf tensor: its gradient leaf, or nil */
 
 struct backend {
 	ggml_backend_t		 be;
@@ -41,9 +42,11 @@ struct graph {
 	struct ggml_context	*ctx;
 	struct ggml_cgraph	*gf;
 	ggml_gallocr_t		 galloc;
+	int			 size;		/* the most ggml tensors */
 	int			 ntensors;
 	int			 plan_nodes;	/* nodes at the last plan; -1 before */
 	int			 plan_tensors;	/* ntensors at the last plan */
+	int			 backward;	/* 1 after tensor:backward */
 	int			 refs;
 	int			 closed;
 };
@@ -65,6 +68,8 @@ struct backend	*lgml_check_backend(lua_State *, int);
 struct tensor	*lgml_check_tensor(lua_State *, int);
 struct store	*lgml_push_store(lua_State *, int, struct ggml_context *,
 		    ggml_backend_buffer_t);
+struct tensor	*lgml_push_leaf(lua_State *, int, struct ggml_tensor *, int);
+void		 lgml_tensor_methods(lua_State *, const luaL_Reg *);
 
 /* Each adds its functions to the module table on top of the stack. */
 void		 lgml_open_sample(lua_State *);
@@ -77,6 +82,7 @@ void		 lgml_open_ops_orpheus(lua_State *);
 void		 lgml_open_ops_qwen3tts(lua_State *);
 void		 lgml_open_ops_vibevoice(lua_State *);
 void		 lgml_open_ops_nn(lua_State *);
+void		 lgml_open_train(lua_State *);
 
 /*
  * For op files. An op checks its graph with lgml_check_graph, takes

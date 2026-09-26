@@ -302,7 +302,7 @@ push_leaf(lua_State *L, int sidx, struct ggml_tensor *gt, int rank)
 	struct store *s = lua_touserdata(L, sidx);
 	struct tensor *t;
 
-	t = lua_newuserdatauv(L, sizeof(*t), 1);
+	t = lua_newuserdatauv(L, sizeof(*t), 2);
 	t->t = gt;
 	t->s = s;
 	t->g = NULL;
@@ -446,7 +446,10 @@ short_read:
 }
 
 /*** Make an empty graph on this backend.
- * A graph holds at most 2048 ggml tensors. Some ops add more than one.
+ * A graph holds at most size ggml tensors. Some ops add more than one.
+ * `tensor:backward` adds about ten for each node on the path from a
+ * trainable leaf to the loss.
+ * @tparam[opt=16384] int size the most ggml tensors, 64 to 1048576
  * @treturn graph the graph
  * @function backend:graph
  */
@@ -454,9 +457,11 @@ static int
 backend_graph(lua_State *L)
 {
 	struct backend *b = check_backend(L, 1);
+	lua_Integer size = luaL_optinteger(L, 2, GRAPH_SIZE);
 	struct ggml_init_params ip;
 	struct graph *g;
 
+	luaL_argcheck(L, size >= 64 && size <= 1048576, 2, "size out of range");
 	g = lua_newuserdatauv(L, sizeof(*g), 2);
 	memset(g, 0, sizeof(*g));
 	g->closed = 1;
@@ -466,7 +471,10 @@ backend_graph(lua_State *L)
 	lua_newtable(L);
 	lua_setiuservalue(L, -2, UV_EXTRA);
 
-	ip.mem_size = ggml_tensor_overhead() * GRAPH_SIZE + ggml_graph_overhead_custom(GRAPH_SIZE, false);
+	/* Room for the forward graph, and for the graphs that backward makes. */
+	ip.mem_size = ggml_tensor_overhead() * (size_t)size +
+	    2 * ggml_graph_overhead_custom((size_t)size, false) +
+	    ggml_graph_overhead_custom((size_t)size, true);
 	ip.mem_buffer = NULL;
 	ip.no_alloc = true;
 	g->ctx = ggml_init(ip);
@@ -478,7 +486,8 @@ backend_graph(lua_State *L)
 		g->ctx = NULL;
 		return luaL_error(L, "ggml_gallocr_new failed");
 	}
-	g->gf = ggml_new_graph_custom(g->ctx, GRAPH_SIZE, false);
+	g->gf = ggml_new_graph_custom(g->ctx, (size_t)size, false);
+	g->size = (int)size;
 	g->plan_nodes = -1;
 	g->b = b;
 	g->closed = 0;
@@ -634,8 +643,8 @@ opt_operand(lua_State *L, struct graph *g, int idx)
 static void
 reserve(lua_State *L, struct graph *g, int n)
 {
-	if (g->ntensors + n > GRAPH_SIZE)
-		luaL_error(L, "graph full (%d tensors)", GRAPH_SIZE);
+	if (g->ntensors + n > g->size)
+		luaL_error(L, "graph full (%d tensors)", g->size);
 	g->ntensors += n;
 }
 
@@ -2181,6 +2190,19 @@ tensor_name(lua_State *L)
 	return 1;
 }
 
+/*** Get the backend of the tensor.
+ * @treturn backend the backend of its weights or graph
+ * @function tensor:backend
+ */
+static int
+tensor_backend(lua_State *L)
+{
+	check_tensor(L, 1);
+	lua_getiuservalue(L, 1, UV_PARENT);
+	lua_getiuservalue(L, -1, UV_PARENT);
+	return 1;
+}
+
 /*** Describe the tensor, as "tensor TYPE OP (SHAPE)".
  * @treturn string description
  * @function tensor:__tostring
@@ -2666,6 +2688,7 @@ static const luaL_Reg tensor_methods[] = {
 	{ "type", tensor_type },
 	{ "nbytes", tensor_nbytes },
 	{ "name", tensor_name },
+	{ "backend", tensor_backend },
 	{ NULL, NULL }
 };
 
@@ -2735,6 +2758,22 @@ lgml_push_node(lua_State *L, struct graph *g, struct ggml_tensor *r, int rank)
 	return push_node(L, g, r, rank);
 }
 
+struct tensor *
+lgml_push_leaf(lua_State *L, int sidx, struct ggml_tensor *gt, int rank)
+{
+	return push_leaf(L, lua_absindex(L, sidx), gt, rank);
+}
+
+/* Add methods to the tensor class. */
+void
+lgml_tensor_methods(lua_State *L, const luaL_Reg *fns)
+{
+	luaL_getmetatable(L, TENSOR_MT);
+	lua_getfield(L, -1, "__index");
+	luaL_setfuncs(L, fns, 0);
+	lua_pop(L, 2);
+}
+
 /* Add ops to the graph class. Op functions take the graph as arg 1. */
 void
 lgml_graph_ops(lua_State *L, const luaL_Reg *ops)
@@ -2767,5 +2806,6 @@ luaopen_lgml(lua_State *L)
 	lgml_open_ops_qwen3tts(L);
 	lgml_open_ops_vibevoice(L);
 	lgml_open_ops_nn(L);
+	lgml_open_train(L);
 	return 1;
 }

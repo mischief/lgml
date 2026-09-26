@@ -63,6 +63,7 @@ lgml = shared_module('lgml',
   'src/ops_qwen3tts.c',
   'src/ops_vibevoice.c',
   'src/ops_nn.c',
+  'src/train.c',
   'src/sample.c',
   'src/grammar.c',
   'src/tokenize.c',
@@ -126,6 +127,9 @@ if lua_bin.found()
   test('ops', lua_bin, args : [files('test/test_ops.lua')],
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
     timeout : 60)
+  test('train', lua_bin, args : [files('test/test_train.lua')],
+    env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
+    timeout : 120)
   test('diffusion_gemma', lua_bin, args : [files('test/test_diffusion_gemma.lua')],
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
     timeout : 120)
