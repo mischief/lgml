@@ -16,7 +16,7 @@ end
 local src = debug.getinfo(1, "S").source:sub(2):match("^(.*)/test/") or "."
 local logs = {}
 local eng = remote.new({
-	lua = "lua5.4", script = src .. "/bin/lgml-worker", args = { "--fake" },
+	lua = "lua5.4", script = src .. "/bin/lgml-worker", args = { "--fake", "-t", "2" },
 	log = function(m) logs[#logs + 1] = m end,
 })
 

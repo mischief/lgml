@@ -69,6 +69,7 @@ end
 --
 -- - `model`: gguf path
 -- - `backend`: backend name (default: the best one)
+-- - `threads`: CPU thread count (default: `lgml.threads()`)
 -- - `n_ctx`: context size (default: the model's, or less so the cache
 --   fits in free device memory; at most the model's)
 -- - `flash_attn`: false to use soft_max attention (default true)
@@ -93,7 +94,7 @@ end
 -- when no chat template fits the model, an adapter does not fit it, or
 -- the mmproj does not fit it
 function M.new(opts)
-	local be = assert(lgml.backend(opts.backend))
+	local be = assert(lgml.backend(opts.backend, { threads = opts.threads }))
 	local info = assert(lgml.gguf(opts.model))
 	local family, family_name = chat.load(info.meta)
 	local arch = info.meta["general.architecture"]

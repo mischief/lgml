@@ -23,11 +23,12 @@ M.is_model = whisper.is_model
 --
 -- - `model`: the model directory
 -- - `backend`: backend name (default: the best one)
+-- - `threads`: CPU thread count (default: `lgml.threads()`)
 -- - `id`: model id (default: the last part of the model path)
 -- @treturn Engine the engine
 -- @raise when the backend or the model does not load
 function M.new(opts)
-	local be = assert(lgml.backend(opts.backend))
+	local be = assert(lgml.backend(opts.backend, { threads = opts.threads }))
 	local model = whisper.load(be, opts.model)
 	return setmetatable({
 		be = be, model = model,

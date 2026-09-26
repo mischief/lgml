@@ -42,6 +42,7 @@ end
 --   Qwen3 gguf (a name with "qwen") and the VAE (ae.safetensors)
 -- - `dit`, `llm`, `vae`: file paths in place of the directory scan
 -- - `backend`: backend name (default: the best one)
+-- - `threads`: CPU thread count (default: `lgml.threads()`)
 -- - `id`: model id (default: the DiT file name without .gguf)
 -- @treturn Engine the engine
 -- @raise when a model does not load
@@ -50,7 +51,9 @@ function M.new(opts)
 	if not (dit and llm and vae) then
 		dit, llm, vae = find((opts.model:gsub("/+$", "")))
 	end
-	local p = pipeline.load({ dit = dit, llm = llm, vae = vae, backend = opts.backend })
+	local p = pipeline.load({
+		dit = dit, llm = llm, vae = vae, backend = opts.backend, threads = opts.threads,
+	})
 	return setmetatable({
 		p = p, id = opts.id or dit:match("([^/]+)%.gguf$"), busy = false, waiting = {},
 	}, E)

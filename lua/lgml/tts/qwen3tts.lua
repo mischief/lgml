@@ -89,11 +89,12 @@ end
 -- @tparam table opts options:
 -- opts.model: a directory, or the talker gguf.
 -- opts.backend: backend name for `lgml.backend`.
+-- opts.threads: CPU thread count (default: `lgml.threads()`).
 -- opts.id: model id (default "qwen3-tts").
 -- @treturn Engine the engine
 -- @raise when files are missing or the talker is not CustomVoice
 function M.new(opts)
-	local be = assert(lgml.backend(opts.backend))
+	local be = assert(lgml.backend(opts.backend, { threads = opts.threads }))
 	local model = qwen3tts.load(be, M.find_models(opts.model))
 	if model.talker.kind ~= "custom_voice" then
 		error(opts.model .. ": only the CustomVoice talker is supported")

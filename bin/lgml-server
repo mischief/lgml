@@ -15,7 +15,7 @@ local openai = require("lgml.server.openai")
 
 local USAGE = [=[
 usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b backend]
-                   [-c n_ctx] [--no-fa] [--ctk type] [--ctv type] [--alias id]
+                   [-t threads] [-c n_ctx] [--no-fa] [--ctk type] [--ctv type] [--alias id]
                    [--recipe file] [--cache-ram MiB] [--ctx-checkpoints n]
                    [--lora file[:scale]]... [--mmproj file] [--image-min-tokens n]
                    [--image-max-tokens n] [--inproc] [--stt] [--engine module]
@@ -23,7 +23,7 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
   -l, --listen addr   address to listen on (default 127.0.0.1)
   -p, --port port     port to listen on (default 8080)
   -C, --config file   Lua file returning { listen, port, cors, vram, ram, idle,
-                      load_wait, models = { spec, ... } };
+                      load_wait, threads, models = { spec, ... } };
                       each model runs in its own worker, which starts on the
                       first request for the model; when a load does not fit
                       the budget, idle models unload, least recently used
@@ -35,11 +35,11 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       models' requests to end (default 60), then it fails
                       with 503; POST /models/load and /models/unload with
                       {"model": id} load and unload a model now;
-                      spec: { model = path, id, backend, ctx, flash_attn, stt,
-                      cache_type_k, cache_type_v, recipe, cache_ram,
-                      ctx_checkpoints, lora = "file[:scale]" or a list of
-                      them or of { path, scale }, mmproj, image_min_tokens,
-                      image_max_tokens,
+                      spec: { model = path, id, backend, threads, ctx,
+                      flash_attn, stt, cache_type_k, cache_type_v, recipe,
+                      cache_ram, ctx_checkpoints, lora = "file[:scale]" or a
+                      list of them or of { path, scale }, mmproj,
+                      image_min_tokens, image_max_tokens,
                       engine = Lua module with new(opts), such as a TTS engine,
                       modes = list of completion, multimodal, decide,
                       transcription, speech, image_generation (default: from
@@ -50,6 +50,9 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       the measure of its worker) }
   -m, --model file    gguf model file, or a Whisper model directory
   -b, --backend name  ggml backend, for example Vulkan0 or CPU (default best)
+  -t, --threads n     CPU threads of each model (default: LGML_THREADS, else
+                      the physical cores); with -C it overrides threads, and
+                      a threads key in a model spec overrides both
   -c, --ctx n         context size in tokens (default: the model's)
       --no-fa         use soft_max attention, not flash attention
       --ctk type      K cache type: f16, q8_0, q4_0, ... (default q8_0,
@@ -119,10 +122,10 @@ local function adapters(spec)
 	return out
 end
 
--- One engine from a model spec: { model, id, backend, ctx, flash_attn,
--- stt, inproc }. With managed, the spec becomes a model of the pool
--- that loads on demand: managed(spec, modes, start) adds it, and start
--- (options) starts its worker.
+-- One engine from a model spec: { model, id, backend, threads, ctx,
+-- flash_attn, stt, inproc }. With managed, the spec becomes a model of
+-- the pool that loads on demand: managed(spec, modes, start) adds it,
+-- and start(options) starts its worker.
 local function model_engine(spec, managed)
 	local n_ctx = spec.ctx and tonumber(spec.ctx)
 	if spec.ctx and not n_ctx then
@@ -135,6 +138,10 @@ local function model_engine(spec, managed)
 	end
 	if spec.ctx_checkpoints and not (ckpt and ckpt >= 0) then
 		die("bad checkpoint count " .. tostring(spec.ctx_checkpoints))
+	end
+	local threads = spec.threads and math.tointeger(tonumber(spec.threads))
+	if spec.threads and not (threads and threads >= 1 and threads <= 1024) then
+		die("bad thread count " .. tostring(spec.threads))
 	end
 	local detect = require("lgml.detect")
 	local stt = not spec.engine and (spec.stt or detect.is_whisper(spec.model))
@@ -154,15 +161,16 @@ local function model_engine(spec, managed)
 	end
 	if spec.inproc and spec.engine then
 		return require(spec.engine).new({
-			model = spec.model, backend = spec.backend, id = spec.id, n_ctx = n_ctx,
+			model = spec.model, backend = spec.backend, threads = threads, id = spec.id,
+			n_ctx = n_ctx,
 		})
 	elseif spec.inproc and stt then
 		return require("lgml.stt_engine").new({
-			model = spec.model, backend = spec.backend, id = spec.id,
+			model = spec.model, backend = spec.backend, threads = threads, id = spec.id,
 		})
 	elseif spec.inproc then
 		return require("lgml.engine").new({
-			model = spec.model, backend = spec.backend, n_ctx = n_ctx,
+			model = spec.model, backend = spec.backend, threads = threads, n_ctx = n_ctx,
 			flash_attn = spec.flash_attn ~= false, id = spec.id,
 			cache_type_k = spec.cache_type_k, cache_type_v = spec.cache_type_v,
 			recipe = spec.recipe, cache_ram = ram, ctx_checkpoints = ckpt, lora = lora,
@@ -171,7 +179,7 @@ local function model_engine(spec, managed)
 	end
 	local wargs = { "-m", spec.model }
 	for flag, v in pairs({
-		["-b"] = spec.backend, ["-c"] = spec.ctx, ["--alias"] = spec.id,
+		["-b"] = spec.backend, ["-t"] = threads, ["-c"] = spec.ctx, ["--alias"] = spec.id,
 		["--ctk"] = spec.cache_type_k, ["--ctv"] = spec.cache_type_v,
 		["--recipe"] = spec.recipe, ["--cache-ram"] = spec.cache_ram,
 		["--ctx-checkpoints"] = spec.ctx_checkpoints, ["--mmproj"] = spec.mmproj,
@@ -324,6 +332,10 @@ local function config_engine(path, opts)
 		if type(spec.model) ~= "string" then
 			die(("%s: models[%d].model must be a path"):format(path, i))
 		end
+		-- The threads of a spec, else --threads, else the threads key.
+		if spec.threads == nil then
+			spec.threads = opts.t or cfg.threads
+		end
 	end
 	local engines = {}
 	if inproc then
@@ -346,7 +358,7 @@ local function make_engine(opts)
 	end
 	if opts.m then
 		return model_engine({
-			model = opts.m, id = opts.alias, backend = opts.b, ctx = opts.c,
+			model = opts.m, id = opts.alias, backend = opts.b, threads = opts.t, ctx = opts.c,
 			flash_attn = not opts["no-fa"], stt = opts.stt, inproc = opts.inproc,
 			cache_type_k = opts.ctk, cache_type_v = opts.ctv, recipe = opts.recipe,
 			cache_ram = opts["cache-ram"], ctx_checkpoints = opts["ctx-checkpoints"],
@@ -359,9 +371,9 @@ local function make_engine(opts)
 end
 
 local function main(args)
-	local opts, rest = getopt.parse(args, "hl:p:m:b:c:C:", {
+	local opts, rest = getopt.parse(args, "hl:p:m:b:t:c:C:", {
 		config = "C", help = "h", listen = "l", port = "p", model = "m", backend = "b",
-		ctx = "c", fake = false, ["no-fa"] = false, ["alias="] = false,
+		threads = "t", ctx = "c", fake = false, ["no-fa"] = false, ["alias="] = false,
 		inproc = false, stt = false, ["ctk="] = false, ["ctv="] = false, ["engine="] = false,
 		["recipe="] = false, ["cache-ram="] = false, ["ctx-checkpoints="] = false,
 		["lora="] = false, ["cors="] = false, ["vram="] = false, ["idle="] = false,

@@ -32,10 +32,11 @@ M.MAX_SIDE = 2048
 -- - `llm`: the Qwen3-4B gguf
 -- - `vae`: the FLUX ae.safetensors
 -- - `backend`: backend name (default: the best one)
+-- - `threads`: CPU thread count (default: `lgml.threads()`)
 -- @treturn Pipeline the pipeline
 -- @raise when a model does not load
 function M.load(opts)
-	local be = assert(lgml.backend(opts.backend))
+	local be = assert(lgml.backend(opts.backend, { threads = opts.threads }))
 	local vae = require("lgml.image.vae")
 	local p = setmetatable({ be = be, vae_mod = vae }, M)
 	p.te = text_encoder.load(be, opts.llm)

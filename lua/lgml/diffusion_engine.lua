@@ -23,6 +23,7 @@ local MAX_LOOP_CUTS = 3
 --
 -- - `model`: gguf path
 -- - `backend`: backend name (default: the best one)
+-- - `threads`: CPU thread count (default: `lgml.threads()`)
 -- - `n_ctx`: context size (default 4096, at most the model's)
 -- - `flash_attn`: true for flash attention and an f16 KV cache
 -- - `id`: model id (default: the gguf `general.name`, or `"lgml"`)
@@ -33,7 +34,7 @@ local MAX_LOOP_CUTS = 3
 -- @raise when the backend, the model or its tokenizer does not load,
 -- or when no chat template fits the model
 function M.new(opts)
-	local be = assert(lgml.backend(opts.backend))
+	local be = assert(lgml.backend(opts.backend, { threads = opts.threads }))
 	local info = assert(lgml.gguf(opts.model))
 	local arch = require("lgml." .. info.meta["general.architecture"])
 	local model = arch.load(be, opts.model, { flash_attn = opts.flash_attn })

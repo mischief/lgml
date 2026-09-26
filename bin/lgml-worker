@@ -11,16 +11,17 @@ require("lgml.strict").on()
 
 local getopt = require("lgml.getopt")
 
-local USAGE = "usage: lgml-worker --fd n (-m model | --fake) [-b backend] [-c n_ctx] [--no-fa]\n" ..
-    "                   [--ctk type] [--ctv type] [--alias id] [--stt] [--engine module]\n" ..
+local USAGE = "usage: lgml-worker --fd n (-m model | --fake) [-b backend] [-t threads] [-c n_ctx]\n" ..
+    "                   [--no-fa] [--ctk type] [--ctv type] [--alias id] [--stt]\n" ..
+    "                   [--engine module]\n" ..
     "                   [--recipe file] [--cache-ram MiB] [--ctx-checkpoints n]\n" ..
     "                   [--lora file[:scale]]...\n" ..
     "                   [--mmproj file] [--image-min-tokens n] [--image-max-tokens n]\n" ..
     "                   [--fake-size MiB] [--fake-load-ms n] [--fake-delay ms] [--fake-fail]\n" ..
     "       lgml-worker --devices\n"
 
-local opts, rest = getopt.parse(arg, "m:b:c:", {
-	model = "m", backend = "b", ctx = "c", ["fd="] = false,
+local opts, rest = getopt.parse(arg, "m:b:t:c:", {
+	model = "m", backend = "b", threads = "t", ctx = "c", ["fd="] = false,
 	["no-fa"] = false, ["alias="] = false, fake = false, stt = false,
 	["engine="] = false, ["ctk="] = false, ["ctv="] = false, ["recipe="] = false,
 	["cache-ram="] = false, ["ctx-checkpoints="] = false, ["lora="] = false,
@@ -35,11 +36,13 @@ if opts and opts.devices then
 	io.stdout:write(require("lgml.json").encode(list), "\n")
 	os.exit(0)
 end
-if not opts or #rest > 0 or not (opts.m or opts.fake) or not tonumber(opts.fd) then
+if not opts or #rest > 0 or not (opts.m or opts.fake) or not tonumber(opts.fd) or
+    (opts.t and not math.tointeger(tonumber(opts.t))) then
 	io.stderr:write("lgml-worker: ", tostring(rest), "\n", USAGE)
 	os.exit(2)
 end
 local fd = math.tointeger(tonumber(opts.fd))
+local threads = opts.t and math.tointeger(tonumber(opts.t))
 local worker = require("lgml.worker")
 
 -- The fake engine for tests: --fake-size is the device MiB it reports,
@@ -68,14 +71,16 @@ local function load()
 	end
 	if opts.engine then
 		return require(opts.engine).new({
-			model = opts.m, backend = opts.b, id = opts.alias,
+			model = opts.m, backend = opts.b, threads = threads, id = opts.alias,
 			n_ctx = opts.c and tonumber(opts.c),
 		})
 	elseif opts.stt or require("lgml.detect").is_whisper(opts.m) then
-		return require("lgml.stt_engine").new({ model = opts.m, backend = opts.b, id = opts.alias })
+		return require("lgml.stt_engine").new({
+			model = opts.m, backend = opts.b, threads = threads, id = opts.alias,
+		})
 	end
 	return require("lgml.engine").new({
-		model = opts.m, backend = opts.b, n_ctx = opts.c and tonumber(opts.c),
+		model = opts.m, backend = opts.b, threads = threads, n_ctx = opts.c and tonumber(opts.c),
 		flash_attn = not opts["no-fa"], id = opts.alias,
 		cache_type_k = opts.ctk, cache_type_v = opts.ctv,
 		recipe = opts.recipe,

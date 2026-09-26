@@ -89,12 +89,13 @@ end
 -- opts.model: the LM gguf, or a directory with the LM and SNAC ggufs.
 -- opts.codec: the SNAC gguf (default: found next to the LM).
 -- opts.backend: backend name for `lgml.backend`.
+-- opts.threads: CPU thread count (default: `lgml.threads()`).
 -- opts.id: model id (default "orpheus").
 -- opts.n_ctx: context size (default 4096, at most the LM context).
 -- @treturn Engine the engine
 -- @raise when a model file is missing or does not load
 function M.new(opts)
-	local be = assert(lgml.backend(opts.backend))
+	local be = assert(lgml.backend(opts.backend, { threads = opts.threads }))
 	local lm, codec = find_models(opts.model, opts.codec)
 	local e = setmetatable({
 		be = be, lm = transformer.load(be, lm), codec = snac.load(be, codec),

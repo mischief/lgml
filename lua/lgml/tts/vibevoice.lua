@@ -79,6 +79,7 @@ end
 -- @tparam table opts options:
 -- opts.model: a gguf path or a directory.
 -- opts.backend: backend name for `lgml.backend`.
+-- opts.threads: CPU thread count (default: `lgml.threads()`).
 -- opts.id: model id (default "vibevoice").
 -- opts.voices: directory of vibevoice-voice-*.gguf presets (default:
 -- the model directory).
@@ -99,7 +100,7 @@ function M.new(opts)
 	if next(voices) == nil then
 		error(vdir .. ": no vibevoice-voice-*.gguf presets")
 	end
-	local be = assert(lgml.backend(opts.backend))
+	local be = assert(lgml.backend(opts.backend, { threads = opts.threads }))
 	local e = setmetatable({
 		be = be, model = model.load(be, path), voices = voices,
 		id = opts.id or "vibevoice", busy = false, waiting = {},

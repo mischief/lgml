@@ -16,6 +16,9 @@ return {
 	-- The most seconds a load waits for requests of other models to end,
 	-- when it needs their memory (default 60).
 	load_wait = 60,
+	-- CPU threads of each model (default: the LGML_THREADS environment
+	-- variable, else the physical cores). A model spec can set its own.
+	threads = 16,
 	models = {
 		-- lora adds LoRA adapters, "file[:scale]", from lgml-finetune or
 		-- llama.cpp; a request can change their scales.
@@ -36,6 +39,6 @@ return {
 		{ id = "qwen3-tts", model = "/home/you/models/qwen3-tts", engine = "lgml.tts.qwen3tts" },
 		-- Models on the CPU do not count against vram.
 		{ id = "vibevoice", model = "/home/you/models/vibevoice-realtime-0.5b", engine = "lgml.tts.vibevoice",
-			backend = "CPU" },
+			backend = "CPU", threads = 8 },
 	},
 }

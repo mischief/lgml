@@ -17,7 +17,7 @@ local lora = require("lgml.lora")
 local finetune = require("lgml.finetune")
 
 local USAGE = [[
-usage: lgml-finetune [-h] -m model -d data [-o out] [-b backend] [-r rank]
+usage: lgml-finetune [-h] -m model -d data [-o out] [-b backend] [-t n] [-r rank]
                      [--alpha a] [--targets list] [--lr x] [--warmup n]
                      [--wd x] [--optimizer name] [-e epochs] [-c ctx]
                      [--batch n] [--grad-accum n] [--eval file]
@@ -37,6 +37,8 @@ usage: lgml-finetune [-h] -m model -d data [-o out] [-b backend] [-r rank]
                        loads in llama.cpp with --lora
   -b, --backend name   ggml backend, for example Vulkan0 or CPU (default
                        best)
+  -t, --threads n      CPU threads (default: LGML_THREADS, else the
+                       physical cores)
   -r, --rank n         LoRA rank (default 8)
       --alpha a        LoRA alpha; the scale is alpha / rank (default
                        2 * rank)
@@ -84,8 +86,8 @@ local function num(opts, k, def, int)
 end
 
 local function main(args)
-	local opts, rest = getopt.parse(args, "hm:d:o:b:r:e:c:", {
-		help = "h", model = "m", data = "d", out = "o", backend = "b", rank = "r",
+	local opts, rest = getopt.parse(args, "hm:d:o:b:t:r:e:c:", {
+		help = "h", model = "m", data = "d", out = "o", backend = "b", threads = "t", rank = "r",
 		epochs = "e", ctx = "c", ["alpha="] = false, ["targets="] = false, ["lr="] = false,
 		["warmup="] = false, ["wd="] = false, ["optimizer="] = false, ["batch="] = false,
 		["grad-accum="] = false, ["eval="] = false, ["eval-split="] = false,
@@ -109,6 +111,7 @@ local function main(args)
 	local ctx = num(opts, "c", 512, true)
 	local split = num(opts, "eval-split", 0)
 	local seed = num(opts, "seed", 1, true)
+	local threads = num(opts, "t", nil, true)
 	local optimizer = opts.optimizer or "adamw"
 	local format = opts.format or "chat"
 	if format ~= "chat" and format ~= "text" then
@@ -117,11 +120,11 @@ local function main(args)
 	if optimizer ~= "adamw" and optimizer ~= "sgd" then
 		die("optimizer must be adamw or sgd")
 	end
-	if rank < 1 or ctx < 2 or split < 0 or split >= 1 then
-		die("rank, ctx or eval split out of range")
+	if rank < 1 or ctx < 2 or split < 0 or split >= 1 or (threads and threads < 1) then
+		die("rank, ctx, threads or eval split out of range")
 	end
 
-	local be = assert(lgml.backend(opts.b))
+	local be = assert(lgml.backend(opts.b, { threads = threads }))
 	local info = assert(lgml.gguf(opts.m))
 	-- Text data needs no chat template.
 	local family
