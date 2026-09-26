@@ -5,6 +5,8 @@
 -- gives its capabilities in `ready().caps`, as
 -- `lgml.server.remote_engine` does.
 -- @module lgml.server.router
+local media = require("lgml.chat.media")
+
 local M = {}
 local R = {}
 R.__index = R
@@ -61,6 +63,30 @@ function R:pick(id, what)
 	return first
 end
 
+-- The chat engines with a vision model, and the ids of those models.
+local function vision_engines(self)
+	local es, ids = {}, {}
+	for _, e in ipairs(self.engines) do
+		if can(e, "chat") then
+			for _, m in ipairs(e:models()) do
+				if m.vision then
+					es[#es + 1], ids[#ids + 1] = e, m.id
+				end
+			end
+		end
+	end
+	return es, ids
+end
+
+-- The model of engine e with the id, or nil.
+local function model_of(e, id)
+	for _, m in ipairs(e:models()) do
+		if m.id == id then
+			return m
+		end
+	end
+end
+
 --- Returns the properties of the first chat engine.
 -- With no chat engine, it uses the first engine.
 -- @treturn table the properties
@@ -70,6 +96,9 @@ function R:props()
 end
 
 --- Runs a chat completion on the engine for `req.model`.
+-- A request with images and no model, or an unknown one, goes to the
+-- first model with vision. A named model without vision is an error
+-- that names the models with vision.
 -- @tparam table req the chat request
 -- @tparam lgml.server.engine.Sink sink the reply
 -- @return the results of `Engine:chat`, or nil, a message and 400 when
@@ -78,6 +107,19 @@ function R:chat(req, sink)
 	local e = self:pick(req.model, "chat")
 	if not e then
 		return nil, "no model serves chat", 400
+	end
+	if type(req.messages) == "table" and media.has_images(req.messages) then
+		local m = model_of(e, req.model)
+		if not (m and m.vision) then
+			local es, ids = vision_engines(self)
+			if #es == 0 then
+				return nil, "image input is not supported: no model has an mmproj", 400
+			elseif m then
+				return nil, ("image input is not supported by %s; models with vision: %s")
+				    :format(m.id, table.concat(ids, ", ")), 400
+			end
+			e = es[1]
+		end
 	end
 	return e:chat(req, sink)
 end
