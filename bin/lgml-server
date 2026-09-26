@@ -172,7 +172,9 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
       --stt           the model is speech-to-text (found from config.json
                       when not given)
       --engine module Lua engine module for the model, such as
-                      lgml.image.engine with -m a Z-Image directory
+                      lgml.image.engine with -m a Z-Image directory, or
+                      lgml.laya_engine with -m a Laya decision model
+                      directory (/v1/systemone only)
       --text-backend name
                       with --engine lgml.image.engine: the backend of the
                       text encoder, such as CPU (default: the -b backend)

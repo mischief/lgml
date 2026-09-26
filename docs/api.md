@@ -180,7 +180,7 @@ lgml extensions.
 | speech | `x-lgml-elapsed-ms`, `x-lgml-audio-seconds` (length of the audio), `x-lgml-rtf` (wall time over audio time), `x-lgml-sample-rate` (samples per second), `x-lgml-channels` (1) |
 | transcriptions | `x-lgml-elapsed-ms`, `x-lgml-audio-seconds` (length of the input), `x-lgml-rtf` |
 | embeddings | `x-lgml-elapsed-ms`, `x-lgml-prompt-n` (tokens of all inputs), `x-lgml-prompt-ms` (model time), `x-lgml-prompt-per-second` |
-| systemone | `x-lgml-elapsed-ms`, and `x-jevify-latency-ms` (the same time with 1 decimal, as Jevify sends) |
+| systemone | `x-lgml-elapsed-ms`, and `x-jevify-latency-ms` (the same time with 1 decimal, as Jevify sends); the Laya engine adds `x-lgml-decide-ms` (model time) |
 | messages, responses | `x-lgml-ignored` (accepted fields with no effect), and for messages `request-id`, `x-lgml-ignored-betas` and `x-lgml-thinking-dropped`; see [Anthropic Messages](#anthropic-messages) and [OpenAI Responses](#openai-responses) |
 
 A streamed chat reply has no `x-lgml-*` headers. Its last chunk holds
@@ -1349,7 +1349,8 @@ curl -s localhost:8080/v1/embeddings -d '{
 of Jev 1.13.0, as Jevify implements it. A model does not generate an
 answer. It reads a state and scores the allowed answers of typed
 questions in one pass each. A chat model with capability `decide`
-serves it. The fields `lgml` and `attachments` are lgml extensions.
+serves it, or a Laya decision model; see [Laya engine](#laya-engine).
+The fields `lgml` and `attachments` are lgml extensions.
 
 Each model has a prompt format, set by `--recipe` (config `recipe`):
 
@@ -1423,7 +1424,8 @@ JSON.
 
 - `lgml.raw`: a boolean. When true, each answer has an `lgml` object
   with the raw log-scores: `runs` (one `{keys, logscores}` per option
-  order) and `prior` (the content-free run, or absent).
+  order) and `prior` (the content-free run, or absent). The Laya engine
+  gives other fields; see [Laya engine](#laya-engine).
 - `lgml.recipe`: an object with recipe fields. They change the server
   recipe (`--recipe`, a Jevify `recipe.json`) for this request. A
   `{"recipe": {...}}` object (the `recipe.json` form) also works. Each
@@ -1544,6 +1546,51 @@ Kev gives 400 for images.
   model decides.
 - 400, 500, 503 and 507 give `{"detail": "message"}`. For example, a prompt
   longer than the context gives 400.
+
+### Laya engine
+
+`lgml.laya_engine` serves a Laya typed-decision model
+(`convaiinnovations/laya`): a ModernBERT encoder and a decision head.
+It does not use a chat model. Its capability is `decide` only.
+
+```sh
+bin/lgml-server --engine lgml.laya_engine -m laya/
+```
+
+The model directory holds `rl_agent_config.json`,
+`encoder/config.json`, `tokenizer/tokenizer.json` and
+`model.safetensors`: the root of the Hugging Face repository, or its
+`typed-decisions` subfolder. In a config, the spec is
+`{ model = "laya/", engine = "lgml.laya_engine" }`. The model is small
+(421M parameters), so the CPU backend (`-b CPU`) also works.
+
+The engine follows the reference code of the repository
+(`rl_agent_api.py`):
+
+- Each question is one sequence: `[CLS] <type> question:
+  <instructions> [SEP]`, then `[MASK] <option>` for each option, then
+  `[SEP] <state> [SEP]`. A JSON state is its one-line JSON. A choice
+  option is `name` or `name: description`, a score level is
+  `level <i>: <text>`, and a noul has `false: ...` then `true: ...`.
+- A sequence has at most `max_len` tokens (512). The options share
+  `head_max_len` tokens (192); the end of the state is cut to fit. A
+  question whose options do not fit gives 400.
+- The head scores the hidden state at each `[MASK]`. The
+  probabilities are the softmax of these logits over a temperature from
+  `rl_agent_config.json`, by question type and option count.
+- All questions of a request run in one graph.
+
+The reply has the shape above. A noul gives the probability of the
+`true` option. `choice`, `score` and `confidence` follow the rules
+above, not Laya's own confidence. With `lgml.raw`, each answer has
+`lgml`: `logits` (the raw marker logits), `temperature`, `confidence`
+(Laya's rule: 1 minus the normalized entropy) and `act_probability`
+(the act head, which the model card says carries no usable signal).
+`usage.input_tokens` counts the tokens of all sequences, and
+`output_tokens` is 0.
+
+`lgml.recipe` gives 400, because Laya has its own temperatures, and so
+do `attachments`.
 
 ### Example
 

@@ -76,6 +76,7 @@ ninja -C build
 bin/lgml-server -m model.gguf                 # one model, port 8080
 bin/lgml-server -m model.gguf --mmproj mmproj.gguf -c 16384
 bin/lgml-server -C etc/lgml.lua               # several models from a config
+bin/lgml-server --engine lgml.laya_engine -m laya/   # Laya decisions, /v1/systemone
 ```
 
 `bin/lgml-server -h` lists the options. `etc/lgml.lua.example` is a
