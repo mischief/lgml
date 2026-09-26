@@ -1,6 +1,7 @@
 -- Autograd against finite differences, and the optimizer steps, on the
 -- CPU backend. Output is TAP.
 local lgml = require("lgml")
+local optim = require("lgml.optim")
 
 local n = 0
 local failed = false
@@ -315,6 +316,52 @@ do
 	local good = pcall(loss.backward, loss)
 	ok(not good, "a graph takes one backward pass")
 	w:requires_grad(false)
+end
+
+-- Optimizer steps against the formulas.
+do
+	local p = be:tensor("f32", { 3 }, { 1, -2, 3 })
+	p:requires_grad()
+	local g <close> = be:graph()
+	local loss = g:sum(g:sqr(p))
+	loss:backward()
+	local sgd = optim.sgd({ p }, { lr = 0.1, weight_decay = 0.5 })
+	sgd:zero_grad()
+	g:compute(loss)
+	sgd:step()
+	-- p - lr * (grad + wd * p): grad = 2p
+	local want = { 1 - 0.1 * (2 + 0.5), -2 - 0.1 * (-4 - 1), 3 - 0.1 * (6 + 1.5) }
+	local got = p:get()
+	local good = true
+	for i = 1, 3 do
+		good = good and math.abs(got[i] - want[i]) < 1e-5
+	end
+	ok(good, "sgd step")
+
+	p:set({ 1, -2, 3 })
+	local adam = optim.adamw({ p }, { lr = 0.01, betas = { 0.9, 0.99 }, eps = 1e-8,
+	    weight_decay = 0.1 })
+	local m, v, x = { 0, 0, 0 }, { 0, 0, 0 }, { 1, -2, 3 }
+	good = true
+	for t = 1, 3 do
+		adam:zero_grad()
+		g:compute(loss)
+		adam:step()
+		for i = 1, 3 do
+			local gr = 2 * x[i]
+			m[i] = 0.9 * m[i] + 0.1 * gr
+			v[i] = 0.99 * v[i] + 0.01 * gr * gr
+			local mh, vh = m[i] / (1 - 0.9 ^ t), v[i] / (1 - 0.99 ^ t)
+			x[i] = x[i] * (1 - 0.01 * 0.1) - 0.01 * mh / (math.sqrt(vh) + 1e-8)
+		end
+	end
+	got = p:get()
+	for i = 1, 3 do
+		good = good and math.abs(got[i] - x[i]) < 1e-5
+	end
+	ok(good, "adamw steps")
+	ok(adam.t == 3, "adamw counts steps")
+	p:requires_grad(false)
 end
 
 io.stderr:write("finite differences, max scaled error:\n")
