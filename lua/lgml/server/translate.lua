@@ -721,7 +721,11 @@ function M.Writer:keepalive(fn, ms)
 	self.timer = t
 	local step = math.max(1, ms // 4)
 	t:start(step, step, function()
-		if self.busy or self.res.done or self.broken or uv.now() - self.last < ms then
+		-- A handler that raised leaves the timer; the closed connection stops it.
+		if self.res.s:gone() then
+			self:stop()
+			return
+		elseif self.busy or self.res.done or self.broken or uv.now() - self.last < ms then
 			return
 		end
 		self.last = uv.now()
