@@ -461,7 +461,16 @@ local function test_store()
 		input = { { type = "function_call_output", call_id = call.call_id, output = "sunny" } } }))
 	m = last.messages
 	ok(status == 200 and m[2].tool_calls[1].id == call.call_id and m[3].role == "tool" and m[3].content == "sunny",
-	    "a function_call_output after a stored call, as the clm client sends it")
+	    "a function_call_output after a stored call")
+	local again
+	status, again = post(body({ tools = TOOLS, previous_response_id = t1.id,
+		input = { { type = "function_call", call_id = call.call_id, name = call.name, arguments = call.arguments },
+			{ type = "function_call_output", call_id = call.call_id, output = "sunny" } } }))
+	m = last.messages
+	ok(status == 200 and #m == 3 and #m[2].tool_calls == 1 and m[3].role == "tool",
+	    "a stored call sent again with its output, as the clm client sends it, is not a second call")
+	local _, items = get("/v1/responses/" .. again.id .. "/input_items")
+	ok(#items.data == 1 and items.data[1].type == "function_call_output", "the input items skip the known call")
 
 	local _, nostore = post(body({ store = false }))
 	local e

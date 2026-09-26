@@ -348,7 +348,8 @@ end
 
 --- Translates input items into chat messages.
 -- Consecutive assistant messages, function calls and reasoning items
--- make one assistant message. Each function_call_output needs a
+-- make one assistant message. A function_call with a call_id that came
+-- before is skipped. Each function_call_output needs a
 -- function_call with its call_id before it. ctx gets `calls`, the
 -- call ids, and `items`, the items in order (for the store).
 -- @tparam lgml.server.translate.Context ctx the request context, with
@@ -402,8 +403,15 @@ function M.convert_items(ctx, items, out, at)
 		if not ok then
 			return nil, err
 		end
-		ctx.items[#ctx.items + 1] = it
-		if kind == "message" then
+		-- A call that the context has already (from the stored chain, as
+		-- the clm client sends it again) is not a new call.
+		local replay = kind == "function_call" and ctx.calls[it.call_id]
+		if not replay then
+			ctx.items[#ctx.items + 1] = it
+		end
+		if replay then
+			L:debug("known function_call skipped", "call_id", it.call_id)
+		elseif kind == "message" then
 			local role = ROLES[it.role]
 			if not role then
 				return fail(p .. ".role: must be user, assistant, system or developer", p .. ".role")
@@ -1127,13 +1135,13 @@ local function delete(opts, req, res)
 end
 
 -- POST /v1/responses/{response_id}/cancel: no response runs in the
--- background, so none can be cancelled.
+-- background, so none can be canceled.
 local function cancel(opts, req, res)
 	local id = req.params.response_id
 	if not opts.store:get(id) then
 		return not_found(res, id)
 	end
-	return res:error(400, "Only responses created with background: true can be cancelled.", nil,
+	return res:error(400, "Only responses created with background: true can be canceled.", nil,
 	    "response_id", "unsupported_value")
 end
 

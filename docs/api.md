@@ -866,7 +866,7 @@ the replies.
 | Item | Notes |
 | --- | --- |
 | message | `{"role", "content"}`, with or without `"type": "message"`. `role`: `user`, `system`, `developer` (as `system`) or `assistant`. `content` is a string or parts. `id`, `status` and `phase` are accepted. |
-| `function_call` | `call_id`, `name` and `arguments` (a JSON string). `id` and `status` are optional. Calls next to an assistant message join its turn. |
+| `function_call` | `call_id`, `name` and `arguments` (a JSON string). `id` and `status` are optional. Calls next to an assistant message join its turn. A call whose `call_id` came before, such as a call of the stored chain that the clm client sends again, is skipped. |
 | `function_call_output` | `call_id` and `output`: a string, or `input_text`, `input_image` and text `input_file` parts. Its `call_id` must be that of an earlier `function_call`, else 400. Images here go into the tool result turn of the template. |
 | `reasoning` | The reasoning of the assistant turn after it. `encrypted_content` made by lgml gives the reasoning; one that the server did not make, or that does not verify, gives 400 (code `invalid_encrypted_content`). Without it, `content` (`reasoning_text`), else `summary`, gives the text. |
 | `item_reference` | An item of a stored response, by id; see [Stored responses](#stored-responses). |
@@ -1005,7 +1005,7 @@ works:
   `limit` (1 to 100, default 20), `order` (`desc`, the default, or
   `asc`) and `after` (an item id).
 - `POST /v1/responses/{response_id}/cancel` gives 400: only background
-  responses can be cancelled.
+  responses can be canceled.
 - An unknown id gives 404 with code `not_found`.
 
 ### Responses token count
