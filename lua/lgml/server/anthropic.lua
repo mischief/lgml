@@ -1074,6 +1074,42 @@ end
 --- Milliseconds without bytes out before a `ping` event in a stream.
 M.PING_MS = 10000
 
+-- POST /v1/messages/count_tokens: the prompt size from the template
+-- and the tokenizer of the model, images too.
+local function count_tokens(eng, opts, req, res)
+	local r, chat = prepare(eng, opts, req, res, true)
+	if not r then
+		return
+	end
+	log.note("model", r.model)
+	local sink = translate.blocks(res)
+	local ok, msg, status = eng:chat(chat, sink)
+	if sink:cancelled() then
+		res.close = true
+		return
+	elseif not ok or not sink.finished then
+		return send_error(r, status or 500, msg or "engine failed")
+	end
+	local n = translate.counts(sink.finished.usage).prompt
+	log.note("prompt_tokens", n)
+	return res:json(200, { input_tokens = n }, headers_of(r))
+end
+
+--- The Anthropic model list for `GET /v1/models` with an
+-- `anthropic-version` header.
+-- @tparam lgml.server.engine.Engine eng the engine
+-- @treturn table `{ data, has_more, first_id, last_id }`; each entry is
+-- `{ type = "model", id, display_name, created_at }`
+function M.models(eng)
+	local data = json.array()
+	for i, m in ipairs(eng:models()) do
+		data[i] = { type = "model", id = m.id, display_name = m.id,
+			created_at = os.date("!%Y-%m-%dT%H:%M:%SZ", m.created or 0) }
+	end
+	return { data = data, has_more = false, first_id = data[1] and data[1].id or json.null,
+		last_id = data[#data] and data[#data].id or json.null }
+end
+
 local function messages(eng, opts, req, res)
 	local r, chat = prepare(eng, opts, req, res, false)
 	if not r then
@@ -1094,8 +1130,8 @@ local function messages(eng, opts, req, res)
 end
 
 --- Adds the Messages routes for eng to srv.
--- `POST /v1/messages`. The path takes a query string, such as
--- `?beta=true`, which it ignores.
+-- `POST /v1/messages` and `POST /v1/messages/count_tokens`. The paths
+-- take a query string, such as `?beta=true`, which they ignore.
 -- @tparam lgml.server.httpd.Server srv the server
 -- @tparam lgml.server.engine.Engine eng the engine
 -- @tparam table opts the options: `key`, the server key for reasoning
@@ -1103,6 +1139,9 @@ end
 function M.install(srv, eng, opts)
 	srv:route("POST", "/v1/messages", function(req, res)
 		return messages(eng, opts, req, res)
+	end)
+	srv:route("POST", "/v1/messages/count_tokens", function(req, res)
+		return count_tokens(eng, opts, req, res)
 	end)
 end
 

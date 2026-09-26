@@ -444,7 +444,11 @@ end
 
 -- handlers
 
-local function models(eng, res)
+local function models(eng, req, res)
+	-- Anthropic clients send anthropic-version and read their own shape.
+	if req.headers["anthropic-version"] then
+		return res:json(200, require("lgml.server.anthropic").models(eng))
+	end
 	local data = json.array()
 	for i, m in ipairs(eng:models()) do
 		local caps = json.array()
@@ -1010,8 +1014,8 @@ function M.install(srv, eng, opts)
 	local function health(_, res)
 		return res:json(200, { status = "ok" })
 	end
-	local function list(_, res)
-		return models(eng, res)
+	local function list(req, res)
+		return models(eng, req, res)
 	end
 	local function completions(req, res)
 		return chat(eng, req, res)

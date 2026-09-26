@@ -498,8 +498,34 @@ local function test_stream_events()
 	    ("pings keep a slow stream alive (%d pings); message_delta has the input tokens"):format(pings))
 end
 
+local function test_count_tokens()
+	local b = example("image_base64")
+	local _, reply = post(b)
+	b.stream, b.max_tokens, b.temperature, b.stop_sequences = true, 7, 0.2, { "x" }
+	local status, c, h = post(b, HEADERS, "/v1/messages/count_tokens?beta=true")
+	local u = reply.usage
+	ok(status == 200 and c.input_tokens == u.input_tokens + u.cache_read_input_tokens and
+	    h["request-id"] == "req_0000abcd", ("count_tokens gives the prompt size: %s"):format(tostring(c.input_tokens)))
+	ok(last.count_only == true and last.stop == nil and last.temperature == nil, "the generation fields are ignored")
+	local plain = post(example("plain_text"), HEADERS, "/v1/messages/count_tokens")
+	ok(plain == 200, "count_tokens without images")
+	local _, img = post(example("image_base64"), HEADERS, "/v1/messages/count_tokens")
+	local _, txt = post({ model = "m", messages = { { role = "user", content = "Describe this image." } } }, HEADERS,
+		"/v1/messages/count_tokens")
+	ok(img.input_tokens == txt.input_tokens + 16, "the image counts its tokens")
+	local e
+	status, e = post({ model = "m" }, HEADERS, "/v1/messages/count_tokens")
+	ok(status == 400 and e.error.message == "messages: Field required", "count_tokens errors have the Anthropic shape")
+	local st, list = inproc.json(srv, "GET", "/v1/models", nil, HEADERS)
+	ok(st == 200 and list.data[1].type == "model" and list.data[1].id == "fake" and list.has_more == false and
+	    list.first_id == "fake" and list.data[1].created_at:match("^%d+%-%d+%-%d+T"), "the Anthropic model list")
+	st, list = inproc.json(srv, "GET", "/v1/models")
+	ok(st == 200 and list.object == "list" and list.data[1].object == "model", "without the header, the OpenAI list")
+end
+
 test_field_table()
 test_examples()
+test_count_tokens()
 test_stream()
 test_stream_events()
 test_requests()

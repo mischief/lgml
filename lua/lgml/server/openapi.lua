@@ -276,6 +276,8 @@ local function messages_schemas(c)
 	}
 	add_fields(props, anthropic.FIELDS, MESSAGES_NOTES)
 	c.MessagesRequest = obj(props, { "model", "messages", "max_tokens" })
+	c.CountTokensRequest = obj(props, { "model", "messages" },
+	    "The body of /v1/messages; the generation fields have no effect.")
 	local block = { type = "object", description = "A content block: text, image (base64 source), " ..
 	    "document (text source), search_result, tool_use, tool_result, thinking or redacted_thinking.",
 	    properties = { type = str() }, required = json.array({ "type" }) }
@@ -457,6 +459,11 @@ local function misc_schemas(c)
 		lgml = ext(obj({ status = str(), bytes = int() })),
 	})
 	c.ModelList = obj({ object = { const = "list" }, data = arr(ref("Model")) })
+	c.AnthropicModelList = obj({
+		data = arr(obj({ type = { const = "model" }, id = str(), display_name = str(), created_at = str() })),
+		has_more = { const = false }, first_id = { type = { "string", "null" } },
+		last_id = { type = { "string", "null" } },
+	})
 	c.Props = ext(obj({
 		default_generation_settings = obj({ n_ctx = int(), params = { type = "object" } }),
 		total_slots = int(), model_path = str(), build_info = str(),
@@ -565,6 +572,15 @@ local function operations()
 				headers = anthropic_headers(),
 			} }),
 		} },
+		["/messages/count_tokens"] = { POST = {
+			tag = "anthropic", summary = "Count the prompt tokens of a Messages request",
+			requestBody = json_body(ref("CountTokensRequest")),
+			responses = anthropic_errors({ ["200"] = {
+				description = "The prompt size.",
+				content = { ["application/json"] = { schema = obj({ input_tokens = int() }, { "input_tokens" }) } },
+				headers = anthropic_headers(),
+			} }),
+		} },
 		["/images/generations"] = { POST = {
 			tag = "openai", summary = "Make images",
 			requestBody = json_body(ref("ImageRequest")),
@@ -616,7 +632,8 @@ local function operations()
 		} },
 		["/models"] = { GET = {
 			tag = "openai", summary = "List models",
-			responses = { ["200"] = reply("Models.", "application/json", ref("ModelList")) },
+			responses = { ["200"] = reply("Models; with an anthropic-version header, the Anthropic list.",
+			    "application/json", { anyOf = json.array({ ref("ModelList"), ref("AnthropicModelList") }) }) },
 		} },
 		["/models/load"] = { POST = {
 			tag = "lgml", summary = "Load a model now",

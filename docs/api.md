@@ -42,6 +42,7 @@ one row are aliases for one handler.
 | --- | --- | --- | --- |
 | POST | `/v1/chat/completions`, `/chat/completions` | OpenAI | [Chat completions](#chat-completions) |
 | POST | `/v1/messages` | Anthropic | [Anthropic Messages](#anthropic-messages) |
+| POST | `/v1/messages/count_tokens` | Anthropic | [Messages token count](#messages-token-count) |
 | POST | `/v1/images/generations`, `/images/generations` | OpenAI | [Images](#images) |
 | POST | `/v1/images/edits`, `/images/edits` | OpenAI | [Images](#images) |
 | POST | `/v1/audio/speech`, `/audio/speech` | OpenAI | [Speech](#speech) |
@@ -739,6 +740,23 @@ data: {"type": "error", "error": {"type": "api_error", "message": "..."}, "reque
 `overloaded_error`. The status is the one of
 [Errors](#errors).
 
+### Messages token count
+
+`POST /v1/messages/count_tokens`. Anthropic. The body is that of
+`/v1/messages`; `max_tokens` is optional. The server renders the prompt
+with the chat template of the model that would serve the request, with
+the system prompt, tools, images and thinking blocks, and tokenizes it.
+It runs no prefill. `max_tokens`, `stream`, `stop_sequences`,
+`temperature`, `top_p`, `top_k`, `metadata` and `service_tier` are
+accepted and ignored. The reply is the exact count:
+
+```json
+{"input_tokens": 2095}
+```
+
+It waits for the model slot as a generation does. Errors are as for
+`/v1/messages`.
+
 ### Messages examples
 
 ```sh
@@ -1011,6 +1029,15 @@ fields. It does not load a model.
   `loaded` or `unloading`. A server without a config gives `loaded`.
 - `lgml.bytes`: with a config, the memory that the model counts
   against its budget.
+
+A request with an `anthropic-version` header gets the Anthropic list
+shape instead, as the Anthropic SDKs read it:
+
+```json
+{"data": [{"type": "model", "id": "qwen3-14b", "display_name": "qwen3-14b",
+  "created_at": "1970-01-01T00:00:00Z"}],
+ "has_more": false, "first_id": "qwen3-14b", "last_id": "qwen3-14b"}
+```
 
 ```sh
 curl -s localhost:8080/v1/models | jq '.data[] | {id, capabilities, status}'
