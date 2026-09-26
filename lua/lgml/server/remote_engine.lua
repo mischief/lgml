@@ -6,6 +6,7 @@
 local uv = require("luv")
 local ipc = require("lgml.ipc")
 local stream = require("lgml.server.stream")
+local detect = require("lgml.detect")
 
 local M = {}
 local R = {}
@@ -23,6 +24,8 @@ local RESTART_MS = 1000
 -- - `script`: the worker script path
 -- - `args`: a list of worker arguments
 -- - `log`: a function for messages (default: write to stderr)
+-- - `modes`: the mode names of the model (default: from the worker's
+--   `HELLO`)
 -- @treturn Remote the engine
 -- @raise when the worker does not start
 function M.new(opts)
@@ -140,6 +143,18 @@ end
 -- @treturn {table,...} the model list
 function R:models()
 	return self:ready().models
+end
+
+--- Lists the modes of the worker's model.
+-- @treturn {string,...} `opts.modes`, else the modes from the worker's
+-- `HELLO` (see `lgml.detect.modes_of`)
+function R:modes()
+	if self.opts.modes then
+		return self.opts.modes
+	end
+	local h = self:ready()
+	local m = h.models[1]
+	return detect.modes_of(h.caps or {}, m and m.vision)
 end
 
 --- Returns the properties of the worker engine.

@@ -28,7 +28,10 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       ctx_checkpoints, lora = "file[:scale]" or a list of
                       them or of { path, scale }, mmproj, image_min_tokens,
                       image_max_tokens,
-                      engine = Lua module with new(opts), such as a TTS engine }
+                      engine = Lua module with new(opts), such as a TTS engine,
+                      modes = list of completion, multimodal, decide,
+                      transcription, speech, image_generation (default: from
+                      the engine and files; needed for other engine modules) }
   -m, --model file    gguf model file, or a Whisper model directory
   -b, --backend name  ggml backend, for example Vulkan0 or CPU (default best)
   -c, --ctx n         context size in tokens (default: the model's)
@@ -112,7 +115,12 @@ local function model_engine(spec)
 	if spec.ctx_checkpoints and not (ckpt and ckpt >= 0) then
 		die("bad checkpoint count " .. tostring(spec.ctx_checkpoints))
 	end
-	local stt = not spec.engine and (spec.stt or require("lgml.detect").is_whisper(spec.model))
+	local detect = require("lgml.detect")
+	local stt = not spec.engine and (spec.stt or detect.is_whisper(spec.model))
+	local okm, modes = pcall(detect.modes, spec)
+	if not okm then
+		die(modes)
+	end
 	local lora = adapters(spec)
 	if #lora > 0 and (stt or spec.engine) then
 		die("lora needs a chat model")
@@ -164,6 +172,7 @@ local function model_engine(spec)
 	end
 	return require("lgml.server.remote_engine").new({
 		lua = arg[-1] or "lua5.4", script = root .. "/bin/lgml-worker", args = wargs,
+		modes = modes,
 	})
 end
 

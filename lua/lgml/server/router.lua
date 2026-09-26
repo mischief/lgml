@@ -1,11 +1,13 @@
 --- Routes requests to one of several engines by the request's model id.
 -- A request with no model or an unknown one goes to the first engine
--- that can serve it, as llama.cpp ignores the model field. A router is
--- an engine (see `lgml.server.engine`). An engine with a `ready` method
--- gives its capabilities in `ready().caps`, as
--- `lgml.server.remote_engine` does.
+-- whose model has the mode of the request, as llama.cpp ignores the
+-- model field. A router is an engine (see `lgml.server.engine`). The
+-- modes of an engine come from `Engine:modes` when it has that method,
+-- else from `ready().caps` (as `lgml.server.remote_engine` gives
+-- them), else from its methods. The mode names are in `lgml.detect`.
 -- @module lgml.server.router
 local media = require("lgml.chat.media")
+local detect = require("lgml.detect")
 
 local M = {}
 local R = {}
@@ -19,23 +21,60 @@ function M.new(engines)
 	return setmetatable({ engines = engines }, R)
 end
 
-local function can(e, what)
-	local caps = e.ready and e:ready().caps
-	if caps then
-		return caps[what] == true
+-- The modes of engine e for model m, as a list.
+local function modes(e, m)
+	if e.modes then
+		return e:modes()
+	elseif m and m.capabilities then
+		return m.capabilities
 	end
-	return e[what] ~= nil
+	local caps = e.ready and e:ready().caps
+	return detect.modes_of(caps or e, m and m.vision)
+end
+
+-- True when e has a mode that the method what serves.
+local function can(e, what)
+	for _, mode in ipairs(modes(e)) do
+		if detect.METHOD[mode] == what then
+			return true
+		end
+	end
+	return false
+end
+
+local function has(list, v)
+	for _, x in ipairs(list) do
+		if x == v then
+			return true
+		end
+	end
+	return false
+end
+
+-- The models of e, each with capabilities.
+local function entries(e)
+	local out = {}
+	for i, m in ipairs(e:models()) do
+		local c = {}
+		for k, v in pairs(m) do
+			c[k] = v
+		end
+		c.capabilities = modes(e, m)
+		out[i] = c
+	end
+	return out
 end
 
 --- A router. It implements `lgml.server.engine.Engine`.
 -- @type Router
 
 --- Lists the models of all engines, in engine order.
+-- Each entry has `capabilities`, the list of its mode names.
 -- @treturn {table,...} the model list
 function R:models()
 	local out = {}
 	for _, e in ipairs(self.engines) do
-		for _, m in ipairs(e:models()) do
+		for _, m in ipairs(entries(e)) do
 			out[#out + 1] = m
 		end
 	end
@@ -43,6 +82,7 @@ function R:models()
 end
 
 --- Picks the engine for a model id and a method.
+-- It uses the modes of each engine, so it does not start a model.
 -- @tparam ?string id the model id
 -- @tparam string what `"chat"`, `"transcribe"`, `"speak"`, `"decide"` or
 -- `"generate"`
@@ -68,8 +108,8 @@ local function vision_engines(self)
 	local es, ids = {}, {}
 	for _, e in ipairs(self.engines) do
 		if can(e, "chat") then
-			for _, m in ipairs(e:models()) do
-				if m.vision then
+			for _, m in ipairs(entries(e)) do
+				if m.vision or has(m.capabilities, "multimodal") then
 					es[#es + 1], ids[#ids + 1] = e, m.id
 				end
 			end
@@ -78,15 +118,14 @@ local function vision_engines(self)
 	return es, ids
 end
 
--- The model of engine e with the id, or nil.
+-- The model of engine e with the id, with capabilities, or nil.
 local function model_of(e, id)
-	for _, m in ipairs(e:models()) do
+	for _, m in ipairs(entries(e)) do
 		if m.id == id then
 			return m
 		end
 	end
 end
-
 --- Returns the properties of the first chat engine.
 -- With no chat engine, it uses the first engine.
 -- @treturn table the properties
@@ -110,7 +149,7 @@ function R:chat(req, sink)
 	end
 	if type(req.messages) == "table" and media.has_images(req.messages) then
 		local m = model_of(e, req.model)
-		if not (m and m.vision) then
+		if not (m and (m.vision or has(m.capabilities, "multimodal"))) then
 			local es, ids = vision_engines(self)
 			if #es == 0 then
 				return nil, "image input is not supported: no model has an mmproj", 400

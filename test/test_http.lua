@@ -166,6 +166,8 @@ local function test_basic(port)
 	ok(r.status == 200 and b.object == "list", "models status and object")
 	ok(b.data[1].id == "fake" and b.data[1].context_length == 4096,
 	    "models context_length")
+	ok(table.concat(b.data[1].capabilities, ",") == "completion,decide,transcription,speech,image_generation",
+	    "models capabilities from the engine methods")
 
 	b = body_json(roundtrip(port, request("GET", "/props")))
 	ok(b.default_generation_settings.n_ctx == 4096 and b.total_slots == 2,

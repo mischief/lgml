@@ -12,6 +12,7 @@ local sse = require("lgml.server.sse")
 local engine_api = require("lgml.server.engine")
 local multipart = require("lgml.server.multipart")
 local metrics = require("lgml.server.metrics")
+local detect = require("lgml.detect")
 local systemone = require("lgml.systemone")
 local grammar = require("lgml.grammar")
 local base64 = require("lgml.base64")
@@ -432,12 +433,16 @@ end
 local function models(eng, res)
 	local data = json.array()
 	for i, m in ipairs(eng:models()) do
+		local caps = json.array()
+		for j, c in ipairs(m.capabilities or detect.modes_of(eng, m.vision)) do
+			caps[j] = c
+		end
 		data[i] = {
 			id = m.id, object = "model", created = m.created or 0,
 			owned_by = m.owned_by or "lgml",
 			context_length = m.context_length,
 			meta = { n_ctx_train = m.context_length },
-			capabilities = m.vision and { "completion", "multimodal" } or nil,
+			capabilities = caps,
 		}
 	end
 	return res:json(200, { object = "list", data = data })
@@ -861,6 +866,20 @@ end
 -- `/v1/systemone` is Jev's System One API (see `lgml.systemone`): a
 -- bad request gives 422 with a FastAPI `detail` list, and other errors
 -- give `{ detail = message }`.
+--
+-- Each `/v1/models` entry has `capabilities`, a list of the modes of
+-- the model. The names are as llama-server gives them where it has
+-- them:
+--
+-- - `completion`: chat completions
+-- - `multimodal`: chat completions with image input
+-- - `decide`: `/v1/systemone`
+-- - `transcription`: `/v1/audio/transcriptions`
+-- - `speech`: `/v1/audio/speech`
+-- - `image_generation`: `/v1/images/generations` and `/v1/images/edits`
+--
+-- A model entry gives them in its `capabilities` field; else they come
+-- from the methods of eng (see `lgml.detect.modes_of`).
 -- @tparam lgml.server.httpd.Server srv the server
 -- @tparam lgml.server.engine.Engine eng the engine
 -- @raise when eng does not implement the interface

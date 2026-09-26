@@ -48,11 +48,18 @@ end
 
 --- Lists the models that the engine serves.
 -- Each entry is `{ id = string, context_length = n }`. An entry can
--- also have `created` and `owned_by`; `/v1/models` shows them. With
--- `vision = true`, `/v1/models` lists the capabilities "completion"
--- and "multimodal".
+-- also have `created` and `owned_by`; `/v1/models` shows them. It can
+-- have `capabilities`, a list of mode names from `lgml.detect.MODES`;
+-- without it, `/v1/models` finds them from the engine methods, and
+-- `vision = true` adds "multimodal".
 -- @treturn {table,...} the model list
 -- @function models
+
+--- Lists the modes of the engine's model without loading it.
+-- The names are from `lgml.detect.MODES`. `lgml.server.router` uses
+-- them to pick an engine. This method is optional.
+-- @treturn {string,...} the mode names
+-- @function modes
 
 --- Returns the server properties for `/props`.
 -- The table is `{ n_ctx = n, total_slots = n }`. It can also have
