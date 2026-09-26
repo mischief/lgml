@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <ggml.h>
 #include <ggml-alloc.h>
@@ -276,12 +277,134 @@ lgml_check_tensor(lua_State *L, int idx)
 
 /* backend */
 
+/* The most threads of the default count. */
+#define THREADS_DEFAULT_MAX	64
+/* The most threads that a caller or LGML_THREADS can ask for. */
+#define THREADS_MAX		1024
+
+/*
+ * Count the physical cores in Linux sysfs: a CPU that is first in its
+ * sibling list starts a core. Return 0 when the files are not there.
+ */
+static int
+physical_cores(long ncpu)
+{
+	char path[96];
+	FILE *f;
+	long cpu;
+	int first, n = 0;
+
+	for (cpu = 0; cpu < ncpu; cpu++) {
+		snprintf(path, sizeof(path),
+		    "/sys/devices/system/cpu/cpu%ld/topology/thread_siblings_list", cpu);
+		if ((f = fopen(path, "r")) == NULL)
+			return 0;
+		if (fscanf(f, "%d", &first) != 1)
+			first = -1;
+		fclose(f);
+		if (first == cpu)
+			n++;
+	}
+	return n;
+}
+
+/* Parse a thread count from 1 to THREADS_MAX. Return 0 when s is bad. */
+static int
+parse_threads(const char *s)
+{
+	char *end;
+	long v;
+
+	if (s == NULL || *s == '\0')
+		return 0;
+	errno = 0;
+	v = strtol(s, &end, 10);
+	if (errno != 0 || *end != '\0' || v < 1 || v > THREADS_MAX)
+		return 0;
+	return (int)v;
+}
+
+/*
+ * The default thread count: LGML_THREADS when set, else the physical
+ * cores, else the online CPUs, at most THREADS_DEFAULT_MAX.
+ */
+static int
+default_threads(void)
+{
+	static int n;
+	long ncpu;
+
+	if (n > 0)
+		return n;
+	if ((n = parse_threads(getenv("LGML_THREADS"))) > 0)
+		return n;
+	ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+	if (ncpu < 1)
+		ncpu = 1;
+	n = physical_cores(ncpu);
+	if (n < 1 || n > ncpu)
+		n = (int)(ncpu < THREADS_DEFAULT_MAX ? ncpu : THREADS_DEFAULT_MAX);
+	if (n > THREADS_DEFAULT_MAX)
+		n = THREADS_DEFAULT_MAX;
+	return n;
+}
+
+/*
+ * Set the thread count of a backend that runs ops on CPU threads. Return
+ * n, or 0 when the backend has no thread count.
+ */
+static int
+set_threads(ggml_backend_t be, int n)
+{
+	ggml_backend_dev_t dev = ggml_backend_get_device(be);
+	ggml_backend_reg_t reg = dev != NULL ? ggml_backend_dev_backend_reg(dev) : NULL;
+	ggml_backend_set_n_threads_t fn;
+	void *p = NULL;
+
+	if (reg != NULL)
+		p = ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+	if (p == NULL)
+		return 0;
+	/* ISO C has no cast from an object pointer to a function pointer. */
+	memcpy(&fn, &p, sizeof(fn));
+	fn(be, n);
+	return n;
+}
+
+/* Check a thread count argument. */
+static int
+check_threads(lua_State *L, int idx, const char *what)
+{
+	lua_Integer n = luaL_checkinteger(L, idx);
+
+	if (n < 1 || n > THREADS_MAX)
+		return luaL_error(L, "%s must be 1 to %d", what, THREADS_MAX);
+	return (int)n;
+}
+
+/*** Get the default CPU thread count of new backends.
+ * It is the LGML_THREADS environment variable when set, else the count of
+ * physical cores, else the count of online CPUs, at most 64.
+ * @treturn integer the thread count
+ * @function threads
+ */
+static int
+l_threads(lua_State *L)
+{
+	lua_pushinteger(L, default_threads());
+	return 1;
+}
+
 /*** Open a backend.
- * Without a name, open the best backend on this machine.
+ * Without a name, open the best backend on this machine. A backend that
+ * runs ops on CPU threads, such as "CPU", uses `threads` of them.
  * @tparam[opt] string name ggml device name, such as "CPU"
+ * @tparam[opt] table opts `threads`: CPU thread count (default:
+ * `lgml.threads()`)
  * @treturn[1] backend the backend
  * @return[2] nil
  * @treturn[2] string error message
+ * @raise if threads is not 1 to 1024
  * @function backend
  */
 static int
@@ -290,7 +413,16 @@ l_backend(lua_State *L)
 	const char *name = luaL_optstring(L, 1, NULL);
 	struct backend *b;
 	ggml_backend_t be;
+	int threads = 0;
 
+	if (!lua_isnoneornil(L, 2)) {
+		luaL_checktype(L, 2, LUA_TTABLE);
+		if (lua_getfield(L, 2, "threads") != LUA_TNIL)
+			threads = check_threads(L, -1, "threads");
+		lua_pop(L, 1);
+	}
+	if (threads == 0)
+		threads = default_threads();
 	be = name != NULL ? ggml_backend_init_by_name(name, NULL) : ggml_backend_init_best();
 	if (be == NULL) {
 		luaL_pushfail(L);
@@ -299,6 +431,7 @@ l_backend(lua_State *L)
 	}
 	b = lua_newuserdatauv(L, sizeof(*b), 0);
 	b->be = be;
+	b->threads = set_threads(be, threads);
 	b->refs = 0;
 	b->closed = 0;
 	luaL_setmetatable(L, BACKEND_MT);
@@ -337,6 +470,28 @@ backend_name(lua_State *L)
 	struct backend *b = check_backend(L, 1);
 
 	lua_pushstring(L, ggml_backend_name(b->be));
+	return 1;
+}
+
+/*** Get or set the CPU thread count of the backend.
+ * Graphs that run after a set use the new count.
+ * @tparam[opt] integer n new thread count, 1 to 1024
+ * @treturn integer|nil the thread count, or nil when the backend does
+ * not run ops on CPU threads
+ * @raise if the backend is closed, or n is out of range
+ * @function backend:threads
+ */
+static int
+backend_threads(lua_State *L)
+{
+	struct backend *b = check_backend(L, 1);
+
+	if (!lua_isnoneornil(L, 2))
+		b->threads = set_threads(b->be, check_threads(L, 2, "n"));
+	if (b->threads == 0)
+		lua_pushnil(L);
+	else
+		lua_pushinteger(L, b->threads);
 	return 1;
 }
 
@@ -2667,6 +2822,7 @@ static const luaL_Reg backend_meta[] = {
 static const luaL_Reg backend_methods[] = {
 	{ "close", backend_close },
 	{ "name", backend_name },
+	{ "threads", backend_threads },
 	{ "tensor", backend_tensor },
 	{ "load", backend_load },
 	{ "graph", backend_graph },
@@ -2793,6 +2949,7 @@ static const luaL_Reg lib[] = {
 	{ "hostbuf", l_hostbuf },
 	{ "log", l_log },
 	{ "row_size", l_row_size },
+	{ "threads", l_threads },
 	{ NULL, NULL }
 };
 

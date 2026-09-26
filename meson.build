@@ -94,6 +94,8 @@ lua_env.append('LUA_PATH', ';', separator : ';')
 meson.add_devenv(lua_env)
 # Tests run with strict globals: see lgml.strict.
 lua_env.set('LUA_INIT_5_4', 'require("lgml.strict").on()')
+# Tests run in parallel, so each one gets few CPU threads.
+lua_env.set('LGML_THREADS', '2')
 add_test_setup('default', is_default : true, env : lua_env)
 # meson test --setup cpu: the Vulkan loader finds no driver, so tests use only the CPU.
 cpu_env = lua_env
@@ -161,7 +163,8 @@ if lua_bin.found()
     timeout : 120)
 
   # Tests that load large models run one at a time, in the 'model'
-  # suite. Each skips when its option is empty.
+  # suite. Each skips when its option is empty. An empty LGML_THREADS
+  # gives them the default CPU thread count.
   model_tests = {
     'qwen3' : { 'LGML_MODEL' : get_option('model') },
     'tts_orpheus' : { 'LGML_ORPHEUS' : get_option('orpheus') },
@@ -171,22 +174,27 @@ if lua_bin.found()
       'LGML_WHISPER_WAV' : get_option('whisper_wav') },
   }
   foreach name, env : model_tests
+    env += { 'LGML_THREADS' : '' }
     test(name, lua_bin, args : [files('test/test_' + name + '.lua')], env : env,
       suite : 'model', is_parallel : false, timeout : 600)
   endforeach
   # LGML_DIFFUSION_GEMMA (a gguf path) comes from the environment.
   test('diffusion_gemma_model', lua_bin, args : [files('test/test_diffusion_gemma_model.lua')],
-    suite : 'model', is_parallel : false, timeout : 3600)
+    suite : 'model', env : { 'LGML_THREADS' : '' },
+    is_parallel : false, timeout : 3600)
   # LGML_ZIMAGE (a directory with the Z-Image files) comes from the environment.
   test('zimage_model', lua_bin, args : [files('test/test_zimage_model.lua')],
-    suite : 'model', is_parallel : false, timeout : 600)
+    suite : 'model', env : { 'LGML_THREADS' : '' },
+    is_parallel : false, timeout : 600)
   # LGML_GEMMA4_VISION, LGML_VISION_IMAGE, LGML_MTMD_EMBD and LGML_MTMD_CLI come
   # from the environment; see the test file.
   test('vision_model', lua_bin, args : [files('test/test_vision_model.lua')],
-    suite : 'model', is_parallel : false, timeout : 3600)
+    suite : 'model', env : { 'LGML_THREADS' : '' },
+    is_parallel : false, timeout : 3600)
   # LGML_ZIMAGE_VAE (ae.safetensors) and optional LGML_VAE_REF come from the environment.
   test('image_model', lua_bin, args : [files('test/test_image_model.lua')],
-    suite : 'model', is_parallel : false, timeout : 600)
+    suite : 'model', env : { 'LGML_THREADS' : '' },
+    is_parallel : false, timeout : 600)
 endif
 
 # Fuzz harness. Built with afl-clang-fast it runs under afl-fuzz. The

@@ -93,6 +93,31 @@ for _, d in ipairs(devs) do
 	ok(math.abs(x:get()[1] - 0.25) < 1e-3, d.name .. ": graph grows between computes")
 end
 
+-- CPU threads: a default from the machine or LGML_THREADS, per backend.
+do
+	local def = lgml.threads()
+	ok(math.type(def) == "integer" and def >= 1 and def <= 1024, "default thread count")
+	local env = tonumber(os.getenv("LGML_THREADS") or "")
+	ok(not env or def == env, "LGML_THREADS sets the default")
+	local be <close> = assert(lgml.backend("CPU"))
+	ok(be:threads() == def, "a CPU backend gets the default")
+	local b3 <close> = assert(lgml.backend("CPU", { threads = 3 }))
+	ok(b3:threads() == 3 and b3:threads(2) == 2 and b3:threads() == 2, "threads option and set")
+	local a <close> = b3:tensor("f32", { 2 }, { 1, 2 })
+	local g <close> = b3:graph()
+	local s = g:add(a, a)
+	g:compute(s)
+	near(s:get(), { 2, 4 }, "compute after a thread change")
+	ok(not pcall(lgml.backend, "CPU", { threads = 0 }) and not pcall(b3.threads, b3, 2000),
+	    "a bad thread count is an error")
+	for _, d in ipairs(devs) do
+		if d.type == "gpu" then
+			local gb <close> = assert(lgml.backend(d.name, { threads = 2 }))
+			ok(gb:threads() == nil, d.name .. ": a GPU backend has no thread count")
+		end
+	end
+end
+
 -- Close the backend first; tensors must stay usable.
 do
 	local be = assert(lgml.backend("CPU"))

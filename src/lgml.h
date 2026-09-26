@@ -26,6 +26,7 @@
 
 struct backend {
 	ggml_backend_t		 be;
+	int			 threads;	/* CPU threads; 0 when the backend has none */
 	int			 refs;
 	int			 closed;
 };
