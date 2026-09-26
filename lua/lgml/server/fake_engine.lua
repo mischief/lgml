@@ -233,10 +233,12 @@ end
 -- option reads its name and text, a score level its text. A noul
 -- scores its instructions and `yes` text against a log-score of 1 for
 -- no. State `"fail"` gives status 500. It waits one delay, so ctl can
--- cancel; a cancel gives status 499.
+-- cancel; a cancel gives status 499. Images do not change the
+-- answers; an image that is not a PNG or JPEG file gives status 400.
+-- `timings` has `images` and `image_bytes`, their count and size.
 -- @tparam table req the decision request
 -- @tparam[opt] lgml.server.engine.Control ctl the cancel control
--- @treturn[1] table `{ model, answers, usage }`
+-- @treturn[1] table `{ model, answers, usage, timings }`
 -- @treturn[2] nil
 -- @treturn[2] string an error message
 -- @treturn[2] int an HTTP status
@@ -247,6 +249,13 @@ function F:decide(req, ctl)
 	end
 	if req.state == "fail" then
 		return nil, "fake failure", 500
+	end
+	local nbytes = 0
+	for i, img in ipairs(req.images or {}) do
+		if img.bytes:sub(1, 8) ~= PNG:sub(1, 8) and img.bytes:sub(1, 3) ~= "\255\216\255" then
+			return nil, ("image %d: not a PNG or JPEG file"):format(i), 400
+		end
+		nbytes = nbytes + #img.bytes
 	end
 	local state = words(req.state)
 	local answers, nout = {}, 0
@@ -266,6 +275,7 @@ function F:decide(req, ctl)
 	return {
 		model = self.model, answers = answers,
 		usage = { input_tokens = #req.state // 4 + 16 * #req.questions, output_tokens = nout },
+		timings = { images = #(req.images or {}), image_bytes = nbytes },
 	}
 end
 

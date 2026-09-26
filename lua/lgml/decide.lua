@@ -211,8 +211,8 @@ end
 
 -- prompt
 
-local function assemble(state, lines)
-	local t = { "State:\n" .. M.render_state(state), "" }
+local function assemble(state, lines, images)
+	local t = { "State:\n" .. (images or "") .. M.render_state(state), "" }
 	table.move(lines, 1, #lines, #t + 1, t)
 	t[#t + 1] = M.CUE
 	return table.concat(t, "\n")
@@ -226,13 +226,18 @@ end
 -- @tparam string state the state text
 -- @tparam table q a question of the engine request
 -- @tparam[opt] table opts `seed`: shuffle the options with this seed;
--- `content_free`: use `CONTENT_FREE_STATE`; `identifiers`: the option
--- identifiers
+-- `content_free`: use `CONTENT_FREE_STATE` and no images;
+-- `identifiers`: the option identifiers; `images`: the image markers,
+-- which go before the state text
 -- @treturn table the rendering
 function M.render(state, q, opts)
 	opts = opts or {}
+	local images = opts.images
 	if opts.content_free then
-		state = M.CONTENT_FREE_STATE
+		state, images = M.CONTENT_FREE_STATE, nil
+	end
+	local function with_state(lines)
+		return assemble(state, lines, images)
 	end
 	local instr = M.strip(q.instructions or "")
 	local function question(default)
@@ -247,7 +252,7 @@ function M.render(state, q, opts)
 			lines[#lines + 1] = "Answer no if: " .. q.no
 		end
 		lines[#lines + 1] = "Allowed answers: yes, no"
-		return { prefix = assemble(state, lines), candidates = { "yes", "no" },
+		return { prefix = with_state(lines), candidates = { "yes", "no" },
 			keys = { "1", "0" }, mode = "yesno" }
 	elseif q.type == "score" then
 		local lines = { question("Which level applies?"), "Levels (ordered from lowest to highest):" }
@@ -257,7 +262,7 @@ function M.render(state, q, opts)
 			lines[#lines + 1] = ("%d. %s"):format(i - 1, d)
 		end
 		lines[#lines + 1] = "Allowed answers: " .. table.concat(keys, ", ")
-		return { prefix = assemble(state, lines), candidates = keys, keys = keys, mode = "digit" }
+		return { prefix = with_state(lines), candidates = keys, keys = keys, mode = "digit" }
 	end
 	local k = #q.options
 	local order = opts.seed and M.shuffle(k, opts.seed) or {}
@@ -280,7 +285,7 @@ function M.render(state, q, opts)
 		    ((desc ~= "" and desc ~= o.key) and (" — " .. desc) or "")
 	end
 	lines[#lines + 1] = "Allowed answers: " .. table.concat(cands, ", ")
-	return { prefix = assemble(state, lines), candidates = cands, keys = keys, mode = "index" }
+	return { prefix = with_state(lines), candidates = cands, keys = keys, mode = "index" }
 end
 
 --- Wraps a rendered prefix in the chat template, as Jevify's `to_chat`.
@@ -600,6 +605,7 @@ end
 
 local function sink_of(ctl)
 	return {
+		cached = 0, computed = 0,
 		cancelled = function()
 			return ctl and ctl.cancelled and ctl.cancelled() or false
 		end,
@@ -610,6 +616,7 @@ end
 -- logits node, or nil on cancel.
 local function advance(e, ids, sink)
 	local cached = e:reuse(ids)
+	sink.cached, sink.computed = sink.cached + cached, sink.computed + #ids - cached
 	return e:prefill(ids, cached + 1, sink)
 end
 
@@ -652,9 +659,17 @@ local function score(e, p, cands, sink)
 end
 
 -- Scores one rendering. Returns the log-scores and the token counts.
-local function run_rendering(e, rd, sink)
+-- keys are the prepared images of the prompt, in order.
+local function run_rendering(e, rd, sink, keys)
 	local text = M.chat_prompt(e.family, rd.prefix)
 	local p, cands = M.tokenize(e.tk, text, rd.candidates)
+	if e.vision then
+		local err
+		p, err = e:expand_images(p, keys or {})
+		if not p then
+			error({ status = 400, msg = err })
+		end
+	end
 	if #p + 8 >= e.n_ctx then
 		error({ status = 400, msg = ("prompt has %d tokens; context is %d"):format(#p, e.n_ctx) })
 	end
@@ -697,10 +712,21 @@ end
 -- `e.eval`, and the recipe `e.recipe`. Questions run in request order;
 -- the state comes first in each prompt, so a question reuses the KV
 -- rows of the state.
+--
+-- The images of `req.images` go at the start of the state, in order,
+-- before the state text. So every question and option order on one
+-- state shares the image rows through the cache. For images, e also
+-- needs `e.vision`, `e.image_marker`, `e.prepare_images` and
+-- `e.expand_images`. The content-free prompt of prior correction has
+-- no images: the prior measures the bias of the question and its
+-- answers alone, and one prior per question serves every state.
 -- @param e the engine
 -- @tparam table req the engine request (see `lgml.systemone.check`)
 -- @tparam[opt] table ctl the cancel control
--- @treturn[1] table the result: `{ model, answers, usage }`
+-- @treturn[1] table the result: `{ model, answers, usage, timings }`.
+-- timings has `images`, `image_encode_ms` (encoder time of this
+-- request), `prompt_n` (prompt positions computed) and `cache_n`
+-- (positions reused from the cache).
 -- @treturn[2] nil
 -- @treturn[2] string an error message
 -- @treturn[2] int an HTTP status
@@ -708,6 +734,19 @@ function M.run(e, req, ctl)
 	local recipe, err = M.recipe(e.recipe or M.default_recipe(), req.recipe)
 	if not recipe then
 		return nil, err, 422
+	end
+	local images = req.images or {}
+	local keys, markers
+	if #images > 0 then
+		if not e.vision then
+			return nil, "image input is not supported: start the server with --mmproj", 400
+		end
+		local kerr
+		keys, kerr = e:prepare_images(images)
+		if not keys then
+			return nil, kerr, 400
+		end
+		markers = string.rep(e.image_marker, #images)
 	end
 	e.decide_ids = e.decide_ids or M.identifiers(e.tk)
 	local ids = e.decide_ids
@@ -720,8 +759,9 @@ function M.run(e, req, ctl)
 			for i = 1, n do
 				local rd = M.render(req.state, q, {
 					identifiers = ids, seed = i > 1 and M.SEED + i - 1 or nil,
+					images = markers,
 				})
-				local run, a, b = run_rendering(e, rd, sink)
+				local run, a, b = run_rendering(e, rd, sink, keys)
 				if not run then
 					return "cancelled"
 				end
@@ -752,6 +792,10 @@ function M.run(e, req, ctl)
 	return {
 		model = e.id, answers = answers,
 		usage = { input_tokens = nin, output_tokens = nout },
+		timings = {
+			images = #images, image_encode_ms = e.image_ms or 0,
+			prompt_n = sink.computed, cache_n = sink.cached,
+		},
 	}
 end
 

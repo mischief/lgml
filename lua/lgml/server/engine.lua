@@ -114,14 +114,15 @@ end
 --- Answers typed questions about a state, as Jev's System One API.
 -- This method is optional. `lgml.systemone.check` makes req from the
 -- request body; its fields are `model`, `state` (text), `questions`,
--- `raw` and `recipe`. Each answer is `{ yes = P(yes) }` for a noul and
+-- `raw`, `recipe` and `images` (`{ bytes, mime }` each, or nil). Each answer is `{ yes = P(yes) }` for a noul and
 -- `{ probabilities }` in option or level order for a choice or a
 -- score, unrounded. An answer can also have `lgml`, the raw log-scores,
 -- when `req.raw` is true.
 -- @tparam table req the request
 -- @tparam Control ctl the cancel control
 -- @treturn[1] table `{ model, answers = { [id] = answer }, usage =
--- { input_tokens, output_tokens } }`
+-- { input_tokens, output_tokens }, timings }`; timings is optional and
+-- its fields become `x-lgml-*` headers
 -- @treturn[2] nil
 -- @treturn[2] string an error message
 -- @treturn[2] int an HTTP status

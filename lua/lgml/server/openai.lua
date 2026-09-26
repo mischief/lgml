@@ -673,9 +673,9 @@ local function systemone_route(eng, req, res)
 	if type(eng.decide) ~= "function" then
 		return res:json(404, { detail = "this server does not serve decisions" })
 	end
-	local dreq, body = systemone.check(req.body)
+	local dreq, body, bstatus = systemone.check(req.body)
 	if not dreq then
-		return res:json(422, body)
+		return res:json(bstatus or 422, body)
 	end
 	local t0 = uv.hrtime()
 	local model = dreq.model or default_model(eng)
@@ -696,11 +696,17 @@ local function systemone_route(eng, req, res)
 	if not ok then
 		return res:json(500, { detail = tostring(text) })
 	end
-	return res:send(200, text, {
+	local t = r.timings or {}
+	if (t.images or 0) > 0 then
+		metrics.add("decide_images_total", "images read by decisions", model, t.images)
+		metrics.add("image_encode_seconds_total", "time spent encoding input images", model,
+		    (t.image_encode_ms or 0) / 1000)
+	end
+	return res:send(200, text, metrics.headers(t, {
 		["Content-Type"] = "application/json",
 		["x-jevify-latency-ms"] = ("%.1f"):format((uv.hrtime() - t0) / 1e6),
 		["x-lgml-elapsed-ms"] = ("%.3f"):format((uv.hrtime() - t0) / 1e6),
-	})
+	}))
 end
 
 -- images
@@ -884,15 +890,17 @@ end
 -- `/audio/transcriptions`, `/systemone`, `/images/generations` and
 -- `/images/edits`, the last six also under `/v1`. A route for a method that eng does not have gives 404.
 -- `/v1/systemone` is Jev's System One API (see `lgml.systemone`): a
--- bad request gives 422 with a FastAPI `detail` list, and other errors
--- give `{ detail = message }`.
+-- bad request gives 422 with a FastAPI `detail` list (400 for an http
+-- image URL in `attachments`), and other errors give `{ detail =
+-- message }`. The `timings` of the result become `x-lgml-*` headers,
+-- such as `x-lgml-images` and `x-lgml-image-encode-ms`.
 --
 -- Each `/v1/models` entry has `capabilities`, a list of the modes of
 -- the model. The names are as llama-server gives them where it has
 -- them:
 --
 -- - `completion`: chat completions
--- - `multimodal`: chat completions with image input
+-- - `multimodal`: chat completions and decisions with image input
 -- - `decide`: `/v1/systemone`
 -- - `transcription`: `/v1/audio/transcriptions`
 -- - `speech`: `/v1/audio/speech`

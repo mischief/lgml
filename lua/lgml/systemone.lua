@@ -4,11 +4,18 @@
 -- request for `Engine:decide`. `reply` makes the response body from the
 -- engine result. The rules follow Jevify (`jevify/wire.py`) and its
 -- notes on the Jev 1.13.0 API (`docs/JEV_CONTRACT.md`).
+-- `attachments` (images of the state) is an lgml extension; see `check`.
 -- @module lgml.systemone
 local json = require("lgml.json")
 local tojson = require("lgml.chat.tojson")
+local media = require("lgml.chat.media")
 
 local M = {}
+
+--- Most images in `attachments` (16).
+M.MAX_ATTACHMENTS = 16
+--- Largest image in bytes after base64 decode (20 MiB).
+M.MAX_ATTACHMENT_BYTES = 20 << 20
 
 --- Most options of a choice question (255).
 M.MAX_CHOICE_OPTIONS = 255
@@ -429,7 +436,70 @@ local function check_lgml(x, out)
 	out.recipe = x.recipe and plain(x.recipe)
 end
 
-local TOP = { state = true, model = true, questions = true, lgml = true }
+-- Raised for an http or https image URL; the route answers 400.
+local Unsupported = {}
+
+local PNG_SIG = "\137PNG\r\n\26\n"
+
+-- The URL of one attachment: a string, or an image_url part.
+local function attachment_url(v, loc)
+	if type(v) == "string" then
+		return v
+	elseif is_object(v) then
+		if v.type ~= "image_url" then
+			bad(at(loc, "type"), 'must be "image_url"')
+		end
+		local u = v.image_url
+		if is_object(u) then
+			u = u.url
+		end
+		if type(u) ~= "string" then
+			bad(at(loc, "image_url", "url"), "must be a string")
+		end
+		return u
+	end
+	bad(loc, "must be a data URL string or an image_url part")
+end
+
+local function check_attachments(list)
+	local loc = { "body", "attachments" }
+	if not is_array(list) then
+		bad(loc, "must be an array of images")
+	elseif #list > M.MAX_ATTACHMENTS then
+		bad(loc, ("at most %d images, got %d"):format(M.MAX_ATTACHMENTS, #list))
+	end
+	local out = {}
+	for i, v in ipairs(list) do
+		local here = at(loc, i - 1)
+		local url = attachment_url(v, here)
+		local scheme = (url:match("^(%a[%w+.-]*):") or ""):lower()
+		if scheme == "http" or scheme == "https" then
+			error(setmetatable({ loc = here,
+				msg = "image url must be a data URL; http and https URLs are not supported" },
+			    Unsupported), 0)
+		end
+		local head = url:match("^[^,]*")
+		if #url - #head > M.MAX_ATTACHMENT_BYTES // 3 * 4 + 8 then
+			bad(here, ("image larger than %d bytes"):format(M.MAX_ATTACHMENT_BYTES))
+		end
+		local bytes, mime = media.data_url(url)
+		if not bytes then
+			bad(here, mime)
+		end
+		local png, jpeg = bytes:sub(1, 8) == PNG_SIG, bytes:sub(1, 3) == "\255\216\255"
+		if not (mime == "image/png" or mime == "image/jpeg" or mime == "image/jpg") then
+			bad(here, "image must be image/png or image/jpeg, got " .. mime)
+		elseif not (png or jpeg) then
+			bad(here, "data is not a PNG or JPEG file")
+		elseif #bytes > M.MAX_ATTACHMENT_BYTES then
+			bad(here, ("image larger than %d bytes"):format(M.MAX_ATTACHMENT_BYTES))
+		end
+		out[i] = { bytes = bytes, mime = png and "image/png" or "image/jpeg" }
+	end
+	return out
+end
+
+local TOP = { state = true, model = true, questions = true, lgml = true, attachments = true }
 
 local function check_body(b)
 	if not is_object(b) then
@@ -464,6 +534,10 @@ local function check_body(b)
 	if b.lgml ~= nil then
 		check_lgml(b.lgml, req)
 	end
+	if b.attachments ~= nil and b.attachments ~= json.null then
+		local images = check_attachments(b.attachments)
+		req.images = #images > 0 and images or nil
+	end
 	return req
 end
 
@@ -472,7 +546,17 @@ end
 -- fields, question types, 2 to 255 choice options with non-empty
 -- names, 2 to 10 score levels, and string, object or array content.
 -- lgml also rejects a repeated question id or option name, which
--- Python would drop in silence. The engine request is:
+-- Python would drop in silence.
+--
+-- lgml extension to the Jev contract: `attachments`, the images of the
+-- state. It is an array of up to `MAX_ATTACHMENTS` items. An item is a
+-- data URL string (`data:image/png;base64,...` or `image/jpeg`), as
+-- the Jev-like wrapper for vision models sends, or an OpenAI part
+-- `{ "type": "image_url", "image_url": { "url": ... } }`. Each image is
+-- a PNG or JPEG file of at most `MAX_ATTACHMENT_BYTES`. An http or
+-- https URL gives status 400; other bad items give 422.
+--
+-- The engine request is:
 --
 -- - `model`: the model name, or nil
 -- - `state`: the state text; a JSON state is its `json.dumps(indent=2)`
@@ -482,21 +566,26 @@ end
 --   the texts of `criteria.true` and `criteria.false`. Every text is
 --   `describe` of the JSON value.
 -- - `raw`, `recipe`: the lgml extension object `lgml` of the body
+-- - `images`: the attachments in order, each `{ bytes, mime }`; nil
+--   when there are none
 -- @tparam string text the body
 -- @treturn[1] table the engine request
 -- @treturn[1] table the decoded body, with key order
 -- @treturn[2] nil
--- @treturn[2] table the 422 error body: `{ detail = { { loc, msg, type } } }`
+-- @treturn[2] table the error body: `{ detail = { { loc, msg, type } } }`
+-- @treturn[2] int the status: 422, or 400 for an http or https image URL
 function M.check(text)
 	local b, err = M.decode(text)
 	if b == nil then
-		return nil, M.error_body({ "body" }, "invalid JSON: " .. err, "json_invalid")
+		return nil, M.error_body({ "body" }, "invalid JSON: " .. err, "json_invalid"), 422
 	end
 	local ok, r = pcall(check_body, b)
 	if ok then
 		return r, b
 	elseif getmetatable(r) == Bad then
-		return nil, M.error_body(r.loc, r.msg)
+		return nil, M.error_body(r.loc, r.msg), 422
+	elseif getmetatable(r) == Unsupported then
+		return nil, M.error_body(r.loc, r.msg), 400
 	end
 	error(r, 0)
 end

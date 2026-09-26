@@ -657,6 +657,172 @@ local function vision_check()
 	os.remove(mpath)
 end
 
+
+-- Runs a decision on e in a coroutine. Returns the result, the error
+-- message and the status.
+local function decide_on(e, req)
+	local uv = require("luv")
+	local r, done = {}, false
+	coroutine.wrap(function()
+		r.res, r.err, r.status = e:decide(req, {})
+		done = true
+	end)()
+	while not done do
+		uv.run("once")
+	end
+	return r.res, r.err, r.status
+end
+
+-- Decisions with images on the tiny model and mmproj: the images
+-- change the readout, text-only requests do not change, and questions
+-- on one image share its cache rows.
+local function decide_vision_check()
+	local tiny = require("mmproj_tiny")
+	local base64 = require("lgml.base64")
+	local so = require("lgml.systemone")
+	local decide = require("lgml.decide")
+	local path, mpath = os.tmpname(), os.tmpname()
+	local kv, ts = build("dense", { "<|image>", "<|image|>", "<image|>" })
+	for _, x in ipairs(kv) do
+		if x[1] == "gemma4.context_length" then
+			x[3] = 2048
+		end
+	end
+	gguf.write(path, kv, ts)
+	local mkv, mts = tiny.build(E)
+	gguf.write(mpath, mkv, mts)
+	local engine = require("lgml.engine")
+	local e = engine.new({ model = path, backend = "CPU", n_ctx = 2048,
+		mmproj = mpath, image_min_tokens = 1, image_max_tokens = 6 })
+	local plain = engine.new({ model = path, backend = "CPU", n_ctx = 2048 })
+	local encodes = 0
+	local encode = e.vision.encode
+	e.vision.encode = function(...)
+		encodes = encodes + 1
+		return encode(...)
+	end
+	local function url(seed)
+		local t <close> = e.be:tensor("f32", { 1, 3, 12, 18 })
+		t:fill("uniform", -1, 1, seed)
+		return "data:image/png;base64," .. base64.encode(lgml.image_from(t):png())
+	end
+	local a, b = url(1), url(2)
+	local Q = {
+		c = '{"type": "choice", "instructions": "Which color?", ' ..
+		    '"criteria": {"red": null, "green": null, "blue": null}}',
+		n = '{"type": "noul", "instructions": "Is it a cat?"}',
+	}
+	local function req(qs, images, extra)
+		local parts = {}
+		for i, id in ipairs(qs) do
+			parts[i] = ('"%s": %s'):format(id, Q[id])
+		end
+		local text = '{"state": "a picture", "questions": {' .. table.concat(parts, ", ") ..
+		    '}, "lgml": {"raw": true' .. (extra or "") .. "}"
+		if images then
+			text = text .. ', "attachments": ["' .. table.concat(images, '", "') .. '"]'
+		end
+		local r, body = assert(so.check(text .. "}"))
+		return r, body
+	end
+	local function ask(eng, qs, images, extra)
+		local r, body = req(qs, images, extra)
+		local res, err, status = decide_on(eng, r)
+		return res and so.reply(r, body, res), res, err, status
+	end
+	-- The largest difference of two score lists from scores.
+	local function diff(x, y)
+		local xs, ys, m = {}, {}, 0
+		for v in x:gmatch("[^,]+") do
+			xs[#xs + 1] = tonumber(v)
+		end
+		for v in y:gmatch("[^,]+") do
+			ys[#ys + 1] = tonumber(v)
+		end
+		if #xs ~= #ys then
+			return math.huge
+		end
+		for i = 1, #xs do
+			m = math.max(m, math.abs(xs[i] - ys[i]))
+		end
+		return m
+	end
+	local function scores(res, id)
+		local out = {}
+		for _, run in ipairs(res.answers[id].lgml.runs) do
+			for _, v in ipairs(run.logscores) do
+				out[#out + 1] = ("%.17g"):format(v)
+			end
+		end
+		return table.concat(out, ",")
+	end
+
+	-- Text only: the same prompt, the same bytes, with or without mmproj.
+	local t1, r1 = ask(plain, { "c", "n" })
+	local t2, r2 = ask(e, { "c", "n" })
+	ok(t1 and t1 == t2 and scores(r1, "c") == scores(r2, "c") and scores(r1, "n") == scores(r2, "n"),
+	    "decide vision: text only gives the same bytes with an mmproj")
+	ok(r2.timings.images == 0 and encodes == 0, "decide vision: text only encodes no image")
+
+	-- One image: the prompt holds it before the state text.
+	e.tokens, e.cache.n_past = {}, 0
+	local ta, ra, err, status = ask(e, { "c" }, { a })
+	ok(ta and scores(ra, "c") ~= scores(r2, "c"),
+	    "decide vision: an image changes the readout" .. (err and ": " .. err .. " " .. status or ""))
+	local keys = 0
+	for _, v in ipairs(e.tokens) do
+		if type(v) == "string" and v:match("^img:%x+:%d+$") then
+			keys = keys + 1
+		end
+	end
+	ok(keys == 6 and encodes == 1 and ra.timings.images == 1 and ra.timings.image_encode_ms > 0,
+	    ("decide vision: 6 image positions, one encode for two option orders (%d, %d)"):format(
+	    keys, encodes))
+	local text = decide.chat_prompt(e.family, decide.render("a picture", req({ "c" }).questions[1],
+	    { identifiers = e.decide_ids, images = e.image_marker }).prefix)
+	ok(text:find("State:\n" .. e.image_marker .. "a picture\n\nQuestion: Which color?", 1, true),
+	    "decide vision: the image goes before the state text")
+	local tb, rb = ask(e, { "c" }, { b })
+	ok(tb and scores(rb, "c") ~= scores(ra, "c") and encodes == 2, "decide vision: another image, another readout")
+
+	-- Another question on the first image reuses the rows up to the state.
+	local before = encodes
+	local tn, rn = ask(e, { "n" }, { a })
+	ok(tn and encodes == before, "decide vision: the image embeddings come from the store")
+	local _, rn2 = ask(e, { "c" }, { a })
+	local d = diff(scores(rn2, "c"), scores(ra, "c"))
+	ok(rn2.timings.cache_n > 6 and d < 1e-3,
+	    ("decide vision: a second question reuses the image rows (%d cached), same answer (%.3g)")
+	    :format(rn2.timings.cache_n, d))
+	local _, both = ask(e, { "c", "n" }, { a })
+	d = math.max(diff(scores(both, "c"), scores(ra, "c")), diff(scores(both, "n"), scores(rn, "n")))
+	ok(d < 1e-3, ("decide vision: two questions in one request give the same scores (%.3g)"):format(d))
+
+	-- Prior correction runs on a text-only content-free prompt.
+	local _, rp = ask(e, { "n" }, { a }, ', "recipe": {"prior_weight": 1}')
+	local marker = false
+	for prefix in pairs(e.decide_priors.runs) do
+		marker = marker or prefix:find(e.image_marker, 1, true) ~= nil
+	end
+	ok(rp and rp.answers.n.lgml.prior and not marker, "decide vision: the prior prompt has no image")
+
+	-- Two images go in order.
+	local _, r12 = ask(e, { "c" }, { a, b })
+	local _, r21 = ask(e, { "c" }, { b, a })
+	ok(r12 and r21 and scores(r12, "c") ~= scores(r21, "c") and r12.timings.images == 2,
+	    "decide vision: two images, in order")
+
+	local _, _, perr, pstatus = ask(plain, { "c" }, { a })
+	ok(pstatus == 400 and perr:find("image input is not supported", 1, true),
+	    "decide vision: no mmproj gives 400")
+	local bad = assert(so.check('{"state": "x", "questions": {"n": ' .. Q.n .. '}}'))
+	bad.images = { { bytes = "\137PNG\r\n\26\nnot really", mime = "image/png" } }
+	local _, berr, bstatus = decide_on(e, bad)
+	ok(bstatus == 400 and berr:find("image 1", 1, true), "decide vision: a bad image gives 400")
+	os.remove(path)
+	os.remove(mpath)
+end
+
 -- The chat engine on the tiny model: a second request with the same
 -- first message reuses the cached prefix.
 local function engine_check(path)
@@ -730,6 +896,7 @@ for _, kind in ipairs({ "dense", "moe" }) do
 	if kind == "dense" then
 		engine_check(path)
 		vision_check()
+		decide_vision_check()
 	end
 	m:close()
 	os.remove(path)

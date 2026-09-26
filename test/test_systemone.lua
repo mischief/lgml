@@ -132,6 +132,57 @@ local function test_check()
 	    "body.lgml.raw", "lgml.raw type")
 end
 
+-- A 1x1 PNG as a data URL, and a JPEG header.
+local PNG64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+local PNG_URL = "data:image/png;base64," .. PNG64
+local JPEG_URL = "data:image/jpeg;base64," .. require("lgml.base64").encode("\255\216\255\224 jfif")
+
+local function with_images(list)
+	return '{"state": "s", "questions": {"q": ' .. NOUL .. '}, "attachments": ' .. list .. "}"
+end
+
+local function test_attachments()
+	local r = assert(so.check(body("s", { { "q", NOUL } })))
+	ok(r.images == nil, "no attachments, no images")
+	r = assert(so.check(with_images("[]")))
+	ok(r.images == nil, "an empty list gives no images")
+	r = assert(so.check(with_images("null")))
+	ok(r.images == nil, "null attachments give no images")
+	r = assert(so.check(with_images(("[%q, %q]"):format(PNG_URL, JPEG_URL))))
+	ok(#r.images == 2 and r.images[1].mime == "image/png" and r.images[1].bytes:sub(2, 4) == "PNG" and
+	    r.images[2].mime == "image/jpeg", "data URL strings, in order")
+	r = assert(so.check(with_images(('[{"type": "image_url", "image_url": {"url": %q}}, ' ..
+	    '{"type": "image_url", "image_url": %q}]'):format(JPEG_URL, PNG_URL))))
+	ok(#r.images == 2 and r.images[1].mime == "image/jpeg" and r.images[2].mime == "image/png",
+	    "OpenAI image_url parts")
+	local _, e, status = so.check(with_images(("[%q]"):format("https://example.com/a.png")))
+	ok(status == 400 and table.concat(e.detail[1].loc, ".") == "body.attachments.0" and
+	    e.detail[1].msg:find("data URL", 1, true), "an https URL gives 400")
+	_, e, status = so.check(with_images(('[{"type": "image_url", "image_url": {"url": "http://x/y.png"}}]')))
+	ok(status == 400, "an http URL in a part gives 400")
+	check_fails(with_images("{}"), "body.attachments", "attachments must be an array")
+	check_fails(with_images("[5]"), "body.attachments.0", "a number is not an attachment")
+	check_fails(with_images('[{"type": "text", "text": "x"}]'), "body.attachments.0.type", "a text part")
+	check_fails(with_images('[{"type": "image_url", "image_url": {}}]'),
+	    "body.attachments.0.image_url.url", "a part without url")
+	check_fails(with_images(("[%q, %q]"):format(PNG_URL, "data:text/plain;base64,aGk=")),
+	    "body.attachments.1", "a text data URL")
+	check_fails(with_images(("[%q]"):format("data:image/gif;base64,R0lGODlh")),
+	    "body.attachments.0", "a GIF")
+	check_fails(with_images(("[%q]"):format("data:image/png;base64,aGVsbG8=")),
+	    "body.attachments.0", "bytes that are not PNG")
+	check_fails(with_images(("[%q]"):format("data:image/png;base64,***")),
+	    "body.attachments.0", "bad base64")
+	check_fails(with_images(("[%q]"):format("/tmp/a.png")), "body.attachments.0", "a path")
+	local many = {}
+	for i = 1, so.MAX_ATTACHMENTS + 1 do
+		many[i] = ("%q"):format(PNG_URL)
+	end
+	check_fails(with_images("[" .. table.concat(many, ", ") .. "]"), "body.attachments", "too many images")
+	local huge = "data:image/png;base64," .. string.rep("A", so.MAX_ATTACHMENT_BYTES // 3 * 4 + 12)
+	check_fails(with_images(("[%q]"):format(huge)), "body.attachments.0", "an image too large")
+end
+
 local function test_stats()
 	local r = so.round({ 0.333333, 0.333333, 0.333334 })
 	ok(r[1] == 0.33 and r[2] == 0.33 and r[3] == 0.34, "largest remainder rounding")
@@ -316,6 +367,12 @@ local function test_http(port, bare_port)
 	ok(status == 422 and json.decode(rb).detail[1].type == "json_invalid", "bad JSON gives 422")
 	status, rb = post(port, "/v1/systemone", body("fail", { { "q", NOUL } }))
 	ok(status == 500 and json.decode(rb).detail == "fake failure", "engine error")
+	status, rb, raw = post(port, "/v1/systemone", '{"state": "x", "questions": {"q": ' .. NOUL ..
+	    '}, "attachments": ["' .. PNG_URL .. '", "' .. JPEG_URL .. '"]}')
+	ok(status == 200 and raw:find("x%-lgml%-images: 2\r\n"), "attachments reach the engine; images header")
+	status, rb = post(port, "/v1/systemone", '{"state": "x", "questions": {"q": ' .. NOUL ..
+	    '}, "attachments": ["https://example.com/a.png"]}')
+	ok(status == 400 and json.decode(rb).detail[1].loc[2] == "attachments", "http image URL gives 400")
 	status = post(bare_port, "/v1/systemone", body("x", { { "q", NOUL } }))
 	ok(status == 404, "engine without decide gives 404")
 end
@@ -365,6 +422,7 @@ local function main()
 	test_random()
 	test_json()
 	test_check()
+	test_attachments()
 	test_stats()
 	test_render()
 	test_tokenize()

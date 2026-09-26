@@ -78,7 +78,8 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       [{"id": 0, "scale": 0.5}]; GET /lora-adapters
                       lists them
       --mmproj file   vision mmproj gguf (llama.cpp format) for image input
-                      in chat messages, as image_url parts with data URLs
+                      in chat messages, as image_url parts with data URLs,
+                      and in /v1/systemone "attachments" (data URLs)
       --image-min-tokens n, --image-max-tokens n
                       token range of one image (default: the encoder's;
                       gemma4v: 40 to 280)
