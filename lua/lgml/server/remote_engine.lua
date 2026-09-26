@@ -8,6 +8,7 @@ local uv = require("luv")
 local ipc = require("lgml.ipc")
 local stream = require("lgml.server.stream")
 local detect = require("lgml.detect")
+local engine_api = require("lgml.server.engine")
 local log = require("lgml.log")
 
 local L = log.new("remote")
@@ -212,9 +213,40 @@ function R:modes()
 end
 
 --- Returns the properties of the worker engine.
+-- The `lora` field has the global scales that `lora_adapters` set.
 -- @treturn table the properties
 function R:props()
-	return self:ready().props
+	local p = self:ready().props
+	if not self.lora then
+		return p
+	end
+	local t = {}
+	for k, v in pairs(p) do
+		t[k] = v
+	end
+	t.lora = engine_api.lora_view(p.lora, self.lora)
+	return t
+end
+
+--- Sets the global LoRA scales (see `lgml.server.engine`).
+-- This process keeps them, and sends them with each chat and decide
+-- request that has no `lora` field.
+-- @tparam {table,...} list `{ id, scale }` entries
+-- @treturn[1] boolean true
+-- @treturn[2] nil
+-- @treturn[2] string an error message
+-- @treturn[2] int an HTTP status
+function R:lora_adapters(list)
+	local hello, rerr = self:ready()
+	if not hello then
+		return nil, rerr, 503
+	end
+	local scales, err = engine_api.lora_scales(list, #(hello.props.lora or {}))
+	if not scales then
+		return nil, err, 400
+	end
+	self.lora = scales
+	return true
 end
 
 --- Sends SIGTERM to the worker. No new worker starts.
@@ -324,7 +356,7 @@ function R:chat(req, sink)
 	self.next_id = id + 1
 	local job = setmetatable({ q = {} }, Job)
 	self.jobs[id] = job
-	self.ch:send(ipc.JOB, id, tagged(req))
+	self.ch:send(ipc.JOB, id, tagged(engine_api.with_lora(req, self.lora)))
 	local map, cancelled = {}, false
 	local function cancel()
 		if not cancelled then
@@ -495,7 +527,7 @@ function R:decide(req, ctl)
 	local job = setmetatable({ q = {} }, Job)
 	self.jobs[id] = job
 	local body, images = {}, req.images or {}
-	for k, v in pairs(req) do
+	for k, v in pairs(engine_api.with_lora(req, self.lora)) do
 		body[k] = v
 	end
 	body.images, body.image_types, body.rid = nil, nil, log.request_id()

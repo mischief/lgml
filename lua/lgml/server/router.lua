@@ -228,6 +228,23 @@ function R:props()
 	return e:props()
 end
 
+--- Sets the global LoRA scales of the first chat engine, whose adapters
+-- `props` lists (see `lgml.server.engine.Engine.lora_adapters`).
+-- @tparam {table,...} list `{ id, scale }` entries
+-- @return the results of `Engine:lora_adapters`; an engine without it
+-- has no adapters
+function R:lora_adapters(list)
+	local e = self:pick(nil, "chat") or self.engines[1]
+	if e.lora_adapters then
+		return e:lora_adapters(list)
+	end
+	local ok, err = engine_api.lora_scales(list, 0)
+	if not ok then
+		return nil, err, 400
+	end
+	return true
+end
+
 --- Runs a chat completion on the engine for `req.model`.
 -- A request with images and no model, or an unknown one, goes to the
 -- first model with vision. A named model without vision is an error

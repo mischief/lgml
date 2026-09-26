@@ -48,6 +48,7 @@ one row are aliases for one handler.
 | POST | `/models/unload`, `/v1/models/unload` | lgml | [Load and unload](#load-and-unload) |
 | GET | `/props`, `/v1/props` | llama.cpp | [Server properties and adapters](#server-properties-and-adapters) |
 | GET | `/lora-adapters`, `/v1/lora-adapters` | llama.cpp | [Server properties and adapters](#server-properties-and-adapters) |
+| POST | `/lora-adapters`, `/v1/lora-adapters` | llama.cpp | [Server properties and adapters](#server-properties-and-adapters) |
 | GET | `/health`, `/v1/health` | llama.cpp | [Health](#health) |
 | GET | `/metrics` | lgml | [Metrics](#metrics) |
 | GET | `/openapi.json`, `/v1/openapi.json` | lgml | [OpenAPI document](#openapi-document) |
@@ -173,7 +174,7 @@ llama.cpp and lgml extensions.
 | `top_k`, `min_p`, `repeat_penalty` | number | llama.cpp | Sampler settings. |
 | `grammar` | string | llama.cpp | GBNF grammar for the answer. |
 | `json_schema` | object | llama.cpp | JSON schema for the answer. |
-| `lora` | array | llama.cpp | Adapter scales for this request: `[{"id": 0, "scale": 0.5}]`. |
+| `lora` | array | llama.cpp | Adapter scales for this request: `[{"id": 0, "scale": 0.5}]`. Adapters that the list does not name get scale 0. Without `lora`, the global scales apply; see [Server properties and adapters](#server-properties-and-adapters). |
 | `chat_template_kwargs` | object | llama.cpp | `enable_thinking`, `reasoning_effort` (a string for the template), `preserve_thinking` (false drops old reasoning). |
 | `reasoning_effort` | string | OpenAI | `"none"` turns thinking off. Other values leave it on. |
 
@@ -608,20 +609,37 @@ With several models, the fields come from the first chat model.
 `model_path` is the model id. `modalities` is absent when the engine
 does not give it.
 
-`GET /lora-adapters` (alias `/v1/lora-adapters`). llama.cpp. It lists the adapters of the first
-chat model, as llama-server does:
+`GET /lora-adapters` (alias `/v1/lora-adapters`). llama.cpp. It lists
+the adapters of the first chat model with their global scales, as
+llama-server does:
 
 ```json
 [{"id": 0, "path": "/models/tuned.gguf", "scale": 1}]
 ```
 
-`scale` is the scale from `--lora file:scale`. A chat request can
-change the scales for itself with `"lora": [{"id": 0, "scale": 0.5}]`.
-Adapters that the request does not list keep their start scale.
+`POST /lora-adapters` (alias `/v1/lora-adapters`). llama.cpp. It sets
+the global scales of the first chat model. The body is a list of
+`{"id", "scale"}`. Adapters that the list does not name get scale 0.
+The reply is `{"success": true}`. A bad id gives 400.
+
+The scale rules are those of llama-server:
+
+- The global scales start at the scales of `--lora file:scale`.
+  `POST /lora-adapters` changes them. `GET /lora-adapters` shows them.
+- A chat request with no `lora` field, and every `/v1/systemone`
+  request, uses the global scales.
+- A chat request with `"lora": [{"id": 0, "scale": 0.5}]` uses those
+  scales for itself only. Adapters that it does not name get scale 0.
+  The global scales do not change.
+- A change of scales between two requests empties the slot cache. The
+  prompt cache keeps entries of each scale set apart.
+- With `-C config`, the server keeps the global scales of a model
+  across unloads.
 
 ```sh
 curl -s localhost:8080/props
 curl -s localhost:8080/lora-adapters
+curl -s localhost:8080/lora-adapters -d '[{"id": 0, "scale": 0.5}]'
 ```
 
 ## Health

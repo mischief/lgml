@@ -16,6 +16,7 @@ local chat = require("lgml.chat")
 local sampler = require("lgml.sampler")
 local tokenizer = require("lgml.tokenizer")
 local stream = require("lgml.server.stream")
+local engine_api = require("lgml.server.engine")
 local replay = require("lgml.replay")
 local transformer = require("lgml.transformer")
 local decide = require("lgml.decide")
@@ -191,7 +192,8 @@ function E:models()
 end
 
 --- Returns the properties: `{ n_ctx, total_slots = 1, lora, modalities }`.
--- lora lists the adapters as llama-server does: `{ id, path, scale }`.
+-- lora lists the adapters as llama-server does: `{ id, path, scale }`,
+-- with the global scales.
 -- modalities is `{ vision = true }` with an mmproj, else `{ vision = false }`.
 -- @treturn table the properties
 function E:props()
@@ -203,27 +205,44 @@ function E:props()
 	    modalities = { vision = self.vision ~= nil } }
 end
 
---- Set the adapter scales for a request.
--- Scales not in the list are the ones the engine loaded with. A new
--- adapter set empties the slot: its cache holds keys and values of the
--- old set. The prompt store keeps entries of each set apart.
+--- Sets the global adapter scales (see
+-- `lgml.server.engine.Engine.lora_adapters`). Adapters that the list
+-- does not name get scale 0. The next request applies them.
+-- @tparam {table,...} list `{ id, scale }` entries, ids from 0
+-- @treturn[1] boolean true
+-- @treturn[2] nil
+-- @treturn[2] string an error message
+-- @treturn[2] int 400
+function E:lora_adapters(list)
+	local scales, err = engine_api.lora_scales(list, #self.adapters)
+	if not scales then
+		return nil, err, 400
+	end
+	for i, a in ipairs(self.adapters) do
+		a.scale = scales[i]
+	end
+	return true
+end
+
+--- Set the adapter scales for a request, as llama-server does.
+-- With no list, the scales are the global ones. A list sets the scales
+-- of the adapters it names; the others get 0. A new adapter set empties
+-- the slot: its cache holds keys and values of the old set. The prompt
+-- store keeps entries of each set apart.
 -- @tparam[opt] {table,...} list `{ id, scale }` entries, ids from 0
 -- @treturn[1] nil
 -- @treturn[2] string an error message for a bad list
 function E:set_lora(list)
-	if list ~= nil and type(list) ~= "table" then
-		return "lora must be an array of { id, scale }"
-	end
 	local scales = {}
 	for i, a in ipairs(self.adapters) do
 		scales[i] = a.scale
 	end
-	for _, x in ipairs(list or {}) do
-		local id = type(x) == "table" and math.tointeger(x.id)
-		if not id or not self.adapters[id + 1] or type(x.scale) ~= "number" then
-			return ("lora: need { id, scale } with id from 0 to %d"):format(#self.adapters - 1)
+	if list ~= nil then
+		local err
+		scales, err = engine_api.lora_scales(list, #self.adapters)
+		if not scales then
+			return err
 		end
-		scales[id + 1] = x.scale
 	end
 	local key = table.concat(scales, ",")
 	if key == self.lora_key then

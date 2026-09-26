@@ -20,6 +20,7 @@
 local uv = require("luv")
 local stream = require("lgml.server.stream")
 local metrics = require("lgml.server.metrics")
+local engine_api = require("lgml.server.engine")
 local log = require("lgml.log")
 
 local L = log.new("pool")
@@ -311,12 +312,41 @@ function Model:modes()
 end
 
 --- Returns the properties. It does not load the model.
+-- The `lora` field has the global scales that `lora_adapters` set.
 -- @treturn table the worker's props when loaded, else the static props
 function Model:props()
+	local p
 	if self.state == "loaded" and self.engine and self.engine.hello then
-		return self.engine.hello.props
+		p = self.engine.hello.props
+	else
+		p = self.static_props or { n_ctx = self.context_length or 0, total_slots = 1 }
 	end
-	return self.static_props or { n_ctx = self.context_length or 0, total_slots = 1 }
+	if not self.lora then
+		return p
+	end
+	local t = {}
+	for k, v in pairs(p) do
+		t[k] = v
+	end
+	t.lora = engine_api.lora_view(p.lora, self.lora)
+	return t
+end
+
+--- Sets the global LoRA scales (see `lgml.server.engine`).
+-- It does not load the model. The model keeps them across loads, and
+-- sends them with each chat and decide request that has no `lora`.
+-- @tparam {table,...} list `{ id, scale }` entries
+-- @treturn[1] boolean true
+-- @treturn[2] nil
+-- @treturn[2] string an error message
+-- @treturn[2] int 400
+function Model:lora_adapters(list)
+	local scales, err = engine_api.lora_scales(list, #(self:props().lora or {}))
+	if not scales then
+		return nil, err, 400
+	end
+	self.lora = scales
+	return true
 end
 
 function Model:set_state(s)
@@ -557,7 +587,7 @@ end
 -- @return the results of `Engine:chat`, or nil, a message and 503
 -- when the model does not load
 function Model:chat(req, sink)
-	return run(self, "chat", req, sink)
+	return run(self, "chat", engine_api.with_lora(req, self.lora), sink)
 end
 
 --- Transcribes speech. See `lgml.server.engine`.
@@ -582,7 +612,7 @@ end
 -- @tparam lgml.server.engine.Control ctl the cancel control
 -- @return the results of `Engine:decide`, or nil, a message and 503
 function Model:decide(req, ctl)
-	return run(self, "decide", req, ctl)
+	return run(self, "decide", engine_api.with_lora(req, self.lora), ctl)
 end
 
 --- Makes images. See `lgml.server.engine`.

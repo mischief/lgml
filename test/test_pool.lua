@@ -356,6 +356,34 @@ local function test_http()
 	cleanup(p)
 end
 
+-- Global LoRA scales stay in the front process, across loads, and go
+-- with each chat and decide request that has no lora field.
+local function test_lora()
+	local p = pool_mod.new()
+	local m = p:add({ id = "l", modes = ALL, size = MiB,
+	    props = { n_ctx = 8, total_slots = 1, lora = { { id = 0, path = "a.gguf", scale = 1 },
+	        { id = 1, path = "b.gguf", scale = 1 } } },
+	    start = function() error("no start") end })
+	local seen = {}
+	local stub = {}
+	function stub.chat(_, req) seen.chat = req.lora return true end
+	function stub.decide(_, req) seen.decide = req.lora return {} end
+	m.load = function() return stub end
+	m.release = function() end
+	ok(m:lora_adapters({ { id = 1, scale = 0.5 } }), "a pool model takes global scales")
+	local l = m:props().lora
+	ok(l[1].scale == 0 and l[2].scale == 0.5 and l[2].path == "b.gguf" and m.static_props.lora[2].scale == 1,
+	    "props show the global scales")
+	m:chat({ messages = {} }, sink())
+	m:decide({ questions = {} })
+	ok(seen.chat and seen.chat[2].scale == 0.5 and seen.chat[1].scale == 0 and
+	    seen.decide and seen.decide[2].scale == 0.5, "chat and decide send the global scales")
+	m:chat({ messages = {}, lora = { { id = 0, scale = 2 } } }, sink())
+	ok(#seen.chat == 1 and seen.chat[1].scale == 2, "a request lora goes as it is")
+	local _, msg, status = m:lora_adapters({ { id = 2, scale = 1 } })
+	ok(status == 400 and msg:find("id from 0 to 1", 1, true), "a bad id gives 400")
+end
+
 -- Estimates from files and the KV cache, checked against a loaded model.
 local function test_estimate()
 	local estimate = require("lgml.estimate")
@@ -417,6 +445,9 @@ local function test_estimate()
 	os.remove(path)
 end
 
+-- A Lua error after main yields ends the coroutine without a report.
+local finished = false
+
 local function main()
 	test_estimate()
 	test_lazy()
@@ -428,7 +459,9 @@ local function main()
 	test_idle()
 	test_failure()
 	test_http()
+	test_lora()
 	print("1.." .. n)
+	finished = true
 	uv.stop()
 end
 
@@ -438,7 +471,7 @@ if not good then
 	error(debug.traceback(co, err))
 end
 uv.run()
-if coroutine.status(co) ~= "dead" then
+if not finished then
 	print("not ok - main did not finish")
 	failed = failed + 1
 end

@@ -481,10 +481,18 @@ local function operations()
 			tag = "llama.cpp", summary = "Server properties",
 			responses = { ["200"] = reply("Properties.", "application/json", ref("Props")) },
 		} },
-		["/lora-adapters"] = { GET = {
-			tag = "llama.cpp", summary = "List LoRA adapters",
-			responses = { ["200"] = reply("Adapters.", "application/json", arr(ref("LoraAdapter"))) },
-		} },
+		["/lora-adapters"] = {
+			GET = {
+				tag = "llama.cpp", summary = "List LoRA adapters with the global scales",
+				responses = { ["200"] = reply("Adapters.", "application/json", arr(ref("LoraAdapter"))) },
+			},
+			POST = {
+				tag = "llama.cpp", summary = "Set the global LoRA scales",
+				requestBody = json_body(arr(obj({ id = int(), scale = num() }, { "id", "scale" }),
+				    "Adapters that the list does not name get scale 0.")),
+				responses = with({ ["200"] = reply("Set.", "application/json", ref("Success")) }, { 400 }),
+			},
+		},
 		["/health"] = { GET = {
 			tag = "llama.cpp", summary = "Health",
 			responses = { ["200"] = reply("Up.", "application/json", ref("Health")) },

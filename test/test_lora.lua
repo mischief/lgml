@@ -367,6 +367,18 @@ do
 	    ("back to the adapter restores its store entry (%d tokens)"):format(a2.timings.restored_n))
 	local bad = req(e, msgs, { lora = { { id = 3, scale = 1 } } })
 	ok(bad.res == nil and bad.status == 400, "a bad adapter id gives 400")
+	ok(e:lora_adapters({ { id = 0, scale = 0 } }) and e:props().lora[1].scale == 0,
+	    "lora_adapters sets the global scale that props shows")
+	ok(req(e, msgs).text == base, "a request with no lora uses the global scales")
+	ok(req(e, msgs, { lora = { { id = 0, scale = 1 } } }).text == a1.text and e:props().lora[1].scale == 0,
+	    "a request lora applies to that request only")
+	e:set_lora(nil)
+	ok(e.lora_key == "0", "no lora list (as decide gives) keeps the global scales")
+	ok(e:lora_adapters({ { id = 0, scale = 1 } }) and req(e, msgs, { lora = {} }).text == base,
+	    "adapters that a request lora does not name get scale 0")
+	local _, lmsg, lstatus = e:lora_adapters({ { id = 1, scale = 1 } })
+	ok(lstatus == 400 and lmsg:find("id from 0 to 0", 1, true) and e:props().lora[1].scale == 1,
+	    "lora_adapters rejects a bad id and keeps the scales")
 	local o = getopt.parse({ "--lora", "a.gguf:0.5", "--lora=b" }, "", { ["lora="] = false },
 	    { lora = true })
 	ok(o and #o.lora == 2 and o.lora[1] == "a.gguf:0.5" and o.lora[2] == "b",

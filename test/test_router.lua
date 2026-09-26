@@ -43,6 +43,30 @@ ok(r:model_for(nil, "chat") == "a" and r:model_for("nope", "chat") == "a" and
     "model_for gives the model that serves chat")
 ok(r:model_for(nil, "transcribe") == "whisper" and router.new({ stt }):model_for(nil, "chat") == nil,
     "model_for gives nil when no model serves the method")
+-- LoRA lists, as llama-server reads them.
+do
+	local api = require("lgml.server.engine")
+	local s = api.lora_scales({ { id = 1, scale = 0.5 } }, 3)
+	ok(s and s[1] == 0 and s[2] == 0.5 and s[3] == 0, "adapters that a list does not name get 0")
+	ok(not api.lora_scales({ { id = 3, scale = 1 } }, 3) and not api.lora_scales({ { id = 0 } }, 3) and
+	    not api.lora_scales("x", 3) and api.lora_scales({}, 0), "lora_scales checks ids and scales")
+	local req = { messages = {} }
+	local w = api.with_lora(req, { 0.25, 1 })
+	ok(w ~= req and req.lora == nil and w.lora[1].id == 0 and w.lora[1].scale == 0.25 and w.lora[2].id == 1,
+	    "with_lora adds the global scales to a copy")
+	local own = { lora = {} }
+	ok(api.with_lora(own, { 1 }) == own and api.with_lora(req, nil) == req, "with_lora keeps a request lora")
+	local set
+	local la = fake.new({ model = "la" })
+	function la.lora_adapters(_, list) set = list return true end
+	local rl = router.new({ stt, la })
+	ok(rl:lora_adapters({ { id = 0, scale = 1 } }) and set and set[1].scale == 1,
+	    "the router sets the adapters of the first chat engine")
+	local _, msg, code = router.new({ stt, a }):lora_adapters({ { id = 0, scale = 1 } })
+	ok(code == 400 and msg:find("no adapters") and router.new({ stt, a }):lora_adapters({}),
+	    "an engine without adapters takes only an empty list")
+end
+
 -- An engine that only makes images.
 local img = {}
 function img.models() return { { id = "zimage", context_length = 0 } } end

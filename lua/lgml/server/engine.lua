@@ -21,6 +21,68 @@ M.reasons = { stop = true, length = true, tool_calls = true }
 -- not load on demand. Such a request gives status 400.
 M.NO_LOAD = "this server does not load models on demand; start it with -C config"
 
+--- Reads a LoRA list as llama-server does.
+-- Each entry is `{ id, scale }`, with an id from 0 to n - 1. Adapters
+-- that the list does not name get scale 0.
+-- @tparam any list the list from a request
+-- @tparam int n the number of adapters
+-- @treturn[1] {number,...} the scales, by adapter index from 1
+-- @treturn[2] nil
+-- @treturn[2] string an error message
+function M.lora_scales(list, n)
+	if type(list) ~= "table" then
+		return nil, "lora must be an array of { id, scale }"
+	end
+	local scales = {}
+	for i = 1, n do
+		scales[i] = 0
+	end
+	for _, x in ipairs(list) do
+		local id = type(x) == "table" and math.tointeger(x.id)
+		if not id or id < 0 or id >= n or type(x.scale) ~= "number" then
+			if n == 0 then
+				return nil, "lora: the model has no adapters"
+			end
+			return nil, ("lora: need { id, scale } with id from 0 to %d"):format(n - 1)
+		end
+		scales[id + 1] = x.scale
+	end
+	return scales
+end
+
+--- The adapter list of the props with other scales.
+-- @tparam {table,...} list `{ id, path, scale }` entries
+-- @tparam[opt] {number,...} scales the scales by index from 1; nil keeps list
+-- @treturn {table,...} a new list
+function M.lora_view(list, scales)
+	local out = {}
+	for i, a in ipairs(list or {}) do
+		out[i] = { id = a.id, path = a.path, scale = scales and scales[i] or a.scale }
+	end
+	return out
+end
+
+--- A request with the global scales when it has no `lora` field.
+-- Front processes keep the scales that `POST /lora-adapters` set, and
+-- send them with each chat and decide request.
+-- @tparam table req the request
+-- @tparam[opt] {number,...} scales the global scales; nil leaves req as is
+-- @treturn table req, or a shallow copy with `lora`
+function M.with_lora(req, scales)
+	if not scales or req.lora ~= nil then
+		return req
+	end
+	local t = {}
+	for k, v in pairs(req) do
+		t[k] = v
+	end
+	t.lora = {}
+	for i, s in ipairs(scales) do
+		t.lora[i] = { id = i - 1, scale = s }
+	end
+	return t
+end
+
 --- Checks that e has the methods of the interface.
 -- @tparam Engine e the engine to check
 -- @treturn Engine e
@@ -163,6 +225,18 @@ end
 -- @treturn[2] string an error message
 -- @treturn[2] int an HTTP status
 -- @function unload
+
+--- Sets the global LoRA scales, as `POST /lora-adapters` of llama-server.
+-- This method is optional. The list is as `lora_scales` reads it:
+-- adapters that it does not name get scale 0. A chat or decide request
+-- with no `lora` field uses the global scales; one with `lora` uses its
+-- own. The `lora` field of `props` shows the global scales.
+-- @tparam {table,...} list `{ id, scale }` entries
+-- @treturn[1] boolean true
+-- @treturn[2] nil
+-- @treturn[2] string an error message
+-- @treturn[2] int an HTTP status
+-- @function lora_adapters
 
 --- The id of the model that serves a request. This method is optional.
 -- `lgml.server.router` has it. Without it, the server uses the request

@@ -527,6 +527,26 @@ local function load_route(eng, req, res, what)
 	return res:json(200, { success = true })
 end
 
+-- POST /lora-adapters: a list of { id, scale } sets the global scales.
+local function set_adapters(eng, req, res)
+	local list, err = json.decode(req.body)
+	if list == nil then
+		return res:error(400, "bad JSON: " .. tostring(err))
+	elseif not json.isarray(list) then
+		return res:error(400, "the body must be an array of { id, scale }")
+	end
+	local ok, msg, status
+	if eng.lora_adapters then
+		ok, msg, status = eng:lora_adapters(list)
+	else
+		ok, msg = engine_api.lora_scales(list, #(eng:props().lora or {}))
+	end
+	if not ok then
+		return res:error(status or 400, msg or "lora-adapters failed")
+	end
+	return res:json(200, { success = true })
+end
+
 local function props(eng, res)
 	local p = eng:props()
 	return res:json(200, {
@@ -980,8 +1000,9 @@ end
 --
 -- - `/health`, `/models`, `/props` and `/openapi.json` (see
 --   `lgml.server.openapi`)
--- - `/lora-adapters`: the adapters from the `lora` field of the engine
---   props, as llama-server lists them
+-- - `/lora-adapters`: GET lists the adapters from the `lora` field of
+--   the engine props, as llama-server lists them. POST takes a list of
+--   `{ id, scale }` and calls `Engine:lora_adapters`.
 -- - `/metrics`: Prometheus text (see `lgml.server.metrics`), at the path
 --   that Prometheus scrapes by default
 -- - `/chat/completions`, `/audio/speech`, `/audio/transcriptions`,
@@ -1052,6 +1073,11 @@ function M.install(srv, eng)
 	end
 	srv:route("GET", "/lora-adapters", adapters)
 	srv:route("GET", "/v1/lora-adapters", adapters)
+	local function post_adapters(req, res)
+		return set_adapters(eng, req, res)
+	end
+	srv:route("POST", "/lora-adapters", post_adapters)
+	srv:route("POST", "/v1/lora-adapters", post_adapters)
 	srv:route("POST", "/v1/chat/completions", completions)
 	srv:route("POST", "/chat/completions", completions)
 	local function transcribe(req, res)

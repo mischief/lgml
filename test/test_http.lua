@@ -184,6 +184,12 @@ local function test_basic(port)
 	r = roundtrip(port, request("GET", "/v1/lora-adapters"))
 	ok(r.status == 200 and r.body:match("^%[%]%s*$"), "/v1/lora-adapters is an alias")
 	ok(roundtrip(port, request("GET", "/v1/metrics")).status == 404, "/metrics has no /v1 alias")
+	r = roundtrip(port, request("POST", "/lora-adapters", "[]"))
+	ok(r.status == 200 and body_json(r).success == true, "POST /lora-adapters takes an empty list")
+	r = roundtrip(port, request("POST", "/v1/lora-adapters", '[{"id": 0, "scale": 1}]'))
+	ok(r.status == 400 and body_json(r).error.message:find("no adapters"), "POST /lora-adapters checks ids")
+	r = roundtrip(port, request("POST", "/lora-adapters", '{"id": 0}'))
+	ok(r.status == 400, "POST /lora-adapters needs an array")
 
 	r = roundtrip(port, request("GET", "/health"))
 	ok(r.status == 200 and body_json(r).status == "ok", "health")
@@ -690,6 +696,9 @@ local function test_logging(port)
 	log.set_level("info")
 end
 
+-- A Lua error after main yields ends the coroutine without a report.
+local finished = false
+
 local function main()
 	local eng = fake.new({ delay = 2 })
 	local srv = server.new({ limits = { max_body = 1 << 20, idle_ms = 500 } })
@@ -716,6 +725,7 @@ local function main()
 	srv2:close()
 	srv:close()
 	print("1.." .. n)
+	finished = true
 	uv.stop()
 end
 
@@ -725,7 +735,7 @@ if not good then
 	error(debug.traceback(co, err))
 end
 uv.run()
-if coroutine.status(co) ~= "dead" then
+if not finished then
 	print("not ok - main did not finish")
 	failed = failed + 1
 end
