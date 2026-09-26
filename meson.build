@@ -130,6 +130,9 @@ if lua_bin.found()
   test('train', lua_bin, args : [files('test/test_train.lua')],
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
     timeout : 120)
+  test('lora', lua_bin, args : [files('test/test_lora.lua')],
+    env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
+    timeout : 120)
   test('diffusion_gemma', lua_bin, args : [files('test/test_diffusion_gemma.lua')],
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
     timeout : 120)

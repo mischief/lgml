@@ -23,6 +23,29 @@ local UBATCH = 512
 -- logit.
 M.gating = { SOFTMAX = 1, SIGMOID = 2 }
 
+-- Layer fields of the weights that adapters can change, by gguf name
+-- after "blk.N.". Routed experts and the embeddings take no adapter.
+local FIELDS = {
+	["attn_q.weight"] = "wq", ["attn_k.weight"] = "wk", ["attn_v.weight"] = "wv",
+	["attn_output.weight"] = "wo", ["ffn_gate.weight"] = "gate", ["ffn_up.weight"] = "up",
+	["ffn_down.weight"] = "down", ["attn_qkv.weight"] = "qkv", ["attn_gate.weight"] = "qkv_gate",
+	["ssm_in.weight"] = "ssm_in", ["ssm_beta.weight"] = "beta", ["ssm_alpha.weight"] = "alpha",
+	["ssm_ba.weight"] = "ba", ["ssm_out.weight"] = "ssm_out", ["ffn_gate_inp.weight"] = "gate_inp",
+	["ffn_gate_shexp.weight"] = "gate_shexp", ["ffn_up_shexp.weight"] = "up_shexp",
+	["ffn_down_shexp.weight"] = "down_shexp", ["inp_gate.weight"] = "ple_gate",
+	["proj.weight"] = "ple_proj",
+}
+
+-- The product of weight L[key] and x, plus the adapter terms
+-- s * B (A x) of L.lora[key].
+local function mm(g, L, key, x)
+	local y = g:mul_mat(L[key], x)
+	for _, e in ipairs(L.lora and L.lora[key] or {}) do
+		y = g:add(y, g:scale(g:mul_mat(e.b, g:mul_mat(e.a, x)), e.s))
+	end
+	return y
+end
+
 -- Settings that the metadata does not hold, per architecture.
 local family = {
 	llama = { rope_mode = "normal", rope_ctx = true },
@@ -335,13 +358,62 @@ end
 --- A loaded model, from `load`.
 -- Fields: be (backend), w (weights), hp (from `config`), meta (gguf
 -- metadata), tok_embd, output, output_norm, rope_freqs (or nil),
--- layers, and recurrent (true when a layer keeps a recurrent state,
--- which cannot go back to an earlier position).
+-- layers, recurrent (true when a layer keeps a recurrent state,
+-- which cannot go back to an earlier position), and adapters (from
+-- `set_adapters`, or nil). A layer with adapters has `lora`: adapter
+-- terms { a, b, s } by weight field.
 -- @type Model
 
 --- Close the weights.
 function M:close()
 	self.w:close()
+end
+
+--- Apply LoRA adapters to the model, or remove them.
+-- Each adapter adds s * B (A x) to the product of each weight it names,
+-- as llama.cpp does, with s from `adapter:scale_of`. The list replaces
+-- the adapters of an earlier call; an empty list removes them. Passes
+-- with other adapters or scales build their own replay graph.
+-- @tparam[opt] {lgml.lora.Adapter,...} list adapters from `lgml.lora`
+-- @raise when an adapter names a weight that the model lacks or that
+-- takes no adapter (routed experts, embeddings), or a shape differs
+function M:set_adapters(list)
+	local maps, out, keys = {}, {}, {}
+	for _, ad in ipairs(list or {}) do
+		for _, name in ipairs(ad.names) do
+			local p = ad.pairs[name]
+			local il, suffix = name:match("^blk%.(%d+)%.(.+)$")
+			local L = il and self.layers[tonumber(il) + 1]
+			local field = L and FIELDS[suffix]
+			local w = field and L[field]
+			if name == "output.weight" and self.output ~= self.tok_embd then
+				w = self.output
+			end
+			if not w then
+				error("lora: " .. name .. ": the model has no such weight that takes an adapter")
+			end
+			local ws, as, bs = w:shape(), p.a:shape(), p.b:shape()
+			if #ws ~= 2 or as[2] ~= ws[2] or bs[1] ~= ws[1] or as[1] ~= bs[2] then
+				error(("lora: %s: A (%s) and B (%s) do not fit the weight (%s)"):format(name,
+				    table.concat(as, ", "), table.concat(bs, ", "), table.concat(ws, ", ")))
+			end
+			local e = { a = p.a, b = p.b, s = ad:scale_of(name) }
+			if L then
+				maps[L] = maps[L] or {}
+				maps[L][field] = maps[L][field] or {}
+				table.insert(maps[L][field], e)
+			else
+				out[#out + 1] = e
+			end
+		end
+		keys[#keys + 1] = ad.id .. "*" .. ad.scale
+	end
+	for _, L in ipairs(self.layers) do
+		L.lora = maps[L]
+	end
+	self.lora_out = #out > 0 and out or nil
+	self.adapters = list and #list > 0 and list or nil
+	self.lora_key = table.concat(keys, ",")
 end
 
 local function conv_dim(hp)
@@ -668,7 +740,7 @@ function M:inputs(ids, cache, opts)
 	return inp
 end
 
---- The replay key of a pass: the pass shape and options.
+--- The replay key of a pass: the pass shape, options and adapters.
 -- Passes with the same key share one graph; see `lgml.replay`.
 -- @tparam table cache the cache
 -- @tparam integer n the token count
@@ -676,8 +748,8 @@ end
 -- @treturn string the key
 function M:replay_key(cache, n, opts)
 	local n_attn, n_swa_attn = spans(cache, cache.n_past + n)
-	return ("%d:%d:%d:%s:%s:%s"):format(n, n_attn, n_swa_attn, tostring(opts.flash_attn),
-	    opts.logits or "all", tostring(opts.hidden))
+	return ("%d:%d:%d:%s:%s:%s:%s"):format(n, n_attn, n_swa_attn, tostring(opts.flash_attn),
+	    opts.logits or "all", tostring(opts.hidden), self.lora_key or "")
 end
 
 --- Load new ids into the inputs of an earlier pass with the same key.
@@ -711,12 +783,12 @@ function M.qkv(g, hp, L, x, pos)
 	if hp.attn_gate then
 		-- q_proj gives [q | gate] per head.
 		local f4 = lgml.row_size("f32", 1)
-		local qg = g:mul_mat(L.wq, cur)
+		local qg = mm(g, L, "wq", cur)
 		local st = { H * 2 * D * f4, 2 * D * f4 }
 		q = g:view(qg, { n, H, D }, st)
 		gate = g:view(qg, { n, H, D }, st, D * f4)
 	else
-		q = g:reshape(g:mul_mat(L.wq, cur), { n, H, D })
+		q = g:reshape(mm(g, L, "wq", cur), { n, H, D })
 	end
 	if L.q_norm then
 		q = g:mul(g:rms_norm(q, eps), L.q_norm)
@@ -725,9 +797,9 @@ function M.qkv(g, hp, L, x, pos)
 	if not L.wk then
 		return q, nil, nil, gate
 	end
-	local kraw = g:mul_mat(L.wk, cur)
+	local kraw = mm(g, L, "wk", cur)
 	k = g:reshape(kraw, { n, L.Hkv, D })
-	v = g:reshape(L.wv and g:mul_mat(L.wv, cur) or kraw, { n, L.Hkv, D })
+	v = g:reshape(L.wv and mm(g, L, "wv", cur) or kraw, { n, L.Hkv, D })
 	if hp.gemma then
 		v = g:rms_norm(v, eps)
 	end
@@ -803,7 +875,7 @@ function M.attn_out(g, hp, L, o, gate, x)
 		local n = o:shape()[1]
 		o = g:mul(o, g:sigmoid(g:reshape(g:cont(gate), { n, hp.n_head * L.D })))
 	end
-	o = g:mul_mat(L.wo, o)
+	o = mm(g, L, "wo", o)
 	if L.post_attn_norm then
 		o = g:mul(g:rms_norm(o, hp.eps), L.post_attn_norm)
 	end
@@ -832,7 +904,7 @@ function M.moe(g, hp, L, x, h, taps, sfx)
 			r_in = g:mul(r_in, L.router_scale)
 		end
 	end
-	local logits = g:mul_mat(L.gate_inp, r_in)
+	local logits = mm(g, L, "gate_inp", r_in)
 	local probs = hp.gating == M.gating.SIGMOID and g:sigmoid(logits) or g:soft_max(logits)
 	local sel = g:argsort_top_k(probs, K)
 	local probs3 = g:reshape(probs, { n, NE, 1 })
@@ -891,9 +963,9 @@ function M.ffn(g, hp, L, x, taps, sfx)
 	local h = g:mul(g:rms_norm(x, eps), L.ffn_norm)
 	local out
 	if L.gate then
-		local gate, up = g:mul_mat(L.gate, h), g:mul_mat(L.up, h)
+		local gate, up = mm(g, L, "gate", h), mm(g, L, "up", h)
 		local act = hp.gemma and g:geglu_split(gate, up) or g:mul(g:silu(gate), up)
-		out = g:mul_mat(L.down, act)
+		out = mm(g, L, "down", act)
 	end
 	if L.gate_inp then
 		if out and L.post_ffn_norm_1 then
@@ -906,8 +978,8 @@ function M.ffn(g, hp, L, x, taps, sfx)
 		end
 		out = out and g:add(out, ex) or ex
 		if L.shexp_gate then
-			local sh = g:swiglu_split(g:mul_mat(L.gate_shexp, h), g:mul_mat(L.up_shexp, h))
-			sh = g:mul_mat(L.down_shexp, sh)
+			local sh = g:swiglu_split(mm(g, L, "gate_shexp", h), mm(g, L, "up_shexp", h))
+			sh = mm(g, L, "down_shexp", sh)
 			out = g:add(out, g:mul(sh, g:sigmoid(g:mul_mat(L.shexp_gate, h))))
 		end
 	end
@@ -928,11 +1000,13 @@ end
 -- @param output_norm the final norm weight
 -- @param output the output projection
 -- @param x the hidden state (n, n_embd)
+-- @tparam[opt] table lora adapter terms on the output projection, as
+-- `layer.lora` entries hold
 -- @return the logits (n, n_vocab)
 -- @return the normed hidden state
-function M.head(g, hp, output_norm, output, x)
+function M.head(g, hp, output_norm, output, x, lora)
 	x = g:mul(g:rms_norm(x, hp.eps), output_norm)
-	local logits = g:mul_mat(output, x)
+	local logits = mm(g, { output = output, lora = lora and { output = lora } }, "output", x)
 	if (hp.softcap or 0) > 0 then
 		logits = g:scale(g:tanh(g:scale(logits, 1 / hp.softcap)), hp.softcap)
 	end
@@ -945,7 +1019,7 @@ local function split_qkvz(g, hp, L, x, n)
 	local nk, hk, hv = hp.n_k_heads, hp.head_k, hp.head_v
 	local r = hp.n_v_heads // nk
 	local f4 = lgml.row_size("f32", 1)
-	local m = g:reshape(g:mul_mat(L.ssm_in, x), { n, nk, 2 * hk + 2 * hv * r })
+	local m = g:reshape(mm(g, L, "ssm_in", x), { n, nk, 2 * hk + 2 * hv * r })
 	local s = m:strides()
 	local function part(off, w)
 		local t = g:cont(g:view(m, { n, nk, w }, { s[1], s[2] }, off * f4))
@@ -960,11 +1034,11 @@ end
 -- head, for that head's value heads.
 local function beta_alpha(g, hp, L, x, n)
 	if not L.ba then
-		return g:mul_mat(L.beta, x), g:mul_mat(L.alpha, x)
+		return mm(g, L, "beta", x), mm(g, L, "alpha", x)
 	end
 	local nk, nv = hp.n_k_heads, hp.n_v_heads
 	local r = nv // nk
-	local ba = g:reshape(g:mul_mat(L.ba, x), { n, nk, 2 * r })
+	local ba = g:reshape(mm(g, L, "ba", x), { n, nk, 2 * r })
 	local s = ba:strides()
 	local b = g:cont(g:view(ba, { n, nk, r }, { s[1], s[2] }))
 	local a = g:cont(g:view(ba, { n, nk, r }, { s[1], s[2] }, lgml.row_size("f32", r)))
@@ -996,7 +1070,7 @@ local function linear_attention(hp, g, inp, L, il, x, taps, sfx)
 	local f4 = lgml.row_size("f32", 1)
 	local qkv, z
 	if L.qkv then
-		qkv, z = g:mul_mat(L.qkv, x), g:mul_mat(L.qkv_gate, x)
+		qkv, z = mm(g, L, "qkv", x), mm(g, L, "qkv_gate", x)
 	else
 		qkv, z = split_qkvz(g, hp, L, x, n)
 	end
@@ -1029,7 +1103,7 @@ local function linear_attention(hp, g, inp, L, il, x, taps, sfx)
 
 	z = g:reshape(z, { 1, n, nv, hv })
 	o = g:mul(g:mul(g:rms_norm(o, hp.eps), L.ssm_norm), g:silu(z))
-	return g:mul_mat(L.ssm_out, g:reshape(o, { n, vd }))
+	return mm(g, L, "ssm_out", g:reshape(o, { n, vd }))
 end
 
 -- Per-layer inputs (n_layer, n, n_embd_per_layer) from the token ids
@@ -1077,8 +1151,8 @@ function M:forward(g, inp)
 		if ple then
 			local P = hp.n_embd_per_layer
 			local e = g:view(ple, { n, P }, { P * 4 }, (il - 1) * n * P * 4)
-			local t = g:mul(g:gelu(g:mul_mat(L.ple_gate, x)), e)
-			t = g:mul(g:rms_norm(g:mul_mat(L.ple_proj, t), hp.eps), L.ple_post_norm)
+			local t = g:mul(g:gelu(mm(g, L, "ple_gate", x)), e)
+			t = g:mul(g:rms_norm(mm(g, L, "ple_proj", t), hp.eps), L.ple_post_norm)
 			x = g:add(x, t)
 		end
 		if L.out_scale then
@@ -1094,7 +1168,7 @@ function M:forward(g, inp)
 		x = g:view(x, { 1, hp.n_embd }, nil, (n - 1) * row)
 	end
 	local logits
-	logits, taps.result_norm = M.head(g, hp, self.output_norm, self.output, x)
+	logits, taps.result_norm = M.head(g, hp, self.output_norm, self.output, x, self.lora_out)
 	return logits, taps
 end
 
