@@ -1,0 +1,81 @@
+{
+  "source": "Request examples of the OpenAI API reference (Create chat completion) and the function calling, vision, logprobs and structured outputs guides. Image URLs are data URLs, as lgml takes no http URLs.",
+  "cases": [
+    {"name": "default", "reply": "chat_completion", "body":
+      {"model": "gpt-4o", "messages": [
+        {"role": "developer", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Hello!"}]}},
+    {"name": "image input", "reply": "chat_completion", "body":
+      {"model": "gpt-4o", "max_tokens": 300, "messages": [
+        {"role": "user", "content": [
+          {"type": "text", "text": "What's in this image?"},
+          {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "detail": "high"}}]}]}},
+    {"name": "streaming", "stream": true, "body":
+      {"model": "gpt-4o", "stream": true, "messages": [
+        {"role": "developer", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Hello!"}]}},
+    {"name": "streaming with usage", "stream": true, "usage": true, "body":
+      {"model": "gpt-4o", "stream": true, "stream_options": {"include_usage": true}, "messages": [
+        {"role": "user", "content": "Hello!"}]}},
+    {"name": "functions", "reply": "tool_calls", "body":
+      {"model": "gpt-4o", "tool_choice": "auto", "messages": [
+        {"role": "user", "content": "What's the weather like in Boston today?"}],
+       "tools": [{"type": "function", "function": {
+         "name": "get_current_weather", "description": "Get the current weather in a given location",
+         "parameters": {"type": "object", "properties": {
+           "location": {"type": "string", "description": "The city and state, e.g. San Francisco, CA"},
+           "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}},
+           "required": ["location"]}}}]}},
+    {"name": "streaming functions", "stream": true, "tools": true, "body":
+      {"model": "gpt-4.1", "stream": true, "messages": [
+        {"role": "user", "content": "What's the weather like in Paris today?"}],
+       "tools": [{"type": "function", "function": {
+         "name": "get_weather", "description": "Get current temperature for a given location.",
+         "strict": true,
+         "parameters": {"type": "object", "properties": {
+           "location": {"type": "string", "description": "City and country e.g. Bogotá, Colombia"}},
+           "required": ["location"], "additionalProperties": false}}}]}},
+    {"name": "tool results", "reply": "chat_completion", "body":
+      {"model": "gpt-4.1", "messages": [
+        {"role": "user", "content": "What's the weather like in Paris today?"},
+        {"role": "assistant", "content": null, "refusal": null, "annotations": [],
+         "tool_calls": [{"id": "call_12345xyz", "type": "function",
+           "function": {"name": "get_weather", "arguments": "{\"location\":\"Paris, France\"}"}}]},
+        {"role": "tool", "tool_call_id": "call_12345xyz", "content": "14"}]}},
+    {"name": "logprobs", "reply": "logprobs", "body":
+      {"model": "gpt-4o", "logprobs": true, "top_logprobs": 2, "messages": [
+        {"role": "user", "content": "Hello!"}]}},
+    {"name": "structured outputs", "reply": "chat_completion", "body":
+      {"model": "gpt-4o-2024-08-06", "messages": [
+        {"role": "system", "content": "Extract the event information."},
+        {"role": "user", "content": "Alice and Bob are going to a science fair on Friday."}],
+       "response_format": {"type": "json_schema", "json_schema": {"name": "calendar_event", "strict": true,
+         "schema": {"type": "object", "properties": {
+           "name": {"type": "string"}, "date": {"type": "string"},
+           "participants": {"type": "array", "items": {"type": "string"}}},
+           "required": ["name", "date", "participants"], "additionalProperties": false}}}}},
+    {"name": "all no-op fields", "reply": "chat_completion", "body":
+      {"model": "gpt-4o", "user": "user-1234", "safety_identifier": "hash", "metadata": {"topic": "demo"},
+       "store": false, "service_tier": "auto", "prompt_cache_key": "k", "prompt_cache_retention": "in_memory",
+       "prediction": {"type": "content", "content": "Hello"}, "modalities": ["text"],
+       "seed": 1, "temperature": 1, "top_p": 1, "n": 1, "presence_penalty": 0, "frequency_penalty": 0,
+       "max_completion_tokens": 100, "parallel_tool_calls": true, "stop": null, "logit_bias": null,
+       "messages": [{"role": "user", "content": "Hello!", "name": "alice"}]}},
+    {"name": "audio output", "status": 400, "param": "audio", "body":
+      {"model": "gpt-4o-audio-preview", "modalities": ["text"], "audio": {"voice": "alloy", "format": "wav"},
+       "messages": [{"role": "user", "content": "Is a golden retriever a good family dog?"}]}},
+    {"name": "audio modality", "status": 400, "param": "modalities", "body":
+      {"model": "gpt-4o-audio-preview", "modalities": ["text", "audio"],
+       "messages": [{"role": "user", "content": "Hello!"}]}},
+    {"name": "web search", "status": 400, "param": "web_search_options", "body":
+      {"model": "gpt-4o-search-preview", "web_search_options": {},
+       "messages": [{"role": "user", "content": "What was a positive news story from today?"}]}},
+    {"name": "legacy functions", "status": 400, "param": "functions", "body":
+      {"model": "gpt-4o", "messages": [{"role": "user", "content": "Weather in Boston?"}],
+       "functions": [{"name": "get_current_weather", "parameters": {"type": "object", "properties": {}}}]}},
+    {"name": "input audio", "status": 400, "param": "messages", "body":
+      {"model": "gpt-4o-audio-preview", "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "What is in this recording?"},
+        {"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}}]}]}}
+  ]
+}

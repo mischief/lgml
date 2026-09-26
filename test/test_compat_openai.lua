@@ -1,6 +1,7 @@
 -- OpenAI Chat Completions compatibility: the field table of docs/api.md
--- against the request checks and the openai-python request fields.
--- TAP output.
+-- against the request checks and the openai-python request fields, and
+-- OpenAI request and reply examples (test/fixtures/openai) against the
+-- server with the fake engine, in process. TAP output.
 
 local uv = require("luv")
 local json = require("lgml.json")
@@ -450,6 +451,168 @@ local function test_tool_images()
 	ok(#images == 1 and img and img > text:find("saved 2", 1, true), "an image part in a tool message (lgml)")
 end
 
+-- conformance with OpenAI examples
+
+local EX = fixture("responses.json")
+local OPTIONAL, NULLABLE = {}, {}
+for _, p in ipairs(EX.optional) do
+	OPTIONAL[p] = true
+end
+for _, p in ipairs(EX.nullable) do
+	NULLABLE[p] = true
+end
+
+local function jtype(v)
+	if v == json.null or v == nil then
+		return "null"
+	elseif type(v) == "table" then
+		return json.isarray(v) and "array" or "object"
+	end
+	return type(v)
+end
+
+-- Checks that got has each field of the example want with the same
+-- JSON type. Adds a message for each difference to bad.
+local function shape(want, got, path, bad)
+	local tw, tg = jtype(want), jtype(got)
+	if tw ~= tg and not (NULLABLE[path] and (tg == "null" or tw == "null")) and
+	    not (tw == "array" and tg == "object" and next(got) == nil) then
+		bad[#bad + 1] = ("%s: want %s, got %s"):format(path, tw, tg)
+		return
+	end
+	if tw == "object" then
+		for k, v in pairs(want) do
+			local p = path == "" and k or path .. "." .. k
+			if got[k] == nil and not OPTIONAL[p] then
+				bad[#bad + 1] = p .. ": missing"
+			elseif got[k] ~= nil then
+				shape(v, got[k], p, bad)
+			end
+		end
+	elseif tw == "array" and #want > 0 and #got > 0 then
+		shape(want[1], got[1], path .. "[]", bad)
+	end
+end
+
+local function same_shape(want, got, name)
+	local bad = {}
+	shape(want, got, "", bad)
+	ok(#bad == 0, name .. (#bad > 0 and ": " .. table.concat(bad, "; ") or ""))
+end
+
+local REASONS = { stop = true, length = true, tool_calls = true, content_filter = true }
+
+-- Checks the values that OpenAI fixes: id prefixes, object names,
+-- finish reasons and roles.
+local function check_values(b, name)
+	local good = type(b.id) == "string" and b.id:match("^chatcmpl%-%x+$") ~= nil and
+	    b.object == "chat.completion" and math.type(b.created) == "integer" and type(b.model) == "string"
+	for _, ch in ipairs(b.choices) do
+		good = good and REASONS[ch.finish_reason] and ch.message.role == "assistant"
+		for _, tc in ipairs(ch.message.tool_calls or {}) do
+			good = good and tc.id:match("^call_") and tc.type == "function" and
+			    type(tc["function"].arguments) == "string" and json.decode(tc["function"].arguments) ~= nil
+		end
+	end
+	local u = b.usage
+	good = good and u.total_tokens == u.prompt_tokens + u.completion_tokens
+	ok(good, name .. ": ids, objects, finish reasons and usage sums")
+end
+
+-- Checks a stream: framing, the chunk shapes and the end.
+local function check_stream(case, text)
+	local list, framed = events(text)
+	local name = case.name
+	ok(framed and list[#list] == "[DONE]", name .. ": data: lines and a final [DONE]")
+	local id, created, finish, role, usage_chunks, null_usage = nil, nil, {}, {}, 0, true
+	local c = EX.chunks
+	for i, ev in ipairs(list) do
+		if ev ~= "[DONE]" then
+			id = id or ev.id
+			created = created or ev.created
+			ok(ev.id == id and ev.created == created and ev.object == "chat.completion.chunk" and
+			    ev.id:match("^chatcmpl%-"), ("%s: chunk %d has the id, created and object"):format(name, i))
+			if #ev.choices == 0 then
+				usage_chunks = usage_chunks + 1
+				same_shape(c.usage, ev, name .. ": usage chunk shape")
+				ok(i == #list - 1, name .. ": the usage chunk is the last before [DONE]")
+			else
+				if case.usage then
+					null_usage = null_usage and ev.usage == json.null
+				else
+					null_usage = null_usage and ev.usage == nil
+				end
+				local ch = ev.choices[1]
+				if ch.delta.role then
+					role[ch.index] = true
+					same_shape(c.first, ev, name .. ": first chunk shape")
+				elseif ch.finish_reason ~= json.null then
+					finish[ch.index] = ch.finish_reason
+					same_shape(c.last, ev, name .. ": last chunk shape")
+				elseif ch.delta.content then
+					same_shape(c.content, ev, name .. ": content chunk shape")
+				end
+			end
+		end
+	end
+	ok(role[0] and REASONS[finish[0]], name .. ": the choice has a role chunk and a finish chunk")
+	ok(usage_chunks == (case.usage and 1 or 0), name .. ": a usage chunk only with include_usage")
+	ok(null_usage, name .. ": other chunks have usage null with include_usage, else no usage")
+	return list
+end
+
+-- The tool call fragments of a stream follow the OpenAI rules.
+local function check_stream_tools(case, list)
+	local calls, good, n = {}, true, 0
+	for _, ev in ipairs(list) do
+		local ch = type(ev) == "table" and ev.choices[1]
+		for _, tc in ipairs(ch and ch.delta.tool_calls or {}) do
+			n = n + 1
+			local have = calls[tc.index]
+			if not have then
+				same_shape(EX.chunks.tool_first, ev, case.name .. ": first tool call chunk shape")
+				good = good and tc.id:match("^call_") and tc.type == "function" and
+				    tc["function"].arguments == ""
+				calls[tc.index] = { name = tc["function"].name, args = {} }
+			else
+				same_shape(EX.chunks.tool_args, ev, case.name .. ": tool arguments chunk shape")
+				good = good and tc.id == nil and tc.type == nil and tc["function"].name == nil and
+				    type(tc["function"].arguments) == "string"
+				have.args[#have.args + 1] = tc["function"].arguments
+			end
+		end
+	end
+	local call = calls[0]
+	local args = call and json.decode(table.concat(call.args))
+	ok(good and n >= 2 and call.name == "get_weather" and args and args.city == "Paris",
+	    case.name .. ": the name comes whole in the first fragment; arguments are string pieces")
+end
+
+local function test_conformance()
+	for _, case in ipairs(fixture("requests.json").cases) do
+		local status, headers, text = post(case.body)
+		if case.status then
+			local b = json.decode(text)
+			ok(status == case.status and b.error and b.error.param == case.param and
+			    type(b.error.message) == "string" and b.error.type == "invalid_request_error",
+			    ("%s: %d with param %s: %s"):format(case.name, case.status, case.param,
+			    tostring(b.error and b.error.message)))
+		elseif case.stream then
+			ok(status == 200 and headers["content-type"] == "text/event-stream",
+			    case.name .. ": 200 with an event stream")
+			local list = check_stream(case, text)
+			if case.tools then
+				check_stream_tools(case, list)
+			end
+		else
+			local b = json.decode(text)
+			ok(status == 200 and headers["content-type"] == "application/json", case.name .. ": 200 with JSON")
+			same_shape(EX[case.reply], b, case.name .. ": reply has the shape of the OpenAI example")
+			check_values(b, case.name)
+		end
+	end
+end
+
 test_field_table()
 test_messages()
 test_tool_images()
@@ -458,5 +621,6 @@ test_tool_choice()
 test_reply_table()
 test_stop()
 test_logprobs()
+test_conformance()
 print("1.." .. n)
 os.exit(failed == 0 and 0 or 1)

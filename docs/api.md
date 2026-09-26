@@ -182,7 +182,12 @@ openai-python SDK. Status values:
   supports it.
 
 `test/test_compat_openai.lua` reads this table and checks it against
-the request checks (`lgml.server.chat_request.FIELDS`).
+the request checks (`lgml.server.chat_request.FIELDS`). It also sends
+the request examples of the OpenAI reference (in
+`test/fixtures/openai`) to the server with the fake engine, and checks
+each reply against the OpenAI reply examples: the fields and their
+types, the id prefixes, the object names, the finish reasons, the
+usage, the event stream framing and the tool call fragments.
 
 ### Request fields
 

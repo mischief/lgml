@@ -1,0 +1,61 @@
+{
+  "source": "Response examples of the OpenAI API reference: the chat completion object, the chunk object, and the tool call and logprobs examples.",
+  "optional": ["service_tier", "choices[].message.annotations", "system_fingerprint"],
+  "nullable": ["system_fingerprint", "choices[].message.content"],
+  "chat_completion": {
+    "id": "chatcmpl-B9MBs8CjcvOU2jLn4n570S5qMJKcT", "object": "chat.completion", "created": 1741569952,
+    "model": "gpt-4.1-2025-04-14",
+    "choices": [{"index": 0,
+      "message": {"role": "assistant", "content": "Hello! How can I assist you today?", "refusal": null,
+        "annotations": []},
+      "logprobs": null, "finish_reason": "stop"}],
+    "usage": {"prompt_tokens": 19, "completion_tokens": 10, "total_tokens": 29,
+      "prompt_tokens_details": {"cached_tokens": 0, "audio_tokens": 0},
+      "completion_tokens_details": {"reasoning_tokens": 0, "audio_tokens": 0,
+        "accepted_prediction_tokens": 0, "rejected_prediction_tokens": 0}},
+    "service_tier": "default"
+  },
+  "tool_calls": {
+    "id": "chatcmpl-abc123", "object": "chat.completion", "created": 1699896916, "model": "gpt-4o-mini",
+    "choices": [{"index": 0,
+      "message": {"role": "assistant", "content": null, "refusal": null,
+        "tool_calls": [{"id": "call_abc123", "type": "function",
+          "function": {"name": "get_current_weather", "arguments": "{\n\"location\": \"Boston, MA\"\n}"}}]},
+      "logprobs": null, "finish_reason": "tool_calls"}],
+    "usage": {"prompt_tokens": 82, "completion_tokens": 17, "total_tokens": 99,
+      "completion_tokens_details": {"reasoning_tokens": 0, "accepted_prediction_tokens": 0,
+        "rejected_prediction_tokens": 0}}
+  },
+  "logprobs": {
+    "id": "chatcmpl-123", "object": "chat.completion", "created": 1702685778, "model": "gpt-4o-mini",
+    "choices": [{"index": 0,
+      "message": {"role": "assistant", "content": "Hello! How can I assist you today?"},
+      "logprobs": {"content": [{"token": "Hello", "logprob": -0.31725305, "bytes": [72, 101, 108, 108, 111],
+        "top_logprobs": [{"token": "Hello", "logprob": -0.31725305, "bytes": [72, 101, 108, 108, 111]},
+          {"token": "Hi", "logprob": -1.3190403, "bytes": [72, 105]}]}]},
+      "finish_reason": "stop"}],
+    "usage": {"prompt_tokens": 9, "completion_tokens": 9, "total_tokens": 18}
+  },
+  "chunks": {
+    "first": {"id": "chatcmpl-123", "object": "chat.completion.chunk", "created": 1694268190,
+      "model": "gpt-4o-mini", "system_fingerprint": "fp_44709d6fcb",
+      "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "logprobs": null,
+        "finish_reason": null}]},
+    "content": {"id": "chatcmpl-123", "object": "chat.completion.chunk", "created": 1694268190,
+      "model": "gpt-4o-mini", "system_fingerprint": "fp_44709d6fcb",
+      "choices": [{"index": 0, "delta": {"content": "Hello"}, "logprobs": null, "finish_reason": null}]},
+    "last": {"id": "chatcmpl-123", "object": "chat.completion.chunk", "created": 1694268190,
+      "model": "gpt-4o-mini", "system_fingerprint": "fp_44709d6fcb",
+      "choices": [{"index": 0, "delta": {}, "logprobs": null, "finish_reason": "stop"}]},
+    "usage": {"id": "chatcmpl-123", "object": "chat.completion.chunk", "created": 1694268190,
+      "model": "gpt-4o-mini", "system_fingerprint": "fp_44709d6fcb", "choices": [],
+      "usage": {"prompt_tokens": 9, "completion_tokens": 9, "total_tokens": 18}},
+    "tool_first": {"id": "chatcmpl-123", "object": "chat.completion.chunk", "created": 1694268190,
+      "model": "gpt-4.1", "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0,
+        "id": "call_DdmO9pD3xa9XTPNJ32zg2hcA", "type": "function",
+        "function": {"name": "get_weather", "arguments": ""}}]}, "logprobs": null, "finish_reason": null}]},
+    "tool_args": {"id": "chatcmpl-123", "object": "chat.completion.chunk", "created": 1694268190,
+      "model": "gpt-4.1", "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0,
+        "function": {"arguments": "{\""}}]}, "logprobs": null, "finish_reason": null}]}
+  }
+}
