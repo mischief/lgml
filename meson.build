@@ -116,6 +116,7 @@ if lua_bin.found()
   test('basic', lua_bin, args : [files('test/test_basic.lua')], timeout : 60)
   test('json', lua_bin, args : [files('test/test_json.lua')], timeout : 60)
   test('strict', lua_bin, args : [files('test/test_strict.lua')], timeout : 30)
+  test('log', lua_bin, args : [files('test/test_log.lua')], timeout : 30)
   test('http', lua_bin, args : [files('test/test_http.lua')], timeout : 60)
   test('openapi', lua_bin, args : [files('test/test_openapi.lua')], timeout : 30)
   test('tokenize', lua_bin, args : [files('test/test_tokenize.lua')],
