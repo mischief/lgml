@@ -119,6 +119,7 @@ if lua_bin.found()
   test('log', lua_bin, args : [files('test/test_log.lua')], timeout : 30)
   test('http', lua_bin, args : [files('test/test_http.lua')], timeout : 60)
   test('openapi', lua_bin, args : [files('test/test_openapi.lua')], timeout : 30)
+  test('compat_openai', lua_bin, args : [files('test/test_compat_openai.lua')], timeout : 60)
   test('tokenize', lua_bin, args : [files('test/test_tokenize.lua')],
     env : { 'LGML_VOCAB_DIR' : get_option('vocab_dir'),
       'LGML_TOK_MODEL' : get_option('model'),

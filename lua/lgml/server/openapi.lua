@@ -64,34 +64,54 @@ local function ext(s)
 	return s
 end
 
+local JSON_TYPES = { boolean = "boolean", number = "number", string = "string" }
+
 --- Makes the schema of one field table entry.
--- The entry is `{ name, Lua type, check, text }`. A "table" whose check
--- accepts an array and not an object is an array; other tables are
--- objects. text becomes the description.
+-- The entry is `{ name, Lua type, check, text }`; the Lua type can be
+-- several names joined by `|`. A "table" whose check accepts an array
+-- and not an object is an array; other tables are objects. text
+-- becomes the description.
 -- @tparam table c the entry
 -- @treturn table the schema
 function M.field_schema(c)
-	local s
-	if c[2] == "table" then
-		local pred = c[3]
-		s = { type = (pred and pred(json.array()) and not pred({})) and "array" or "object" }
-	else
-		s = { type = c[2] }
+	local types = {}
+	for t in c[2]:gmatch("[^|]+") do
+		if t == "table" then
+			local pred = c[3]
+			types[#types + 1] = (pred and pred(json.array()) and not pred({})) and "array" or "object"
+		else
+			types[#types + 1] = JSON_TYPES[t] or t
+		end
 	end
+	local s = { type = #types == 1 and types[1] or json.array(types) }
 	if c[4] then
 		s.description = "Must be " .. c[4] .. "."
 	end
 	return s
 end
 
--- Adds the entries of a field table to props. note gives a
--- description for fields whose entry has no text.
+-- Adds the entries of a field table to props. A field that props has
+-- keeps its schema; the check text goes after its description. note
+-- gives a description for fields whose entry has no text. An entry
+-- with a status or a label other than OpenAI marks the schema.
 local function add_fields(props, tbl, note, skip)
 	for _, c in ipairs(tbl) do
 		if not (skip and skip[c[1]]) then
 			local s = M.field_schema(c)
+			local have = props[c[1]]
+			if have then
+				if s.description then
+					have.description = have.description and have.description .. " " .. s.description
+					    or s.description
+				end
+				s = have
+			end
 			if not s.description and note[c[1]] then
 				s.description = note[c[1]]
+			end
+			s["x-lgml-status"] = c.status
+			if c.label and c.label ~= "OpenAI" then
+				ext(s)
 			end
 			props[c[1]] = s
 		end
@@ -108,24 +128,22 @@ local CHAT_NOTES = {
 	top_p = "Nucleus sampling threshold.",
 }
 
--- Fields that engines read and that check_chat does not check.
+-- Schemas of chat fields with more shape than their CHAT_FIELDS entry
+-- gives.
 local function chat_extras()
 	return {
 		messages = arr(ref("ChatMessage"), "A non-empty array of messages."),
-		grammar = ext(str("GBNF grammar for the answer (llama.cpp). Not with a JSON schema.")),
+		grammar = str("GBNF grammar for the answer (llama.cpp). Not with a JSON schema."),
 		response_format = obj({
 			type = { type = "string", enum = json.array({ "text", "json_object", "json_schema" }) },
 			json_schema = obj({ schema = { type = "object" } }),
 			schema = { type = "object" },
 		}, { "type" }, "Constrains the answer to JSON; json_object may carry `schema` (llama.cpp)."),
-		json_schema = ext({ type = "object", description = "JSON schema for the answer (llama.cpp)." }),
-		seed = ext(int("Sampler seed.")),
-		top_k = ext(int("Top-k sampling.")),
-		min_p = ext(num("Min-p sampling.")),
-		presence_penalty = num("Presence penalty."),
-		frequency_penalty = num("Frequency penalty."),
-		repeat_penalty = ext(num("Repeat penalty.")),
+		json_schema = { type = "object", description = "JSON schema for the answer (llama.cpp)." },
+		seed = int("Sampler seed."),
+		top_k = int("Top-k sampling."),
 		reasoning_effort = str('"none" turns thinking off; other values leave it on.'),
+		tools = arr(ref("Tool")),
 		chat_template_kwargs = ext(obj({
 			enable_thinking = { type = "boolean" },
 			reasoning_effort = { type = "string" },
@@ -145,7 +163,10 @@ local function chat_schemas(c)
 			obj({ type = { const = "text" }, text = str() }, { "type", "text" }),
 			obj({
 				type = { const = "image_url" },
-				image_url = { oneOf = json.array({ str(), obj({ url = str() }, { "url" }) }) },
+				image_url = { oneOf = json.array({ str(), obj({
+					url = str(), detail = { type = "string", enum = json.array({ "auto", "low", "high" }),
+					    description = "No effect." },
+				}, { "url" }) }) },
 			}, { "type", "image_url" }, "A data URL of a PNG or JPEG image. Needs a model with vision."),
 		}),
 	}
@@ -155,7 +176,18 @@ local function chat_schemas(c)
 		reasoning_content = ext(str("Reasoning text of an earlier assistant turn.")),
 		tool_calls = arr(ref("ToolCall")),
 		tool_call_id = str(),
+		name = str("No effect."),
+		annotations = arr({ type = "object" }, "No effect."),
+		refusal = { type = { "string", "null" }, description = "Only null or empty." },
 	}, { "role" })
+	c.ChatMessage.additionalProperties = false
+	c.Tool = obj({
+		type = { const = "function" },
+		["function"] = obj({
+			name = str(), description = str(), parameters = { type = "object" },
+			strict = { type = "boolean" },
+		}, { "name" }),
+	}, { "type", "function" })
 	c.ToolCall = obj({
 		id = str(), type = { const = "function" },
 		["function"] = obj({
@@ -559,7 +591,8 @@ function M.document(routes)
 		info = {
 			title = "lgml", version = "scm", license = { name = "ISC", identifier = "ISC" },
 			description = "OpenAI-shaped API of lgml-server. docs/api.md has the full reference. " ..
-			    "Fields marked x-lgml-extension are lgml or llama.cpp extensions.",
+			    "Fields marked x-lgml-extension are lgml or llama.cpp extensions. " ..
+			    "x-lgml-status gives the compatibility status of a chat request field.",
 		},
 		tags = json.array({
 			{ name = "openai", description = "OpenAI-compatible, with lgml extensions." },

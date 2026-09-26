@@ -15,7 +15,6 @@ local metrics = require("lgml.server.metrics")
 local detect = require("lgml.detect")
 local media = require("lgml.chat.media")
 local systemone = require("lgml.systemone")
-local grammar = require("lgml.grammar")
 local base64 = require("lgml.base64")
 local log = require("lgml.log")
 
@@ -33,12 +32,11 @@ end
 
 -- request checks
 
-local ROLES = {
-	system = true, developer = true, user = true, assistant = true,
-	tool = true,
-}
+local chat_request = require("lgml.server.chat_request")
+
 --- The message roles that a chat request can use, as a set. Read only.
-M.MESSAGE_ROLES = ROLES
+-- This is `lgml.server.chat_request.MESSAGE_ROLES`.
+M.MESSAGE_ROLES = chat_request.MESSAGE_ROLES
 
 -- Removes top-level nulls, so "max_tokens": null reads as absent.
 local function strip_nulls(b)
@@ -49,149 +47,18 @@ local function strip_nulls(b)
 	end
 end
 
-local function is_object(v)
-	return type(v) == "table" and not json.isarray(v)
-end
+--- The top-level fields of a chat request, with their checks and
+-- compatibility status. This is `lgml.server.chat_request.FIELDS`.
+M.CHAT_FIELDS = chat_request.FIELDS
 
--- Content is a string, null or an array of parts. A text part has a
--- string text; an image_url part has a URL string, in image_url.url
--- or as image_url itself.
-local function check_content(c)
-	if c == nil or c == json.null or type(c) == "string" then
-		return true
-	elseif not json.isarray(c) then
-		return false
-	end
-	for _, part in ipairs(c) do
-		if not is_object(part) or type(part.type) ~= "string" or
-		    (part.type == "text" and type(part.text) ~= "string") then
-			return false
-		end
-		local u = part.image_url
-		if part.type == "image_url" and type(u) ~= "string" and
-		    not (is_object(u) and type(u.url) == "string") then
-			return false
-		end
-	end
-	return true
-end
-
--- Each call names a function; arguments is a string or an object.
-local function check_tool_calls(calls)
-	if not json.isarray(calls) then
-		return false
-	end
-	for _, tc in ipairs(calls) do
-		local f = is_object(tc) and (tc["function"] or tc)
-		if not is_object(f) or type(f.name) ~= "string" or
-		    (type(f.arguments) ~= "string" and not is_object(f.arguments)) then
-			return false
-		end
-	end
-	return true
-end
-
--- Checks the fields the chat template reads. A null tool_calls or
--- reasoning_content reads as absent.
-local function check_messages(msgs)
-	if type(msgs) ~= "table" or not json.isarray(msgs) or #msgs == 0 then
-		return nil, "messages must be a non-empty array"
-	end
-	for i, m in ipairs(msgs) do
-		local at = ("messages[%d]"):format(i - 1)
-		if not is_object(m) or not ROLES[m.role] then
-			return nil, at .. ".role is not valid"
-		end
-		strip_nulls(m)
-		if not check_content(m.content) then
-			return nil, at .. ".content is not valid"
-		elseif m.reasoning_content ~= nil and type(m.reasoning_content) ~= "string" then
-			return nil, at .. ".reasoning_content is not valid"
-		elseif m.tool_calls ~= nil and not check_tool_calls(m.tool_calls) then
-			return nil, at .. ".tool_calls is not valid"
-		end
-	end
-	return true
-end
-
-local function check_type(b, key, want, pred)
-	local v = b[key]
-	if v ~= nil and (type(v) ~= want or (pred and not pred(v))) then
-		return nil, key .. " is not valid"
-	end
-	return true
-end
-
--- lgml.json decodes whole numbers as integers, so 5 and 5.0 both pass.
-local function positive_int(v)
-	local i = math.tointeger(v)
-	return i ~= nil and i > 0
-end
-
-local function is_list(v)
-	return json.isarray(v)
-end
-
-local CHECKS = {
-	{ "model", "string" }, { "stream", "boolean" },
-	{ "stream_options", "table" }, { "temperature", "number" },
-	{ "top_p", "number" }, { "max_tokens", "number", positive_int, "a positive integer" },
-	{ "max_completion_tokens", "number", positive_int, "a positive integer" },
-	{ "tools", "table", is_list, "an array" },
-	{ "n", "number", function(v) return v == 1 end, "1" },
-}
---- The top-level fields of a chat request that `check_chat` checks.
--- Each entry is `{ name, Lua type, check, text }`; check and text are
--- optional. text tells what check accepts. Read only.
-M.CHAT_FIELDS = CHECKS
-
---- Checks a chat request body.
--- It removes top-level nulls and nulls in each message. It checks the
--- messages and the types of `model`, `stream`, `stream_options`,
--- `temperature`, `top_p`, `max_tokens`, `max_completion_tokens`,
--- `tools` and `n` (only 1). It turns `grammar`, `response_format` or
--- `json_schema` into GBNF text in `grammar` and checks it (see
--- `lgml.grammar`); with raw, schema properties keep their order.
+--- Checks a chat request body. This is `lgml.server.chat_request.check`.
 -- @tparam any b the decoded body
 -- @tparam[opt] string raw the body text
 -- @treturn[1] boolean true
 -- @treturn[2] nil
 -- @treturn[2] string an error message
 -- @treturn[2] ?string the bad parameter name
-function M.check_chat(b, raw)
-	if type(b) ~= "table" or json.isarray(b) then
-		return nil, "request body must be a JSON object"
-	end
-	strip_nulls(b)
-	local ok, err = check_messages(b.messages)
-	if not ok then
-		return nil, err, "messages"
-	end
-	for _, c in ipairs(CHECKS) do
-		ok, err = check_type(b, c[1], c[2], c[3])
-		if not ok then
-			return nil, err, c[1]
-		end
-	end
-	if raw and type(b.response_format) == "table" then
-		local o = require("lgml.json_schema").decode(raw)
-		if type(o) == "table" and type(o.response_format) == "table" then
-			b.response_format = o.response_format
-		end
-	end
-	local text, param
-	text, err, param = grammar.from_request(b)
-	if err then
-		return nil, err, param
-	elseif text then
-		ok, err = grammar.check(text)
-		if not ok then
-			return nil, err, b.grammar and "grammar" or "response_format"
-		end
-		b.grammar, b.response_format, b.json_schema = text, nil, nil
-	end
-	return true
-end
+M.check_chat = chat_request.check
 
 -- sink
 

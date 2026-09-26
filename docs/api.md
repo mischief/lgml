@@ -17,6 +17,7 @@ Labels in this file:
 - [Common behavior](#common-behavior)
 - [Errors](#errors)
 - [Response headers](#response-headers)
+- [Compatibility](#compatibility)
 - [Chat completions](#chat-completions)
 - [Images](#images)
 - [Speech](#speech)
@@ -68,8 +69,9 @@ one row are aliases for one handler.
   connection closes after 60 s.
 - `Expect: 100-continue` gets `100 Continue`.
 - There is no authentication. An `Authorization` header has no effect.
-- Unknown JSON fields are ignored, except on `/v1/systemone`, which
-  rejects them.
+- A chat request with a field that the server does not know gives
+  400 (see [Compatibility](#compatibility)), and so does
+  `/v1/systemone`. The other routes ignore unknown fields.
 - A JSON `null` at the top level of a chat or image request reads as
   an absent field.
 - When the client closes the connection, the server cancels the work.
@@ -150,6 +152,101 @@ A streamed chat reply has no `x-lgml-*` headers. Its last chunk holds
 the `timings` object instead. With `--cors`, browsers can read these
 headers (`Access-Control-Expose-Headers: *`).
 
+## Compatibility
+
+`POST /v1/chat/completions` is a superset of the OpenAI Chat
+Completions API:
+
+- The server accepts each request that the OpenAI API accepts. A
+  standard OpenAI client works with no change.
+- A field that lgml cannot do as the OpenAI reference says gives 400
+  with an OpenAI error object. Its `param` names the field. The server
+  does not ignore such a field.
+- A field that the OpenAI API does not know, and that is not an
+  extension in the table below, gives 400, as the OpenAI API does.
+- The extensions (llama.cpp and lgml fields) are optional. The server
+  never requires them.
+
+The request fields list is the one of `CompletionCreateParams` in the
+openai-python SDK. Status values:
+
+- **supported**: the server does what the OpenAI reference says.
+- **limited**: supported, with the limits in the notes.
+- **no-op**: accepted. It has no effect. For OpenAI it only labels,
+  stores or routes the request, or it changes speed or cost only.
+- **rejected**: a value other than the default gives 400.
+- **planned**: a value other than the default gives 400 until lgml
+  supports it.
+
+`test/test_compat_openai.lua` reads this table and checks it against
+the request checks (`lgml.server.chat_request.FIELDS`).
+
+### Request fields
+
+| Field | Label | Status | Notes |
+| --- | --- | --- | --- |
+| `messages` | OpenAI | supported | See [Messages](#messages). |
+| `model` | OpenAI | supported | See [Model selection](#model-selection). |
+| `stream` | OpenAI | supported | See [Streaming](#streaming). |
+| `stream_options` | OpenAI | supported | `include_usage` adds a usage chunk. `include_obfuscation` has no effect: the server sends no `obfuscation` field. |
+| `max_tokens` | OpenAI | supported | A positive integer. Default: the rest of the context. |
+| `max_completion_tokens` | OpenAI | supported | As `max_tokens`; it counts reasoning tokens too. It wins when both are set. |
+| `temperature` | OpenAI | supported | A number from 0. 0 picks the most likely token. |
+| `top_p` | OpenAI | supported | From 0 to 1. |
+| `presence_penalty` | OpenAI | supported | From -2 to 2. |
+| `frequency_penalty` | OpenAI | supported | From -2 to 2. |
+| `seed` | OpenAI | supported | Sampler seed. The same seed and request give the same reply on the same build. |
+| `stop` | OpenAI | planned | A value gives 400. |
+| `n` | OpenAI | planned | Only 1. |
+| `logprobs` | OpenAI | planned | Only `false`. |
+| `top_logprobs` | OpenAI | planned | A value gives 400. |
+| `logit_bias` | OpenAI | planned | Only `{}`. |
+| `tools` | OpenAI | limited | Function tools only. A `custom` tool gives 400. `strict` is accepted; the arguments follow the schema only when `tool_choice` forces a call. |
+| `tool_choice` | OpenAI | planned | Only `"auto"`. |
+| `parallel_tool_calls` | OpenAI | planned | Only `true`. |
+| `response_format` | OpenAI | supported | See [Constrained output](#constrained-output). |
+| `reasoning_effort` | OpenAI | limited | `none` turns thinking off. The other values turn it on and do not change its length. |
+| `modalities` | OpenAI | limited | Only `["text"]`. |
+| `user` | OpenAI | no-op | A string. |
+| `safety_identifier` | OpenAI | no-op | A string. |
+| `metadata` | OpenAI | no-op | At most 16 string values. |
+| `store` | OpenAI | no-op | The server stores nothing. |
+| `service_tier` | OpenAI | no-op | `auto`, `default`, `flex`, `scale`, `priority` or `fast`. |
+| `prompt_cache_key` | OpenAI | no-op | The server reuses each shared prompt prefix; see `timings.cache_n`. |
+| `prompt_cache_retention` | OpenAI | no-op | `in_memory` or `24h`. |
+| `prompt_cache_options` | OpenAI | no-op | `mode` and `ttl`. |
+| `prediction` | OpenAI | no-op | The reply is the same without it. |
+| `verbosity` | OpenAI | rejected | Only `medium`. |
+| `audio` | OpenAI | rejected | No audio output. |
+| `moderation` | OpenAI | rejected | No moderation. |
+| `web_search_options` | OpenAI | rejected | No web search. |
+| `functions` | OpenAI | rejected | Deprecated by OpenAI. Use `tools`. |
+| `function_call` | OpenAI | rejected | Deprecated by OpenAI. Use `tool_choice`. |
+| `top_k` | llama.cpp | supported | Top-k sampling; 0 turns it off. |
+| `min_p` | llama.cpp | supported | Min-p sampling, from 0 to 1. |
+| `repeat_penalty` | llama.cpp | supported | Repeat penalty, above 0. |
+| `grammar` | llama.cpp | supported | GBNF text for the answer. |
+| `json_schema` | llama.cpp | supported | A JSON schema for the answer. |
+| `chat_template_kwargs` | llama.cpp | supported | `enable_thinking`, `reasoning_effort` (a string for the template), `preserve_thinking` (false drops old reasoning). |
+| `lora` | llama.cpp | supported | Adapter scales for this request: `[{"id": 0, "scale": 0.5}]`. Adapters that the list does not name get scale 0. Without `lora`, the global scales apply; see [Server properties and adapters](#server-properties-and-adapters). |
+
+### Message fields
+
+| Field | Status | Notes |
+| --- | --- | --- |
+| `role` | supported | `system`, `developer`, `user`, `assistant` or `tool`. The deprecated `function` role gives 400. |
+| `content` | limited | A string, `null`, or text and `image_url` parts. `input_audio` and `file` parts give 400. |
+| `name` | no-op | The chat templates have no field for it. |
+| `tool_calls` | supported | Function calls only. |
+| `tool_call_id` | supported | Passed to the chat template. |
+| `refusal` | rejected | Only `null` or `""`. |
+| `annotations` | no-op | An array. |
+| `audio`, `function_call` | rejected | 400. |
+| `reasoning_content` | supported | llama.cpp: the reasoning of an earlier assistant turn. |
+
+An `image_url.detail` value (`auto`, `low` or `high`) has no effect.
+A text part can have `prompt_cache_breakpoint`; it has no effect.
+
 ## Chat completions
 
 `POST /v1/chat/completions` (alias `/chat/completions`). OpenAI, with
@@ -157,32 +254,10 @@ llama.cpp and lgml extensions.
 
 ### Request
 
-| Field | Type | Label | Notes |
-| --- | --- | --- | --- |
-| `messages` | array | OpenAI | Required, not empty. See [Messages](#messages). |
-| `model` | string | OpenAI | See [Model selection](#model-selection). |
-| `stream` | boolean | OpenAI | Send server-sent events. Default false. |
-| `stream_options` | object | OpenAI | `include_usage: true` adds a usage chunk at the end of a stream. |
-| `max_tokens`, `max_completion_tokens` | integer | OpenAI | A positive integer. `max_completion_tokens` wins when both are set. Default: the rest of the context. |
-| `temperature` | number | OpenAI | Sampler temperature. |
-| `top_p` | number | OpenAI | Nucleus sampling. |
-| `presence_penalty`, `frequency_penalty` | number | OpenAI | Sampler penalties. |
-| `seed` | integer | OpenAI | Sampler seed. |
-| `n` | integer | OpenAI | Only 1. |
-| `tools` | array | OpenAI | Function tools. The chat template renders them. |
-| `response_format` | object | OpenAI | See [Constrained output](#constrained-output). |
-| `top_k`, `min_p`, `repeat_penalty` | number | llama.cpp | Sampler settings. |
-| `grammar` | string | llama.cpp | GBNF grammar for the answer. |
-| `json_schema` | object | llama.cpp | JSON schema for the answer. |
-| `lora` | array | llama.cpp | Adapter scales for this request: `[{"id": 0, "scale": 0.5}]`. Adapters that the list does not name get scale 0. Without `lora`, the global scales apply; see [Server properties and adapters](#server-properties-and-adapters). |
-| `chat_template_kwargs` | object | llama.cpp | `enable_thinking`, `reasoning_effort` (a string for the template), `preserve_thinking` (false drops old reasoning). |
-| `reasoning_effort` | string | OpenAI | `"none"` turns thinking off. Other values leave it on. |
-
-The server checks the types of `model`, `stream`, `stream_options`,
-`temperature`, `top_p`, `max_tokens`, `max_completion_tokens`, `tools`
-and `n`, and each message. A failed check gives 400 with `param`. The
-engine reads the other fields. It ignores fields that it does not
-know, such as `stop`, `tool_choice`, `logprobs` and `user`.
+The [Compatibility](#compatibility) section lists each request field
+with its status. The server checks each field and each message; a
+failed check gives 400 with `param`. A field that is not in the table
+gives 400.
 
 Thinking is on by default for templates that have it.
 `chat_template_kwargs.enable_thinking` decides when it is set. Else
@@ -207,9 +282,11 @@ Each message is an object:
   earlier assistant turn.
 - `tool_calls`: an array. Each call has `function.name` and
   `function.arguments`, a JSON string or an object.
-- `tool_call_id`, `name`: passed to the chat template.
+- `tool_call_id`: passed to the chat template.
+- `name`, `annotations`: accepted; they have no effect.
 
-A `null` field in a message reads as absent.
+A `null` field in a message reads as absent. Another field gives 400;
+see [Message fields](#message-fields).
 
 Image input:
 
