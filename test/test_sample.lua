@@ -145,6 +145,28 @@ for _, name in ipairs(names) do
 	ln:accept(3)
 	ok(ln:sample(xr) == 1, tag .. "repeat_last_n drops old ids")
 
+	-- logit_bias
+	local lb = lgml.sampler({ temperature = 0, logit_bias = { [2] = 5, [9] = 100 } })
+	ok(lb:sample(x) == 2, tag .. "logit_bias raises a token; ids past the vocab do nothing")
+	local ban = lgml.sampler({ temperature = 0, logit_bias = { [1] = -100 } })
+	ok(ban:sample(x) == 2, tag .. "logit_bias -100 bans a token")
+	ok(not pcall(lgml.sampler, { logit_bias = { a = 1 } }), tag .. "logit_bias needs id keys")
+
+	-- logprobs
+	local lpx <close> = tensor(logs({ 0.1, 0.2, 0.3, 0.4 }))
+	local lp = lgml.sampler({ temperature = 0 })
+	ok(not pcall(lp.logprobs, lp, 0), tag .. "logprobs before a sample is an error")
+	local pick = lp:sample(lpx)
+	local v, top = lp:logprobs(pick, 3)
+	ok(pick == 3 and math.abs(v - math.log(0.4)) < 1e-5, tag .. "logprob of the pick")
+	ok(#top == 3 and top[1][1] == 3 and top[2][1] == 2 and top[3][1] == 1 and
+	    math.abs(top[3][2] - math.log(0.2)) < 1e-5, tag .. "top logprobs, most likely first")
+	local _, none = lp:logprobs(0)
+	ok(#none == 0 and not pcall(lp.logprobs, lp, 4), tag .. "k defaults to 0; a bad id is an error")
+	local lpb = lgml.sampler({ temperature = 0, logit_bias = { [0] = math.log(4) } })
+	lpb:sample(lpx)
+	ok(math.abs(lpb:logprobs(0) - math.log(0.4 / 1.3)) < 1e-5, tag .. "logprobs include logit_bias")
+
 	-- top_p and min_p
 	local q = { 0.5, 0.3, 0.15, 0.05 }
 	local xq <close> = tensor(logs(q))

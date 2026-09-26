@@ -40,6 +40,11 @@ struct sampler {
 	float		 pres;
 	int32_t		 last_n;
 
+	/* logit_bias: nbias pairs of token id and bias. */
+	int32_t		*bias_id;
+	float		*bias;
+	int32_t		 nbias;
+
 	uint64_t	 rng[4];
 
 	/* Buffers, sized for vocab entries. */
@@ -189,12 +194,52 @@ ensure_vocab(lua_State *L, struct sampler *s, int64_t vocab)
 	}
 }
 
+/* Read opts.logit_bias, a table of token id to bias, into s. */
+static void
+read_bias(lua_State *L, struct sampler *s)
+{
+	lua_Integer id;
+	int32_t n = 0, k = 0;
+	int isint;
+
+	if (lua_getfield(L, 1, "logit_bias") == LUA_TNIL) {
+		lua_pop(L, 1);
+		return;
+	}
+	luaL_argcheck(L, lua_istable(L, -1), 1, "logit_bias must be a table");
+	lua_pushnil(L);
+	while (lua_next(L, -2) != 0) {
+		n++;
+		lua_pop(L, 1);
+	}
+	if (n > 0) {
+		s->bias_id = malloc((size_t)n * sizeof(*s->bias_id));
+		s->bias = malloc((size_t)n * sizeof(*s->bias));
+		if (s->bias_id == NULL || s->bias == NULL)
+			luaL_error(L, "out of memory");
+	}
+	lua_pushnil(L);
+	while (lua_next(L, -2) != 0 && k < n) {
+		id = lua_tointegerx(L, -2, &isint);
+		if (!isint || id < 0 || id > INT32_MAX || !lua_isnumber(L, -1))
+			luaL_error(L, "logit_bias: need token id keys and number values");
+		s->bias_id[k] = (int32_t)id;
+		s->bias[k] = (float)lua_tonumber(L, -1);
+		k++;
+		lua_pop(L, 1);
+	}
+	s->nbias = k;
+	lua_pop(L, 1);
+}
+
 /*** Make a token sampler.
  * The chain follows llama.cpp: penalties, `top_k`, `top_p`, `min_p`,
  * temperature, then a draw. opts fields and defaults: temperature (0.8;
  * <= 0 picks the largest logit), `top_k` (40; 0 is off), `top_p` (0.95),
  * `min_p` (0.05), `repeat_penalty` (1), `frequency_penalty` (0),
  * `presence_penalty` (0), `repeat_last_n` (64), seed (from the clock).
+ * `logit_bias` is a table of token id to a number that the sampler adds
+ * to the logit of that id before the penalties.
  * grammar is GBNF text; tokens must then fit it (see `sampler:sample`).
  * It needs tokenizer, an object with `n_vocab`, `token` and `special`
  * methods; `grammar_root` names the start rule (default "root").
@@ -252,6 +297,7 @@ l_sampler(lua_State *L)
 			return luaL_error(L, "out of memory");
 	}
 	s->closed = 0;
+	read_bias(L, s);
 	if (lua_getfield(L, 1, "grammar") == LUA_TNIL) {
 		lua_pop(L, 1);
 		return 1;
@@ -289,6 +335,11 @@ sampler_close(lua_State *L)
 	free_buffers(s);
 	free(s->hist);
 	s->hist = NULL;
+	free(s->bias_id);
+	free(s->bias);
+	s->bias_id = NULL;
+	s->bias = NULL;
+	s->nbias = 0;
 	grammar_free(s->g);
 	s->g = NULL;
 	free(s->mask);
@@ -741,15 +792,66 @@ static int
 sampler_sample(lua_State *L)
 {
 	struct sampler *s = check_sampler(L, 1);
-	int32_t id;
+	int32_t id, i;
 
 	read_row(L, s, 2);
+	for (i = 0; i < s->nbias; i++)
+		if (s->bias_id[i] < s->vocab)
+			s->logits[s->bias_id[i]] += s->bias[i];
 	apply_penalties(s);
 	id = chain(s);
 	if (s->g != NULL)
 		id = constrain(L, s, id);
 	lua_pushinteger(L, id);
 	return 1;
+}
+
+/*** Log probabilities from the last `sampler:sample` call.
+ * They are the log-softmax of the logits after `logit_bias` and the
+ * penalties, before temperature and truncation. When the grammar masked
+ * tokens, the masked tokens have -inf.
+ * @tparam int id a token id, from 0
+ * @tparam[opt=0] int k the number of most likely tokens to list
+ * @treturn number the log probability of id
+ * @treturn {{int,number},...} the k most likely `{ id, logprob }` pairs,
+ * most likely first
+ * @raise before the first sample, or when id or k is out of range
+ * @function sampler:logprobs
+ */
+static int
+sampler_logprobs(lua_State *L)
+{
+	struct sampler *s = check_sampler(L, 1);
+	lua_Integer id = luaL_checkinteger(L, 2);
+	lua_Integer k = luaL_optinteger(L, 3, 0);
+	const float *l = s->logits;
+	double sum = 0, lse;
+	float m = -INFINITY;
+	int64_t i;
+
+	if (l == NULL)
+		return luaL_error(L, "no logits: sample first");
+	luaL_argcheck(L, id >= 0 && id < s->vocab, 2, "bad token id");
+	luaL_argcheck(L, k >= 0 && k <= s->vocab, 3, "bad count");
+	for (i = 0; i < s->vocab; i++)
+		if (l[i] > m)
+			m = l[i];
+	for (i = 0; i < s->vocab; i++)
+		sum += exp((double)l[i] - m);
+	lse = m + log(sum);
+	lua_pushnumber(L, (double)l[id] - lse);
+	lua_createtable(L, (int)k, 0);
+	if (k > 0)
+		heap_top(l, s->vocab, s->cand, k);
+	for (i = 0; i < k; i++) {
+		lua_createtable(L, 2, 0);
+		lua_pushinteger(L, s->cand[i].id);
+		lua_rawseti(L, -2, 1);
+		lua_pushnumber(L, (double)s->cand[i].logit - lse);
+		lua_rawseti(L, -2, 2);
+		lua_rawseti(L, -2, i + 1);
+	}
+	return 2;
 }
 
 /*** List the token ids that fit the grammar now.
@@ -869,6 +971,7 @@ static const luaL_Reg sampler_methods[] = {
 	{ "accept", sampler_accept },
 	{ "reset", sampler_reset },
 	{ "allowed", sampler_allowed },
+	{ "logprobs", sampler_logprobs },
 	{ "can_end", sampler_can_end },
 	{ "close", sampler_close },
 	{ NULL, NULL }
