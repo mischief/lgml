@@ -81,6 +81,7 @@ local ACCEPTED = { supported = true, limited = true, ["no-op"] = true }
 local COMPANIONS = {
 	tool_choice = { tools = json.array({ { type = "function", ["function"] = { name = "f" } } }) },
 	top_logprobs = { logprobs = true },
+	stream_options = { stream = true },
 }
 
 local function test_field_table()
@@ -136,8 +137,16 @@ local function test_field_table()
 			end
 		end
 	end
-	local _, err, param = chat_request.check(body({ nope = 1 }))
-	ok(param == "nope" and err:find("unknown field"), "an unknown field gives 400")
+	local _, err, param, code = chat_request.check(body({ nope = 1 }))
+	ok(param == "nope" and err:find("unknown field") and code == "unknown_parameter",
+	    "an unknown field gives 400 with code unknown_parameter")
+	_, _, param, code = chat_request.check(body({ verbosity = "low" }))
+	ok(param == "verbosity" and code == "unsupported_value", "a rejected value has code unsupported_value")
+	_, _, param, code = chat_request.check(body({ temperature = -1 }))
+	ok(param == "temperature" and code == "invalid_value", "a bad value has code invalid_value")
+	_, _, param = chat_request.check(body({ stream_options = { include_usage = true } }))
+	ok(param == "stream_options", "stream_options needs stream")
+
 end
 
 local function test_messages()
@@ -153,11 +162,16 @@ local function test_messages()
 				["function"] = { name = "f", arguments = "{}" } } }) },
 		{ role = "tool", tool_call_id = "call_1", content = json.array({ { type = "text", text = "ok" } }) },
 		{ role = "developer", content = "Be brief." },
+		{ role = "user", content = json.array({ { type = "image_url",
+			image_url = { url = "data:image/png;base64,AA", detail = "original" } } }) },
 	}
 	for i, m in ipairs(good) do
 		local r, err = msg_check(m)
 		ok(r == true, ("message %d is accepted: %s"):format(i, tostring(err)))
 	end
+	local m = { role = "assistant", content = "x", reasoning = "because" }
+	ok(msg_check(m) and m.reasoning_content == "because" and m.reasoning == nil,
+	    "assistant reasoning becomes reasoning_content")
 	local bad = {
 		{ { role = "function", name = "f", content = "x" }, "role" },
 		{ { role = "user", content = json.array({ { type = "input_audio",
@@ -291,6 +305,9 @@ local function test_reply_table()
 end
 
 local function test_stop()
+	local es, eb = post_json(body({ nope = 1 }))
+	ok(es == 400 and eb.error.code == "unknown_parameter" and eb.error.param == "nope" and
+	    eb.error.type == "invalid_request_error", "the error object has the code")
 	local status, b = post_json(body({ stop = "weather" }))
 	local ch = b.choices[1]
 	ok(status == 200 and ch.message.content == "Let me check the " and ch.finish_reason == "stop",
@@ -397,8 +414,45 @@ local function test_n()
 	ok(status == 400 and b.error.param == "n", "n 0 gives 400")
 end
 
+-- Images after tool results: the OpenAI form (a user message after the
+-- tool messages) and the lgml extension (image parts in a tool message).
+local function test_tool_images()
+	local gemma4 = require("lgml.chat.gemma4")
+	local media = require("lgml.chat.media")
+	local png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+	local function run(msgs)
+		local b = { messages = json.array(msgs) }
+		local good, err = chat_request.check(b)
+		assert(good, err)
+		local m, images = media.extract(b.messages, gemma4.image.token)
+		return gemma4.render(m, { add_generation_prompt = true }), images
+	end
+	local calls = json.array({ { id = "call_1", type = "function",
+		["function"] = { name = "shot", arguments = "{}" } },
+		{ id = "call_2", type = "function", ["function"] = { name = "shot", arguments = "{}" } } })
+	local head = {
+		{ role = "user", content = "Take two screenshots." },
+		{ role = "assistant", content = json.null, tool_calls = calls },
+		{ role = "tool", tool_call_id = "call_1", content = "saved 1" },
+		{ role = "tool", tool_call_id = "call_2", content = "saved 2" },
+	}
+	local msgs = table.move(head, 1, #head, 1, {})
+	msgs[#msgs + 1] = { role = "user", content = json.array({ { type = "text", text = "The screenshots:" },
+		{ type = "image_url", image_url = { url = png } }, { type = "image_url", image_url = { url = png } } }) }
+	local text, images = run(msgs)
+	local a, b, img = text:find("saved 1", 1, true), text:find("saved 2", 1, true), text:find(gemma4.image.token, 1, true)
+	ok(#images == 2 and a and b and img and img > b, "images in a user message after the tool results")
+	msgs = table.move(head, 1, 3, 1, {})
+	msgs[4] = { role = "tool", tool_call_id = "call_2", content = json.array({ { type = "text", text = "saved 2" },
+		{ type = "image_url", image_url = { url = png } } }) }
+	text, images = run(msgs)
+	img = text:find(gemma4.image.token, 1, true)
+	ok(#images == 1 and img and img > text:find("saved 2", 1, true), "an image part in a tool message (lgml)")
+end
+
 test_field_table()
 test_messages()
+test_tool_images()
 test_n()
 test_tool_choice()
 test_reply_table()

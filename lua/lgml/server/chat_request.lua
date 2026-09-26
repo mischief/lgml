@@ -70,7 +70,7 @@ local PART_KEYS = {
 	image_url = set_of("type", "image_url"),
 }
 local IMAGE_URL_KEYS = set_of("url", "detail")
-local DETAIL = set_of("auto", "low", "high")
+local DETAIL = set_of("auto", "low", "high", "original")
 
 -- Checks one content part. Returns true, or nil and a message.
 local function check_part(part, at)
@@ -99,7 +99,7 @@ local function check_part(part, at)
 		if k then
 			return nil, ("%s.image_url.%s is not supported"):format(at, k)
 		elseif u.detail ~= nil and not DETAIL[u.detail] then
-			return nil, at .. ".image_url.detail must be auto, low or high"
+			return nil, at .. ".image_url.detail must be auto, low, high or original"
 		end
 		u = u.url
 	end
@@ -149,7 +149,7 @@ local MESSAGE_KEYS = {
 	developer = set_of(table.unpack(COMMON_KEYS)),
 	user = set_of(table.unpack(COMMON_KEYS)),
 	assistant = set_of("role", "content", "name", "tool_calls", "reasoning_content",
-	    "refusal", "annotations"),
+	    "reasoning", "refusal", "annotations"),
 	tool = set_of("role", "content", "tool_call_id", "name"),
 }
 
@@ -171,6 +171,8 @@ local function check_message(m, at)
 		return nil, at .. ".name must be a string"
 	elseif m.reasoning_content ~= nil and type(m.reasoning_content) ~= "string" then
 		return nil, at .. ".reasoning_content must be a string"
+	elseif m.reasoning ~= nil and type(m.reasoning) ~= "string" then
+		return nil, at .. ".reasoning must be a string"
 	elseif m.tool_call_id ~= nil and type(m.tool_call_id) ~= "string" then
 		return nil, at .. ".tool_call_id must be a string"
 	elseif m.refusal ~= nil and m.refusal ~= "" then
@@ -179,6 +181,11 @@ local function check_message(m, at)
 		return nil, at .. ".annotations must be an array"
 	elseif m.tool_calls ~= nil then
 		return check_tool_calls(m.tool_calls, at .. ".tool_calls")
+	end
+	-- vLLM names the field reasoning.
+	if m.reasoning ~= nil then
+		m.reasoning_content = m.reasoning_content or m.reasoning
+		m.reasoning = nil
 	end
 	return true
 end
@@ -523,23 +530,9 @@ local function field(name)
 	return by_name[name]
 end
 
---- Checks a chat request body.
--- It removes top-level nulls and nulls in each message. It gives an
--- error for a field that is not in `FIELDS`, for a value that fails
--- the check of its field, and for a bad message. A string `stop`
--- becomes an array of one string. `tool_choice` `"none"` removes
--- `tools`; `allowed_tools` keeps the tools that it names and becomes
--- its mode. It turns `grammar`,
--- `response_format` or `json_schema` into GBNF text in `grammar` and
--- checks it (see `lgml.grammar`); with raw, schema properties keep
--- their order.
--- @tparam any b the decoded body
--- @tparam[opt] string raw the body text
--- @treturn[1] boolean true
--- @treturn[2] nil
--- @treturn[2] string an error message
--- @treturn[2] ?string the bad parameter name
-function M.check(b, raw)
+-- Checks b. On error it returns nil, a message, the parameter and
+-- maybe an error code.
+local function check_body(b, raw)
 	if type(b) ~= "table" or json.isarray(b) then
 		return nil, "request body must be a JSON object"
 	end
@@ -547,7 +540,7 @@ function M.check(b, raw)
 	for k in pairs(b) do
 		if type(k) ~= "string" or not field(k) then
 			return nil, ("unknown field %s: see the Compatibility section of docs/api.md"):format(
-			    tostring(k)), tostring(k)
+			    tostring(k)), tostring(k), "unknown_parameter"
 		end
 	end
 	local ok, err = check_messages(b.messages)
@@ -557,11 +550,14 @@ function M.check(b, raw)
 	for _, c in ipairs(M.FIELDS) do
 		ok, err = check_field(b, c)
 		if not ok then
-			return nil, err, c[1]
+			local code = (c.status == "rejected" or c.status == "planned") and "unsupported_value" or nil
+			return nil, err, c[1], code
 		end
 	end
 	if b.top_logprobs ~= nil and b.logprobs ~= true then
 		return nil, "top_logprobs needs logprobs: true", "top_logprobs"
+	elseif b.stream_options ~= nil and b.stream ~= true then
+		return nil, "stream_options needs stream: true", "stream_options"
 	end
 	ok, err = normal_tool_choice(b)
 	if not ok then
@@ -588,6 +584,35 @@ function M.check(b, raw)
 		b.grammar, b.response_format, b.json_schema = text, nil, nil
 	end
 	return true
+end
+
+--- Checks a chat request body.
+-- It removes top-level nulls and nulls in each message. It gives an
+-- error for a field that is not in `FIELDS`, for a value that fails
+-- the check of its field, and for a bad message. A string `stop`
+-- becomes an array of one string. `tool_choice` `"none"` removes
+-- `tools`; `allowed_tools` keeps the tools that it names and becomes
+-- its mode. It turns `grammar`, `response_format` or `json_schema` into
+-- GBNF text in `grammar` and checks it (see `lgml.grammar`); with raw,
+-- schema properties keep their order. `stream_options` needs `stream`.
+-- An assistant `reasoning` field becomes `reasoning_content`.
+-- @tparam any b the decoded body
+-- @tparam[opt] string raw the body text
+-- @treturn[1] boolean true
+-- @treturn[2] nil
+-- @treturn[2] string an error message
+-- @treturn[2] ?string the bad parameter name
+-- @treturn[2] ?string the OpenAI error code: `"unknown_parameter"`,
+-- `"unsupported_value"` or `"invalid_value"`
+function M.check(b, raw)
+	local ok, err, param, code = check_body(b, raw)
+	if ok or not param then
+		return ok, err, param
+	end
+	if not code then
+		code = err:find("not supported", 1, true) and "unsupported_value" or "invalid_value"
+	end
+	return nil, err, param, code
 end
 
 return M

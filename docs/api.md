@@ -109,7 +109,10 @@ The OpenAI routes give the OpenAI error object:
   `server_error` for 500 and higher. Other codes give
   `invalid_request_error`.
 - `param` names the bad field when the server knows it, else `null`.
-- `code` is always `null`.
+- `code` is `null`, except for a chat request that fails a check:
+  `unknown_parameter` for a field that the server does not know,
+  `unsupported_value` for a value that lgml does not support, and
+  `invalid_value` for another bad value.
 
 `/v1/systemone` uses the FastAPI error shape instead; see
 [System One errors](#system-one-errors).
@@ -188,7 +191,7 @@ the request checks (`lgml.server.chat_request.FIELDS`).
 | `messages` | OpenAI | supported | See [Messages](#messages). |
 | `model` | OpenAI | supported | See [Model selection](#model-selection). |
 | `stream` | OpenAI | supported | See [Streaming](#streaming). |
-| `stream_options` | OpenAI | supported | `include_usage` adds a usage chunk. `include_obfuscation` has no effect: the server sends no `obfuscation` field. |
+| `stream_options` | OpenAI | supported | `include_usage` adds a usage chunk. `include_obfuscation` has no effect: the server sends no `obfuscation` field. It needs `stream: true`, as for OpenAI. |
 | `max_tokens` | OpenAI | supported | A positive integer. Default: the rest of the context. |
 | `max_completion_tokens` | OpenAI | supported | As `max_tokens`; it counts reasoning tokens too. It wins when both are set. |
 | `temperature` | OpenAI | supported | A number from 0. 0 picks the most likely token. |
@@ -276,9 +279,14 @@ are `choices[].message.reasoning_content` and `timings` (llama.cpp).
 | `refusal` | rejected | Only `null` or `""`. |
 | `annotations` | no-op | An array. |
 | `audio`, `function_call` | rejected | 400. |
-| `reasoning_content` | supported | llama.cpp: the reasoning of an earlier assistant turn. |
+| `reasoning_content` | supported | llama.cpp: the reasoning of an earlier assistant turn. `reasoning` (vLLM) is a synonym. |
 
-An `image_url.detail` value (`auto`, `low` or `high`) has no effect.
+An `image_url.detail` value (`auto`, `low`, `high` or `original`) has
+no effect. Image parts work in each role (lgml); OpenAI takes them in
+`user` messages only. In a `tool` message, OpenAI takes text parts
+only, so a standard client sends the images of a tool result in a
+`user` message after the `tool` messages of the batch. lgml takes both
+forms.
 A text part can have `prompt_cache_breakpoint`; it has no effect.
 
 ## Chat completions

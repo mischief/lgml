@@ -58,6 +58,7 @@ M.CHAT_FIELDS = chat_request.FIELDS
 -- @treturn[2] nil
 -- @treturn[2] string an error message
 -- @treturn[2] ?string the bad parameter name
+-- @treturn[2] ?string the OpenAI error code
 M.check_chat = chat_request.check
 
 -- sink
@@ -538,9 +539,9 @@ local function chat(eng, req, res)
 	if not body then
 		return res:error(400, "bad JSON: " .. err)
 	end
-	local ok, msg, param = M.check_chat(body, req.body)
+	local ok, msg, param, code = M.check_chat(body, req.body)
 	if not ok then
-		return res:error(400, msg, nil, param)
+		return res:error(400, msg, nil, param, code)
 	end
 	return run_chat(eng, res, body, served_model(eng, body.model, "chat", media.has_images(body.messages)))
 end
