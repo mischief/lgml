@@ -135,6 +135,9 @@ if lua_bin.found()
   test('systemone', lua_bin, args : [files('test/test_systemone.lua')], timeout : 600)
   test('worker', lua_bin, args : [files('test/test_worker.lua')], timeout : 60)
   test('pool', lua_bin, args : [files('test/test_pool.lua')], timeout : 120)
+  test('placement', lua_bin, args : [files('test/test_placement.lua')],
+    env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
+    timeout : 60)
   test('chat', lua_bin, args : [files('test/test_chat.lua')], timeout : 60)
   test('sample', lua_bin, args : [files('test/test_sample.lua')], timeout : 120)
   test('grammar', lua_bin, args : [files('test/test_grammar.lua')], timeout : 60)
