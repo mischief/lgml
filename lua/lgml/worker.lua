@@ -78,21 +78,31 @@ function M.fail(fd, msg)
 	ch:close()
 end
 
---- The device bytes in use on the non-CPU devices.
--- It sums total minus free over them. Other processes change it too.
--- @treturn ?int the bytes, or nil with no such device
-function M.device_used()
+--- The bytes in use on the device of a backend: total minus free.
+-- Other processes change it too.
+-- @tparam[opt] string backend the backend name (default: the first
+-- GPU, else the first integrated GPU)
+-- @treturn ?int the bytes, or nil for a CPU backend or no such device
+function M.device_used(backend)
 	local ok, lgml = pcall(require, "lgml")
 	if not ok then
 		return nil
 	end
-	local used
+	local pick, gpu, igpu
 	for _, d in ipairs(lgml.devices()) do
-		if d.type ~= "cpu" and d.total > 0 then
-			used = (used or 0) + d.total - d.free
+		if d.name == backend then
+			pick = d
 		end
+		gpu = gpu or (d.type == "gpu" and d) or nil
+		igpu = igpu or (d.type == "igpu" and d) or nil
 	end
-	return used
+	if not backend then
+		pick = gpu or igpu
+	end
+	if not pick or pick.type == "cpu" or pick.total == 0 then
+		return nil
+	end
+	return pick.total - pick.free
 end
 
 --- Serves the engine on fd until the front closes it.

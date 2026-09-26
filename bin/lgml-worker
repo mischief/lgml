@@ -89,7 +89,7 @@ local function load()
 end
 
 local mem
-local before = not opts.fake and worker.device_used()
+local before = not opts.fake and worker.device_used(opts.b)
 local ok, engine = pcall(opts.fake and fake or load)
 if not ok then
 	io.stderr:write("lgml-worker: ", tostring(engine), "\n")
@@ -99,7 +99,7 @@ end
 if opts.fake and opts["fake-size"] then
 	mem = { used = math.floor(tonumber(opts["fake-size"]) * 1048576) }
 elseif before then
-	local after = worker.device_used()
+	local after = worker.device_used(opts.b)
 	if after and after > before then
 		mem = { used = after - before }
 	end
