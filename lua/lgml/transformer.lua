@@ -7,6 +7,7 @@
 -- @module lgml.transformer
 local lgml = require("lgml")
 local kv = require("lgml.kv")
+local placement = require("lgml.placement")
 local replay = require("lgml.replay")
 
 local M = {}
@@ -317,14 +318,22 @@ end
 -- @tparam string path path to the gguf file
 -- @tparam[opt] table opts options:
 -- opts.replay: false builds a new graph for every pass (default true).
+-- opts.placement: rules from `lgml.placement.rules`; the weights they
+-- place on the CPU load to `be:cpu()`, and so do the caches of layers
+-- whose attn_norm is there (default: all on be).
 -- @treturn Model the model
--- @raise when the file does not open, a weight is missing or the
--- architecture is not supported
+-- @raise when the file does not open, a weight is missing, the
+-- architecture is not supported, or the placement moves weights and be
+-- has no CPU backend
 function M.load(be, path, opts)
 	opts = opts or {}
 	local info = assert(lgml.gguf(path))
-	local w = assert(be:load(path))
 	local hp = M.config(info.meta)
+	local cpu = opts.placement and placement.plan(opts.placement, info.tensors, hp.n_layer)
+	if cpu and not be:cpu() then
+		error(path .. ": the placement moves weights to the CPU; open the backend with cpu = true")
+	end
+	local w = assert(be:load(path, cpu and { cpu = cpu }))
 	local function get(name)
 		return assert(w:get(name), name)
 	end
@@ -347,6 +356,7 @@ function M.load(be, path, opts)
 			    "blk." .. (i - 1) .. ": no per-layer input weights")
 		end
 		m.recurrent = m.recurrent or L.recr or nil
+		L.cpu = L.attn_norm:backend() ~= be or nil
 		m.layers[i] = L
 	end
 	if opts.replay == false then
@@ -455,15 +465,16 @@ function M:cache(n_ctx, opts)
 		c.rs_pos, c.conv, c.ssm = 0, {}, {}
 	end
 	for il, L in ipairs(self.layers) do
+		local lbe = L.cpu and be:cpu() or be
 		if L.recr then
-			c.conv[il] = be:tensor("f32", { 1, conv_dim(hp), hp.d_conv - 1 })
-			c.ssm[il] = be:tensor("f32", { 1, hp.n_v_heads, hp.head_v, hp.head_v })
+			c.conv[il] = lbe:tensor("f32", { 1, conv_dim(hp), hp.d_conv - 1 })
+			c.ssm[il] = lbe:tensor("f32", { 1, hp.n_v_heads, hp.head_v, hp.head_v })
 			c.conv[il]:zero()
 			c.ssm[il]:zero()
 		elseif not L.kv_src then
 			local rows = L.swa and c.ring or n_ctx
-			c.k[il] = be:tensor(tk, { rows, L.Hkv * L.D })
-			c.v[il] = be:tensor(tv, { rows, L.Hkv * L.D })
+			c.k[il] = lbe:tensor(tk, { rows, L.Hkv * L.D })
+			c.v[il] = lbe:tensor(tv, { rows, L.Hkv * L.D })
 			-- Rows past n_past are read under a -inf mask; zero keeps
 			-- them finite.
 			c.k[il]:zero()
@@ -474,10 +485,14 @@ function M:cache(n_ctx, opts)
 end
 
 --- Bytes a cache from `cache` takes on the device.
+-- A layer with `cpu` set keeps its cache on the CPU; its bytes are the
+-- third and fourth results.
 -- @tparam[opt] table opts the cache options, as for `cache`
 -- @treturn integer bytes per position (full-attention layers)
 -- @treturn integer bytes that do not grow with n_ctx (rings, recurrent
 -- states)
+-- @treturn integer bytes per position on the CPU
+-- @treturn integer fixed bytes on the CPU
 function M:cache_size(opts)
 	opts = opts or {}
 	local hp = self.hp
@@ -489,20 +504,21 @@ function M:cache_size(opts)
 	end
 	local tk, tv = kv.types_of(opts, dims)
 	local ring = hp.n_swa and hp.n_swa - 1 + (opts.ubatch or UBATCH)
-	local per, fixed = 0, 0
+	local s = { dev = { 0, 0 }, cpu = { 0, 0 } }
 	for _, L in ipairs(self.layers) do
+		local p = L.cpu and s.cpu or s.dev
 		if L.recr then
-			fixed = fixed + 4 * (conv_dim(hp) * (hp.d_conv - 1) + hp.n_v_heads * hp.head_v * hp.head_v)
+			p[2] = p[2] + 4 * (conv_dim(hp) * (hp.d_conv - 1) + hp.n_v_heads * hp.head_v * hp.head_v)
 		elseif not L.kv_src then
 			local row = lgml.row_size(tk, L.Hkv * L.D) + lgml.row_size(tv, L.Hkv * L.D)
 			if L.swa then
-				fixed = fixed + ring * row
+				p[2] = p[2] + ring * row
 			else
-				per = per + row
+				p[1] = p[1] + row
 			end
 		end
 	end
-	return per, fixed
+	return s.dev[1], s.dev[2], s.cpu[1], s.cpu[2]
 end
 
 --- Find how many cached positions stay valid after a rewind.

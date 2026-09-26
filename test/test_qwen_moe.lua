@@ -706,6 +706,53 @@ local function grammar_engine_check(arch, path)
 	ok(r2, tag .. "the engine serves after errors")
 end
 
+-- Weight placement: parts of the model on a second CPU backend give
+-- the same logits as one backend, through the scheduler.
+local function offload_check(arch, path, m, ref, long)
+	local placement = require("lgml.placement")
+	local transformer = require("lgml.transformer")
+	local sb <close> = assert(lgml.backend(os.getenv("LGML_DEVICE") or "CPU", { cpu = true }))
+	local cb = sb:cpu()
+	local want = our_rows(m, ref)
+	local cases = {
+		{ "cpu_moe", { cpu_moe = true } },
+		{ "n_cpu_moe 1", { n_cpu_moe = 1 } },
+		{ "n_gpu_layers 1", { n_gpu_layers = 1 } },
+		{ "override", { override = { "attn_output=GPU", "attn=CPU" } } },
+	}
+	for _, c in ipairs(cases) do
+		local tag = ("%s %s: "):format(arch, c[1])
+		local s = transformer.load(sb, path, { placement = placement.rules(c[2]) })
+		local L1, L2 = s.layers[1], s.layers[#s.layers]
+		if c[1] == "cpu_moe" then
+			ok(L1.down_exps:backend() == cb and L2.down_exps:backend() == cb and
+			    L1.gate_inp:backend() == sb and s.output:backend() == sb,
+			    tag .. "experts on the CPU, router and output on the backend")
+		elseif c[1] == "n_cpu_moe 1" then
+			ok(L1.down_exps:backend() == cb and L2.down_exps:backend() == sb,
+			    tag .. "experts of the first layer on the CPU")
+		elseif c[1] == "n_gpu_layers 1" then
+			ok(L1.attn_norm:backend() == cb and L2.attn_norm:backend() == sb and
+			    s.tok_embd:backend() == cb and s.output:backend() == cb and L1.cpu and not L2.cpu,
+			    tag .. "the first layers, embeddings and output on the CPU")
+		else
+			local wq = L2.wq or L2.qkv
+			ok((not wq or wq:backend() == cb) and L2.attn_norm:backend() == cb and
+			    L2.wo:backend() == sb, tag .. "patterns in order")
+		end
+		local dev, host = s.w:size()
+		ok(host > 0 and dev > 0, ("%sweights split: %d bytes on the device, %d on the CPU")
+		    :format(tag, dev, host))
+		local got = our_rows(s, ref)
+		local d = 0
+		for i = 1, #want do
+			d = math.max(d, maxdiff(got[i] or {}, want[i]))
+		end
+		ok(#got == #want and d < ((os.getenv("LGML_DEVICE") or "CPU") == "CPU" and 1e-4 or LOOSE), ("%slogits equal one backend (max error %.3g)"):format(tag, d))
+		s:close()
+	end
+end
+
 local be <close> = assert(lgml.backend(os.getenv("LGML_DEVICE") or "CPU"))
 local bin = os.getenv("LGML_LLAMA_LOGITS")
 
@@ -759,6 +806,9 @@ for _, arch in ipairs({ "llama", "qwen3", "qwen3moe", "qwen3next", "qwen35moe", 
 		rc.restart(ok, arch .. ": ", m)
 	end
 	snapshot_check(arch, m)
+	if ref and (arch == "qwen3moe" or arch == "qwen3next" or arch == "qwen35moe") then
+		offload_check(arch, path, m, ref, long)
+	end
 	if arch == "qwen35moe" or arch == "qwen3" then
 		prompt_cache_check(arch, path)
 	end

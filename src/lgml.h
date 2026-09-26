@@ -23,9 +23,16 @@
 #define UV_PARENT	1	/* tensor: store or graph; store, graph: backend */
 #define UV_EXTRA	2	/* store: name -> tensor; graph: set of leaves */
 #define UV_GRAD		2	/* leaf tensor: its gradient leaf, or nil */
+#define UV_HOST		3	/* store: the store of its CPU part, or nil */
+#define UV_CPU		1	/* backend: its CPU backend, or nil */
 
+/*
+ * A backend opened with a CPU backend (opts.cpu) computes graphs that use
+ * weights on both through a ggml_backend_sched.
+ */
 struct backend {
 	ggml_backend_t		 be;
+	struct backend		*cpu;		/* its CPU backend, or NULL */
 	int			 threads;	/* CPU threads; 0 when the backend has none */
 	int			 refs;
 	int			 closed;
@@ -59,6 +66,12 @@ struct graph {
 	int			 nleaves;	/* leaf operands from other stores */
 	int			 plan_nodes;	/* nodes at the last plan; -1 before */
 	int			 plan_tensors;	/* ntensors at the last plan */
+	int			 mixed;		/* has leaves on the CPU backend of b */
+	int			 use_sched;	/* the last plan went through sched */
+	ggml_backend_sched_t	 sched;		/* for mixed graphs, or NULL */
+	int			 sched_size;	/* the graph size of sched */
+	struct ggml_tensor	**saved;	/* node and its srcs, before sched */
+	int			 nsaved;	/* nodes in saved */
 	int			 backward;	/* 1 after tensor:backward */
 	int			 refs;
 	int			 closed;

@@ -873,6 +873,37 @@ local function engine_check(path)
 	ok(b.usage.cached_tokens > 0, "engine: the second request reuses the prefix")
 end
 
+-- Weight placement: experts or the first layers on a second CPU backend
+-- give the same logits as one backend.
+local function offload_check(kind, path, m, ref, long)
+	local placement = require("lgml.placement")
+	local sb <close> = assert(lgml.backend(os.getenv("LGML_DEVICE") or "CPU", { cpu = true }))
+	local cb = sb:cpu()
+	local want = our_rows(m, ref, { ubatch = 8 })
+	for _, c in ipairs({ { "cpu_moe", { cpu_moe = true } }, { "n_gpu_layers 2", { n_gpu_layers = 2 } } }) do
+		local tag = ("%s %s: "):format(kind, c[1])
+		local s = transformer.load(sb, path, { placement = placement.rules(c[2]) })
+		local L1, L4 = s.layers[1], s.layers[4]
+		if c[1] == "cpu_moe" then
+			ok(L1.down_exps:backend() == cb and L1.gate:backend() == sb and
+			    L1.down_exps_scale:backend() == sb, tag .. "routed experts on the CPU")
+		else
+			ok(L1.cpu and not L4.cpu and s.ple_embd:backend() == cb and s.output:backend() == cb,
+			    tag .. "the first layers and the embeddings on the CPU")
+		end
+		local got = our_rows(s, ref, { ubatch = 8 })
+		local d = 0
+		for i = 1, #want do
+			for j = 1, #want[i] do
+				d = math.max(d, math.abs(want[i][j] - ((got[i] or {})[j] or math.huge)))
+			end
+		end
+		ok(#got == #want and d < (GPU and TOL or 1e-4),
+		    ("%slogits equal one backend (max error %.3g)"):format(tag, d))
+		s:close()
+	end
+end
+
 local be <close> = assert(lgml.backend(os.getenv("LGML_DEVICE") or "CPU"))
 local bin = os.getenv("LGML_LLAMA_LOGITS")
 
@@ -925,6 +956,9 @@ for _, kind in ipairs({ "dense", "moe" }) do
 		-- Decode steps from n_past 5 to 45 wrap the ring on one graph.
 		rc.decode(ok, tag .. "ring wrap: ", m, { n_ctx = 64, cache = { ubatch = 8 },
 		    ubatch = 8, prompt = { 20, 40, 60, 80, 100 }, n = 40, flash_attn = fa, builds = 2 })
+	end
+	if kind == "moe" and ref and #ref > 0 then
+		offload_check(kind, path, m, ref, long)
 	end
 	if kind == "dense" then
 		engine_check(path)

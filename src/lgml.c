@@ -50,9 +50,16 @@ log_cb(enum ggml_log_level level, const char *text, void *arg)
 static void
 backend_release(struct backend *b)
 {
+	struct backend *cpu;
+
 	if (b->closed && b->refs == 0 && b->be != NULL) {
 		ggml_backend_free(b->be);
 		b->be = NULL;
+		if ((cpu = b->cpu) != NULL) {
+			b->cpu = NULL;
+			cpu->refs--;
+			backend_release(cpu);
+		}
 	}
 }
 
@@ -79,6 +86,12 @@ graph_release(struct graph *g)
 		return;
 	if (g->galloc != NULL)
 		ggml_gallocr_free(g->galloc);
+	if (g->sched != NULL)
+		ggml_backend_sched_free(g->sched);
+	free(g->saved);
+	g->sched = NULL;
+	g->saved = NULL;
+	g->nsaved = 0;
 	for (i = 0; i < g->nctx; i++)
 		ggml_free(g->ctxs[i]);
 	free(g->ctxs);
@@ -395,12 +408,32 @@ l_threads(lua_State *L)
 	return 1;
 }
 
+/* Push a backend userdata that owns be. */
+static struct backend *
+push_backend(lua_State *L, ggml_backend_t be, int threads)
+{
+	struct backend *b;
+
+	b = lua_newuserdatauv(L, sizeof(*b), 1);
+	b->be = be;
+	b->cpu = NULL;
+	b->threads = set_threads(be, threads);
+	b->refs = 0;
+	b->closed = 0;
+	luaL_setmetatable(L, BACKEND_MT);
+	return b;
+}
+
 /*** Open a backend.
  * Without a name, open the best backend on this machine. A backend that
  * runs ops on CPU threads, such as "CPU", uses `threads` of them.
+ * With `cpu`, the backend also opens a CPU backend (see `backend:cpu`).
+ * A graph that uses tensors on both runs through a ggml scheduler: each
+ * op runs where its weights are, and the scheduler copies activations
+ * between the two.
  * @tparam[opt] string name ggml device name, such as "CPU"
  * @tparam[opt] table opts `threads`: CPU thread count (default:
- * `lgml.threads()`)
+ * `lgml.threads()`); `cpu`: true to open a CPU backend too
  * @treturn[1] backend the backend
  * @return[2] nil
  * @treturn[2] string error message
@@ -412,13 +445,16 @@ l_backend(lua_State *L)
 {
 	const char *name = luaL_optstring(L, 1, NULL);
 	struct backend *b;
-	ggml_backend_t be;
-	int threads = 0;
+	ggml_backend_t be, cbe = NULL;
+	int threads = 0, cpu = 0;
 
 	if (!lua_isnoneornil(L, 2)) {
 		luaL_checktype(L, 2, LUA_TTABLE);
 		if (lua_getfield(L, 2, "threads") != LUA_TNIL)
 			threads = check_threads(L, -1, "threads");
+		lua_pop(L, 1);
+		lua_getfield(L, 2, "cpu");
+		cpu = lua_toboolean(L, -1);
 		lua_pop(L, 1);
 	}
 	if (threads == 0)
@@ -429,12 +465,18 @@ l_backend(lua_State *L)
 		lua_pushfstring(L, "no backend '%s'", name != NULL ? name : "best");
 		return 2;
 	}
-	b = lua_newuserdatauv(L, sizeof(*b), 0);
-	b->be = be;
-	b->threads = set_threads(be, threads);
-	b->refs = 0;
-	b->closed = 0;
-	luaL_setmetatable(L, BACKEND_MT);
+	if (cpu && (cbe = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, NULL)) == NULL) {
+		ggml_backend_free(be);
+		luaL_pushfail(L);
+		lua_pushliteral(L, "no CPU backend");
+		return 2;
+	}
+	b = push_backend(L, be, threads);
+	if (cbe != NULL) {
+		b->cpu = push_backend(L, cbe, threads);
+		b->cpu->refs++;
+		lua_setiuservalue(L, -2, UV_CPU);
+	}
 	return 1;
 }
 
@@ -475,6 +517,8 @@ backend_name(lua_State *L)
 
 /*** Get or set the CPU thread count of the backend.
  * Graphs that run after a set use the new count.
+ * A set also applies to the CPU backend of `backend:cpu`, and a get
+ * without CPU threads here gives the count of that CPU backend.
  * @tparam[opt] integer n new thread count, 1 to 1024
  * @treturn integer|nil the thread count, or nil when the backend does
  * not run ops on CPU threads
@@ -485,13 +529,39 @@ static int
 backend_threads(lua_State *L)
 {
 	struct backend *b = check_backend(L, 1);
+	int n;
 
-	if (!lua_isnoneornil(L, 2))
-		b->threads = set_threads(b->be, check_threads(L, 2, "n"));
+	if (!lua_isnoneornil(L, 2)) {
+		n = check_threads(L, 2, "n");
+		b->threads = set_threads(b->be, n);
+		if (b->cpu != NULL)
+			b->cpu->threads = set_threads(b->cpu->be, n);
+	}
+	if (b->threads == 0 && b->cpu != NULL)
+		b = b->cpu;
 	if (b->threads == 0)
 		lua_pushnil(L);
 	else
 		lua_pushinteger(L, b->threads);
+	return 1;
+}
+
+/*** Get the CPU backend of the backend.
+ * It exists when `lgml.backend` had `cpu = true`. Weights that
+ * `backend:load` puts on the CPU and leaves from its `backend:tensor`
+ * can take part in graphs of this backend.
+ * @treturn backend|nil the CPU backend, or nil
+ * @function backend:cpu
+ */
+static int
+backend_cpu(lua_State *L)
+{
+	struct backend *b = check_backend(L, 1);
+
+	if (b->cpu == NULL)
+		lua_pushnil(L);
+	else
+		lua_getiuservalue(L, 1, UV_CPU);
 	return 1;
 }
 
@@ -502,7 +572,7 @@ push_store(lua_State *L, int bidx, struct ggml_context *ctx, ggml_backend_buffer
 	struct backend *b = lua_touserdata(L, bidx);
 	struct store *s;
 
-	s = lua_newuserdatauv(L, sizeof(*s), 2);
+	s = lua_newuserdatauv(L, sizeof(*s), 3);
 	s->b = b;
 	s->ctx = ctx;
 	s->buf = buf;
@@ -598,12 +668,98 @@ backend_tensor(lua_State *L)
 	return 1;
 }
 
+/* Read the data of each tensor of ctx from the gguf file f. */
+static int
+read_tensors(FILE *f, const struct gguf_context *gctx, struct ggml_context *ctx, char *chunk)
+{
+	struct ggml_tensor *gt;
+	size_t base, off, n, done, size;
+
+	base = gguf_get_data_offset(gctx);
+	for (gt = ggml_get_first_tensor(ctx); gt != NULL; gt = ggml_get_next_tensor(ctx, gt)) {
+		off = base + gguf_get_tensor_offset(gctx, gguf_find_tensor(gctx, ggml_get_name(gt)));
+		size = ggml_nbytes(gt);
+		if (fseeko(f, (off_t)off, SEEK_SET) != 0)
+			return -1;
+		for (done = 0; done < size; done += n) {
+			n = size - done < LOAD_CHUNK ? size - done : LOAD_CHUNK;
+			if (fread(chunk, 1, n, f) != n)
+				return -1;
+			ggml_backend_tensor_set(gt, chunk, done, n);
+		}
+	}
+	return 0;
+}
+
+/*
+ * Move the tensors of *ctx that the set at hidx names to a new context
+ * *hctx, and the others to a new *ctx. Return the count moved; with none,
+ * the contexts stay as they are.
+ */
+static int
+split_ctx(lua_State *L, int hidx, struct ggml_context **ctx, struct ggml_context **hctx)
+{
+	struct ggml_init_params ip = { 0, NULL, true };
+	struct ggml_context *d, *h, *c = *ctx;
+	struct ggml_tensor *gt, *nt;
+	int n = 0, nh = 0, on;
+
+	for (gt = ggml_get_first_tensor(c); gt != NULL; gt = ggml_get_next_tensor(c, gt)) {
+		lua_getfield(L, hidx, ggml_get_name(gt));
+		nh += lua_toboolean(L, -1);
+		lua_pop(L, 1);
+		n++;
+	}
+	if (nh == 0)
+		return 0;
+	ip.mem_size = (size_t)(n - nh + 1) * ggml_tensor_overhead();
+	d = ggml_init(ip);
+	ip.mem_size = (size_t)(nh + 1) * ggml_tensor_overhead();
+	h = ggml_init(ip);
+	if (d == NULL || h == NULL) {
+		if (d != NULL)
+			ggml_free(d);
+		if (h != NULL)
+			ggml_free(h);
+		return -1;
+	}
+	for (gt = ggml_get_first_tensor(c); gt != NULL; gt = ggml_get_next_tensor(c, gt)) {
+		lua_getfield(L, hidx, ggml_get_name(gt));
+		on = lua_toboolean(L, -1);
+		lua_pop(L, 1);
+		nt = ggml_dup_tensor(on ? h : d, gt);
+		ggml_set_name(nt, ggml_get_name(gt));
+	}
+	ggml_free(c);
+	*ctx = d;
+	*hctx = h;
+	return nh;
+}
+
+/* Allocate the tensors of ctx on be as weights. NULL for no tensors. */
+static int
+alloc_weights(struct ggml_context *ctx, ggml_backend_t be, ggml_backend_buffer_t *buf)
+{
+	*buf = NULL;
+	if (ggml_get_first_tensor(ctx) == NULL)
+		return 0;
+	if ((*buf = ggml_backend_alloc_ctx_tensors(ctx, be)) == NULL)
+		return -1;
+	ggml_backend_buffer_set_usage(*buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+	return 0;
+}
+
 /*** Load every tensor of a gguf file to the device.
+ * With `opts.cpu`, the tensors it names go to the CPU backend of this
+ * backend (see `backend:cpu`); `weights:get` finds tensors of both parts.
  * @tparam string path gguf file
+ * @tparam[opt] table opts `cpu`: a set of tensor names, `{ [name] =
+ * true }`, to put on the CPU backend
  * @treturn[1] weights the tensors
  * @return[2] nil if the file is not a gguf file
  * @treturn[2] string error message
- * @raise if the device is out of memory or the read fails
+ * @raise if the device is out of memory, the read fails, or `opts.cpu`
+ * names a tensor and the backend has no CPU backend
  * @function backend:load
  */
 static int
@@ -613,14 +769,19 @@ backend_load(lua_State *L)
 	const char *path = luaL_checkstring(L, 2);
 	struct gguf_init_params gp;
 	struct gguf_context *gctx;
-	struct ggml_context *ctx = NULL;
-	struct ggml_tensor *gt;
-	ggml_backend_buffer_t buf;
-	size_t base, off, n, done, size;
+	struct ggml_context *ctx = NULL, *hctx = NULL;
+	ggml_backend_buffer_t buf, hbuf = NULL;
 	char *chunk;
 	FILE *f;
-	int e;
+	int e, hidx = 0, sidx, nh = 0;
 
+	if (!lua_isnoneornil(L, 3)) {
+		luaL_checktype(L, 3, LUA_TTABLE);
+		if (lua_getfield(L, 3, "cpu") != LUA_TNIL) {
+			luaL_checktype(L, -1, LUA_TTABLE);
+			hidx = lua_gettop(L);
+		}
+	}
 	gp.no_alloc = true;
 	gp.ctx = &ctx;
 	gctx = gguf_init_from_file(path, gp);
@@ -629,13 +790,36 @@ backend_load(lua_State *L)
 		lua_pushfstring(L, "%s: not a gguf file", path);
 		return 2;
 	}
-	buf = ggml_backend_alloc_ctx_tensors(ctx, b->be);
-	if (buf == NULL) {
+	if (hidx != 0 && (nh = split_ctx(L, hidx, &ctx, &hctx)) != 0) {
+		if (nh < 0 || b->cpu == NULL) {
+			gguf_free(gctx);
+			ggml_free(ctx);
+			if (hctx != NULL)
+				ggml_free(hctx);
+			return luaL_error(L, nh < 0 ? "ggml_init failed" :
+			    "%s: tensors for the CPU, but the backend has no CPU backend", path);
+		}
+		if (alloc_weights(ctx, b->be, &buf) != 0 || alloc_weights(hctx, b->cpu->be, &hbuf) != 0) {
+			if (hbuf == NULL && buf != NULL)
+				ggml_backend_buffer_free(buf);
+			gguf_free(gctx);
+			ggml_free(ctx);
+			ggml_free(hctx);
+			return luaL_error(L, "out of device memory");
+		}
+	} else if ((buf = ggml_backend_alloc_ctx_tensors(ctx, b->be)) == NULL) {
 		gguf_free(gctx);
 		ggml_free(ctx);
 		return luaL_error(L, "out of device memory");
 	}
 	push_store(L, 1, ctx, buf);
+	sidx = lua_gettop(L);
+	if (hctx != NULL) {
+		lua_getiuservalue(L, 1, UV_CPU);
+		push_store(L, lua_gettop(L), hctx, hbuf);
+		lua_setiuservalue(L, sidx, UV_HOST);
+		lua_pop(L, 1);
+	}
 
 	f = fopen(path, "rb");
 	e = errno;
@@ -648,29 +832,15 @@ backend_load(lua_State *L)
 		gguf_free(gctx);
 		return luaL_error(L, "%s: %s", path, strerror(e));
 	}
-	base = gguf_get_data_offset(gctx);
-	for (gt = ggml_get_first_tensor(ctx); gt != NULL; gt = ggml_get_next_tensor(ctx, gt)) {
-		off = base + gguf_get_tensor_offset(gctx, gguf_find_tensor(gctx, ggml_get_name(gt)));
-		size = ggml_nbytes(gt);
-		if (fseeko(f, (off_t)off, SEEK_SET) != 0)
-			goto short_read;
-		for (done = 0; done < size; done += n) {
-			n = size - done < LOAD_CHUNK ? size - done : LOAD_CHUNK;
-			if (fread(chunk, 1, n, f) != n)
-				goto short_read;
-			ggml_backend_tensor_set(gt, chunk, done, n);
-		}
-	}
+	e = read_tensors(f, gctx, ctx, chunk);
+	if (e == 0 && hctx != NULL)
+		e = read_tensors(f, gctx, hctx, chunk);
 	free(chunk);
 	fclose(f);
 	gguf_free(gctx);
+	if (e != 0)
+		return luaL_error(L, "%s: short read", path);
 	return 1;
-
-short_read:
-	free(chunk);
-	fclose(f);
-	gguf_free(gctx);
-	return luaL_error(L, "%s: short read", path);
 }
 
 /*** Make an empty graph on this backend.
@@ -742,6 +912,13 @@ store_close(lua_State *L)
 		lua_call(L, 1, 0);
 	}
 	lua_pop(L, 1);
+	if (lua_getiuservalue(L, 1, UV_HOST) == LUA_TUSERDATA) {
+		lua_pushcfunction(L, store_close);
+		lua_insert(L, -2);
+		lua_call(L, 1, 0);
+	} else {
+		lua_pop(L, 1);
+	}
 	store_release(s);
 	return 0;
 }
@@ -756,60 +933,84 @@ store_close(lua_State *L)
 static int
 store_get(lua_State *L)
 {
-	struct store *s = check_store(L, 1);
+	struct store *s = check_store(L, 1), *h;
 	const char *name = luaL_checkstring(L, 2);
 	struct ggml_tensor *gt;
+	int sidx = 1;
 
 	lua_getiuservalue(L, 1, UV_EXTRA);
 	if (lua_getfield(L, -1, name) != LUA_TNIL)
 		return 1;
+	lua_pop(L, 1);
 	gt = ggml_get_tensor(s->ctx, name);
-	if (gt == NULL)
+	if (gt == NULL && lua_getiuservalue(L, 1, UV_HOST) == LUA_TUSERDATA) {
+		h = lua_touserdata(L, -1);
+		sidx = lua_gettop(L);
+		gt = ggml_get_tensor(h->ctx, name);
+	}
+	if (gt == NULL) {
+		lua_pushnil(L);
 		return 1;
-	push_leaf(L, 1, gt, min_rank(gt));
+	}
+	push_leaf(L, sidx, gt, min_rank(gt));
 	lua_pushvalue(L, -1);
-	lua_setfield(L, -4, name);
+	lua_setfield(L, 3, name);
 	return 1;
 }
 
 /*** List the tensor names.
- * @treturn {string,...} names in storage order
+ * @treturn {string,...} names in storage order, the CPU part last
  * @function weights:names
  */
 static int
 store_names(lua_State *L)
 {
-	struct store *s = check_store(L, 1);
+	struct store *s = check_store(L, 1), *h = NULL;
+	struct ggml_context *c;
 	struct ggml_tensor *gt;
 	int i = 0;
 
+	if (lua_getiuservalue(L, 1, UV_HOST) == LUA_TUSERDATA)
+		h = lua_touserdata(L, -1);
 	lua_newtable(L);
-	for (gt = ggml_get_first_tensor(s->ctx); gt != NULL; gt = ggml_get_next_tensor(s->ctx, gt)) {
-		lua_pushstring(L, ggml_get_name(gt));
-		lua_seti(L, -2, ++i);
+	for (c = s->ctx; c != NULL; c = c == s->ctx && h != NULL ? h->ctx : NULL) {
+		for (gt = ggml_get_first_tensor(c); gt != NULL; gt = ggml_get_next_tensor(c, gt)) {
+			lua_pushstring(L, ggml_get_name(gt));
+			lua_seti(L, -2, ++i);
+		}
 	}
 	return 1;
 }
 
 /*** Get the size of the device buffer.
- * @treturn int bytes
+ * @treturn int bytes on the backend
+ * @treturn int bytes on its CPU backend (see `backend:load`)
  * @function weights:size
  */
 static int
 store_size(lua_State *L)
 {
-	struct store *s = check_store(L, 1);
+	struct store *s = check_store(L, 1), *h;
 
-	lua_pushinteger(L, (lua_Integer)ggml_backend_buffer_get_size(s->buf));
-	return 1;
+	lua_pushinteger(L, s->buf != NULL ? (lua_Integer)ggml_backend_buffer_get_size(s->buf) : 0);
+	if (lua_getiuservalue(L, 1, UV_HOST) == LUA_TUSERDATA) {
+		h = lua_touserdata(L, -1);
+		lua_pushinteger(L, h->buf != NULL ? (lua_Integer)ggml_backend_buffer_get_size(h->buf) : 0);
+	} else {
+		lua_pushinteger(L, 0);
+	}
+	lua_remove(L, -2);
+	return 2;
 }
 
 /* graph */
 
 /*** A graph of ops on one backend.
  * Each op returns a node tensor. Nodes get storage when `graph:compute`
- * runs. An operand is a leaf on the same backend or a node of this graph.
- * The graph keeps its leaves alive until it closes.
+ * runs. An operand is a leaf on the same backend or its CPU backend (see
+ * `backend:cpu`), or a node of this graph. A graph with leaves on both
+ * runs through a ggml scheduler. The graph keeps its leaves alive until
+ * it closes.
  * @type graph
  */
 
@@ -841,8 +1042,11 @@ operand(lua_State *L, struct graph *g, int idx)
 		return t;
 	if (t->g != NULL)
 		luaL_argerror(L, idx, "node of another graph");
-	if (t->s->b != g->b)
-		luaL_argerror(L, idx, "tensor on another backend");
+	if (t->s->b != g->b) {
+		if (g->b->cpu == NULL || t->s->b != g->b->cpu)
+			luaL_argerror(L, idx, "tensor on another backend");
+		g->mixed = 1;
+	}
 	lua_getiuservalue(L, 1, UV_EXTRA);
 	lua_pushvalue(L, idx);
 	if (lua_rawget(L, -2) == LUA_TNIL) {
@@ -1778,6 +1982,56 @@ graph_top_k(lua_State *L)
 	return push_node(L, g, ggml_top_k(g->ctx, a->t, (int)k), a->rank);
 }
 
+/* Put back the srcs that the scheduler replaced with its copies. */
+static void
+restore_srcs(struct graph *g)
+{
+	struct ggml_tensor **p;
+	int i, j;
+
+	for (i = 0; i < g->nsaved; i++) {
+		p = g->saved + (size_t)i * (GGML_MAX_SRC + 1);
+		for (j = 0; j < GGML_MAX_SRC; j++)
+			p[0]->src[j] = p[j + 1];
+	}
+	g->nsaved = 0;
+}
+
+/*
+ * Plan a mixed graph through the scheduler. The scheduler points node
+ * srcs at its copies, so keep the srcs for the next plan.
+ */
+static int
+plan_sched(struct graph *g)
+{
+	ggml_backend_t bes[2] = { g->b->be, g->b->cpu->be };
+	struct ggml_tensor **p, *node;
+	int i, j, n = ggml_graph_n_nodes(g->gf);
+
+	if (g->sched != NULL && g->sched_size < g->size) {
+		ggml_backend_sched_free(g->sched);
+		g->sched = NULL;
+	}
+	if (g->sched == NULL) {
+		g->sched = ggml_backend_sched_new(bes, NULL, 2, (size_t)g->size, false, true);
+		g->sched_size = g->size;
+	}
+	free(g->saved);
+	g->saved = malloc((size_t)n * (GGML_MAX_SRC + 1) * sizeof(*g->saved));
+	if (g->saved == NULL)
+		return -1;
+	for (i = 0; i < n; i++) {
+		node = ggml_graph_node(g->gf, i);
+		p = g->saved + (size_t)i * (GGML_MAX_SRC + 1);
+		p[0] = node;
+		for (j = 0; j < GGML_MAX_SRC; j++)
+			p[j + 1] = node->src[j];
+	}
+	g->nsaved = n;
+	ggml_backend_sched_reset(g->sched);
+	return ggml_backend_sched_alloc_graph(g->sched, g->gf) ? 0 : -1;
+}
+
 /*** Run the graph.
  * The arguments become outputs. Each call runs every output of this and
  * earlier calls, and every node passed to `graph:expand`. Storage is
@@ -1807,9 +2061,11 @@ graph_compute(lua_State *L)
 	}
 	if (g->plan_nodes == ggml_graph_n_nodes(g->gf) && g->plan_tensors == g->ntensors)
 		goto run;
+	restore_srcs(g);
 	for (i = 0; i < ggml_graph_n_nodes(g->gf); i++) {
 		node = ggml_graph_node(g->gf, i);
-		if (!ggml_backend_supports_op(g->b->be, node))
+		if (!ggml_backend_supports_op(g->b->be, node) &&
+		    !(g->mixed && ggml_backend_supports_op(g->b->cpu->be, node)))
 			return luaL_error(L, "%s: op %s not supported",
 			    ggml_backend_name(g->b->be), ggml_op_desc(node));
 	}
@@ -1825,12 +2081,16 @@ graph_compute(lua_State *L)
 		}
 	}
 	g->plan_nodes = -1;
-	if (!ggml_gallocr_alloc_graph(g->galloc, g->gf))
+	g->use_sched = g->mixed;
+	if (g->mixed ? plan_sched(g) != 0 : !ggml_gallocr_alloc_graph(g->galloc, g->gf))
 		return luaL_error(L, "graph allocation failed");
 	g->plan_nodes = ggml_graph_n_nodes(g->gf);
 	g->plan_tensors = g->ntensors;
 run:
-	st = ggml_backend_graph_compute(g->b->be, g->gf);
+	if (g->use_sched)
+		st = ggml_backend_sched_graph_compute(g->sched, g->gf);
+	else
+		st = ggml_backend_graph_compute(g->b->be, g->gf);
 	if (st != GGML_STATUS_SUCCESS)
 		return luaL_error(L, "compute: %s", ggml_status_to_string(st));
 	return 0;
@@ -1839,7 +2099,8 @@ run:
 /*** Get the size of the compute buffer.
  * The buffer holds the nodes of the graph. Its size is 0 before the
  * first `graph:compute`.
- * @treturn int bytes
+ * @treturn int bytes on the backend
+ * @treturn int bytes on its CPU backend, for a graph with leaves on both
  * @function graph:buffer_size
  */
 static int
@@ -1847,8 +2108,15 @@ graph_buffer_size(lua_State *L)
 {
 	struct graph *g = check_graph(L, 1);
 
+	if (g->use_sched && g->sched != NULL) {
+		lua_pushinteger(L, (lua_Integer)ggml_backend_sched_get_buffer_size(g->sched, g->b->be));
+		lua_pushinteger(L, (lua_Integer)ggml_backend_sched_get_buffer_size(g->sched,
+		    g->b->cpu->be));
+		return 2;
+	}
 	lua_pushinteger(L, (lua_Integer)ggml_gallocr_get_buffer_size(g->galloc, 0));
-	return 1;
+	lua_pushinteger(L, 0);
+	return 2;
 }
 
 /* tensor */
@@ -2823,6 +3091,7 @@ static const luaL_Reg backend_methods[] = {
 	{ "close", backend_close },
 	{ "name", backend_name },
 	{ "threads", backend_threads },
+	{ "cpu", backend_cpu },
 	{ "tensor", backend_tensor },
 	{ "load", backend_load },
 	{ "graph", backend_graph },

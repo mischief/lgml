@@ -101,6 +101,39 @@ ok(nn == 2 and dev == total - 200, "auto: 2 layers for 150 bytes less")
 nn = placement.auto(r, tensors(), 4, 10)
 ok(nn == 4, "auto: all layers when nothing fits")
 
+-- Load and compute: a split needs a backend with a CPU backend.
+local lgml = require("lgml")
+local here = debug.getinfo(1, "S").source:match("^@(.*/)") or "./"
+package.path = here .. "?.lua;" .. package.path
+local gguf = require("gguf")
+local path = os.tmpname()
+gguf.write(path, { { "general.architecture", gguf.STRING, "test" } }, {
+	{ "a.weight", { 2, 4 }, { 1, 2, 3, 4, 5, 6, 7, 8 } },
+	{ "b.weight", { 3, 4 }, { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0 } },
+})
+local one <close> = assert(lgml.backend("CPU"))
+ok(not pcall(one.load, one, path, { cpu = { ["b.weight"] = true } }),
+    "a split load without a CPU backend is an error")
+local be <close> = assert(lgml.backend("CPU", { cpu = true, threads = 2 }))
+ok(be:cpu() and be:cpu():name() == "CPU" and be:threads() == 2, "backend with a CPU backend")
+local w = assert(be:load(path, { cpu = { ["b.weight"] = true } }))
+local a, b = w:get("a.weight"), w:get("b.weight")
+ok(a:backend() == be and b:backend() == be:cpu() and w:get("b.weight") == b, "weights:get finds both parts")
+local dev_bytes, host_bytes = w:size()
+ok(dev_bytes >= 32 and host_bytes >= 48 and #w:names() == 2, "weights:size gives both parts")
+local x = be:tensor("f32", { 1, 4 }, { 1, 1, 1, 1 })
+local g = be:graph()
+local ya, yb = g:mul_mat(a, x), g:mul_mat(b, x)
+local sum = g:sum_rows(g:concat(ya, yb, 2))
+g:compute(sum, yb)
+ok(sum:get()[1] == 39 and yb:get()[3] == 1, "a graph on both parts computes")
+local y2 = g:scale(sum, 2)
+g:compute(y2)
+ok(y2:get()[1] == 78 and sum:get()[1] == 39, "a mixed graph plans again after it grows")
+g:close()
+w:close()
+os.remove(path)
+
 print("1.." .. n)
 if failed then
 	os.exit(1)
