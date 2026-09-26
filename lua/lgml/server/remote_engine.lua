@@ -442,6 +442,7 @@ function R:speak(req, ctl)
 end
 
 --- Runs a decide job on the worker.
+-- The images of the request go as raw `IMAGE` messages after `DECIDE`.
 -- @tparam table req the decision request
 -- @tparam[opt] lgml.server.engine.Control ctl the cancel control
 -- @treturn[1] table the result of `Engine:decide`
@@ -463,10 +464,27 @@ function R:decide(req, ctl)
 	self.next_id = id + 1
 	local job = setmetatable({ q = {} }, Job)
 	self.jobs[id] = job
-	local ok, err = self.ch:send(ipc.DECIDE, id, req)
+	local body, images = {}, req.images or {}
+	for k, v in pairs(req) do
+		body[k] = v
+	end
+	body.images, body.image_types = nil, nil
+	if #images > 0 then
+		body.image_types = {}
+		for i, img in ipairs(images) do
+			body.image_types[i] = img.mime or "image/png"
+		end
+	end
+	local ok, err = self.ch:send(ipc.DECIDE, id, body)
+	for _, img in ipairs(images) do
+		if not ok then
+			break
+		end
+		ok, err = self.ch:send(ipc.IMAGE, id, img.bytes)
+	end
 	if not ok then
 		self.jobs[id] = nil
-		return nil, "send to worker: " .. tostring(err), 503
+		return nil, "send to worker: " .. tostring(err), err == "message too large" and 413 or 503
 	end
 	local cancelled = false
 	while true do

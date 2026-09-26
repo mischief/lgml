@@ -128,8 +128,19 @@ in_co(function()
 	local p = r and r.answers.q.probabilities
 	ok(p and p[2] > 0.9 and r.model == "fake" and r.usage.output_tokens == 2,
 	    "decide runs on the worker")
-	req.state = "fail"
+	local png = require("lgml.base64").decode(
+	    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+	local big = png .. string.rep("\0\255", 1 << 20)
+	req.images = { { bytes = big, mime = "image/png" }, { bytes = "\255\216\255\224", mime = "image/jpeg" } }
+	r = eng:decide(req)
+	ok(r and r.timings.images == 2 and r.timings.image_bytes == #big + 4 and #req.images == 2,
+	    "decide images go to the worker as raw bytes")
+	req.images = { { bytes = "GIF89a", mime = "image/gif" } }
 	local res, msg, status = eng:decide(req)
+	ok(res == nil and status == 400 and msg:find("image 1", 1, true), "a bad decide image gives 400")
+	req.images = nil
+	req.state = "fail"
+	res, msg, status = eng:decide(req)
 	ok(res == nil and msg == "fake failure" and status == 500, "decide error forwarded")
 end)
 

@@ -113,7 +113,7 @@ end
 -- @tparam lgml.server.engine.Engine engine the engine
 -- @tparam[opt] table mem the `mem` field of `HELLO`: `{ used }`
 function M.serve(fd, engine, mem)
-	local jobs, pending = {}, {}
+	local jobs, pending, deciding = {}, {}, {}
 	local ch
 	local function chat(id, req)
 		local sink = proxy(ch, id)
@@ -237,8 +237,19 @@ function M.serve(fd, engine, mem)
 			transcribe(id, v)
 		elseif t == ipc.SPEAK then
 			speak(id, v)
+		elseif t == ipc.DECIDE and type(v.image_types) == "table" and #v.image_types > 0 then
+			v.images = {}
+			deciding[id] = v
 		elseif t == ipc.DECIDE then
 			decide(id, v)
+		elseif t == ipc.IMAGE and deciding[id] then
+			local req = deciding[id]
+			local k = #req.images + 1
+			req.images[k] = { bytes = v, mime = req.image_types[k] }
+			if k == #req.image_types then
+				deciding[id], req.image_types = nil, nil
+				decide(id, req)
+			end
 		elseif t == ipc.GENERATE and v.has_image then
 			v.has_image = nil
 			pending[id] = v

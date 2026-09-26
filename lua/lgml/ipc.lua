@@ -56,7 +56,10 @@ M.AUDIO = 7
 -- then `DONE`.
 M.SPEAK = 8
 --- Front to worker: start a decide job.
--- Payload: the request for `Engine:decide`. The worker sends `DONE`.
+-- Payload: the request for `Engine:decide` without its images. When the
+-- payload has `image_types`, one `IMAGE` message with the same id
+-- follows for each entry, in order, and the job starts when the last
+-- arrives. The worker sends `DONE`.
 M.DECIDE = 9
 --- Front to worker: start an image job.
 -- Payload: the request for `Engine:generate` without its image bytes.
@@ -65,8 +68,8 @@ M.DECIDE = 9
 -- `IMAGE` for each result image, then `DONE`.
 M.GENERATE = 10
 --- Raw image bytes for a job, in either direction.
--- Front to worker: the input file of an edit. Worker to front: one PNG
--- file of the result, in order.
+-- Front to worker: the input file of an edit, or one input image of a
+-- decide job. Worker to front: one PNG file of the result, in order.
 M.IMAGE = 11
 --- Worker to front: the engine did not load. The worker then exits.
 -- Payload: `{ msg }`, the error message.
