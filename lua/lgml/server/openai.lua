@@ -11,6 +11,7 @@ local http = require("lgml.server.http")
 local sse = require("lgml.server.sse")
 local engine_api = require("lgml.server.engine")
 local multipart = require("lgml.server.multipart")
+local metrics = require("lgml.server.metrics")
 local systemone = require("lgml.systemone")
 
 local M = {}
@@ -354,7 +355,7 @@ local function reply_whole(self)
 			finish_reason = f.reason,
 		} }),
 		usage = f.usage, timings = f.timings,
-	})
+	}, metrics.headers(f.timings))
 end
 
 -- Ends the stream with an error event, or sends an error response.
@@ -371,6 +372,10 @@ end
 local function run_chat(eng, res, body, model)
 	local sink = new_sink(res, body, model)
 	local ok, msg, status = eng:chat(body, sink)
+	metrics.request(model, "chat", ok == true)
+	if sink.finished and sink.finished.timings then
+		metrics.chat(model, sink.finished.timings)
+	end
 	if sink:cancelled() then
 		res.close = true
 		return
@@ -450,14 +455,14 @@ local function verbose(r)
 	}
 end
 
-local function reply_transcription(res, r, fmt)
+local function reply_transcription(res, r, fmt, headers)
 	if fmt == "text" then
-		return res:send(200, r.text .. "\n",
-		    { ["Content-Type"] = "text/plain; charset=utf-8" })
+		headers["Content-Type"] = "text/plain; charset=utf-8"
+		return res:send(200, r.text .. "\n", headers)
 	elseif fmt == "verbose_json" then
-		return res:json(200, verbose(r))
+		return res:json(200, verbose(r), headers)
 	end
-	return res:json(200, { text = r.text })
+	return res:json(200, { text = r.text }, headers)
 end
 
 -- Reads the multipart form. Returns the request, the file bytes and
@@ -490,6 +495,8 @@ local function transcriptions(eng, req, res)
 	if not treq then
 		return res:error(400, file, nil, param)
 	end
+	local t0 = uv.hrtime()
+	local model = treq.model or default_model(eng)
 	local r, msg, status = eng:transcribe(treq, file, {
 		cancelled = function()
 			return res.s:gone()
@@ -499,10 +506,17 @@ local function transcriptions(eng, req, res)
 		res.close = true
 		return
 	end
+	metrics.request(model, "transcription", r ~= nil)
 	if not r then
 		return res:error(status or 500, msg or "transcription failed")
 	end
-	return reply_transcription(res, r, treq.response_format)
+	local ms = (uv.hrtime() - t0) / 1e6
+	local fields = { elapsed_ms = ms, audio_seconds = r.duration }
+	if r.duration and r.duration > 0 then
+		fields.rtf = ms / 1000 / r.duration
+		metrics.add("transcribed_seconds_total", "audio seconds transcribed", model, r.duration)
+	end
+	return reply_transcription(res, r, treq.response_format, metrics.headers(fields))
 end
 
 -- speech
@@ -563,6 +577,8 @@ local function speech(eng, req, res)
 	if not ok then
 		return res:error(400, msg, nil, param)
 	end
+	local t0 = uv.hrtime()
+	local model = body.model or default_model(eng)
 	local r, emsg, status = eng:speak(body, {
 		cancelled = function()
 			return res.s:gone()
@@ -572,14 +588,28 @@ local function speech(eng, req, res)
 		res.close = true
 		return
 	end
+	metrics.request(model, "speech", r ~= nil)
 	if not r then
 		return res:error(status or 500, emsg or "speech failed")
 	end
 	local wav = r.wav or r.audio:wav(1, "s16")
-	if body.response_format == "pcm" then
-		return res:send(200, wav_data(wav), { ["Content-Type"] = "audio/pcm" })
+	local pcm = wav_data(wav)
+	-- 16-bit mono; the rate is in the canonical WAV header.
+	local rate = #wav >= 28 and string.unpack("<I4", wav, 25) or 0
+	local ms = (uv.hrtime() - t0) / 1e6
+	local fields = { elapsed_ms = ms }
+	if rate > 0 then
+		fields.audio_seconds = #pcm / 2 / rate
+		fields.rtf = ms / 1000 / math.max(fields.audio_seconds, 1e-9)
+		metrics.add("spoken_seconds_total", "audio seconds of speech made", model, fields.audio_seconds)
 	end
-	return res:send(200, wav, { ["Content-Type"] = "audio/wav" })
+	local headers = metrics.headers(fields)
+	if body.response_format == "pcm" then
+		headers["Content-Type"] = "audio/pcm"
+		return res:send(200, pcm, headers)
+	end
+	headers["Content-Type"] = "audio/wav"
+	return res:send(200, wav, headers)
 end
 
 -- System One decisions
@@ -593,6 +623,7 @@ local function systemone_route(eng, req, res)
 		return res:json(422, body)
 	end
 	local t0 = uv.hrtime()
+	local model = dreq.model or default_model(eng)
 	local r, msg, status = eng:decide(dreq, {
 		cancelled = function()
 			return res.s:gone()
@@ -602,6 +633,7 @@ local function systemone_route(eng, req, res)
 		res.close = true
 		return
 	end
+	metrics.request(model, "decide", r ~= nil)
 	if not r then
 		return res:json(status or 500, { detail = msg or "decision failed" })
 	end
@@ -612,6 +644,7 @@ local function systemone_route(eng, req, res)
 	return res:send(200, text, {
 		["Content-Type"] = "application/json",
 		["x-jevify-latency-ms"] = ("%.1f"):format((uv.hrtime() - t0) / 1e6),
+		["x-lgml-elapsed-ms"] = ("%.3f"):format((uv.hrtime() - t0) / 1e6),
 	})
 end
 
@@ -637,6 +670,10 @@ function M.install(srv, eng)
 	local function completions(req, res)
 		return chat(eng, req, res)
 	end
+	srv:route("GET", "/metrics", function(_, res)
+		return res:send(200, metrics.render(),
+		    { ["Content-Type"] = "text/plain; version=0.0.4; charset=utf-8" })
+	end)
 	srv:route("GET", "/health", health)
 	srv:route("GET", "/v1/health", health)
 	srv:route("GET", "/v1/models", list)

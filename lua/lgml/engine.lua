@@ -379,7 +379,10 @@ function E:run(req, sink)
 	}, {
 		cache_n = cached, restored_n = self.pc and self.pc.restored or 0,
 		prompt_n = #prompt - cached, prompt_ms = (t1 - t0) * 1000,
+		prompt_per_token_ms = (t1 - t0) * 1000 / math.max(#prompt - cached, 1),
+		prompt_per_second = (#prompt - cached) / math.max(t1 - t0, 1e-9),
 		predicted_n = n, predicted_ms = (t2 - t1) * 1000,
+		predicted_per_token_ms = (t2 - t1) * 1000 / math.max(n, 1),
 		predicted_per_second = n / math.max(t2 - t1, 1e-9),
 	})
 	return true

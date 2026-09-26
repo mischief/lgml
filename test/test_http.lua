@@ -241,6 +241,8 @@ local function test_chat(port)
 	    and args and args.city == "Paris" and tc.id:find("^call_"),
 	    "non-stream tool call")
 	ok(ch.finish_reason == "tool_calls", "non-stream finish_reason")
+	ok(r.headers["x-lgml-predicted-n"] == "7" and r.headers["x-lgml-prompt-n"] ~= nil,
+	    "non-stream x-lgml timing headers")
 	ok(b.usage.completion_tokens == 7 and b.usage.total_tokens ==
 	    b.usage.prompt_tokens + 7 and
 	    b.usage.prompt_tokens_details.cached_tokens == 0, "non-stream usage")
@@ -256,6 +258,16 @@ local function test_chat(port)
 	    chat_body())))
 	ok(b.choices[1].finish_reason == "stop" and
 	    b.choices[1].message.tool_calls == nil, "no tools gives stop")
+end
+
+-- GET /metrics counts the earlier chat requests in Prometheus text.
+local function test_metrics(port)
+	local r = roundtrip(port, request("GET", "/metrics"))
+	local n = r.body:match('lgml_chat_requests_total{model="[^"]*"} (%d+)')
+	ok(r.status == 200 and r.headers["content-type"]:find("^text/plain") and
+	    n and tonumber(n) >= 3, "metrics count chat requests")
+	ok(r.body:find("# TYPE lgml_predicted_tokens_total counter", 1, true) ~= nil,
+	    "metrics have type lines")
 end
 
 -- Assembles stream events the way a client does.
@@ -477,6 +489,7 @@ local function main()
 	test_errors(port)
 	test_chat(port)
 	test_stream(port)
+	test_metrics(port)
 	test_keepalive(port)
 	test_cancel(port, eng)
 	test_multipart()
