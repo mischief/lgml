@@ -16,6 +16,9 @@ M.MARGIN = 1024 * MiB
 --- Bytes added to a text encoder on its own backend, for its compute
 -- buffers: 256 MiB.
 M.TEXT_MARGIN = 256 * MiB
+--- Bytes added to the CPU part of a chat model with weights on the CPU
+-- (see `lgml.placement`), for its compute buffers: 256 MiB.
+M.CPU_MARGIN = 256 * MiB
 
 -- Default ids of engine modules that do not take them from a file.
 local ENGINE_IDS = {
@@ -108,27 +111,71 @@ function M.id(spec)
 	return (basename(spec.model):gsub("%.gguf$", ""))
 end
 
--- KV cache bytes of a chat gguf: per position, fixed, and the trained
--- context. nil for other models.
-local function cache_size(meta, spec)
+-- The config of a chat gguf for the transformer, or nil.
+local function config(meta)
 	local transformer = require("lgml.transformer")
-	local arch = meta["general.architecture"]
-	if not transformer.supports(arch) then
+	if not transformer.supports(meta["general.architecture"]) then
 		return nil
 	end
 	local ok, hp = pcall(transformer.config, meta)
-	if not ok then
+	return ok and hp or nil
+end
+
+-- KV cache bytes of a chat gguf: per position and fixed on the device,
+-- the trained context, then per position and fixed on the CPU. cpu is
+-- the set of layers, from 0, whose cache is on the CPU. nil for other
+-- models.
+local function cache_size(meta, spec, cpu)
+	local transformer = require("lgml.transformer")
+	local hp = config(meta)
+	if not hp then
 		return nil
 	end
-	local shape = { hp = hp, layers = hp.layers }
+	local layers = {}
+	for i, d in ipairs(hp.layers) do
+		layers[i] = setmetatable({ cpu = cpu and cpu[i - 1] or nil }, { __index = d })
+	end
+	local shape = { hp = hp, layers = layers }
 	local fa = spec.flash_attn ~= false
 	local copts = { type_k = spec.cache_type_k or "f16", type_v = spec.cache_type_v or "f16" }
 	if fa and not spec.cache_type_k and not spec.cache_type_v and
 	    pcall(transformer.cache_size, shape, { type = "q8_0" }) then
 		copts = { type = "q8_0" }
 	end
-	local per, fixed = transformer.cache_size(shape, copts)
-	return per, fixed, hp.n_ctx
+	local per, fixed, cper, cfixed = transformer.cache_size(shape, copts)
+	return per, fixed, hp.n_ctx, cper, cfixed
+end
+
+-- Place the weights of a chat model on a GPU by the placement keys of
+-- spec. Sets r.n_cpu_moe for "auto", moves bytes from r.files to
+-- r.extra.cpu, and returns the set of layers whose cache is on the CPU.
+local function place(r, spec, meta, budget)
+	local placement = require("lgml.placement")
+	local rules = placement.rules(spec)
+	local hp = rules and config(meta)
+	if not hp then
+		return nil
+	end
+	local tensors = lgml.gguf(spec.model).tensors
+	if rules.auto then
+		local n = 0
+		if budget and budget < math.huge then
+			local per, fixed = cache_size(meta, spec)
+			local ctx = math.tointeger(tonumber(spec.ctx)) or math.min(hp.n_ctx, placement.AUTO_CTX)
+			local mmproj = spec.mmproj and M.files(spec.mmproj) or 0
+			n = placement.auto(rules, tensors, hp.n_layer,
+			    budget - mmproj - M.MARGIN - fixed - per * ctx)
+		end
+		rules.n_cpu_moe, rules.auto = n, nil
+		r.n_cpu_moe = n
+	end
+	local set, bytes, layers = placement.plan(rules, tensors, hp.n_layer)
+	if not set then
+		return nil
+	end
+	r.files = r.files - bytes
+	r.extra.cpu = (r.extra.cpu or 0) + bytes + M.CPU_MARGIN
+	return layers
 end
 
 --- The memory estimate of a spec.
@@ -141,16 +188,23 @@ end
 -- that the model fits budget alone, in steps of 256 and at least 256.
 -- The cache types follow `lgml.engine`: q8_0 with flash attention when
 -- it fits, else f16.
+-- A chat model on a GPU with placement keys (see `lgml.placement`) has
+-- a cpu part: its weights on the CPU, the KV cache of its layers on the
+-- CPU, and `CPU_MARGIN`. With `n_cpu_moe = "auto"` and a budget, the
+-- estimate picks the count so the weights and the cache of `ctx`
+-- positions (default: at most `lgml.placement.AUTO_CTX`) fit; the
+-- result gives it as n_cpu_moe.
 -- @tparam table spec the model spec: `model`, `engine`, `stt`, `mmproj`,
--- `ctx`, `flash_attn`, `cache_type_k`, `cache_type_v`, `backend` and
--- `text_backend`
+-- `ctx`, `flash_attn`, `cache_type_k`, `cache_type_v`, `backend`,
+-- `text_backend`, `cpu_moe`, `n_cpu_moe`, `n_gpu_layers` and `override`
 -- @tparam[opt] number budget the memory budget in bytes of the kind of
 -- `backend`
 -- @tparam[opt] boolean gpu false when the machine has no GPU (see `kind`)
--- @treturn table `{ bytes, files, kv, margin, n_ctx, kind, extra }`; bytes
--- is the part on the kind of `backend`; n_ctx is the context for the
--- worker, or nil when the estimate does not know it; extra is
--- `{ [kind] = bytes }` for the parts on other kinds
+-- @treturn table `{ bytes, files, kv, margin, n_ctx, kind, extra,
+-- n_cpu_moe }`; bytes is the part on the kind of `backend`; n_ctx is the
+-- context for the worker, or nil when the estimate does not know it;
+-- extra is `{ [kind] = bytes }` for the parts on other kinds
+-- @raise on bad placement keys
 function M.model(spec, budget, gpu)
 	local files = M.files(spec.model) + (spec.mmproj and M.files(spec.mmproj) or 0)
 	local kind = M.kind(spec.backend, gpu)
@@ -164,15 +218,19 @@ function M.model(spec, budget, gpu)
 	end
 	local meta = not spec.engine and not spec.stt and gguf_meta(spec.model)
 	if meta and not detect.is_whisper(spec.model) then
-		local per, fixed, n_train = cache_size(meta, spec)
+		local cpu = kind == "gpu" and place(r, spec, meta, budget) or nil
+		local per, fixed, n_train, cper, cfixed = cache_size(meta, spec, cpu)
 		if per then
 			local n = math.tointeger(tonumber(spec.ctx)) or n_train
 			if not spec.ctx and budget and budget < math.huge and per > 0 then
-				local fit = (budget - files - fixed - M.MARGIN) // per // 256 * 256
+				local fit = (budget - r.files - fixed - M.MARGIN) // per // 256 * 256
 				n = math.min(n, math.max(math.tointeger(fit) or 256, 256))
 			end
 			r.n_ctx = n
 			r.kv = per * n + fixed
+			if cpu then
+				r.extra.cpu = r.extra.cpu + cper * n + cfixed
+			end
 		end
 	end
 	r.bytes = r.files + r.kv + r.margin

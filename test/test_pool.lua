@@ -384,6 +384,12 @@ local function test_lora()
 	ok(status == 400 and msg:find("id from 0 to 1", 1, true), "a bad id gives 400")
 end
 
+-- KV cache bytes of the tiny model at 256 positions, f16.
+local function per256(model)
+	local per, fixed = model:cache_size({ type = "f16" })
+	return per * 256 + fixed
+end
+
 -- Estimates from files and the KV cache, checked against a loaded model.
 local function test_estimate()
 	local estimate = require("lgml.estimate")
@@ -407,6 +413,34 @@ local function test_estimate()
 	ok(estimate.id({ model = path }) == "tiny qwen3" and estimate.id({ model = "/m/x.gguf", id = "y" }) == "y" and
 	    estimate.id({ model = "/m/w/", engine = "lgml.stt_engine" }) == "w" and
 	    estimate.id({ model = "/m/o", engine = "lgml.tts.orpheus" }) == "orpheus", "estimate: model ids")
+	-- Weights on the CPU count against cpu, with the cache of their layers.
+	local info = lgml.gguf(path)
+	local ffn, first = 0, 0
+	for _, t in ipairs(info.tensors) do
+		if t.name:find("ffn_") then
+			ffn = ffn + t.size
+		end
+		if t.name:match("^blk%.0%.") or t.name:match("^token_embd") or t.name:match("^output") then
+			first = first + t.size
+		end
+	end
+	local gspec = { model = path, backend = "Vulkan0", override = "ffn_=CPU" }
+	e = estimate.model(gspec)
+	ok(e.files == size - ffn and e.extra.cpu == ffn + estimate.CPU_MARGIN and
+	    e.kv == per256(model) and e.bytes == e.files + e.kv + estimate.MARGIN,
+	    "estimate: weights on the CPU count against cpu")
+	gspec = { model = path, backend = "Vulkan0", n_gpu_layers = 1 }
+	e = estimate.model(gspec)
+	local lper = model:cache_size({ type = "f16" }) // 2
+	ok(e.files == size - first and e.kv == lper * 256 and
+	    e.extra.cpu == first + lper * 256 + estimate.CPU_MARGIN,
+	    "estimate: a layer on the CPU takes its cache along")
+	e = estimate.model({ model = path, backend = "CPU", n_gpu_layers = 1 })
+	ok(e.files == size and next(e.extra) == nil, "estimate: placement on a CPU backend moves nothing")
+	e = estimate.model({ model = path, backend = "Vulkan0", n_cpu_moe = "auto" }, 1)
+	ok(e.n_cpu_moe == 0 and next(e.extra) == nil, "estimate: auto without experts moves nothing")
+	ok(not pcall(estimate.model, { model = path, backend = "Vulkan0", override = "x" }),
+	    "estimate: a bad override is an error")
 	ok(estimate.kind("CPU") == "cpu" and estimate.kind("Vulkan0") == "gpu" and
 	    estimate.kind(nil) == "gpu" and estimate.kind(nil, false) == "cpu", "estimate: backend kinds")
 	-- An image model with its text encoder on the CPU has a cpu part.

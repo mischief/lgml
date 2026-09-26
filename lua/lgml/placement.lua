@@ -190,19 +190,23 @@ end
 -- @tparam {table,...} tensors as for `plan`
 -- @tparam integer n_layer the layer count
 -- @tparam number budget the bytes the weights may take on the backend
--- @treturn integer the count; n_layer when even all experts on the CPU
--- do not fit
+-- @treturn integer the count; the last layer with experts, plus 1, when
+-- even all experts on the CPU do not fit
 -- @treturn integer the weight bytes on the backend with that count
 function M.auto(rules, tensors, n_layer, budget)
 	local r = { override = rules.override, n_gpu_layers = rules.n_gpu_layers }
-	local total = 0
+	local total, last = 0, 0
 	for _, t in ipairs(tensors) do
 		total = total + (t.size or 0)
+		local il = t.name:match(M.EXPERTS)
+		if il then
+			last = math.max(last, tonumber(il) + 1)
+		end
 	end
 	local _, cpu = M.plan(r, tensors, n_layer)
 	local dev = total - cpu
 	local n = 0
-	while dev > budget and n < n_layer do
+	while dev > budget and n < math.min(last, n_layer) do
 		n = n + 1
 		r.n_cpu_moe = n
 		local _, c = M.plan(r, tensors, n_layer)
