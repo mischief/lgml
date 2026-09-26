@@ -195,6 +195,10 @@ local function test_errors(port)
 	ok(r.status == 400 and body_json(r).error.param == "max_tokens",
 	    "bad max_tokens")
 
+	r = roundtrip(port, request("POST", "/v1/chat/completions", json.encode({ messages = {
+		{ role = "user", content = { { type = "image_url", image_url = { detail = "low" } } } } } })))
+	ok(r.status == 400 and body_json(r).error.param == "messages", "image part without a URL")
+
 	r = roundtrip(port, request("GET", "/nope"))
 	ok(r.status == 404 and body_json(r).error.type == "not_found_error",
 	    "unknown path gives 404")

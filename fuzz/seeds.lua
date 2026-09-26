@@ -17,6 +17,10 @@ put("json", "chat", [[{"model":"m","messages":[{"role":"system","content":"s"},]
     [["content":"ok"}],"tools":[{"type":"function","function":{"name":"f",]] ..
     [["description":"d","parameters":{"type":"object","properties":{"a":{"type":"integer"}}}}}],]] ..
     [["stream":true,"max_tokens":16,"temperature":0.5}]])
+put("json", "image", [[{"model":"m","messages":[{"role":"user","content":[]] ..
+    [[{"type":"text","text":"a"},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}},]] ..
+    [[{"type":"image_url","image_url":"data:image/jpeg;base64,/9j/"},{"type":"text","text":"b"}]}]}]])
+put("json", "data-url", [["data:image/png;base64,iVBORw0KGgo="]])
 put("json", "speech", [[{"model":"vibevoice","input":"hello","voice":"alloy","speed":1.0,"response_format":"wav"}]])
 put("json", "scalars", [=[[1,-2.5e3,"é😀",true,false,null,{},[]]]=])
 put("json", "number", "5")

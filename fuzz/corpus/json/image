@@ -1,0 +1,1 @@
+{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}},{"type":"image_url","image_url":"data:image/jpeg;base64,/9j/"},{"type":"text","text":"b"}]}]}

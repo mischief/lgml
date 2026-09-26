@@ -10,6 +10,7 @@ local qwen3 = require("lgml.chat.qwen3")
 local gemma4 = require("lgml.chat.gemma4")
 local qwen35 = require("lgml.chat.qwen35")
 local tojson = require("lgml.chat.tojson")
+local media = require("lgml.chat.media")
 
 local n, failed = 0, 0
 local function ok(cond, name)
@@ -636,8 +637,74 @@ local function test_qwen35_render()
 	ok(not pcall(qwen35.render, bad, {}), "qwen35: arguments that are not JSON raise")
 end
 
+-- Image content parts: data URLs, and the llama-server text joins.
+local function test_media()
+	local png = "\137PNG\r\n\26\n"
+	local bytes, mime = media.data_url("data:image/png;base64,iVBORw0KGgo=")
+	ok(bytes == png and mime == "image/png", "media: data URL decodes")
+	bytes, mime = media.data_url("DATA:Image/JPEG;charset=x;BASE64,iVBO Rw0K\nGgo=")
+	ok(bytes == png and mime == "image/jpeg", "media: scheme, type and base64 flag ignore case")
+	local cases = {
+		{ "https://example.com/cat.png", "http and https URLs are not supported" },
+		{ "http://x/y", "not supported" },
+		{ "file:///etc/passwd", "must be a data URL" },
+		{ "cat.png", "must be a data URL" },
+		{ "data:image/png;base64", "no comma" },
+		{ "data:text/plain;base64,aGk=", "image type" },
+		{ "data:;base64,aGk=", "image type" },
+		{ "data:image/png,rawbytes", "must be base64" },
+		{ "data:image/png;base64,a!==", "base64" },
+		{ "data:image/png;base64,", "no data" },
+	}
+	for _, c in ipairs(cases) do
+		local b, err = media.data_url(c[1])
+		ok(b == nil and err and err:find(c[2], 1, true), "media: " .. c[1] .. " gives an error")
+	end
+	ok(select(2, media.data_url(42)):find("string", 1, true), "media: a URL that is not a string")
+
+	local url = "data:image/png;base64,iVBORw0KGgo="
+	local msgs = {
+		{ role = "system", content = "sys" },
+		{ role = "user", content = {
+			{ type = "text", text = "a" }, { type = "text", text = "b" },
+			{ type = "image_url", image_url = { url = url } },
+			{ type = "text", text = "c" }, { type = "image_url", image_url = url },
+			{ type = "image_url", image_url = { url = url } }, { type = "text", text = "" },
+			{ type = "text", text = "d" }, { type = "input_audio" } } },
+		{ role = "user", content = { { type = "text", text = "only text" } } },
+	}
+	ok(media.has_images(msgs) and not media.has_images({ msgs[1], msgs[3] }),
+	    "media: has_images finds image parts")
+	local out, images = media.extract(msgs, "<M>")
+	ok(out[2].content == "a\nb<M>c<M><M>\nd" and #images == 3 and images[1].bytes == png,
+	    "media: text joins as llama-server: " .. tostring(out[2].content))
+	ok(out[1] == msgs[1] and out[3] == msgs[3] and msgs[2].content[1].text == "a",
+	    "media: other messages and the input stay as they are")
+	local lead = media.extract({ { role = "user", content = {
+		{ type = "text", text = "" }, { type = "text", text = "x" } , { type = "image_url",
+		image_url = { url = url } } } } }, "<M>")
+	ok(lead[1].content == "x<M>", "media: no newline after empty text")
+	local bad, err = media.extract({ { role = "user", content = {
+		{ type = "text", text = "x" }, { type = "image_url", image_url = { url = 5 } } } } }, "<M>")
+	ok(bad == nil and err == "messages[0].content[1]: image_url.url must be a string",
+	    "media: a bad part names its place: " .. tostring(err))
+	bad, err = media.extract({ { role = "user", content = {
+		{ type = "image_url", image_url = { url = "https://x/y.png" } } } } }, "<M>")
+	ok(bad == nil and err:find("^messages%[0%]%.content%[0%]: image url must be a data URL"),
+	    "media: an http URL is an error with its place")
+
+	local im = gemma4.image
+	local rendered = gemma4.render(media.extract({ { role = "user", content = {
+		{ type = "image_url", image_url = { url = url } },
+		{ type = "text", text = " What is this? " } } } }, im.begin .. im.token .. im.finish),
+		{ add_generation_prompt = true, enable_thinking = false })
+	ok(rendered == "<|turn>user\n<|image><|image|><image|> What is this?<turn|>\n<|turn>model\n",
+	    "gemma4: an image renders as llama-server: " .. rendered)
+end
+
 test_tojson()
 test_detect()
+test_media()
 test_fixtures()
 test_gemma4_fixtures()
 test_qwen35_fixtures("chat/qwen35", nil)

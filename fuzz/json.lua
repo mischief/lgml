@@ -1,10 +1,12 @@
--- JSON request bodies: lgml.json, the OpenAI checks and the chat
--- templates. Bad input must give nil and a message, not an error.
+-- JSON request bodies: lgml.json, the OpenAI checks, image content
+-- parts and data URLs, and the chat templates. Bad input must give nil
+-- and a message, not an error.
 local json = require("lgml.json")
 local openai = require("lgml.server.openai")
 local qwen3 = require("lgml.chat.qwen3")
 local gemma4 = require("lgml.chat.gemma4")
 local qwen35 = require("lgml.chat.qwen35")
+local media = require("lgml.chat.media")
 
 -- Qwen3.5 render raises where its Jinja template raises. Those errors
 -- start with "chat: "; any other error is a bug.
@@ -25,7 +27,18 @@ return function(s)
 		assert(json.decode(text) ~= nil, "encoded JSON does not decode")
 	end
 	openai.check_speech(v)
+	if type(v) == "string" then
+		local bytes, mime = media.data_url(v)
+		assert(bytes == nil or type(mime) == "string", "data URL type")
+	end
 	if openai.check_chat(v) then
+		local msgs, images = media.extract(v.messages, gemma4.image.token)
+		if msgs then
+			assert(#images > 0 or not media.has_images(v.messages), "images lost")
+			gemma4.render(msgs, { add_generation_prompt = true })
+		else
+			assert(type(images) == "string", "extract error is not a string")
+		end
 		qwen3.render(v.messages, { tools = v.tools, add_generation_prompt = true })
 		gemma4.render(v.messages, { tools = v.tools, add_generation_prompt = true })
 		gemma4.render(v.messages, { tools = v.tools, continue_final_message = true })

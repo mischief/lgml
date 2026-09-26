@@ -47,7 +47,8 @@ local function is_object(v)
 end
 
 -- Content is a string, null or an array of parts. A text part has a
--- string text.
+-- string text; an image_url part has a URL string, in image_url.url
+-- or as image_url itself.
 local function check_content(c)
 	if c == nil or c == json.null or type(c) == "string" then
 		return true
@@ -57,6 +58,11 @@ local function check_content(c)
 	for _, part in ipairs(c) do
 		if not is_object(part) or type(part.type) ~= "string" or
 		    (part.type == "text" and type(part.text) ~= "string") then
+			return false
+		end
+		local u = part.image_url
+		if part.type == "image_url" and type(u) ~= "string" and
+		    not (is_object(u) and type(u.url) == "string") then
 			return false
 		end
 	end

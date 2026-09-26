@@ -1,8 +1,9 @@
 --- Chat template family selection from gguf metadata.
 -- A family module has `render(messages, opts)`, which returns the
 -- prompt text, and `new_parser(opts)`, which returns a streaming output
--- parser. See `lgml.chat.qwen3`, `lgml.chat.qwen35` and
--- `lgml.chat.gemma4`.
+-- parser. A family that takes images also has `image`, its image
+-- tokens; `lgml.chat.media` reads image parts. See `lgml.chat.qwen3`,
+-- `lgml.chat.qwen35` and `lgml.chat.gemma4`.
 -- @module lgml.chat
 local M = {}
 

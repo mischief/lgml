@@ -8,6 +8,10 @@ local tojson = require("lgml.chat.tojson")
 
 local M = {}
 
+--- The image tokens, as llama.cpp mtmd for gemma4v: `begin` and
+-- `finish` go around the soft `token`, one for each image embedding.
+M.image = { begin = "<|image>", token = "<|image|>", finish = "<image|>" }
+
 local Q = '<|"|>'
 
 local function isnull(v)
