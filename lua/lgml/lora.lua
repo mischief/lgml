@@ -69,7 +69,8 @@ end
 -- opts.rank: the rank (default 8).
 -- opts.alpha: alpha (default 2 * rank).
 -- opts.targets: weight names after "blk.N." without ".weight", such as
--- "attn_q" (default `TARGETS`); "output" adds the output projection.
+-- "attn_q" (default `TARGETS`); "output" adds the output projection when
+-- the model has one apart from the token embedding.
 -- opts.layers: a list of layer indexes from 1 (default all layers).
 -- opts.seed: the seed for A (default 1).
 -- @treturn Adapter the adapter
