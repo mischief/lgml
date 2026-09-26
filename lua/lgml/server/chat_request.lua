@@ -350,6 +350,74 @@ local function tools(v)
 	return true
 end
 
+-- The name of a { type = "function", function = { name } } choice.
+local function choice_name(v)
+	local f = is_object(v) and v.type == "function" and v["function"]
+	return is_object(f) and type(f.name) == "string" and f.name or nil
+end
+
+-- "none", "auto", "required", a named function or allowed_tools.
+local function tool_choice(v)
+	if v == "none" or v == "auto" or v == "required" then
+		return true
+	elseif not is_object(v) then
+		return false
+	elseif v.type == "custom" then
+		return false, "tool_choice: custom tools are not supported"
+	elseif v.type == "function" then
+		return choice_name(v) ~= nil
+	elseif v.type ~= "allowed_tools" then
+		return false
+	end
+	local a = v.allowed_tools
+	if not is_object(a) or (a.mode ~= "auto" and a.mode ~= "required") or not json.isarray(a.tools) then
+		return false
+	end
+	for _, t in ipairs(a.tools) do
+		if not choice_name(t) then
+			return false, "tool_choice: allowed_tools takes function tools only"
+		end
+	end
+	return true
+end
+
+-- The tool of tools with name, or nil.
+local function tool_named(tools, name)
+	for _, t in ipairs(tools or {}) do
+		if t["function"].name == name then
+			return t
+		end
+	end
+	return nil
+end
+
+-- Checks tool_choice against the tools and puts it in a normal form:
+-- "none" drops the tools, and allowed_tools keeps the tools that it
+-- names, with its mode as tool_choice.
+local function normal_tool_choice(b)
+	local tc, tools = b.tool_choice, b.tools
+	if type(tc) == "table" and tc.type == "allowed_tools" then
+		local keep = json.array()
+		for _, t in ipairs(tc.allowed_tools.tools) do
+			local name = choice_name(t)
+			local tool = tool_named(tools, name)
+			if not tool then
+				return nil, ("tool_choice: %s is not in tools"):format(name)
+			end
+			keep[#keep + 1] = tool
+		end
+		b.tools, b.tool_choice, tools, tc = keep, tc.allowed_tools.mode, keep, tc.allowed_tools.mode
+	end
+	if tc == "none" then
+		b.tools = nil
+	elseif tc == "required" and not (tools and #tools > 0) then
+		return nil, 'tool_choice "required" needs tools'
+	elseif type(tc) == "table" and not tool_named(tools, choice_name(tc)) then
+		return nil, ("tool_choice: %s is not in tools"):format(choice_name(tc))
+	end
+	return true
+end
+
 --- The top-level fields of a chat request, in the order of the checks.
 -- Each entry is `{ name, types, check, text, status = s, label = l }`.
 -- types is a Lua type name, or names joined by `|`. check is optional:
@@ -385,10 +453,9 @@ M.FIELDS = {
 	{ "logit_bias", "table", logit_bias, "an object of token ids to numbers from -100 to 100",
 	    status = "supported", label = "OpenAI" },
 	{ "tools", "table", tools, "an array of function tools", status = "limited", label = "OpenAI" },
-	{ "tool_choice", "string|table", function(v) return v == "auto" end, '"auto" (planned: more)',
-	    status = "planned", label = "OpenAI" },
-	{ "parallel_tool_calls", "boolean", function(v) return v == true end, "true (planned)",
-	    status = "planned", label = "OpenAI" },
+	{ "tool_choice", "string|table", tool_choice,
+	    "none, auto, required, a function or allowed_tools", status = "supported", label = "OpenAI" },
+	{ "parallel_tool_calls", "boolean", status = "supported", label = "OpenAI" },
 	{ "response_format", "table", is_object, "an object", status = "supported", label = "OpenAI" },
 	{ "reasoning_effort", "string", one_of("none", "minimal", "low", "medium", "high", "xhigh", "max"),
 	    "none, minimal, low, medium, high, xhigh or max", status = "limited", label = "OpenAI" },
@@ -461,7 +528,9 @@ end
 -- It removes top-level nulls and nulls in each message. It gives an
 -- error for a field that is not in `FIELDS`, for a value that fails
 -- the check of its field, and for a bad message. A string `stop`
--- becomes an array of one string. It turns `grammar`,
+-- becomes an array of one string. `tool_choice` `"none"` removes
+-- `tools`; `allowed_tools` keeps the tools that it names and becomes
+-- its mode. It turns `grammar`,
 -- `response_format` or `json_schema` into GBNF text in `grammar` and
 -- checks it (see `lgml.grammar`); with raw, schema properties keep
 -- their order.
@@ -494,6 +563,10 @@ function M.check(b, raw)
 	end
 	if b.top_logprobs ~= nil and b.logprobs ~= true then
 		return nil, "top_logprobs needs logprobs: true", "top_logprobs"
+	end
+	ok, err = normal_tool_choice(b)
+	if not ok then
+		return nil, err, "tool_choice"
 	end
 	if type(b.stop) == "string" then
 		b.stop = json.array({ b.stop })

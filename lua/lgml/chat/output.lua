@@ -28,6 +28,7 @@ local CONTENT = { start = true, content = true }
 -- @tparam[opt] table opts the options:
 --
 -- - `stop`: a list of stop strings; empty strings are skipped
+-- - `one_call`: end the reply after the first tool call
 -- @treturn Output the output
 function M.new(sink, parser, opts)
 	opts = opts or {}
@@ -39,7 +40,7 @@ function M.new(sink, parser, opts)
 	end
 	return setmetatable({
 		sink = sink, parser = parser, map = {},
-		reasoning_tokens = 0, stops = stops, hold = "", lp = {},
+		reasoning_tokens = 0, stops = stops, hold = "", lp = {}, one_call = opts.one_call,
 	}, O)
 end
 
@@ -118,14 +119,16 @@ function O:event(ev)
 		return idx ~= nil or nil
 	elseif t == "tool_call_args" then
 		return sink:tool_arguments(self.map[ev.index], ev.text)
+	elseif t == "tool_call_end" and self.one_call and self.map[ev.index] then
+		return "stop"
 	end
 	return true
 end
 
 --- Sends parser events.
 -- @tparam {table,...} events the events
--- @treturn ?boolean|string true; `"stop"` when a stop string ends the
--- reply; nil when the client is gone. After `"stop"`, end the reply
+-- @treturn ?boolean|string true; `"stop"` when a stop string or the end
+-- of a call with `one_call` ends the reply; nil when the client is gone. After `"stop"`, end the reply
 -- with reason `stop` and do not call the output again.
 function O:deliver(events)
 	for _, ev in ipairs(events) do

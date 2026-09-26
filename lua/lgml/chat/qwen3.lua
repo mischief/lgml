@@ -198,4 +198,13 @@ end
 -- @treturn lgml.chat.hermes.Parser the parser
 M.new_parser = require("lgml.chat.hermes").new_parser
 
+--- Makes a grammar that forces tool calls. This is
+-- `lgml.chat.tool_grammar.hermes`.
+-- @function tool_grammar
+-- @tparam {table,...} tools OpenAI function tools
+-- @tparam[opt] table opts the options
+-- @treturn string the GBNF text
+-- @treturn string the start rule
+M.tool_grammar = require("lgml.chat.tool_grammar").hermes
+
 return M

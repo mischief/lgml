@@ -1,10 +1,13 @@
 -- OpenAI request features of the gguf chat engine on a tiny qwen3 gguf
--- with random weights: stop strings, logprobs, logit_bias, and the
--- parser output. TAP output.
+-- with random weights: stop strings, logprobs, logit_bias, tool_choice
+-- and the tool grammars, and the parser output. TAP output.
 local uv = require("luv")
 local engine = require("lgml.engine")
 local output = require("lgml.chat.output")
 local hermes = require("lgml.chat.hermes")
+local json = require("lgml.json")
+local lgml = require("lgml")
+local tool_grammar = require("lgml.chat.tool_grammar")
 
 local here = debug.getinfo(1, "S").source:match("^@(.*/)") or "./"
 package.path = here .. "?.lua;" .. package.path
@@ -97,11 +100,54 @@ local function test_output()
 	out:token('Hi <tool_call>{"name": "f", "arguments": {"x": "END"}}</tool_call>')
 	ok(out:finish() == true and #r2.tools == 1 and text(r2.tools[1].args) == '{"x": "END"}',
 	    "stop does not apply to tool call arguments")
+	local r3 = recorder()
+	out = output.new(r3.sink, hermes.new_parser({ tools = { "f", "g" } }), { one_call = true })
+	local call = '<tool_call>{"name": "%s", "arguments": {}}</tool_call>\n'
+	local res = out:token(call:format("f") .. call:format("g"))
+	ok(res == "stop" and #r3.tools == 1 and r3.tools[1].name == "f", "one_call ends the reply after a call")
+	local r4 = recorder()
+	out = output.new(r4.sink, hermes.new_parser({ tools = {} }))
+	out:token(call:format("f"))
+	ok(out:finish() == true and #r4.tools == 0, "with no tools a call is content")
+end
+
+local WEATHER = { type = "function", ["function"] = { name = "get_weather", parameters = {
+	type = "object", properties = { city = { enum = { "Paris", "Rome" } }, days = { type = "integer" } },
+	required = { "city" } } } }
+local TIME = { type = "function", ["function"] = { name = "get_time" } }
+
+local function test_tool_grammars()
+	local function matches(text, root, s)
+		local g = assert(lgml.grammar(text, { root = root, lax = true }))
+		local r = g:accept(s) and g:can_end()
+		g:close()
+		return r == true
+	end
+	local t, root = assert(tool_grammar.hermes({ WEATHER, TIME }, { parallel = true }))
+	local call = '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n</tool_call>'
+	ok(matches(t, root, call), "hermes grammar takes a call")
+	ok(matches(t, root, call .. "\n" .. '<tool_call>\n{"name": "get_time", "arguments": {}}\n</tool_call>'),
+	    "hermes grammar takes two calls with parallel")
+	ok(not matches(t, root, call:gsub("Paris", "Oslo")), "hermes arguments follow the schema")
+	ok(not matches(t, root, call:gsub("get_weather", "get_other")), "hermes grammar takes the tools only")
+	ok(not matches(t, root, "Hello"), "hermes grammar takes no text")
+	t, root = tool_grammar.hermes({ WEATHER })
+	ok(not matches(t, root, call .. "\n" .. call), "one call without parallel")
+	t, root = tool_grammar.qwen35({ WEATHER, TIME }, { parallel = true })
+	local x = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>"
+	ok(matches(t, root, x), "qwen35 grammar takes a call")
+	ok(matches(t, root, "<tool_call>\n<function=get_time>\n<parameter=any>\n1\n</parameter>\n</function>\n" ..
+	    "</tool_call>"), "qwen35: a tool with no schema takes any parameter")
+	ok(not matches(t, root, x:gsub("=city", "=town")), "qwen35 parameter names follow the schema")
+	t, root = tool_grammar.gemma4({ WEATHER })
+	ok(matches(t, root, '<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>'),
+	    "gemma4 grammar takes a call")
+	ok(not matches(t, root, '<|tool_call>call:get_time{}<tool_call|>'), "gemma4 grammar takes the tools only")
 end
 
 local path = tiny.tmp(".gguf")
-tiny.write(path, "qwen3")
-local e = engine.new({ model = path, backend = "CPU", n_ctx = 256 })
+tiny.write(path, "qwen3", { n_ctx = 1024 })
+local e = engine.new({ model = path, backend = "CPU", n_ctx = 1024 })
 
 local function chat(extra)
 	local req = { messages = { { role = "user", content = "Hi there" } }, max_tokens = 40,
@@ -180,10 +226,45 @@ local function test_logit_bias()
 	ok(bad.res == nil and bad.status == 400 and bad.err:find("logit_bias"), "a token id past the vocab gives 400")
 end
 
+local function test_tool_choice()
+	local tools = { WEATHER, TIME }
+	local base = chat({ tools = tools })
+	ok(base.res and #base.tools == 0, "auto: the random model writes no call")
+	local r = chat({ tools = tools, tool_choice = "required", max_tokens = 200 })
+	local args = r.tools[1] and json.decode(text(r.tools[1].args))
+	ok(r.res and #r.tools >= 1 and text(r.content) == "", ("required forces a call: %d calls, content %q")
+	    :format(#r.tools, text(r.content)))
+	ok(r.tools[1] and (r.tools[1].name == "get_time" or (args and (args.city == "Paris" or
+	    args.city == "Rome"))), "the forced call follows the schema")
+	r = chat({ tools = tools, tool_choice = { type = "function", ["function"] = { name = "get_time" } },
+		max_tokens = 200 })
+	ok(#r.tools == 1 and r.tools[1].name == "get_time", "a named function forces one call to it")
+	r = chat({ tools = tools, tool_choice = "required", parallel_tool_calls = false, max_tokens = 400,
+		temperature = 1, seed = 3 })
+	ok(#r.tools == 1, "required without parallel calls makes one call")
+	-- Biases on the tags and on "<" lead the random model through a
+	-- short reasoning block to the call, not into white space.
+	local bias = { ["60"] = 10 }
+	for id = 0, e.tk:n_vocab() - 1 do
+		local t = e.tk:token(id)
+		if t == "<think>" or t == "</think>" then
+			bias[tostring(id)] = 20
+		end
+	end
+	r = chat({ tools = tools, tool_choice = "required", max_tokens = 200, logit_bias = bias,
+		chat_template_kwargs = { enable_thinking = true } })
+	ok(#r.tools >= 1, ("required with thinking calls after the reasoning (%d reasoning tokens)")
+	    :format(r.usage and r.usage.reasoning_tokens or -1))
+	r = chat({ tools = tools, tool_choice = "none" })
+	ok(r.res and #r.tools == 0, "none: no calls")
+end
+
 test_output()
+test_tool_grammars()
 test_stop()
 test_logprobs()
 test_logit_bias()
+test_tool_choice()
 os.remove(path)
 print("1.." .. n)
 os.exit(failed == 0 and 0 or 1)

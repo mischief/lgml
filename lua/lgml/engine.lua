@@ -446,6 +446,8 @@ end
 -- The request can set sampler settings, `seed`, `max_tokens`,
 -- `max_completion_tokens`, `stop` (see `lgml.chat.output`), `logprobs`
 -- and `top_logprobs` (from the C `sampler:logprobs`), `logit_bias`, `tools`,
+-- `tool_choice` (`"required"` or a named function forces a call with
+-- the tool grammar of the chat family), `parallel_tool_calls`,
 -- `reasoning_effort = "none"` and
 -- `chat_template_kwargs` `enable_thinking`, `reasoning_effort` and
 -- `preserve_thinking`. `grammar` (GBNF) or `response_format` (see
@@ -511,17 +513,49 @@ function E:decide(req, ctl)
 	return a, b, c
 end
 
--- Sampler options for the grammar of req: {} when it has none, or nil
--- and an error. With thinking on, the grammar applies after the block.
-function E:grammar_opts(req, think, prompt)
-	local text, err = grammar.from_request(req)
-	if not text then
-		return err == nil and {} or nil, err
+-- The tools that req forces a call to, and whether it allows more than
+-- one call: all tools for tool_choice "required", one for a named
+-- function. nil when the model may answer without a call.
+local function forced_tools(req)
+	local tc, tools = req.tool_choice, req.tools or {}
+	if tc == "required" then
+		return tools, req.parallel_tool_calls ~= false
+	elseif type(tc) == "table" then
+		local name = type(tc["function"]) == "table" and tc["function"].name
+		for _, t in ipairs(tools) do
+			if type(t["function"]) == "table" and t["function"].name == name then
+				return { t }, false
+			end
+		end
 	end
-	local root, tags = "root", THINK[self.family_name]
+	return nil
+end
+
+-- Sampler options for the grammar of req: {} when it has none, or nil
+-- and an error. A forced tool call takes the tool call grammar of the
+-- chat family. With thinking on, the grammar applies after the block.
+function E:grammar_opts(req, think, prompt)
+	local text, err, root
+	local forced, parallel = forced_tools(req)
+	if forced then
+		if not self.family.tool_grammar then
+			return nil, ("tool_choice: the %s chat template cannot force a tool call"):format(self.family_name)
+		end
+		text, root = self.family.tool_grammar(forced, { parallel = parallel })
+		if not text then
+			return nil, "tool_choice: " .. root
+		end
+	else
+		text, err = grammar.from_request(req)
+		if not text then
+			return err == nil and {} or nil, err
+		end
+		root = "root"
+	end
+	local tags = THINK[self.family_name]
 	if think and tags then
 		local opened = prompt:gsub("%s+$", ""):sub(-#tags[1]) == tags[1]
-		text, root = grammar.reasoning(text, tags[1], tags[2], opened)
+		text, root = grammar.reasoning(text, tags[1], tags[2], opened, root)
 	end
 	return { grammar = text, grammar_root = root, tokenizer = self.tk }
 end
@@ -730,8 +764,9 @@ function E:run_prompt(req, sink)
 		    "seed", req.seed or "random", "max_tokens", max, "thinking", think,
 		    "grammar", gopts.grammar and first_lines(gopts.grammar, 6), "root", gopts.grammar_root)
 	end
-	local out = output.new(sink, self.family.new_parser({ tools = req.tools, enable_thinking = think }),
-	    { stop = req.stop })
+	-- With no tools, as with tool_choice "none", the parser reads no calls.
+	local out = output.new(sink, self.family.new_parser({ tools = req.tools or {}, enable_thinking = think }),
+	    { stop = req.stop, one_call = req.parallel_tool_calls == false })
 	local dec = tokenizer.decoder(self.tk, { special = false })
 
 	local t0 = lgml.clock()

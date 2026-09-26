@@ -81,24 +81,21 @@ local function hex(c)
 	return ("\\x%02X"):format(c)
 end
 
---- Wraps a grammar so that a reasoning block before the answer is free.
--- The block is `open`, any text without `close`, then `close`; the
--- answer may follow after white space. The rules match the text with a
--- string-search automaton, one rule per matched byte of close.
--- @tparam string text the grammar of the answer, with a `root` rule
--- @tparam string open the tag that opens the block, ASCII
--- @tparam string close the tag that ends the block, ASCII
--- @tparam boolean opened true when the prompt already opened the block
--- @treturn string the new grammar text
--- @treturn string the start rule name
-function M.reasoning(text, open, close, opened)
-	assert(#close > 0 and not close:find("[\128-\255]"), "close tag must be ASCII")
+--- Rules that match any text without close, then close.
+-- The rules match the text with a string-search automaton, one rule per
+-- matched byte of close. They are named `prefix-0` to `prefix-<n-1>`;
+-- `prefix-0` is the start rule.
+-- @tparam string prefix the rule name prefix
+-- @tparam string close the text that ends the match, ASCII
+-- @tparam[opt] string next the rule that follows close; nil ends there
+-- @treturn string the rules, one per line
+function M.until_text(prefix, close, next)
+	assert(#close > 0 and not close:find("[\128-\255]"), "close must be ASCII")
 	local n = #close
-	local rules = {}
 	local function state(k)
-		return "lgml-think-" .. k
+		return prefix .. "-" .. k
 	end
-	-- next[k][c]: the state after byte c in state k (KMP).
+	-- next_state(k, c): the state after byte c in state k (KMP).
 	local fail = { [0] = 0, [1] = 0 }
 	for k = 2, n do
 		local f = fail[k - 1]
@@ -123,12 +120,13 @@ function M.reasoning(text, open, close, opened)
 	for i = 1, n do
 		bytes[close:byte(i)] = true
 	end
+	local rules = {}
 	for k = 0, n - 1 do
 		local alts, stay = {}, {}
 		for c in pairs(bytes) do
 			local t = next_state(k, c)
 			if t == n then
-				alts[#alts + 1] = ('"%s" lgml-answer'):format(hex(c))
+				alts[#alts + 1] = ('"%s"%s'):format(hex(c), next and " " .. next or "")
 			elseif t > 0 then
 				alts[#alts + 1] = ('"%s" %s'):format(hex(c), state(t))
 			end
@@ -141,13 +139,36 @@ function M.reasoning(text, open, close, opened)
 		alts[#alts + 1] = ("[^%s] %s"):format(table.concat(stay), state(0))
 		rules[#rules + 1] = ("%s ::= %s"):format(state(k), table.concat(alts, " | "))
 	end
-	local lit = open:gsub(".", function(c)
+	return table.concat(rules, "\n") .. "\n"
+end
+
+--- A GBNF string literal for s.
+-- Quotes, backslashes and control bytes become escapes.
+-- @tparam string s the text
+-- @treturn string the literal, with its quotes
+function M.literal(s)
+	return '"' .. s:gsub('[%c"\\]', function(c)
 		return hex(c:byte())
-	end)
-	local root = opened and state(0) or ('"%s" %s | lgml-answer'):format(lit, state(0))
-	rules[#rules + 1] = "lgml-answer ::= [ \\t\\r\\n]* root"
-	rules[#rules + 1] = "lgml-root ::= " .. root
-	return text .. "\n" .. table.concat(rules, "\n") .. "\n", "lgml-root"
+	end) .. '"'
+end
+
+--- Wraps a grammar so that a reasoning block before the answer is free.
+-- The block is `open`, any text without `close`, then `close`; the
+-- answer may follow after white space. See `until_text`.
+-- @tparam string text the grammar of the answer
+-- @tparam string open the tag that opens the block, ASCII
+-- @tparam string close the tag that ends the block, ASCII
+-- @tparam boolean opened true when the prompt already opened the block
+-- @tparam[opt="root"] string answer the start rule of the answer
+-- @treturn string the new grammar text
+-- @treturn string the start rule name
+function M.reasoning(text, open, close, opened, answer)
+	local rules = { M.until_text("lgml-think", close, "lgml-answer") }
+	local root = opened and "lgml-think-0" or
+	    ("%s lgml-think-0 | lgml-answer"):format(M.literal(open))
+	rules[#rules + 1] = "lgml-answer ::= [ \\t\\r\\n]* " .. (answer or "root") .. "\n"
+	rules[#rules + 1] = "lgml-root ::= " .. root .. "\n"
+	return text .. "\n" .. table.concat(rules), "lgml-root"
 end
 
 return M

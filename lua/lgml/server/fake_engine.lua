@@ -71,6 +71,10 @@ local function plan(req)
 	}
 	local tool = req.tools and req.tools[1]
 	local name = tool and tool["function"] and tool["function"].name
+	local tc = req.tool_choice
+	if type(tc) == "table" and type(tc["function"]) == "table" then
+		name = tc["function"].name
+	end
 	if name then
 		p[#p + 1] = { "tool", name }
 		p[#p + 1] = { "args", '{"city":' }
@@ -133,6 +137,8 @@ function F:cancel()
 end
 
 --- Streams the canned reply.
+-- With tools, the reply calls the first tool, or the tool that
+-- `tool_choice` names.
 -- The user message `"fail"` makes the call fail before any output. The
 -- reply counts one token per piece and stops at `max_tokens`. `stop`
 -- strings apply to the content, as `lgml.chat.output` applies them. With

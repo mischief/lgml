@@ -51,7 +51,8 @@ end
 
 -- Write a tiny model of arch ("llama" or "qwen3") to path. opts.quant
 -- ("q8_0" or "q4_0") stores the 2-D weights of the layers quantized.
--- opts.tied leaves out output.weight. opts.override gives f32 values
+-- opts.tied leaves out output.weight. opts.n_ctx sets the context length
+-- (default 256). opts.override gives f32 values
 -- by tensor name in place of the random ones. Returns the tensors, { name =
 -- { shape, values } }, for tests that compute by hand.
 function M.write(path, arch, opts)
@@ -106,7 +107,7 @@ function M.write(path, arch, opts)
 	kv[#kv + 1] = { "general.architecture", gguf.STRING, arch }
 	kv[#kv + 1] = { "general.name", gguf.STRING, "tiny " .. arch }
 	key("block_count", gguf.UINT32, M.NL)
-	key("context_length", gguf.UINT32, 256)
+	key("context_length", gguf.UINT32, opts.n_ctx or 256)
 	key("embedding_length", gguf.UINT32, E)
 	key("feed_forward_length", gguf.UINT32, F)
 	key("attention.head_count", gguf.UINT32, H)

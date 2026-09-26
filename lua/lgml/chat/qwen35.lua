@@ -572,6 +572,7 @@ function M.bind(tpl)
 			return M.render(messages, o)
 		end,
 		new_parser = M.new_parser,
+		tool_grammar = M.tool_grammar,
 	}
 end
 
@@ -580,5 +581,14 @@ end
 -- @tparam[opt] table opts the parser options
 -- @treturn lgml.chat.hermes.Parser the parser
 M.new_parser = require("lgml.chat.qwen35_parser").new_parser
+
+--- Makes a grammar that forces tool calls. This is
+-- `lgml.chat.tool_grammar.qwen35`.
+-- @function tool_grammar
+-- @tparam {table,...} tools OpenAI function tools
+-- @tparam[opt] table opts the options
+-- @treturn string the GBNF text
+-- @treturn string the start rule
+M.tool_grammar = require("lgml.chat.tool_grammar").qwen35
 
 return M

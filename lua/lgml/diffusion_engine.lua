@@ -101,6 +101,8 @@ local function unsupported(req)
 		return "logprobs"
 	elseif type(req.logit_bias) == "table" and next(req.logit_bias) ~= nil then
 		return "logit_bias"
+	elseif req.tool_choice == "required" or type(req.tool_choice) == "table" then
+		return "tool_choice"
 	end
 	return nil
 end
@@ -110,8 +112,8 @@ end
 -- at an end token, at the token limit, at the context end, or after 3
 -- blocks in a row that end in a loop. The request can set `seed`,
 -- `max_tokens`, `max_completion_tokens`, `stop`, `tools`, `reasoning_effort =
--- "none"` and `chat_template_kwargs.enable_thinking`. `logprobs` and
--- `logit_bias` give status 400. A Lua error resets the cache and returns
+-- "none"` and `chat_template_kwargs.enable_thinking`. `logprobs`,
+-- `logit_bias` and a `tool_choice` that forces a call give status 400. A Lua error resets the cache and returns
 -- status 500.
 -- @tparam table req the chat request
 -- @tparam lgml.server.engine.Sink sink the reply
@@ -153,7 +155,8 @@ function E:run(req, sink)
 	local max = req.max_completion_tokens or req.max_tokens
 	max = math.min(max or self.n_ctx, self.n_ctx - #prompt)
 	local seed = math.tointeger(req.seed) or self.seed or math.random(0, 0x7fffffff)
-	local out = output.new(sink, self.family.new_parser({ tools = req.tools }), { stop = req.stop })
+	local out = output.new(sink, self.family.new_parser({ tools = req.tools or {} }),
+	    { stop = req.stop, one_call = req.parallel_tool_calls == false })
 	local dec = tokenizer.decoder(self.tk, { special = false })
 
 	local t0 = lgml.clock()

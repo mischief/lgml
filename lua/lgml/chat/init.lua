@@ -2,7 +2,9 @@
 -- A family module has `render(messages, opts)`, which returns the
 -- prompt text, and `new_parser(opts)`, which returns a streaming output
 -- parser. A family that takes images also has `image`, its image
--- tokens; `lgml.chat.media` reads image parts. See `lgml.chat.qwen3`,
+-- tokens; `lgml.chat.media` reads image parts. A family can have
+-- `tool_grammar(tools, opts)`, a grammar that forces tool calls (see
+-- `lgml.chat.tool_grammar`). See `lgml.chat.qwen3`,
 -- `lgml.chat.qwen35` and `lgml.chat.gemma4`.
 -- @module lgml.chat
 local M = {}

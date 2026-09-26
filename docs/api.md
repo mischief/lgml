@@ -201,9 +201,9 @@ the request checks (`lgml.server.chat_request.FIELDS`).
 | `logprobs` | OpenAI | supported | `choices[].logprobs.content` lists the content tokens, in the stream too; see [Log probabilities](#log-probabilities). |
 | `top_logprobs` | OpenAI | supported | From 0 to 20. It needs `logprobs: true`. |
 | `logit_bias` | OpenAI | supported | Token ids of the model's tokenizer to a bias from -100 to 100. An id that the tokenizer does not have gives 400. |
-| `tools` | OpenAI | limited | Function tools only. A `custom` tool gives 400. `strict` is accepted; the arguments follow the schema only when `tool_choice` forces a call. |
-| `tool_choice` | OpenAI | planned | Only `"auto"`. |
-| `parallel_tool_calls` | OpenAI | planned | Only `true`. |
+| `tools` | OpenAI | limited | Function tools only. A `custom` tool gives 400. `strict` is accepted, but the arguments follow the parameter schema only when `tool_choice` forces a call on a Qwen3 template; see [Tool choice](#tool-choice). |
+| `tool_choice` | OpenAI | supported | `none`, `auto`, `required`, `{"type": "function", "function": {"name": ...}}` or `allowed_tools`. A `custom` choice gives 400. See [Tool choice](#tool-choice). |
+| `parallel_tool_calls` | OpenAI | supported | `false` ends the reply after the first tool call. |
 | `response_format` | OpenAI | supported | See [Constrained output](#constrained-output). |
 | `reasoning_effort` | OpenAI | limited | `none` turns thinking off. The other values turn it on and do not change its length. |
 | `modalities` | OpenAI | limited | Only `["text"]`. |
@@ -331,6 +331,36 @@ Image input:
 - The image is PNG or JPEG, at most 32 MiB after base64 decode.
 - `--image-min-tokens` and `--image-max-tokens` set the token range of
   one image.
+
+### Tool choice
+
+- `none`: the server does not give the tools to the chat template, and
+  the reply has no tool calls.
+- `auto` (the default): the model answers or calls tools. Without
+  `tools`, the reply has no tool calls.
+- `required`: the model must call one or more of the tools; with
+  `parallel_tool_calls: false`, exactly one.
+- `{"type": "function", "function": {"name": "f"}}`: the model must
+  call `f`, once.
+- `{"type": "allowed_tools", "allowed_tools": {"mode": ..., "tools":
+  [...]}}`: the server keeps only the named tools and applies the mode,
+  `auto` or `required`.
+
+A name that is not in `tools`, or `required` without tools, gives 400.
+
+`required` and a named function run with a grammar that allows only
+tool calls in the syntax of the chat template, after the reasoning
+block. The grammar replaces a `response_format` of the same request: a
+reply with only tool calls has no content to format.
+
+| Template | Forced call |
+| --- | --- |
+| Qwen3 (hermes) | The name and the arguments; the arguments follow the parameter schema. |
+| Qwen3.5 | The name and the parameter names; the values are free text. |
+| Gemma 4 | The name; the argument text is free. |
+
+The diffusion engine cannot force a call; there `required` and a named
+function give 400.
 
 ### Constrained output
 

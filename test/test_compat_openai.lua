@@ -79,7 +79,7 @@ local ACCEPTED = { supported = true, limited = true, ["no-op"] = true }
 
 -- Fields that the good value of a field needs, when lgml accepts it.
 local COMPANIONS = {
-	tool_choice = { tools = { { type = "function", ["function"] = { name = "f" } } } },
+	tool_choice = { tools = json.array({ { type = "function", ["function"] = { name = "f" } } }) },
 	top_logprobs = { logprobs = true },
 }
 
@@ -325,8 +325,38 @@ local function test_logprobs()
 	ok(b.choices[1].logprobs == json.null, "logprobs are null when not asked")
 end
 
+local function test_tool_choice()
+	local two = json.array({ TOOLS[1], { type = "function", ["function"] = { name = "get_time" } } })
+	local status, b = post_json(body({ tools = two, tool_choice = "none" }))
+	ok(status == 200 and b.choices[1].message.tool_calls == nil and b.choices[1].finish_reason == "stop",
+	    "tool_choice none gives no calls")
+	status, b = post_json(body({ tools = two, tool_choice = { type = "function",
+		["function"] = { name = "get_time" } } }))
+	ok(b.choices[1].message.tool_calls[1]["function"].name == "get_time", "a named tool_choice")
+	status, b = post_json(body({ tools = two, tool_choice = { type = "allowed_tools", allowed_tools = {
+		mode = "required", tools = json.array({ { type = "function", ["function"] = { name = "get_time" } } }) } } }))
+	ok(status == 200 and b.choices[1].message.tool_calls[1]["function"].name == "get_time",
+	    "allowed_tools keeps the named tools")
+	local bad = {
+		{ { tool_choice = "required" }, "needs tools" },
+		{ { tools = two, tool_choice = { type = "function", ["function"] = { name = "nope" } } }, "not in tools" },
+		{ { tools = two, tool_choice = { type = "custom", custom = { name = "x" } } }, "custom" },
+		{ { tools = two, tool_choice = "sometimes" }, "tool_choice" },
+		{ { tools = two, tool_choice = { type = "allowed_tools", allowed_tools = { mode = "auto",
+			tools = json.array({ { type = "function", ["function"] = { name = "nope" } } }) } } }, "not in tools" },
+	}
+	for _, c in ipairs(bad) do
+		status, b = post_json(body(c[1]))
+		ok(status == 400 and b.error.param == "tool_choice" and b.error.message:find(c[2], 1, true),
+		    "bad tool_choice gives 400: " .. tostring(b.error and b.error.message))
+	end
+	status, b = post_json(body({ tools = two, parallel_tool_calls = false }))
+	ok(status == 200 and #b.choices[1].message.tool_calls == 1, "parallel_tool_calls false")
+end
+
 test_field_table()
 test_messages()
+test_tool_choice()
 test_reply_table()
 test_stop()
 test_logprobs()
