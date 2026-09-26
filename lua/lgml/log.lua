@@ -289,12 +289,16 @@ function M.full(s)
 	return setmetatable({ s }, FULL)
 end
 
-local function cut(s, max)
+--- Shortens s to at most max bytes and marks the end.
+-- The cut does not end inside a UTF-8 sequence.
+-- @tparam string s the text
+-- @tparam int max the most bytes to keep
+-- @treturn string the text, with `...[+N bytes]` when cut
+function M.cut(s, max)
 	if #s <= max then
 		return s
 	end
 	local n = max
-	-- Do not end inside a UTF-8 sequence.
 	while n > 0 and (s:byte(n + 1) or 0) & 0xC0 == 0x80 do
 		n = n - 1
 	end
@@ -351,7 +355,7 @@ local ESC = { ["\\"] = "\\\\", ['"'] = '\\"', ["\n"] = "\\n", ["\r"] = "\\r", ["
 function M.value(v)
 	local s, whole = to_text(v)
 	if not whole then
-		s = cut(s, M.MAX_VALUE)
+		s = M.cut(s, M.MAX_VALUE)
 	end
 	if s ~= "" and not s:find('[%s"=\\%c]') then
 		return s
@@ -457,6 +461,38 @@ function M.dump(kind, text)
 	f:write(M.elide(text))
 	f:close()
 	return path
+end
+
+--- Tells if `prompt` does anything now.
+-- Check it before work that only a prompt log needs.
+-- @treturn boolean true at debug level or with a dump directory
+function M.want_prompt()
+	return M.level >= M.DEBUG or dump_dir ~= nil
+end
+
+--- Logs a rendered prompt at debug level and dumps it.
+-- The line is `<kind> prompt` with the fields and then `text`, never
+-- cut. The dump file of kind gets a `### key=value ...` header line,
+-- the text and a blank line.
+-- @tparam Logger logger the logger
+-- @tparam string kind the kind, such as `"chat"` or `"decide"`
+-- @tparam string text the prompt text
+-- @param ... key, value pairs
+function M.prompt(logger, kind, text, ...)
+	local f = table.pack(...)
+	if M.level >= M.DEBUG then
+		f[f.n + 1], f[f.n + 2] = "text", M.full(text)
+		M.write(M.DEBUG, logger.comp, kind .. " prompt", table.unpack(f, 1, f.n + 2))
+	end
+	if dump_dir then
+		local head = { "###" }
+		for i = 1, f.n, 2 do
+			if f[i + 1] ~= nil then
+				head[#head + 1] = f[i] .. "=" .. M.value(f[i + 1])
+			end
+		end
+		M.dump(kind, table.concat(head, " ") .. "\n" .. text .. "\n\n")
+	end
 end
 
 -- loggers

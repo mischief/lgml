@@ -28,7 +28,7 @@ end
 local root = (arg[0]:match("^(.*)/[^/]*$") or ".") .. "/.."
 local api_md = read(root .. "/docs/api.md")
 
-local srv = server.new({ log = function() end })
+local srv = server.new()
 openai.install(srv, fake.new())
 local routes = srv.routes
 

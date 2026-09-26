@@ -137,5 +137,10 @@ os.remove(path)
 os.remove(dir .. "/r1.chat.txt")
 os.remove(dir)
 
+-- -v counts for the log level.
+local getopt = require("lgml.getopt")
+local o = getopt.parse({ "-vv", "--verbose", "-h" }, "hv", { verbose = "v" }, { v = true })
+ok(o and o.v == 3 and o.h == true, "getopt counts a repeated flag in multi")
+
 print("1.." .. n)
 os.exit(failed == 0 and 0 or 1)

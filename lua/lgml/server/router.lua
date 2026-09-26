@@ -5,9 +5,13 @@
 -- modes of an engine come from `Engine:modes` when it has that method,
 -- else from `ready().caps` (as `lgml.server.remote_engine` gives
 -- them), else from its methods. The mode names are in `lgml.detect`.
+-- Each request logs its choice and why at debug level (see `lgml.log`).
 -- @module lgml.server.router
 local media = require("lgml.chat.media")
 local detect = require("lgml.detect")
+local log = require("lgml.log")
+
+local L = log.new("router")
 
 local M = {}
 local R = {}
@@ -81,6 +85,17 @@ function R:models()
 	return out
 end
 
+-- The engine with a model of this id, and that model.
+local function find(self, id)
+	for _, e in ipairs(self.engines) do
+		for _, m in ipairs(e:models()) do
+			if m.id == id then
+				return e, m
+			end
+		end
+	end
+end
+
 --- Picks the engine for a model id and a method.
 -- It uses the modes of each engine, so it does not start a model.
 -- @tparam ?string id the model id
@@ -88,19 +103,30 @@ end
 -- `"generate"`
 -- @treturn ?lgml.server.engine.Engine the engine that serves id with
 -- what, else the first engine with what, else nil
+-- @treturn ?string the id of the picked model
+-- @treturn ?string why: `"named"` (id matched), `"default"` (no id),
+-- `"unknown"` (no model has id) or `"capability"` (the model of id
+-- does not serve what)
 function R:pick(id, what)
-	local first
+	local first, first_id
 	for _, e in ipairs(self.engines) do
 		if can(e, what) then
-			first = first or e
-			for _, m in ipairs(e:models()) do
+			local list = e:models()
+			if not first then
+				first, first_id = e, list[1] and list[1].id
+			end
+			for _, m in ipairs(list) do
 				if m.id == id then
-					return e
+					return e, id, "named"
 				end
 			end
 		end
 	end
-	return first
+	if not first then
+		return nil
+	end
+	local why = id == nil and "default" or (find(self, id) and "capability" or "unknown")
+	return first, first_id, why
 end
 
 -- The engines of method what with a vision model, and the ids of
@@ -134,7 +160,7 @@ end
 local function to_vision(self, e, id, what)
 	local m = model_of(e, id)
 	if m and (m.vision or has(m.capabilities, "multimodal")) then
-		return e
+		return e, m.id
 	end
 	local es, ids = vision_engines(self, what)
 	if #es == 0 then
@@ -143,7 +169,32 @@ local function to_vision(self, e, id, what)
 		return nil, ("image input is not supported by %s; models with vision: %s")
 		    :format(m.id, table.concat(ids, ", ")), 400
 	end
-	return es[1]
+	return es[1], ids[1]
+end
+
+-- The engine for a request: by id and method, then by vision when the
+-- request has images. It logs the choice and notes the model for the
+-- access line. Returns the engine, or nil, a message and a status.
+local function route(self, id, what, images, none)
+	local e, mid, why = self:pick(id, what)
+	if not e then
+		L:debug("route", "what", what, "requested", id, "why", "none")
+		return nil, none, 400
+	end
+	if images then
+		local v, vid, status = to_vision(self, e, id, what)
+		if not v then
+			L:debug("route", "what", what, "requested", id, "why", "vision", "err", vid)
+			return nil, vid, status
+		end
+		if v ~= e or vid ~= mid then
+			e, mid, why = v, vid, "vision"
+		end
+	end
+	L:debug("route", "what", what, "requested", id, "model", mid, "why", why,
+	    "images", images or nil)
+	log.note("model", mid)
+	return e
 end
 
 --- Returns the properties of the first chat engine.
@@ -163,16 +214,10 @@ end
 -- @return the results of `Engine:chat`, or nil, a message and 400 when
 -- no engine serves chat
 function R:chat(req, sink)
-	local e = self:pick(req.model, "chat")
+	local images = type(req.messages) == "table" and media.has_images(req.messages)
+	local e, err, status = route(self, req.model, "chat", images, "no model serves chat")
 	if not e then
-		return nil, "no model serves chat", 400
-	end
-	if type(req.messages) == "table" and media.has_images(req.messages) then
-		local err, status
-		e, err, status = to_vision(self, e, req.model, "chat")
-		if not e then
-			return nil, err, status
-		end
+		return nil, err, status
 	end
 	return e:chat(req, sink)
 end
@@ -184,9 +229,9 @@ end
 -- @return the results of `Engine:transcribe`, or nil, a message and 400
 -- when no engine serves transcription
 function R:transcribe(req, audio, ctl)
-	local e = self:pick(req.model, "transcribe")
+	local e, err, status = route(self, req.model, "transcribe", false, "no model serves transcription")
 	if not e then
-		return nil, "no model serves transcription", 400
+		return nil, err, status
 	end
 	return e:transcribe(req, audio, ctl)
 end
@@ -197,9 +242,9 @@ end
 -- @return the results of `Engine:speak`, or nil, a message and 400 when
 -- no engine serves speech
 function R:speak(req, ctl)
-	local e = self:pick(req.model, "speak")
+	local e, err, status = route(self, req.model, "speak", false, "no model serves speech")
 	if not e then
-		return nil, "no model serves speech", 400
+		return nil, err, status
 	end
 	return e:speak(req, ctl)
 end
@@ -214,16 +259,10 @@ end
 -- @return the results of `Engine:decide`, or nil, a message and 400
 -- when no engine can decide
 function R:decide(req, ctl)
-	local e = self:pick(req.model, "decide")
+	local images = type(req.images) == "table" and #req.images > 0
+	local e, err, status = route(self, req.model, "decide", images, "no model serves decisions")
 	if not e then
-		return nil, "no model serves decisions", 400
-	end
-	if type(req.images) == "table" and #req.images > 0 then
-		local err, status
-		e, err, status = to_vision(self, e, req.model, "decide")
-		if not e then
-			return nil, err, status
-		end
+		return nil, err, status
 	end
 	return e:decide(req, ctl)
 end
@@ -234,22 +273,11 @@ end
 -- @return the results of `Engine:generate`, or nil, a message and 400
 -- when no engine makes images
 function R:generate(req, ctl)
-	local e = self:pick(req.model, "generate")
+	local e, err, status = route(self, req.model, "generate", false, "no model serves images")
 	if not e then
-		return nil, "no model serves images", 400
+		return nil, err, status
 	end
 	return e:generate(req, ctl)
-end
-
--- The engine with a model of this id, and that model.
-local function find(self, id)
-	for _, e in ipairs(self.engines) do
-		for _, m in ipairs(e:models()) do
-			if m.id == id then
-				return e, m
-			end
-		end
-	end
 end
 
 --- Loads a model by id, or waits for its load under way.

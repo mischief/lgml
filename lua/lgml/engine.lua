@@ -20,6 +20,9 @@ local prompt_cache = require("lgml.prompt_cache")
 local grammar = require("lgml.grammar")
 local lora = require("lgml.lora")
 local media = require("lgml.chat.media")
+local log = require("lgml.log")
+
+local L = log.new("engine")
 
 local M = {}
 local E = {}
@@ -110,8 +113,7 @@ function M.new(opts)
 	if not opts.n_ctx then
 		n_ctx = fit_ctx(be, model, n_ctx, copts) or n_ctx
 		if n_ctx < model.hp.n_ctx then
-			io.stderr:write(("lgml: context %d of %d, to fit free device memory\n"):format(
-			    n_ctx, model.hp.n_ctx))
+			L:info("context cut to fit free device memory", "n_ctx", n_ctx, "n_ctx_train", model.hp.n_ctx)
 		end
 	end
 	local adapters = {}

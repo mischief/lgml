@@ -12,6 +12,9 @@ local uv = require("luv")
 local getopt = require("lgml.getopt")
 local server = require("lgml.server.httpd")
 local openai = require("lgml.server.openai")
+local log = require("lgml.log")
+
+local L = log.new("server")
 
 local USAGE = [=[
 usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b backend]
@@ -20,10 +23,12 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                    [--lora file[:scale]]... [--mmproj file] [--image-min-tokens n]
                    [--image-max-tokens n] [--inproc] [--stt] [--engine module]
                    [--text-backend name] [--cors origin] [--vram MiB] [--idle seconds]
+                   [-v]... [--log-level name] [--log-file path] [--dump-prompts dir]
   -l, --listen addr   address to listen on (default 127.0.0.1)
   -p, --port port     port to listen on (default 8080)
   -C, --config file   Lua file returning { listen, port, cors, vram, ram, idle,
-                      load_wait, threads, models = { spec, ... } };
+                      load_wait, threads, log_level, log_file, dump_prompts,
+                      models = { spec, ... } };
                       each model runs in its own worker, which starts on the
                       first request for the model; when a load does not fit
                       the budget, idle models unload, least recently used
@@ -96,6 +101,18 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
       --vram MiB      with -C: the GPU memory budget (overrides vram)
       --idle seconds  with -C: unload a model after this many seconds
                       without requests (overrides idle)
+  -v, --verbose       log more: -v is debug, -vv is trace (default level:
+                      log_level of the config, else LGML_LOG, else info)
+      --log-level name
+                      error, warn, info, debug or trace; info logs one
+                      access line per request and model loads; debug adds
+                      routing, budgets, request bodies and the rendered
+                      prompts; trace adds each token and graph replay
+      --log-file path append log lines to path, not stderr; SIGHUP opens
+                      it again
+      --dump-prompts dir
+                      write each rendered chat and decision prompt to
+                      dir/<request id>.<kind>.txt
       --fake          serve the fake test engine
   -h, --help          show this help
 ]=]
@@ -212,7 +229,7 @@ local function model_engine(spec, managed)
 	end
 	local function start(o)
 		return require("lgml.server.remote_engine").new({
-			lua = arg[-1] or "lua5.4", script = root .. "/bin/lgml-worker", args = wargs,
+			lua = arg[-1] or "lua5.4", script = root .. "/bin/lgml-worker", args = wargs, id = spec.id,
 			modes = modes, restart = o.restart, on_exit = o.on_exit,
 		})
 	end
@@ -278,10 +295,9 @@ local function managed_engines(path, cfg, opts)
 		cpu = ram and ram * MiB or math.huge,
 	}
 	local pool = require("lgml.server.pool").new({ budget = budget, idle = idle, load_wait = wait })
-	io.stderr:write(("lgml-server: gpu budget %s, cpu budget %s, idle unload %s\n"):format(
-	    budget.gpu < math.huge and ("%d MiB"):format(budget.gpu // MiB) or "none",
-	    budget.cpu < math.huge and ("%d MiB"):format(budget.cpu // MiB) or "none",
-	    (idle or 0) > 0 and ("after %g s"):format(idle) or "off"))
+	L:info("budget", "gpu", budget.gpu < math.huge and ("%d MiB"):format(budget.gpu // MiB) or "none",
+	    "cpu", budget.cpu < math.huge and ("%d MiB"):format(budget.cpu // MiB) or "none",
+	    "idle_unload", (idle or 0) > 0 and ("after %g s"):format(idle) or "off")
 	local preload = {}
 	local kinds, ests = {}, {}
 	local function managed(spec, modes, lora, start)
@@ -305,11 +321,11 @@ local function managed_engines(path, cfg, opts)
 		})
 		local extra = {}
 		for k, bytes in pairs(est.extra) do
-			extra[#extra + 1] = (", %d MiB %s"):format(bytes // MiB, k)
+			extra[#extra + 1] = ("%d MiB %s"):format(bytes // MiB, k)
 		end
-		io.stderr:write(("lgml-server: model %s: %s, %d MiB%s%s%s\n"):format(m.id, kind,
-		    m.size // MiB, mem and " (mem)" or " (estimate)", table.concat(extra),
-		    spec.preload and ", preload" or ""))
+		L:info("model", "model", m.id, "kind", kind, "size", ("%d MiB"):format(m.size // MiB),
+		    "from", mem and "mem" or "estimate", "extra", #extra > 0 and table.concat(extra, ", ") or nil,
+		    "preload", spec.preload and true or nil)
 		if spec.preload then
 			preload[#preload + 1] = m
 		end
@@ -332,8 +348,7 @@ local function managed_engines(path, cfg, opts)
 end
 
 -- A config file is Lua that returns { models = { spec, ... } }.
-local function config_engine(path, opts)
-	local inproc = opts.inproc
+local function load_config(path)
 	local chunk, err = loadfile(path, "t", {})
 	if not chunk then
 		die(err)
@@ -342,6 +357,11 @@ local function config_engine(path, opts)
 	if not ok or type(cfg) ~= "table" or type(cfg.models) ~= "table" or #cfg.models == 0 then
 		die(path .. ": must return { models = { ... } }")
 	end
+	return cfg
+end
+
+local function config_engine(path, cfg, opts)
+	local inproc = opts.inproc
 	for i, spec in ipairs(cfg.models) do
 		if type(spec.model) ~= "string" then
 			die(("%s: models[%d].model must be a path"):format(path, i))
@@ -363,12 +383,12 @@ local function config_engine(path, opts)
 	return require("lgml.server.router").new(engines), cfg
 end
 
-local function make_engine(opts)
+local function make_engine(opts, cfg)
 	if opts.fake then
 		return require("lgml.server.fake_engine").new({ delay = 30 })
 	end
 	if opts.C then
-		return config_engine(opts.C, opts)
+		return config_engine(opts.C, cfg, opts)
 	end
 	if opts.m then
 		return model_engine({
@@ -385,16 +405,52 @@ local function make_engine(opts)
 	die("no engine: give -m model, -C config or --fake")
 end
 
+-- The log level: -v or --log-level, else log_level of the config, else
+-- LGML_LOG, else info. The log file and the dump directory come from the
+-- flag, else the config key.
+local function setup_log(opts, cfg)
+	local level = opts["log-level"]
+	if opts.v then
+		level = log.INFO + opts.v
+		if level > log.TRACE then
+			level = log.TRACE
+		end
+	end
+	level = level or cfg.log_level or os.getenv("LGML_LOG")
+	if level then
+		local ok, err = log.set_level(level)
+		if not ok then
+			die(err)
+		end
+	end
+	local file = opts["log-file"] or cfg.log_file
+	if file then
+		local ok, err = log.open(file)
+		if not ok then
+			die("log file: " .. tostring(err))
+		end
+	end
+	local dir = opts["dump-prompts"] or cfg.dump_prompts
+	if dir then
+		local ok, err = uv.fs_stat(dir)
+		if not ok or ok.type ~= "directory" then
+			die(("dump directory %s: %s"):format(dir, err or "not a directory"))
+		end
+		log.set_dump_dir(dir)
+	end
+end
+
 local function main(args)
-	local opts, rest = getopt.parse(args, "hl:p:m:b:t:c:C:", {
-		config = "C", help = "h", listen = "l", port = "p", model = "m", backend = "b",
+	local opts, rest = getopt.parse(args, "hvl:p:m:b:t:c:C:", {
+		config = "C", help = "h", verbose = "v", ["log-level="] = false, ["log-file="] = false,
+		["dump-prompts="] = false, listen = "l", port = "p", model = "m", backend = "b",
 		threads = "t", ctx = "c", fake = false, ["no-fa"] = false, ["alias="] = false,
 		inproc = false, stt = false, ["ctk="] = false, ["ctv="] = false, ["engine="] = false,
 		["recipe="] = false, ["cache-ram="] = false, ["ctx-checkpoints="] = false,
 		["lora="] = false, ["cors="] = false, ["vram="] = false, ["idle="] = false,
 		["mmproj="] = false, ["image-min-tokens="] = false, ["image-max-tokens="] = false,
 		["text-backend="] = false,
-	}, { lora = true })
+	}, { lora = true, v = true })
 	if not opts then
 		io.stderr:write("lgml-server: ", rest, "\n", USAGE)
 		os.exit(2)
@@ -407,8 +463,9 @@ local function main(args)
 		io.stderr:write(USAGE)
 		os.exit(2)
 	end
-	local engine, cfg = make_engine(opts)
-	cfg = cfg or {}
+	local cfg = opts.C and load_config(opts.C) or {}
+	setup_log(opts, cfg)
+	local engine = make_engine(opts, cfg)
 	local port = math.tointeger(tonumber(opts.p or cfg.port or 8080))
 	if not port or port < 0 or port > 65535 then
 		die("bad port " .. tostring(opts.p or cfg.port))
@@ -422,8 +479,7 @@ local function main(args)
 		end
 		die("listen: " .. tostring(err))
 	end
-	io.stderr:write(("lgml-server: listening on %s:%d\n"):format(srv.host,
-	    bound))
+	L:info("listening", "addr", ("%s:%d"):format(srv.host, bound), "log_level", log.level_name())
 	local sigs
 	local function stop()
 		if engine.stop then
@@ -440,6 +496,15 @@ local function main(args)
 		sigs[i] = uv.new_signal()
 		sigs[i]:start(name, stop)
 	end
+	-- SIGHUP opens the log file again, here and in each worker.
+	sigs[#sigs + 1] = uv.new_signal()
+	sigs[#sigs]:start("sighup", function()
+		local ok, err = log.reopen()
+		if not ok then
+			L:error("log file", "err", err)
+		end
+		require("lgml.server.remote_engine").signal("sighup")
+	end)
 	uv.run()
 end
 

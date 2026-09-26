@@ -213,9 +213,8 @@ function E:run(req, spk, ctl)
 		return nil, "no speech produced", 500
 	end
 	local dt = lgml.clock() - t0
-	io.stderr:write(("qwen3tts: %d frames, %.2f s audio in %.2f s (rtf %.2f)%s\n"):format(
-	    st.frames, audio:duration(), dt, dt / audio:duration(),
-	    st.eos and "" or ", frame cap hit"))
+	require("lgml.log").new("tts"):info("speech", "frames", st.frames, "audio_s", audio:duration(),
+	    "s", dt, "rtf", dt / audio:duration(), "frame_cap_hit", not st.eos or nil)
 	return { audio = audio }
 end
 

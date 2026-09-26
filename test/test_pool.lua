@@ -23,7 +23,18 @@ end
 local MiB = 1048576
 local src = debug.getinfo(1, "S").source:sub(2):match("^(.*)/test/") or "."
 local ALL = { "completion", "decide", "transcription", "speech", "image_generation" }
-local quiet = function() end
+-- Pool log lines, for checks.
+local log = require("lgml.log")
+local lines = {}
+log.set_output(function(l) lines[#lines + 1] = l end)
+
+local function logged(pat)
+	for _, l in ipairs(lines) do
+		if l:find(pat) then
+			return l
+		end
+	end
+end
 
 -- Adds a fake model to pool. o: size (MiB, the estimate), measured
 -- (MiB, what the worker reports), extra (MiB of each other kind),
@@ -49,7 +60,7 @@ local function add(pool, id, o)
 			m.starts = (m.starts or 0) + 1
 			return remote.new({
 				lua = "lua5.4", script = src .. "/bin/lgml-worker", args = args,
-				restart = false, on_exit = on_exit, log = quiet,
+				restart = false, on_exit = on_exit,
 			})
 		end,
 	})
@@ -111,7 +122,7 @@ local function states(pool)
 end
 
 local function test_lazy()
-	local p = pool_mod.new({ log = quiet })
+	local p = pool_mod.new()
 	local a = add(p, "a")
 	local r = router.new({ a })
 	ok(a.state == "unloaded" and a.starts == 0 and r:models()[1].status == "unloaded",
@@ -127,7 +138,7 @@ local function test_lazy()
 end
 
 local function test_shared_load()
-	local p = pool_mod.new({ log = quiet })
+	local p = pool_mod.new()
 	local b = add(p, "b", { load_ms = 150 })
 	local hs = {}
 	for i = 1, 3 do
@@ -145,7 +156,7 @@ end
 
 local function test_lru()
 	metrics.reset()
-	local p = pool_mod.new({ budget = { gpu = 100 * MiB }, log = quiet })
+	local p = pool_mod.new({ budget = { gpu = 100 * MiB } })
 	local a, b, c = add(p, "a"), add(p, "b"), add(p, "c")
 	chat(a)
 	chat(b)
@@ -153,6 +164,8 @@ local function test_lru()
 	ok(states(p) == "a=loaded,b=loaded,c=unloaded", "two models fit")
 	ok(chat(c) == true and states(p) == "a=loaded,b=unloaded,c=loaded",
 	    "the least recently used model unloads")
+	ok(logged('msg=unloading model=b why="least recently used" for=c kind=gpu'),
+	    "the unload logs its model and why")
 	chat(b)
 	ok(states(p) == "a=unloaded,b=loaded,c=loaded" and p:used("gpu") == 80 * MiB,
 	    "then the next least recently used one")
@@ -162,7 +175,7 @@ local function test_lru()
 end
 
 local function test_in_flight()
-	local p = pool_mod.new({ budget = { gpu = 100 * MiB }, log = quiet })
+	local p = pool_mod.new({ budget = { gpu = 100 * MiB } })
 	local a = add(p, "a", { delay = 80 })
 	local b, d = add(p, "b"), add(p, "d", { size = 50 })
 	local long = spawn(function() return chat(a) end)
@@ -179,7 +192,7 @@ end
 
 -- A model with parts on two kinds counts each part against its budget.
 local function test_parts()
-	local p = pool_mod.new({ budget = { gpu = 100 * MiB, cpu = 100 * MiB }, log = quiet })
+	local p = pool_mod.new({ budget = { gpu = 100 * MiB, cpu = 100 * MiB } })
 	local g = add(p, "g", { size = 50 })
 	local c = add(p, "c", { size = 60, kind = "cpu" })
 	local s = add(p, "s", { size = 40, measured = 30, extra = { cpu = 50 } })
@@ -199,7 +212,7 @@ local function test_parts()
 end
 
 local function test_no_room()
-	local p = pool_mod.new({ budget = { gpu = 100 * MiB }, load_wait = 0.2, log = quiet })
+	local p = pool_mod.new({ budget = { gpu = 100 * MiB }, load_wait = 0.2 })
 	local a = add(p, "a", { size = 60, delay = 150 })
 	local b = add(p, "b", { size = 60 })
 	local big = add(p, "big", { size = 200 })
@@ -220,7 +233,7 @@ local function test_no_room()
 	cleanup(p)
 
 	-- With a longer wait, the load waits for the request to end.
-	p = pool_mod.new({ budget = { gpu = 100 * MiB }, load_wait = 10, log = quiet })
+	p = pool_mod.new({ budget = { gpu = 100 * MiB }, load_wait = 10 })
 	a = add(p, "a", { size = 60, delay = 60 })
 	b = add(p, "b", { size = 60 })
 	long = spawn(function() return chat(a) end)
@@ -233,7 +246,7 @@ local function test_no_room()
 end
 
 local function test_idle()
-	local p = pool_mod.new({ idle = 0.15, log = quiet })
+	local p = pool_mod.new({ idle = 0.15 })
 	local a = add(p, "a")
 	local k = add(p, "keep", { idle = 0 })
 	chat(a)
@@ -250,7 +263,7 @@ local function test_idle()
 end
 
 local function test_failure()
-	local p = pool_mod.new({ budget = { gpu = 100 * MiB }, log = quiet })
+	local p = pool_mod.new({ budget = { gpu = 100 * MiB } })
 	local f = add(p, "f", { fail = true })
 	local hs = { spawn(function() return chat(f) end), spawn(function() return chat(f) end) }
 	local r1 = table.pack(wait(hs[1]))
@@ -264,7 +277,7 @@ local function test_failure()
 	cleanup(p)
 
 	-- A worker that dies after its load: the model is unloaded, then loads again.
-	p = pool_mod.new({ log = quiet })
+	p = pool_mod.new()
 	local a = add(p, "a", { size = 40, measured = 30 })
 	chat(a)
 	ok(a.size == 30 * MiB, "the measure of the worker replaces the estimate")
@@ -314,10 +327,10 @@ local function roundtrip(port, method, path, body)
 end
 
 local function test_http()
-	local p = pool_mod.new({ log = quiet })
+	local p = pool_mod.new()
 	local a = add(p, "a", { modes = { "completion", "multimodal", "decide" } })
 	local w = add(p, "w", { modes = { "transcription" } })
-	local srv = server.new({ log = quiet })
+	local srv = server.new()
 	openai.install(srv, router.new({ a, w }))
 	local port = assert(srv:listen("127.0.0.1", 0))
 	local status, b = roundtrip(port, "GET", "/v1/models")

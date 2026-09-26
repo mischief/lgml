@@ -17,7 +17,7 @@ local HIGH_WATER = 1 << 20
 local function resume(co, ...)
 	local ok, err = coroutine.resume(co, ...)
 	if not ok then
-		io.stderr:write("lgml.server: ", debug.traceback(co, err), "\n")
+		require("lgml.log").new("stream"):error("coroutine error", "err", debug.traceback(co, err))
 	end
 end
 

@@ -8,7 +8,8 @@
 -- `TRANSCRIBE`, `SPEAK`, `DECIDE` or `GENERATE`, each with a new id.
 -- The worker answers each job with zero or more `DELTA`, `AUDIO` or
 -- `IMAGE` messages and one `DONE`. The front sends `CANCEL` to stop a job; the job still
--- ends with `DONE`.
+-- ends with `DONE`. The JSON payload of a message that starts a job can
+-- have `rid`, the request id for the log lines of the job (see `lgml.log`).
 -- @module lgml.ipc
 local uv = require("luv")
 local imsg = require("imsg")

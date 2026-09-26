@@ -9,6 +9,11 @@ local fake = require("lgml.server.fake_engine")
 local stream = require("lgml.server.stream")
 local multipart = require("lgml.server.multipart")
 local base64 = require("lgml.base64")
+local log = require("lgml.log")
+
+-- Log lines go to a table.
+local lines = {}
+log.set_output(function(l) lines[#lines + 1] = l end)
 
 local n, failed = 0, 0
 
@@ -555,7 +560,7 @@ end
 -- CORS: headers on every response and preflight answers, only when the
 -- server has an origin.
 local function test_cors(eng, plain_port)
-	local srv = server.new({ cors = "*", log = function() end })
+	local srv = server.new({ cors = "*" })
 	openai.install(srv, eng)
 	local port = assert(srv:listen("127.0.0.1", 0))
 	local r = roundtrip(port, request("OPTIONS", "/v1/chat/completions", nil, {
@@ -580,10 +585,69 @@ local function test_cors(eng, plain_port)
 	ok(r.status == 405 and r.headers["access-control-allow-origin"] == nil, "no CORS by default")
 end
 
+-- Log lines of a request id.
+local function lines_of(rid)
+	local out = {}
+	for _, l in ipairs(lines) do
+		if l:find(" rid=" .. rid .. " ", 1, true) then
+			out[#out + 1] = l
+		end
+	end
+	return out
+end
+
+local function find_line(list, pat)
+	for _, l in ipairs(list) do
+		if l:find(pat, 1, true) then
+			return l
+		end
+	end
+end
+
+-- Request ids, access lines and debug lines.
+local function test_logging(port)
+	local r = roundtrip(port, request("POST", "/v1/chat/completions", chat_body({ max_tokens = 3 })))
+	local rid = r.headers["x-lgml-request-id"]
+	ok(r.status == 200 and rid and rid:match("^%x+$"), "the reply has x-lgml-request-id")
+	local got = lines_of(rid)
+	local access = find_line(got, "msg=access ")
+	ok(access and access:find("level=info comp=http", 1, true) and
+	    access:find(" method=POST path=/v1/chat/completions status=200 ", 1, true) and
+	    access:find(" model=fake prompt_tokens=", 1, true) and access:find(" finish=length", 1, true),
+	    "info gives an access line with the model, tokens and finish reason")
+	ok(not find_line(got, "level=debug"), "info gives no debug lines")
+	r = roundtrip(port, request("POST", "/v1/chat/completions", "{}"))
+	access = find_line(lines_of(r.headers["x-lgml-request-id"]), "msg=access ")
+	ok(access and access:find(' status=400 ', 1, true) and
+	    access:find('err="messages must be a non-empty array"', 1, true), "an error reply logs its message")
+
+	log.set_level("debug")
+	local png = base64.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+	local url = "data:image/png;base64," .. base64.encode(png .. string.rep("\0", 300))
+	local body = assert(json.encode({ messages = {
+		{ role = "system", content = "Be brief." },
+		{ role = "user", content = { { type = "text", text = "what is this?" },
+		    { type = "image_url", image_url = { url = url } } } },
+		{ role = "user", content = "weather in Paris?" },
+	} }))
+	r = roundtrip(port, request("POST", "/v1/chat/completions", body, { ["Content-Type"] = "application/json" }))
+	rid = r.headers["x-lgml-request-id"]
+	got = lines_of(rid)
+	local req_line = find_line(got, "msg=request ")
+	ok(req_line and req_line:find("level=debug comp=http", 1, true) and
+	    req_line:find("<data image/png 370B sha256:", 1, true) and not req_line:find("iVBOR", 1, true),
+	    "debug logs the body with the data URL elided")
+	local prompt = find_line(got, 'msg="chat prompt"')
+	ok(prompt and prompt:find('text="<|system|>\\nBe brief.\\n<|user|>\\n\\n<|user|>\\nweather in Paris?\\n' ..
+	    '<|assistant|>\\n"', 1, true), "debug logs the rendered prompt")
+	ok(find_line(got, "msg=finish reason=stop") and find_line(got, 'msg=reply ') and
+	    find_line(got, "msg=access "), "debug logs the finish reason and the reply")
+	log.set_level("info")
+end
+
 local function main()
 	local eng = fake.new({ delay = 2 })
-	local srv = server.new({ limits = { max_body = 1 << 20, idle_ms = 500 },
-	    log = function() end })
+	local srv = server.new({ limits = { max_body = 1 << 20, idle_ms = 500 } })
 	openai.install(srv, eng)
 	local port = assert(srv:listen("127.0.0.1", 0))
 	ok(port > 0, "listen on an ephemeral port")
@@ -596,12 +660,13 @@ local function main()
 	test_cancel(port, eng)
 	test_multipart()
 	local bare = setmetatable({ transcribe = false, generate = false }, { __index = eng })
-	local srv2 = server.new({ log = function() end })
+	local srv2 = server.new()
 	openai.install(srv2, bare)
 	local bare_port = assert(srv2:listen("127.0.0.1", 0))
 	test_transcribe(port, bare_port)
 	test_images(port, bare_port)
 	test_cors(eng, port)
+	test_logging(port)
 	srv2:close()
 	srv:close()
 	print("1.." .. n)

@@ -8,6 +8,9 @@ local uv = require("luv")
 local ipc = require("lgml.ipc")
 local stream = require("lgml.server.stream")
 local detect = require("lgml.detect")
+local log = require("lgml.log")
+
+local L = log.new("remote")
 
 local M = {}
 local R = {}
@@ -17,14 +20,16 @@ local CANCEL_POLL_MS = 250
 local RESTART_MS = 1000
 
 --- Starts a worker and makes an engine for it.
--- The worker gets `--fd 3` and args, and the `LUA_PATH` and `LUA_CPATH`
--- of this process.
+-- The worker gets `--fd 3`, the log settings of this process (see
+-- `lgml.log.args`) and args, and the `LUA_PATH` and `LUA_CPATH` of this
+-- process. Each job message carries the request id of the calling
+-- coroutine in the field `rid`.
 -- @tparam table opts the options:
 --
 -- - `lua`: the Lua interpreter path
 -- - `script`: the worker script path
+-- - `id`: the model id, for log lines
 -- - `args`: a list of worker arguments
--- - `log`: a function for messages (default: write to stderr)
 -- - `modes`: the mode names of the model (default: from the worker's
 --   `HELLO`)
 -- - `restart`: false to start no new worker when the worker exits
@@ -36,12 +41,22 @@ local RESTART_MS = 1000
 function M.new(opts)
 	local r = setmetatable({
 		opts = opts, jobs = {}, next_id = 1, hello = nil, waiting = {}, exit_waiting = {},
-		log = opts.log or function(msg)
-			io.stderr:write("lgml-server: ", msg, "\n")
-		end,
 	}, R)
 	r:start()
 	return r
+end
+
+-- The engines with a worker, for signal.
+local live = setmetatable({}, { __mode = "k" })
+
+--- Sends a signal to each running worker.
+-- @tparam string sig the signal name, such as `"sighup"`
+function M.signal(sig)
+	for r in pairs(live) do
+		if r.proc then
+			r.proc:kill(sig)
+		end
+	end
 end
 
 local function environ(extra)
@@ -67,6 +82,8 @@ function R:start()
 	self.failed = nil
 	local pair = assert(uv.socketpair("stream", 0, { nonblock = true }, {}))
 	local args = { o.script, "--fd", "3" }
+	local la = log.args()
+	table.move(la, 1, #la, #args + 1, args)
 	table.move(o.args, 1, #o.args, #args + 1, args)
 	local proc, pid = uv.spawn(o.lua, {
 		args = args, stdio = { 0, 1, 2, pair[2] },
@@ -78,6 +95,8 @@ function R:start()
 		error("spawn worker: " .. tostring(pid))
 	end
 	self.proc = proc
+	live[self] = true
+	L:debug("worker started", "model", o.id, "pid", pid, "args", table.concat(args, " ", 2))
 	-- The child has its end now.
 	uv.fs_close(pair[2])
 	self.ch = ipc.channel(pair[1], function(t, id, v)
@@ -101,7 +120,8 @@ end
 function R:exited(code, sig)
 	self.proc:close()
 	self.proc = nil
-	self.log(("worker exited, code %s signal %s"):format(code, sig))
+	local level = ((code == 0 and sig == 0) or self.stopping) and log.INFO or log.WARN
+	log.write(level, "remote", "worker exited", "model", self.opts.id, "code", code, "signal", sig)
 	if self.ch then
 		self.ch:close("exit")
 	end
@@ -218,7 +238,7 @@ function R:shutdown(kill_ms)
 	local t = uv.new_timer()
 	t:start(kill_ms or 5000, 0, function()
 		if self.proc then
-			self.log("worker did not exit; sending SIGKILL")
+			L:warn("worker did not exit; sending SIGKILL", "model", self.opts.id)
 			self.proc:kill("sigkill")
 		end
 	end)
@@ -258,6 +278,16 @@ function Job:wait()
 	t:close()
 end
 
+-- A shallow copy of req with the request id of the running coroutine.
+local function tagged(req)
+	local t = {}
+	for k, v in pairs(req) do
+		t[k] = v
+	end
+	t.rid = log.request_id()
+	return t
+end
+
 local function forward(sink, map, v)
 	local k = v.k
 	if k == "reasoning" then
@@ -294,7 +324,7 @@ function R:chat(req, sink)
 	self.next_id = id + 1
 	local job = setmetatable({ q = {} }, Job)
 	self.jobs[id] = job
-	self.ch:send(ipc.JOB, id, req)
+	self.ch:send(ipc.JOB, id, tagged(req))
 	local map, cancelled = {}, false
 	local function cancel()
 		if not cancelled then
@@ -329,7 +359,7 @@ end
 
 -- Send a transcription job: the request as JSON, then the raw audio.
 function R:send_transcribe(id, req, audio)
-	local ok, err = self.ch:send(ipc.TRANSCRIBE, id, req)
+	local ok, err = self.ch:send(ipc.TRANSCRIBE, id, tagged(req))
 	if ok then
 		ok, err = self.ch:send(ipc.AUDIO, id, audio)
 	end
@@ -411,7 +441,7 @@ function R:speak(req, ctl)
 	self.next_id = id + 1
 	local job = setmetatable({ q = {} }, Job)
 	self.jobs[id] = job
-	local ok, err = self.ch:send(ipc.SPEAK, id, req)
+	local ok, err = self.ch:send(ipc.SPEAK, id, tagged(req))
 	if not ok then
 		self.jobs[id] = nil
 		return nil, "send to worker: " .. tostring(err), 503
@@ -468,7 +498,7 @@ function R:decide(req, ctl)
 	for k, v in pairs(req) do
 		body[k] = v
 	end
-	body.images, body.image_types = nil, nil
+	body.images, body.image_types, body.rid = nil, nil, log.request_id()
 	if #images > 0 then
 		body.image_types = {}
 		for i, img in ipairs(images) do
@@ -535,7 +565,7 @@ function R:generate(req, ctl)
 	for k, v in pairs(req) do
 		body[k] = v
 	end
-	body.image, body.has_image = nil, req.image ~= nil or nil
+	body.image, body.has_image, body.rid = nil, req.image ~= nil or nil, log.request_id()
 	local ok, err = self.ch:send(ipc.GENERATE, id, body)
 	if ok and req.image then
 		ok, err = self.ch:send(ipc.IMAGE, id, req.image)

@@ -16,6 +16,9 @@ local detect = require("lgml.detect")
 local systemone = require("lgml.systemone")
 local grammar = require("lgml.grammar")
 local base64 = require("lgml.base64")
+local log = require("lgml.log")
+
+local L = log.new("openai")
 
 local M = {}
 
@@ -395,6 +398,7 @@ end
 
 -- Ends the stream with an error event, or sends an error response.
 local function fail(self, status, msg)
+	self.res.err = msg
 	if not self.writer then
 		return self.res:error(status or 500, msg)
 	end
@@ -404,13 +408,46 @@ local function fail(self, status, msg)
 	end
 end
 
+-- Notes for the access line and debug lines on the reply.
+local function log_chat(sink)
+	local f = sink.finished
+	if sink:cancelled() then
+		log.note("cancelled", true)
+	end
+	if not f then
+		return
+	end
+	local u, t = f.usage, f.timings or {}
+	local cached = u.prompt_tokens_details.cached_tokens
+	log.note("prompt_tokens", u.prompt_tokens)
+	log.note("cached_tokens", cached > 0 and cached or nil)
+	log.note("completion_tokens", u.completion_tokens)
+	log.note("tok_s", t.predicted_per_second)
+	log.note("images", (t.images or 0) > 0 and t.images or nil)
+	log.note("finish", f.reason)
+	log.note("tool_calls", #sink.tools > 0 and #sink.tools or nil)
+	if not L:on(log.DEBUG) then
+		return
+	end
+	L:debug("finish", "reason", f.reason, "prompt_tokens", u.prompt_tokens, "cached_tokens", cached,
+	    "completion_tokens", u.completion_tokens, "prompt_ms", t.prompt_ms, "predicted_ms", t.predicted_ms)
+	L:debug("reply", "reasoning", #sink.reasoning_parts > 0 and table.concat(sink.reasoning_parts) or nil,
+	    "content", table.concat(sink.content_parts))
+	for i, tc in ipairs(sink.tools) do
+		L:debug("tool call", "index", i - 1, "id", tc.id, "name", tc.name,
+		    "arguments", table.concat(tc.args))
+	end
+end
+
 local function run_chat(eng, res, body, model)
 	local sink = new_sink(res, body, model)
+	log.note("model", model)
 	local ok, msg, status = eng:chat(body, sink)
 	metrics.request(model, "chat", ok == true)
 	if sink.finished and sink.finished.timings then
 		metrics.chat(model, sink.finished.timings)
 	end
+	log_chat(sink)
 	if sink:cancelled() then
 		res.close = true
 		return
@@ -560,6 +597,8 @@ local function transcriptions(eng, req, res)
 	end
 	local t0 = uv.hrtime()
 	local model = treq.model or default_model(eng)
+	log.note("model", model)
+	L:debug("transcribe", "bytes", #file, "language", treq.language, "format", treq.response_format)
 	local r, msg, status = eng:transcribe(treq, file, {
 		cancelled = function()
 			return res.s:gone()
@@ -575,6 +614,7 @@ local function transcriptions(eng, req, res)
 	end
 	local ms = (uv.hrtime() - t0) / 1e6
 	local fields = { elapsed_ms = ms, audio_seconds = r.duration }
+	log.note("audio_s", r.duration)
 	if r.duration and r.duration > 0 then
 		fields.rtf = ms / 1000 / r.duration
 		metrics.add("transcribed_seconds_total", "audio seconds transcribed", model, r.duration)
@@ -644,6 +684,9 @@ local function speech(eng, req, res)
 	end
 	local t0 = uv.hrtime()
 	local model = body.model or default_model(eng)
+	log.note("model", model)
+	L:debug("speak", "voice", body.voice, "speed", body.speed, "format", body.response_format,
+	    "input", body.input)
 	local r, emsg, status = eng:speak(body, {
 		cancelled = function()
 			return res.s:gone()
@@ -665,6 +708,7 @@ local function speech(eng, req, res)
 	local fields = { elapsed_ms = ms }
 	if rate > 0 then
 		fields.audio_seconds = #pcm / 2 / rate
+		log.note("audio_s", fields.audio_seconds)
 		fields.rtf = ms / 1000 / math.max(fields.audio_seconds, 1e-9)
 		metrics.add("spoken_seconds_total", "audio seconds of speech made", model, fields.audio_seconds)
 	end
@@ -689,6 +733,9 @@ local function systemone_route(eng, req, res)
 	end
 	local t0 = uv.hrtime()
 	local model = dreq.model or default_model(eng)
+	log.note("model", model)
+	log.note("questions", #dreq.questions)
+	log.note("images", #(dreq.images or {}) > 0 and #dreq.images or nil)
 	local r, msg, status = eng:decide(dreq, {
 		cancelled = function()
 			return res.s:gone()
@@ -702,10 +749,16 @@ local function systemone_route(eng, req, res)
 	if not r then
 		return res:json(status or 500, { detail = msg or "decision failed" })
 	end
+	if r.usage then
+		log.note("prompt_tokens", r.usage.input_tokens)
+		log.note("completion_tokens", r.usage.output_tokens)
+	end
+	log.note("cached_tokens", r.timings and r.timings.cache_n)
 	local ok, text = pcall(systemone.reply, dreq, body, r)
 	if not ok then
 		return res:json(500, { detail = tostring(text) })
 	end
+	L:debug("decide reply", "body", text)
 	local t = r.timings or {}
 	if (t.images or 0) > 0 then
 		metrics.add("decide_images_total", "images read by decisions", model, t.images)
@@ -826,6 +879,7 @@ end
 local function run_image(eng, res, ireq)
 	local t0 = uv.hrtime()
 	local model = ireq.model or default_model(eng)
+	log.note("model", model)
 	local r, msg, status = eng:generate(ireq, {
 		cancelled = function()
 			return res.s:gone()
@@ -845,6 +899,10 @@ local function run_image(eng, res, ireq)
 		data[i] = { b64_json = base64.encode(png), seed = r.seeds and r.seeds[i] }
 	end
 	metrics.add("images_total", "images made", model, #r.images)
+	log.note("images", #r.images)
+	log.note("steps", r.steps)
+	log.note("size", r.width and ("%dx%d"):format(r.width, r.height))
+	log.note("seed", r.seeds and r.seeds[1])
 	metrics.add("image_steps_total", "image sampling steps run", model, r.steps)
 	metrics.add("image_seconds_total", "time spent making images", model, secs)
 	local fields = {

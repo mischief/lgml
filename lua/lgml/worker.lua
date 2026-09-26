@@ -3,9 +3,14 @@
 -- so `JOB` and `CANCEL` messages arrive while other jobs run. The
 -- messages are in `lgml.ipc`. A chat job gets a sink that sends each
 -- piece of output as a `DELTA` message.
+-- Each job coroutine gets the request id of its message (see
+-- `lgml.log.bind`), so the log lines of the job carry it.
 -- @module lgml.worker
 local uv = require("luv")
 local ipc = require("lgml.ipc")
+local log = require("lgml.log")
+
+local L = log.new("worker")
 
 local M = {}
 
@@ -55,6 +60,24 @@ local function proxy(ch, id)
 	end
 
 	return s
+end
+
+-- Binds the request id of a job message to the running coroutine and
+-- logs the job start. Returns the start time.
+local function begin(kind, id, req)
+	log.bind(req.rid)
+	req.rid = nil
+	L:debug("job", "kind", kind, "job", id)
+	return uv.hrtime()
+end
+
+local function finish(kind, id, t0, ok, msg, status)
+	if ok then
+		L:debug("job done", "kind", kind, "job", id, "ms", (uv.hrtime() - t0) / 1e6)
+	else
+		L:debug("job failed", "kind", kind, "job", id, "ms", (uv.hrtime() - t0) / 1e6,
+		    "status", status, "err", msg)
+	end
 end
 
 local function caps(engine)
@@ -107,7 +130,7 @@ end
 
 --- Serves the engine on fd until the front closes it.
 -- It sends `HELLO`, then runs the luv loop. It returns when the channel
--- closes. A job for a method that the engine does not have ends with
+-- closes. SIGHUP opens the log file again (see `lgml.log.reopen`). A job for a method that the engine does not have ends with
 -- status 400.
 -- @tparam int fd the imsg socket to the front
 -- @tparam lgml.server.engine.Engine engine the engine
@@ -119,6 +142,7 @@ function M.serve(fd, engine, mem)
 		local sink = proxy(ch, id)
 		jobs[id] = sink
 		coroutine.wrap(function()
+			local t0 = begin("chat", id, req)
 			local ok, msg, status
 			if engine.chat then
 				ok, msg, status = engine:chat(req, sink)
@@ -126,6 +150,7 @@ function M.serve(fd, engine, mem)
 				msg, status = "model does not support chat", 400
 			end
 			jobs[id] = nil
+			finish("chat", id, t0, ok, msg, status)
 			ch:send(ipc.DONE, id, {
 				ok = ok == true, msg = msg, status = status, finish = sink.done,
 			})
@@ -144,6 +169,7 @@ function M.serve(fd, engine, mem)
 		end
 		jobs[id] = ctl
 		coroutine.wrap(function()
+			local t0 = begin("transcribe", id, req)
 			local r, msg, status
 			if engine.transcribe then
 				r, msg, status = engine:transcribe(req, audio, ctl)
@@ -151,6 +177,7 @@ function M.serve(fd, engine, mem)
 				msg, status = "model does not support transcription", 400
 			end
 			jobs[id] = nil
+			finish("transcribe", id, t0, r ~= nil, msg, status)
 			ch:send(ipc.DONE, id, { ok = r ~= nil, msg = msg, status = status, result = r })
 		end)()
 	end
@@ -162,6 +189,7 @@ function M.serve(fd, engine, mem)
 		end
 		jobs[id] = ctl
 		coroutine.wrap(function()
+			local t0 = begin("speak", id, req)
 			local r, msg, status
 			if engine.speak then
 				r, msg, status = engine:speak(req, ctl)
@@ -178,6 +206,7 @@ function M.serve(fd, engine, mem)
 					r, msg, status = nil, "send audio: " .. tostring(err), 500
 				end
 			end
+			finish("speak", id, t0, r ~= nil, msg, status)
 			ch:send(ipc.DONE, id, { ok = r ~= nil, msg = msg, status = status, result = result })
 		end)()
 	end
@@ -188,6 +217,7 @@ function M.serve(fd, engine, mem)
 		end
 		jobs[id] = ctl
 		coroutine.wrap(function()
+			local t0 = begin("decide", id, req)
 			local r, msg, status
 			if engine.decide then
 				r, msg, status = engine:decide(req, ctl)
@@ -195,6 +225,7 @@ function M.serve(fd, engine, mem)
 				msg, status = "model does not support decisions", 400
 			end
 			jobs[id] = nil
+			finish("decide", id, t0, r ~= nil, msg, status)
 			ch:send(ipc.DONE, id, { ok = r ~= nil, msg = msg, status = status, result = r })
 		end)()
 	end
@@ -206,6 +237,7 @@ function M.serve(fd, engine, mem)
 		end
 		jobs[id] = ctl
 		coroutine.wrap(function()
+			local t0 = begin("generate", id, req)
 			local r, msg, status
 			if engine.generate then
 				r, msg, status = engine:generate(req, ctl)
@@ -225,6 +257,7 @@ function M.serve(fd, engine, mem)
 			if r then
 				r.images = nil
 			end
+			finish("generate", id, t0, r ~= nil, msg, status)
 			ch:send(ipc.DONE, id, { ok = r ~= nil, msg = msg, status = status, result = r })
 		end)()
 	end
@@ -266,6 +299,12 @@ function M.serve(fd, engine, mem)
 	end, function()
 		uv.stop()
 	end)
+	-- SIGHUP opens the log file again, for log rotation.
+	local hup = uv.new_signal()
+	hup:start("sighup", function()
+		log.reopen()
+	end)
+	hup:unref()
 	ch:send(ipc.HELLO, 0, {
 		models = engine:models(), props = engine:props(), caps = caps(engine), mem = mem,
 	})

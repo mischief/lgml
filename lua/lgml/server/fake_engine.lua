@@ -7,6 +7,9 @@
 
 local sleep = require("lgml.server.stream").sleep
 local base64 = require("lgml.base64")
+local log = require("lgml.log")
+
+local L = log.new("engine")
 
 -- A 1x1 PNG.
 local PNG = base64.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
@@ -83,6 +86,16 @@ local function prompt_tokens(req)
 	return n
 end
 
+-- A plain rendering of the messages, for the prompt log.
+local function render(req)
+	local t = {}
+	for _, m in ipairs(req.messages) do
+		t[#t + 1] = ("<|%s|>\n%s\n"):format(m.role, type(m.content) == "string" and m.content or "")
+	end
+	t[#t + 1] = "<|assistant|>\n"
+	return table.concat(t)
+end
+
 local function emit(sink, piece, index)
 	local kind, text = piece[1], piece[2]
 	if kind == "reasoning" then
@@ -108,7 +121,9 @@ end
 
 --- Streams the canned reply.
 -- The user message `"fail"` makes the call fail before any output. The
--- reply counts one token per piece and stops at `max_tokens`.
+-- reply counts one token per piece and stops at `max_tokens`. The
+-- prompt log (see `lgml.log.prompt`) shows each message as
+-- `<|role|>\ncontent\n`.
 -- @tparam table req the chat request
 -- @tparam lgml.server.engine.Sink sink the reply
 -- @treturn[1] boolean true
@@ -123,6 +138,9 @@ function F:chat(req, sink)
 	local max = req.max_completion_tokens or req.max_tokens
 	local usage = { prompt_tokens = prompt_tokens(req),
 	    completion_tokens = 0, cached_tokens = 0 }
+	if log.want_prompt() then
+		log.prompt(L, "chat", render(req), "model", self.model, "tokens", usage.prompt_tokens)
+	end
 	local index
 	for _, piece in ipairs(plan(req)) do
 		sleep(self.delay)
@@ -260,6 +278,10 @@ function F:decide(req, ctl)
 	local state = words(req.state)
 	local answers, nout = {}, 0
 	for _, q in ipairs(req.questions) do
+		if log.want_prompt() then
+			log.prompt(L, "decide", ("State:\n%s\n\nQuestion: %s\nAnswer: "):format(req.state,
+			    q.instructions or ""), "question", q.id, "type", q.type)
+		end
 		local s = {}
 		if q.type == "noul" then
 			s = { overlap(state, q.instructions .. " " .. (q.yes or "")), 1 }
@@ -270,6 +292,7 @@ function F:decide(req, ctl)
 			end
 			answers[q.id] = { probabilities = softmax(s) }
 		end
+		L:debug("logscores", "question", q.id, "logscores", s)
 		nout = nout + #s
 	end
 	return {

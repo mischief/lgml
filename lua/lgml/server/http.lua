@@ -61,6 +61,22 @@ function M.error_object(status, message, etype, param, code)
 	}
 end
 
+--- The message of an error body, for logs.
+-- It reads the OpenAI `error.message`, or a FastAPI `detail` (a string,
+-- or a list whose first entry has `msg`).
+-- @tparam table value the error body
+-- @treturn ?string the message
+function M.error_message(value)
+	local e, d = value.error, value.detail
+	if type(e) == "table" and type(e.message) == "string" then
+		return e.message
+	elseif type(d) == "string" then
+		return d
+	elseif type(d) == "table" and type(d[1]) == "table" and d[1].msg then
+		return tostring(d[1].msg)
+	end
+end
+
 -- request reading
 
 local function pdecode(s)
@@ -241,6 +257,10 @@ end
 --- An HTTP response.
 -- The fields `started` and `done` track the state. Set the field
 -- `close` to true to close the connection after the response.
+-- After it starts, `status` holds the status and `bytes_out` the body
+-- bytes sent so far. A JSON reply with status 400 or more sets `err` to
+-- its message. When the field `rid` is set, each response has the header
+-- `x-lgml-request-id` with it.
 -- @type Response
 
 local function header_block(res, status, headers)
@@ -258,6 +278,9 @@ local function header_block(res, status, headers)
 		if not (headers and headers[k]) then
 			out[#out + 1] = k .. ": " .. tostring(v) .. "\r\n"
 		end
+	end
+	if res.rid then
+		out[#out + 1] = "x-lgml-request-id: " .. res.rid .. "\r\n"
 	end
 	if res.close then
 		out[#out + 1] = "Connection: close\r\n"
@@ -283,10 +306,12 @@ function R:send(status, body, headers)
 	headers = headers or {}
 	headers["Content-Length"] = #body
 	self.started, self.done = true, true
+	self.status = status
 	local head = header_block(self, status, headers)
 	if self.req and self.req.method == "HEAD" then
 		body = ""
 	end
+	self.bytes_out = (self.bytes_out or 0) + #body
 	return self.s:write(head .. body)
 end
 
@@ -299,6 +324,9 @@ end
 -- @treturn[2] string an error message
 -- @raise when the response has started, or value cannot be encoded
 function R:json(status, value, headers)
+	if status >= 400 and type(value) == "table" then
+		self.err = M.error_message(value)
+	end
 	headers = headers or {}
 	headers["Content-Type"] = "application/json"
 	return self:send(status, assert(json.encode(value)) .. "\n", headers)
@@ -337,6 +365,7 @@ function R:start(status, headers)
 	else
 		self.close = true
 	end
+	self.status = status
 	self.started = true
 	return self.s:write(header_block(self, status, headers))
 end
@@ -352,6 +381,7 @@ function R:write(data)
 	if #data == 0 then
 		return true
 	end
+	self.bytes_out = (self.bytes_out or 0) + #data
 	if self.chunked then
 		data = ("%x\r\n%s\r\n"):format(#data, data)
 	end

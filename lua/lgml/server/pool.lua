@@ -12,13 +12,17 @@
 -- requests to end, for at most `load_wait` seconds, and then fails
 -- with status 503.
 --
--- Each model is an engine (see `lgml.server.engine`); a router
+-- Loads and unloads log at info level, budget checks at debug (see
+-- `lgml.log`). Each model is an engine (see `lgml.server.engine`); a router
 -- (`lgml.server.router`) picks among them by id and mode. Loads of one
 -- kind run one at a time, so the worker can measure what its load took.
 -- @module lgml.server.pool
 local uv = require("luv")
 local stream = require("lgml.server.stream")
 local metrics = require("lgml.server.metrics")
+local log = require("lgml.log")
+
+local L = log.new("pool")
 
 local M = {}
 local P = {}
@@ -56,16 +60,12 @@ end
 --   turns it off (default off)
 -- - `load_wait`: the most seconds a load waits for requests of other
 --   models to end, when it needs their room (default 60)
--- - `log`: a function for messages (default: write to stderr)
 -- @treturn Pool the pool
 function M.new(opts)
 	opts = opts or {}
 	return setmetatable({
 		budget = opts.budget or {}, idle = opts.idle, load_wait = opts.load_wait or 60,
 		models = {}, lock = {}, events = {},
-		log = opts.log or function(msg)
-			io.stderr:write("lgml-server: ", msg, "\n")
-		end,
 	}, P)
 end
 
@@ -197,6 +197,8 @@ end
 function P:reserve_kind(m, kind, deadline)
 	local budget = self.budget[kind] or math.huge
 	local need = m:need(kind)
+	L:debug("reserve", "model", m.id, "kind", kind, "need", mib(need), "budget", mib(budget),
+	    "used", mib(self:used(kind)))
 	if need > budget then
 		return nil, ("model %s needs %s; the %s budget is %s"):format(m.id, mib(need),
 		    kind, mib(budget))
@@ -213,7 +215,9 @@ function P:reserve_kind(m, kind, deadline)
 		end
 		if room >= need then
 			local o = idle[1]
-			self.log(("unloading %s (least recently used) to load %s"):format(o.id, m.id))
+			L:info("unloading", "model", o.id, "why", "least recently used", "for", m.id,
+			    "kind", kind, "frees", mib(o:need(kind)), "need", mib(need), "budget", mib(budget),
+			    "used", mib(used))
 			o:unload()
 		else
 			local busy = {}
@@ -227,7 +231,9 @@ function P:reserve_kind(m, kind, deadline)
 			    mib(need), kind, mib(budget), mib(used))
 			if #busy == 0 then
 				return nil, why
-			elseif now() >= deadline or not self:wait_event(deadline) then
+			end
+			L:debug("waiting for room", "model", m.id, "kind", kind, "busy", table.concat(busy, ","))
+			if now() >= deadline or not self:wait_event(deadline) then
 				return nil, ("%s; models with requests in flight: %s; waited %g s"):format(why,
 				    table.concat(busy, ", "), self.load_wait)
 			end
@@ -257,7 +263,7 @@ function P:preload(list)
 		for _, m in ipairs(list) do
 			local ok, err = m:load()
 			if not ok then
-				self.log(("preload %s: %s"):format(m.id, err))
+				L:error("preload failed", "model", m.id, "err", err)
 			end
 		end
 	end)()
@@ -365,7 +371,7 @@ function Model:arm_idle()
 	self.idle_timer:start(math.floor(idle * 1000), 0, function()
 		if self.state == "loaded" and self.inflight == 0 and now() - self.last >= idle - 0.001 then
 			coroutine.wrap(function()
-				self.pool.log(("unloading %s: idle for %g s"):format(self.id, idle))
+				L:info("unloading", "model", self.id, "why", "idle", "idle_s", idle)
 				self:unload()
 			end)()
 		end
@@ -377,7 +383,7 @@ function Model:exited(eng)
 	if self.engine ~= eng or self.state ~= "loaded" then
 		return
 	end
-	self.pool.log(("model %s: worker exited; unloaded"):format(self.id))
+	L:warn("worker exited; unloaded", "model", self.id)
 	self.engine, self.counted = nil, false
 	metrics.add("model_unloads_total", "model unloads", self.id, 1)
 	metrics.set("model_loaded_bytes", "device or host bytes of the loaded model", self.id, 0)
@@ -435,7 +441,8 @@ function Model:do_load()
 	local ok, err = pool:reserve(self)
 	local eng
 	if ok then
-		pool.log(("loading %s (%s)"):format(self.id, self:describe()))
+		L:info("loading", "model", self.id, "size", self:describe(),
+		    "from", self.measured and "measure" or (self.fixed and "mem" or "estimate"))
 		ok, eng = pcall(self.start, function()
 			self:exited(eng)
 		end)
@@ -454,7 +461,7 @@ function Model:do_load()
 		self:set_state("unloaded")
 		metrics.add("model_load_failures_total", "model loads that failed", self.id, 1)
 		err = ("model %s did not load: %s"):format(self.id, tostring(err))
-		pool.log(err)
+		L:error("load failed", "model", self.id, "err", err)
 		wake(self.waiters, false, err)
 		return nil, err
 	end
@@ -464,7 +471,8 @@ function Model:do_load()
 		self.size = self.measured
 	end
 	local secs = now() - t0
-	pool.log(("loaded %s in %.2f s (%s)"):format(self.id, secs, self:describe()))
+	L:info("loaded", "model", self.id, "s", secs, "size", self:describe(),
+	    "estimate", mib(self.estimate), "measured", used and mib(used) or nil)
 	self.engine, self.last = eng, now()
 	self.state = "loaded"
 	metrics.add("model_loads_total", "model loads", self.id, 1)

@@ -10,6 +10,7 @@ package.cpath = root .. "/" .. (os.getenv("LGML_BUILD") or "build") .. "/?.so;" 
 require("lgml.strict").on()
 
 local getopt = require("lgml.getopt")
+local log = require("lgml.log")
 
 local USAGE = "usage: lgml-worker --fd n (-m model | --fake) [-b backend] [-t threads] [-c n_ctx]\n" ..
     "                   [--no-fa] [--ctk type] [--ctv type] [--alias id] [--stt]\n" ..
@@ -17,6 +18,7 @@ local USAGE = "usage: lgml-worker --fd n (-m model | --fake) [-b backend] [-t th
     "                   [--recipe file] [--cache-ram MiB] [--ctx-checkpoints n]\n" ..
     "                   [--lora file[:scale]]...\n" ..
     "                   [--mmproj file] [--image-min-tokens n] [--image-max-tokens n]\n" ..
+    "                   [--log-level name] [--log-file path] [--dump-prompts dir]\n" ..
     "                   [--fake-size MiB] [--fake-load-ms n] [--fake-delay ms] [--fake-fail]\n" ..
     "       lgml-worker --devices\n"
 
@@ -27,7 +29,8 @@ local opts, rest = getopt.parse(arg, "m:b:t:c:", {
 	["recipe="] = false, ["cache-ram="] = false, ["ctx-checkpoints="] = false, ["lora="] = false,
 	["mmproj="] = false, ["image-min-tokens="] = false, ["image-max-tokens="] = false,
 	["fake-size="] = false, ["fake-load-ms="] = false, ["fake-delay="] = false,
-	["fake-fail"] = false, devices = false,
+	["fake-fail"] = false, devices = false, ["log-level="] = false, ["log-file="] = false,
+	["dump-prompts="] = false,
 }, { lora = true })
 -- --devices prints the ggml devices as JSON, for the memory budget of
 -- the front.
@@ -41,6 +44,23 @@ if not opts or #rest > 0 or not (opts.m or opts.fake) or not tonumber(opts.fd) o
 	io.stderr:write("lgml-worker: ", tostring(rest), "\n", USAGE)
 	os.exit(2)
 end
+-- Log settings: --log-level, else LGML_LOG, else info. The front passes
+-- its own settings (see lgml.log.args).
+local level = opts["log-level"] or os.getenv("LGML_LOG")
+if level and not log.set_level(level) then
+	io.stderr:write("lgml-worker: ", select(2, log.parse_level(level)), "\n")
+	os.exit(2)
+end
+if opts["log-file"] then
+	local lok, lerr = log.open(opts["log-file"])
+	if not lok then
+		io.stderr:write("lgml-worker: log file: ", tostring(lerr), "\n")
+		os.exit(2)
+	end
+end
+log.set_dump_dir(opts["dump-prompts"])
+log.set_prefix("worker:" .. (opts.alias or (opts.m and opts.m:match("([^/]+)/*$")) or "fake"))
+local L = log.new("worker")
 local fd = math.tointeger(tonumber(opts.fd))
 local threads = opts.t and math.tointeger(tonumber(opts.t))
 local worker = require("lgml.worker")
@@ -97,7 +117,7 @@ local mem
 local before = not opts.fake and worker.device_used(opts.b)
 local ok, engine = pcall(opts.fake and fake or load)
 if not ok then
-	io.stderr:write("lgml-worker: ", tostring(engine), "\n")
+	L:error("load failed", "model", opts.m, "err", tostring(engine))
 	worker.fail(fd, tostring(engine))
 	os.exit(1)
 end
@@ -109,4 +129,9 @@ elseif before then
 		mem = { used = after - before }
 	end
 end
+if not opts.alias then
+	local m = engine:models()[1]
+	log.set_prefix("worker:" .. (m and m.id or "lgml"))
+end
+L:info("ready", "file", opts.m, "used_mib", mem and mem.used // 1048576)
 worker.serve(fd, engine, mem)

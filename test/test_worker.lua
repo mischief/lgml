@@ -14,10 +14,8 @@ local function ok(cond, name)
 end
 
 local src = debug.getinfo(1, "S").source:sub(2):match("^(.*)/test/") or "."
-local logs = {}
 local eng = remote.new({
 	lua = "lua5.4", script = src .. "/bin/lgml-worker", args = { "--fake", "-t", "2" },
-	log = function(m) logs[#logs + 1] = m end,
 })
 
 -- A sink that records what it gets.
@@ -165,7 +163,7 @@ in_co(function()
 	local exits = 0
 	local bad = remote.new({
 		lua = "lua5.4", script = src .. "/bin/lgml-worker", args = { "--fake", "--fake-fail" },
-		restart = false, log = function() end, on_exit = function() exits = exits + 1 end,
+		restart = false, on_exit = function() exits = exits + 1 end,
 	})
 	local h, msg = bad:ready()
 	ok(h == nil and msg == "fake load failure" and exits == 1, "a failed load gives its message")
@@ -174,12 +172,41 @@ in_co(function()
 	local good = remote.new({
 		lua = "lua5.4", script = src .. "/bin/lgml-worker",
 		args = { "--fake", "--alias", "sized", "--fake-size", "12" }, restart = false,
-		log = function() end,
 	})
 	h = good:ready()
 	ok(h and h.models[1].id == "sized" and h.mem.used == 12 * 1048576, "hello has the measured size")
 	good:shutdown()
 	ok(good.proc == nil, "shutdown waits for the exit")
 end)
+-- The worker gets the log level and file of the front, and the lines
+-- of a job carry the request id of the caller.
+in_co(function()
+	local log = require("lgml.log")
+	local path = os.tmpname()
+	log.set_level("debug")
+	assert(log.open(path))
+	local w = remote.new({
+		lua = "lua5.4", script = src .. "/bin/lgml-worker", args = { "--fake", "--alias", "logged" },
+		restart = false,
+	})
+	log.bind("feedc0de")
+	local r = recorder()
+	local res = w:chat({ messages = { { role = "user", content = "hi" } } }, r)
+	log.bind(nil)
+	w:shutdown()
+	log.open(nil)
+	log.set_level("info")
+	local f = assert(io.open(path))
+	local text = f:read("a")
+	f:close()
+	os.remove(path)
+	ok(res == true and text:find("--log-level debug --log-file " .. path, 1, true),
+	    "the worker gets --log-level and --log-file")
+	ok(text:find('level=debug comp=worker:logged/engine rid=feedc0de msg="chat prompt"', 1, true),
+	    "a worker debug line has the model id and the request id")
+	ok(text:find("comp=worker:logged rid=feedc0de msg=\"job done\" kind=chat", 1, true),
+	    "the worker logs the job with the request id")
+end)
+
 print("1.." .. n)
 os.exit(failed == 0 and 0 or 1)
