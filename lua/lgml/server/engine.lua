@@ -48,13 +48,15 @@ end
 
 --- Lists the models that the engine serves.
 -- Each entry is `{ id = string, context_length = n }`. An entry can
--- also have `created` and `owned_by`; `/v1/models` shows them.
+-- also have `created` and `owned_by`; `/v1/models` shows them. With
+-- `vision = true`, `/v1/models` lists the capabilities "completion"
+-- and "multimodal".
 -- @treturn {table,...} the model list
 -- @function models
 
 --- Returns the server properties for `/props`.
 -- The table is `{ n_ctx = n, total_slots = n }`. It can also have
--- `model_path`.
+-- `model_path` and `modalities` (such as `{ vision = true }`).
 -- @treturn table the properties
 -- @function props
 

@@ -13,13 +13,15 @@ local getopt = require("lgml.getopt")
 local USAGE = "usage: lgml-worker --fd n (-m model | --fake) [-b backend] [-c n_ctx] [--no-fa]\n" ..
     "                   [--ctk type] [--ctv type] [--alias id] [--stt] [--engine module]\n" ..
     "                   [--recipe file] [--cache-ram MiB] [--ctx-checkpoints n]\n" ..
-    "                   [--lora file[:scale]]...\n"
+    "                   [--lora file[:scale]]...\n" ..
+    "                   [--mmproj file] [--image-min-tokens n] [--image-max-tokens n]\n"
 
 local opts, rest = getopt.parse(arg, "m:b:c:", {
 	model = "m", backend = "b", ctx = "c", ["fd="] = false,
 	["no-fa"] = false, ["alias="] = false, fake = false, stt = false,
 	["engine="] = false, ["ctk="] = false, ["ctv="] = false, ["recipe="] = false,
 	["cache-ram="] = false, ["ctx-checkpoints="] = false, ["lora="] = false,
+	["mmproj="] = false, ["image-min-tokens="] = false, ["image-max-tokens="] = false,
 }, { lora = true })
 if not opts or #rest > 0 or not (opts.m or opts.fake) or not tonumber(opts.fd) then
 	io.stderr:write("lgml-worker: ", tostring(rest), "\n", USAGE)
@@ -49,6 +51,9 @@ else
 		cache_ram = tonumber(opts["cache-ram"]),
 		ctx_checkpoints = math.tointeger(tonumber(opts["ctx-checkpoints"])),
 		lora = lora,
+		mmproj = opts.mmproj,
+		image_min_tokens = math.tointeger(tonumber(opts["image-min-tokens"])),
+		image_max_tokens = math.tointeger(tonumber(opts["image-max-tokens"])),
 	})
 end
 require("lgml.worker").serve(math.tointeger(tonumber(opts.fd)), engine)

@@ -27,6 +27,23 @@ end
 local devs = lgml.devices()
 ok(#devs >= 1, "devices listed")
 
+ok(lgml.sha256("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" and
+    lgml.sha256("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" and
+    lgml.sha256(string.rep("a", 1000000)) ==
+    "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0", "sha256 digests")
+-- Lengths at the edges of the padding block.
+local edges = {
+	[55] = "d5e285683cd4efc02d021a5c62014694958901005d6f71e89e0989fac77e4072",
+	[56] = "04c26261370ee7541549d16dee320c723e3fd14671e66a099afe0a377c16888e",
+	[64] = "7ce100971f64e7001e8fe5a51973ecdfe1ced42befe7ee8d5fd6219506b5393c",
+	[119] = "000b48d4edf0fa7bee3c6236ecd2785baa5db4eeb8bb54341b029e0d9fa5fb0c",
+}
+local good = true
+for len, want in pairs(edges) do
+	good = good and lgml.sha256(string.rep("x", len)) == want
+end
+ok(good, "sha256 at block edges")
+
 for _, d in ipairs(devs) do
 	local be <close> = assert(lgml.backend(d.name))
 	local tag = d.name .. ": "

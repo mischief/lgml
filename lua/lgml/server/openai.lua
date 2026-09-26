@@ -437,6 +437,7 @@ local function models(eng, res)
 			owned_by = m.owned_by or "lgml",
 			context_length = m.context_length,
 			meta = { n_ctx_train = m.context_length },
+			capabilities = m.vision and { "completion", "multimodal" } or nil,
 		}
 	end
 	return res:json(200, { object = "list", data = data })
@@ -449,6 +450,7 @@ local function props(eng, res)
 		    params = json.object() },
 		total_slots = p.total_slots,
 		model_path = p.model_path or default_model(eng),
+		modalities = p.modalities,
 		build_info = "lgml",
 	})
 end

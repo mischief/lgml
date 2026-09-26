@@ -3,6 +3,10 @@
 -- `lgml.server.engine`. One slot: requests run one at a time. The slot
 -- keeps its KV cache and token list, so a request that shares a prefix
 -- computes only the rest.
+-- With a vision encoder (`mmproj`), user messages can hold images. An
+-- image takes one prompt position for each of its embeddings. In the
+-- token list such a position is the string `"img:<sha256>:<i>"`, so
+-- the cached prefix and the prompt store match only the same image.
 -- @module lgml.engine
 local lgml = require("lgml")
 local chat = require("lgml.chat")
@@ -15,12 +19,16 @@ local decide = require("lgml.decide")
 local prompt_cache = require("lgml.prompt_cache")
 local grammar = require("lgml.grammar")
 local lora = require("lgml.lora")
+local media = require("lgml.chat.media")
 
 local M = {}
 local E = {}
 E.__index = E
 
 local UBATCH = 512
+
+-- Image embeddings kept in host memory, most recent first.
+local EMBD_KEEP = 8
 
 -- Device memory kept free for compute buffers when the engine sizes the
 -- context to fit.
@@ -76,9 +84,14 @@ end
 -- - `lora`: LoRA adapters, a list of { path, scale } (scale default 1);
 --   see `lgml.lora.load`. A request can change the scales with
 --   `lora = { { id, scale }, ... }`, ids from 0, as llama-server takes.
+-- - `mmproj`: a vision mmproj gguf for image input (default none); see
+--   `lgml.vision`
+-- - `image_min_tokens`, `image_max_tokens`: the token range of one
+--   image (default: the encoder's)
 -- @treturn Engine the engine
 -- @raise when the backend, the model or its tokenizer does not load,
--- when no chat template fits the model, or an adapter does not fit it
+-- when no chat template fits the model, an adapter does not fit it, or
+-- the mmproj does not fit it
 function M.new(opts)
 	local be = assert(lgml.backend(opts.backend))
 	local info = assert(lgml.gguf(opts.model))
@@ -124,6 +137,9 @@ function M.new(opts)
 		e.eog[id] = true
 	end
 	e:set_lora()
+	if opts.mmproj then
+		e:load_vision(opts)
+	end
 	if model.snapshot then
 		local ram = opts.cache_ram or 8192
 		e.pc = prompt_cache.new(model, cache, {
@@ -139,21 +155,46 @@ end
 --- A chat engine. It implements `lgml.server.engine.Engine`.
 -- @type Engine
 
---- Lists the one model of the engine.
--- @treturn {table,...} `{ { id, context_length = n_ctx } }`
-function E:models()
-	return { { id = self.id, context_length = self.n_ctx } }
+-- Load the vision encoder of opts.mmproj on the model's backend.
+function E:load_vision(opts)
+	local vision = require("lgml.vision")
+	local enc = vision.load(self.be, opts.mmproj, {
+		min_tokens = opts.image_min_tokens, max_tokens = opts.image_max_tokens,
+	})
+	if enc.hp.n_out ~= self.model.hp.n_embd then
+		error(("%s: image embeddings have %d values; the model takes %d"):format(opts.mmproj,
+		    enc.hp.n_out, self.model.hp.n_embd))
+	end
+	local im = self.family.image
+	if not im then
+		error(("chat: the %s template has no image tokens"):format(self.family_name))
+	end
+	self.image_id = self.tk:special().tokens[im.token]
+	if not self.image_id then
+		error("tokenizer has no image token " .. im.token)
+	end
+	self.vision, self.image_marker = enc, im.begin .. im.token .. im.finish
+	self.embd_store = {}
 end
 
---- Returns the properties: `{ n_ctx, total_slots = 1, lora }`.
+--- Lists the one model of the engine.
+-- @treturn {table,...} `{ { id, context_length = n_ctx, vision } }`;
+-- vision is true with an mmproj
+function E:models()
+	return { { id = self.id, context_length = self.n_ctx, vision = self.vision ~= nil } }
+end
+
+--- Returns the properties: `{ n_ctx, total_slots = 1, lora, modalities }`.
 -- lora lists the adapters as llama-server does: `{ id, path, scale }`.
+-- modalities is `{ vision = true }` with an mmproj, else `{ vision = false }`.
 -- @treturn table the properties
 function E:props()
 	local list = {}
 	for i, a in ipairs(self.adapters) do
 		list[i] = { id = i - 1, path = a.path, scale = a.scale }
 	end
-	return { n_ctx = self.n_ctx, total_slots = 1, lora = list }
+	return { n_ctx = self.n_ctx, total_slots = 1, lora = list,
+	    modalities = { vision = self.vision ~= nil } }
 end
 
 --- Set the adapter scales for a request.
@@ -243,23 +284,42 @@ end
 
 -- Run ids at cache.n_past. Returns the logits node, which stays valid
 -- until the next pass: the cache keeps the graph for replay. rows is
--- "last" (the default) or "all".
-function E:eval(ids, rows)
-	return replay.run(self.model, self.cache, ids,
-	    { logits = rows or "last", flash_attn = self.flash_attn })
+-- "last" (the default) or "all". embd holds embeddings for the ids: a
+-- non-causal pass reads them in place of the token embeddings.
+function E:eval(ids, rows, embd)
+	return replay.run(self.model, self.cache, ids, {
+		logits = rows or "last", flash_attn = self.flash_attn,
+		embd = embd, causal = embd == nil,
+	})
+end
+
+-- The image key of a token list entry, or nil for a token id.
+local function image_key(v)
+	return type(v) == "string" and v:match("^(.*):%d+$") or nil
+end
+
+-- Move n back to the start of the image that holds position n + 1.
+local function span_start(prompt, n)
+	local key = image_key(prompt[n + 1])
+	while key and n > 0 and image_key(prompt[n]) == key do
+		n = n - 1
+	end
+	return n
 end
 
 -- Keep the longest shared prefix of the cached tokens. At least one
--- prompt token must run to get logits.
+-- prompt token must run to get logits. An image runs whole or not at
+-- all.
 function E:reuse(prompt)
 	local n = 0
 	local old = self.tokens
 	while n < #old and n < #prompt - 1 and old[n + 1] == prompt[n + 1] do
 		n = n + 1
 	end
+	n = span_start(prompt, n)
 	-- The prompt cache can swap in a stored slot that shares more.
 	if self.pc then
-		n = self.pc:reuse(self, prompt, n)
+		n = span_start(prompt, self.pc:reuse(self, prompt, n))
 		old = self.tokens
 	end
 	local want = n
@@ -284,7 +344,26 @@ function E:reuse(prompt)
 	return n
 end
 
--- Prefill prompt[from..] in chunks. Returns the last logits node.
+-- The embeddings of the image with key: from the host store, or from
+-- the encoder with the prepared images of this request.
+function E:image_embd(key)
+	for i, e in ipairs(self.embd_store) do
+		if e.key == key then
+			table.insert(self.embd_store, 1, table.remove(self.embd_store, i))
+			return e.buf
+		end
+	end
+	local img = assert(self.images and self.images[key], "no image for " .. key)
+	local buf = assert(self.vision:encode(img.prep))
+	table.insert(self.embd_store, 1, { key = key, buf = buf })
+	while #self.embd_store > EMBD_KEEP do
+		table.remove(self.embd_store).buf:close()
+	end
+	return buf
+end
+
+-- Prefill prompt[from..] in chunks. Returns the last logits node. An
+-- image runs as one non-causal pass of its embeddings.
 function E:prefill(prompt, from, sink)
 	local logits
 	local i = from
@@ -295,7 +374,30 @@ function E:prefill(prompt, from, sink)
 		if stops[c] and stops[c] <= j then
 			j = stops[c]
 		end
-		logits = self:eval(table.move(prompt, i, j, 1, {}))
+		local key = image_key(prompt[i])
+		local embd
+		if key then
+			assert(prompt[i] == key .. ":1", "prefill starts inside an image")
+			j = i
+			while j < #prompt and image_key(prompt[j + 1]) == key do
+				j = j + 1
+			end
+			embd = self:image_embd(key)
+		else
+			for k = i + 1, j do
+				if image_key(prompt[k]) then
+					j = k - 1
+					break
+				end
+			end
+		end
+		local ids = table.move(prompt, i, j, 1, {})
+		if embd then
+			for k = 1, #ids do
+				ids[k] = 0
+			end
+		end
+		logits = self:eval(ids, "last", embd)
 		table.move(prompt, i, j, #self.tokens + 1, self.tokens)
 		if j == stops[c] then
 			self.pc:checkpoint()
@@ -416,16 +518,90 @@ function E:grammar_opts(req, think, prompt)
 	return { grammar = text, grammar_root = root, tokenizer = self.tk }
 end
 
+-- Put the images of a request into prompt: each image token becomes
+-- one entry for each image embedding. Returns the new prompt, or nil
+-- and an error message.
+function E:add_images(prompt, images)
+	local out, k = {}, 0
+	self.images = {}
+	for _, id in ipairs(prompt) do
+		if id ~= self.image_id then
+			out[#out + 1] = id
+		else
+			k = k + 1
+			local img = images[k]
+			if not img then
+				return nil, "the prompt holds more image tokens than images"
+			end
+			local key = "img:" .. lgml.sha256(img.bytes)
+			local have = self.images[key]
+			if not have then
+				local prep, err = self.vision:prepare(img.bytes)
+				if not prep then
+					return nil, ("image %d: %s"):format(k, err)
+				end
+				have = { prep = prep, n = self.vision:tokens(prep) }
+				self.images[key] = have
+			end
+			if have.n > (self.cache.ubatch or have.n) then
+				return nil, ("image %d has %d tokens; a pass takes %d"):format(k, have.n,
+				    self.cache.ubatch)
+			end
+			for i = 1, have.n do
+				out[#out + 1] = key .. ":" .. i
+			end
+		end
+	end
+	if k ~= #images then
+		return nil, "the prompt holds fewer image tokens than images"
+	end
+	return out
+end
+
+-- Free the prepared images of the last request.
+function E:drop_images()
+	for _, img in pairs(self.images or {}) do
+		img.prep:close()
+	end
+	self.images = nil
+end
+
 function E:run(req, sink)
+	local ok, a, b, c = pcall(self.run_prompt, self, req, sink)
+	self:drop_images()
+	if not ok then
+		error(a, 0)
+	end
+	return a, b, c
+end
+
+function E:run_prompt(req, sink)
 	local think = thinking(req)
 	local kw = type(req.chat_template_kwargs) == "table" and req.chat_template_kwargs or {}
 	local effort, keep = kw.reasoning_effort, kw.preserve_thinking
-	local text = self.family.render(req.messages, {
+	local messages, images = req.messages, nil
+	if media.has_images(messages) then
+		if not self.vision then
+			return nil, "image input is not supported: start the server with --mmproj", 400
+		end
+		messages, images = media.extract(messages, self.image_marker)
+		if not messages then
+			return nil, images, 400
+		end
+	end
+	local text = self.family.render(messages, {
 		tools = req.tools, add_generation_prompt = true, enable_thinking = think,
 		reasoning_effort = type(effort) == "string" and effort or nil,
 		preserve_thinking = keep == false and false or nil,
 	})
 	local prompt = self.tk:encode(text)
+	if self.vision then
+		local err
+		prompt, err = self:add_images(prompt, images or {})
+		if not prompt then
+			return nil, err, 400
+		end
+	end
 	if #prompt >= self.n_ctx then
 		return nil, ("prompt has %d tokens; context is %d"):format(#prompt, self.n_ctx), 400
 	end

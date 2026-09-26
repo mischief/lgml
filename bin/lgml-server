@@ -16,7 +16,8 @@ local USAGE = [=[
 usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b backend]
                    [-c n_ctx] [--no-fa] [--ctk type] [--ctv type] [--alias id]
                    [--recipe file] [--cache-ram MiB] [--ctx-checkpoints n]
-                   [--lora file[:scale]]... [--inproc] [--stt] [--engine module]
+                   [--lora file[:scale]]... [--mmproj file] [--image-min-tokens n]
+                   [--image-max-tokens n] [--inproc] [--stt] [--engine module]
                    [--cors origin]
   -l, --listen addr   address to listen on (default 127.0.0.1)
   -p, --port port     port to listen on (default 8080)
@@ -24,7 +25,8 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       spec: { model = path, id, backend, ctx, flash_attn, stt,
                       cache_type_k, cache_type_v, recipe, cache_ram,
                       ctx_checkpoints, lora = "file[:scale]" or a list of
-                      them or of { path, scale },
+                      them or of { path, scale }, mmproj, image_min_tokens,
+                      image_max_tokens,
                       engine = Lua module with new(opts), such as a TTS engine }
   -m, --model file    gguf model file, or a Whisper model directory
   -b, --backend name  ggml backend, for example Vulkan0 or CPU (default best)
@@ -49,6 +51,11 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       more; a request can change scales with "lora":
                       [{"id": 0, "scale": 0.5}]; GET /lora-adapters
                       lists them
+      --mmproj file   vision mmproj gguf (llama.cpp format) for image input
+                      in chat messages, as image_url parts with data URLs
+      --image-min-tokens n, --image-max-tokens n
+                      token range of one image (default: the encoder's;
+                      gemma4v: 40 to 280)
       --inproc        run the model in this process, not in a worker
       --stt           the model is speech-to-text (found from config.json
                       when not given)
@@ -109,6 +116,12 @@ local function model_engine(spec)
 	if #lora > 0 and (stt or spec.engine) then
 		die("lora needs a chat model")
 	end
+	local imin, imax = spec.image_min_tokens and math.tointeger(tonumber(spec.image_min_tokens)),
+	    spec.image_max_tokens and math.tointeger(tonumber(spec.image_max_tokens))
+	if (spec.image_min_tokens and not (imin and imin > 0)) or
+	    (spec.image_max_tokens and not (imax and imax >= (imin or 1))) then
+		die("bad image token range")
+	end
 	if spec.inproc and spec.engine then
 		return require(spec.engine).new({
 			model = spec.model, backend = spec.backend, id = spec.id, n_ctx = n_ctx,
@@ -123,6 +136,7 @@ local function model_engine(spec)
 			flash_attn = spec.flash_attn ~= false, id = spec.id,
 			cache_type_k = spec.cache_type_k, cache_type_v = spec.cache_type_v,
 			recipe = spec.recipe, cache_ram = ram, ctx_checkpoints = ckpt, lora = lora,
+			mmproj = spec.mmproj, image_min_tokens = imin, image_max_tokens = imax,
 		})
 	end
 	local wargs = { "-m", spec.model }
@@ -130,7 +144,8 @@ local function model_engine(spec)
 		["-b"] = spec.backend, ["-c"] = spec.ctx, ["--alias"] = spec.id,
 		["--ctk"] = spec.cache_type_k, ["--ctv"] = spec.cache_type_v,
 		["--recipe"] = spec.recipe, ["--cache-ram"] = spec.cache_ram,
-		["--ctx-checkpoints"] = spec.ctx_checkpoints,
+		["--ctx-checkpoints"] = spec.ctx_checkpoints, ["--mmproj"] = spec.mmproj,
+		["--image-min-tokens"] = imin, ["--image-max-tokens"] = imax,
 	}) do
 		table.move({ flag, tostring(v) }, 1, 2, #wargs + 1, wargs)
 	end
@@ -185,7 +200,9 @@ local function make_engine(opts)
 			flash_attn = not opts["no-fa"], stt = opts.stt, inproc = opts.inproc,
 			cache_type_k = opts.ctk, cache_type_v = opts.ctv, recipe = opts.recipe,
 			cache_ram = opts["cache-ram"], ctx_checkpoints = opts["ctx-checkpoints"],
-			engine = opts.engine, lora = opts.lora,
+			engine = opts.engine, lora = opts.lora, mmproj = opts.mmproj,
+			image_min_tokens = opts["image-min-tokens"],
+			image_max_tokens = opts["image-max-tokens"],
 		})
 	end
 	die("no engine: give -m model, -C config or --fake")
@@ -198,6 +215,7 @@ local function main(args)
 		inproc = false, stt = false, ["ctk="] = false, ["ctv="] = false, ["engine="] = false,
 		["recipe="] = false, ["cache-ram="] = false, ["ctx-checkpoints="] = false,
 		["lora="] = false, ["cors="] = false,
+		["mmproj="] = false, ["image-min-tokens="] = false, ["image-max-tokens="] = false,
 	}, { lora = true })
 	if not opts then
 		io.stderr:write("lgml-server: ", rest, "\n", USAGE)

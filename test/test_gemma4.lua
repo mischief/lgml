@@ -41,12 +41,18 @@ local X, USED, FX, PLE = 4, 2, 16, 8
 
 -- kv and tensors for a tiny model. "dense" has a sliding and a global
 -- layer. "moe" has four layers with routed experts, per-layer inputs
--- and two layers that share the cache of earlier layers.
-local function build(kind)
+-- and two layers that share the cache of earlier layers. extra lists
+-- control tokens to add at the end of the vocab.
+local function build(kind, extra)
 	local r = rng(#kind * 7919)
 	local kv = bpe_vocab.gemma4_kv()
 	local nv
 	for _, e in ipairs(kv) do
+		if e[1] == "tokenizer.ggml.tokens" or e[1] == "tokenizer.ggml.token_type" then
+			for _, piece in ipairs(extra or {}) do
+				table.insert(e[3], e[1]:find("type") and 3 or piece)
+			end
+		end
 		if e[1] == "tokenizer.ggml.tokens" then
 			nv = #e[3]
 		end
@@ -544,37 +550,120 @@ local function embd_check(kind, m)
 	buf:close()
 end
 
+-- Run one chat request on engine e; returns { res, err, status,
+-- reason, usage, text }.
+local function chat_on(e, messages, extra)
+	local uv = require("luv")
+	local r = { text = {} }
+	local sink = {}
+	function sink.content(_, t)
+		r.text[#r.text + 1] = t
+		return true
+	end
+	sink.reasoning, sink.tool_arguments = sink.content, sink.content
+	function sink.tool_call()
+		return 0
+	end
+	function sink.finish(_, reason, usage)
+		r.reason, r.usage = reason, usage
+	end
+	function sink.cancelled()
+		return false
+	end
+	local req = { messages = messages, max_tokens = 4 }
+	for k, v in pairs(extra or {}) do
+		req[k] = v
+	end
+	local done
+	coroutine.wrap(function()
+		r.res, r.err, r.status = e:chat(req, sink)
+		done = true
+	end)()
+	while not done do
+		uv.run("once")
+	end
+	r.text = table.concat(r.text)
+	return r
+end
+
+-- Image input on a tiny model and a tiny mmproj: prompt positions, the
+-- cached prefix, and request errors.
+local function vision_check()
+	local tiny = require("mmproj_tiny")
+	local base64 = require("lgml.base64")
+	local path, mpath = os.tmpname(), os.tmpname()
+	local kv, ts = build("dense", { "<|image>", "<|image|>", "<image|>" })
+	gguf.write(path, kv, ts)
+	local mkv, mts = tiny.build(E)
+	gguf.write(mpath, mkv, mts)
+	local e = require("lgml.engine").new({ model = path, backend = "CPU", n_ctx = 96,
+		mmproj = mpath, image_min_tokens = 1, image_max_tokens = 6 })
+	local function url(seed)
+		local t <close> = e.be:tensor("f32", { 1, 3, 12, 18 })
+		t:fill("uniform", -1, 1, seed)
+		return "data:image/png;base64," .. base64.encode(lgml.image_from(t):png())
+	end
+	local a, b = url(1), url(2)
+	local greedy = { temperature = 0 }
+	local function msg(u, text)
+		return { { role = "user", content = {
+			{ type = "image_url", image_url = { url = u } }, { type = "text", text = text } } } }
+	end
+	local plain = chat_on(e, { { role = "user", content = "hello world" } }, greedy)
+	local r1 = chat_on(e, msg(a, "hello world"), greedy)
+	ok(r1.res == true and r1.usage.prompt_tokens == plain.usage.prompt_tokens + 8,
+	    ("vision: an image adds 6 positions and 2 tokens (%s, %s)"):format(
+	    r1.usage and r1.usage.prompt_tokens, tostring(r1.err)))
+	local keys = 0
+	for _, v in ipairs(e.tokens) do
+		if type(v) == "string" and v:match("^img:%x+:%d+$") then
+			keys = keys + 1
+		end
+	end
+	ok(keys == 6, "vision: the token list holds 6 image keys")
+	local r2 = chat_on(e, msg(a, "hello world"), greedy)
+	ok(r2.usage.cached_tokens == r2.usage.prompt_tokens - 1 and r2.text == r1.text,
+	    "vision: the same image reuses the cache and gives the same answer")
+	local r3 = chat_on(e, msg(b, "hello world"), greedy)
+	local start
+	for i, v in ipairs(e.tokens) do
+		if type(v) == "string" then
+			start = start or i
+		end
+	end
+	ok(r3.res == true and r3.usage.cached_tokens == start - 1,
+	    ("vision: another image reuses only the text before it (%d)"):format(r3.usage.cached_tokens))
+	local r4 = chat_on(e, msg(a, "hello world"), greedy)
+	ok(r4.text == r1.text, "vision: the first image again gives the first answer")
+	local two = chat_on(e, { { role = "user", content = {
+		{ type = "image_url", image_url = { url = a } }, { type = "text", text = "x" },
+		{ type = "image_url", image_url = { url = b } } } } })
+	ok(two.res == true and two.usage.prompt_tokens == plain.usage.prompt_tokens - 2 + 17,
+	    "vision: two images in one message " .. tostring(two.err))
+	local bad = chat_on(e, msg("https://example.com/a.png", "hi"))
+	ok(bad.res == nil and bad.status == 400 and bad.err:find("data URL", 1, true),
+	    "vision: an http URL gives 400: " .. tostring(bad.err))
+	bad = chat_on(e, msg("data:image/png;base64,aGVsbG8=", "hi"))
+	ok(bad.res == nil and bad.status == 400, "vision: bytes that are not an image give 400")
+	bad = chat_on(e, { { role = "user", content = "<|image|>" } })
+	ok(bad.res == nil and bad.status == 400, "vision: an image token without an image gives 400")
+	ok(e:models()[1].vision == true and e:props().modalities.vision == true,
+	    "vision: models and props report vision")
+	local text_only = require("lgml.engine").new({ model = path, backend = "CPU", n_ctx = 96 })
+	bad = chat_on(text_only, msg(a, "hi"))
+	ok(bad.res == nil and bad.status == 400 and bad.err:find("--mmproj", 1, true),
+	    "vision: no mmproj gives 400")
+	os.remove(path)
+	os.remove(mpath)
+end
+
 -- The chat engine on the tiny model: a second request with the same
 -- first message reuses the cached prefix.
 local function engine_check(path)
-	local uv = require("luv")
 	local e = require("lgml.engine").new({ model = path, backend = "CPU", n_ctx = 96 })
 	require("lgml.server.engine").check(e)
 	local function chat(messages)
-		local r = {}
-		local sink = {}
-		function sink.content()
-			return true
-		end
-		sink.reasoning, sink.tool_arguments = sink.content, sink.content
-		function sink.tool_call()
-			return 0
-		end
-		function sink.finish(_, reason, usage)
-			r.reason, r.usage = reason, usage
-		end
-		function sink.cancelled()
-			return false
-		end
-		local done
-		coroutine.wrap(function()
-			r.res, r.err = e:chat({ messages = messages, max_tokens = 4 }, sink)
-			done = true
-		end)()
-		while not done do
-			uv.run("once")
-		end
-		return r
+		return chat_on(e, messages)
 	end
 	local first = { role = "user", content = "hello world" }
 	local a = chat({ first })
@@ -640,6 +729,7 @@ for _, kind in ipairs({ "dense", "moe" }) do
 	end
 	if kind == "dense" then
 		engine_check(path)
+		vision_check()
 	end
 	m:close()
 	os.remove(path)

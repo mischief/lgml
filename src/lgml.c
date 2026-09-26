@@ -2880,6 +2880,7 @@ luaopen_lgml(lua_State *L)
 	lgml_open_safetensors(L);
 	lgml_open_audio(L);
 	lgml_open_image(L);
+	lgml_open_sha256(L);
 	lgml_open_vocab(L);
 	lgml_open_ops_orpheus(L);
 	lgml_open_ops_qwen3tts(L);
