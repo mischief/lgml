@@ -13,6 +13,7 @@ local engine_api = require("lgml.server.engine")
 local multipart = require("lgml.server.multipart")
 local metrics = require("lgml.server.metrics")
 local systemone = require("lgml.systemone")
+local base64 = require("lgml.base64")
 
 local M = {}
 
@@ -648,11 +649,185 @@ local function systemone_route(eng, req, res)
 	})
 end
 
+-- images
+
+--- Image sides in pixels are multiples of this.
+M.IMAGE_MULTIPLE = 16
+--- The largest image side in pixels.
+M.IMAGE_MAX_SIDE = 2048
+
+-- A size "WxH" to width and height, or nil.
+local function image_size(s)
+	local w, h = s:match("^(%d+)x(%d+)$")
+	w, h = math.tointeger(tonumber(w)), math.tointeger(tonumber(h))
+	if not w or not h then
+		return nil
+	end
+	for _, v in ipairs({ w, h }) do
+		if v < M.IMAGE_MULTIPLE or v > M.IMAGE_MAX_SIDE or v % M.IMAGE_MULTIPLE ~= 0 then
+			return nil
+		end
+	end
+	return w, h
+end
+
+local function int_in(v, lo, hi)
+	local i = math.tointeger(v)
+	return i ~= nil and i >= lo and i <= hi
+end
+
+-- Fields that an image request can hold, with a check for each.
+local IMAGE_CHECKS = {
+	{ "model", "string" }, { "negative_prompt", "string" },
+	{ "n", "number", function(v) return int_in(v, 1, 10) end, "an integer from 1 to 10" },
+	{ "steps", "number", function(v) return int_in(v, 1, 100) end, "an integer from 1 to 100" },
+	{ "seed", "number", function(v) return int_in(v, 0, (1 << 53) - 1) end,
+	    "an integer from 0 to 2^53 - 1" },
+	{ "cfg_scale", "number", function(v) return v >= 0 and v <= 30 end, "a number from 0 to 30" },
+	{ "strength", "number", function(v) return v > 0 and v <= 1 end, "a number above 0, at most 1" },
+}
+
+--- Checks an image request and makes the request for `Engine:generate`.
+-- b is the decoded JSON body, or the fields of an edit form with
+-- numbers as strings. prompt is a string of 1 to 16384 bytes. size is
+-- "WxH", with sides that are multiples of 16 from 16 to 2048, or
+-- "auto" (default: 1024x1024, or the input size for an edit).
+-- response_format is "b64_json", the default; output_format is "png".
+-- The fields n (1 to 10), steps (1 to 100), seed, `cfg_scale`,
+-- `negative_prompt` and strength (edits, above 0 to 1) are optional.
+-- @tparam any b the body
+-- @tparam[opt] boolean edit true for an edit
+-- @treturn[1] table the request
+-- @treturn[2] nil
+-- @treturn[2] string an error message
+-- @treturn[2] ?string the bad parameter name
+function M.check_image(b, edit)
+	if type(b) ~= "table" or json.isarray(b) then
+		return nil, "request body must be a JSON object"
+	end
+	strip_nulls(b)
+	if type(b.prompt) ~= "string" or b.prompt == "" then
+		return nil, "prompt must be a non-empty string", "prompt"
+	elseif #b.prompt > 16384 then
+		return nil, "prompt is longer than 16384 bytes", "prompt"
+	end
+	local r = { prompt = b.prompt }
+	for _, c in ipairs(IMAGE_CHECKS) do
+		local k, v = c[1], b[c[1]]
+		if edit and c[2] == "number" and type(v) == "string" then
+			v = tonumber(v)
+			if v == nil then
+				return nil, k .. " must be " .. c[4], k
+			end
+		end
+		if v ~= nil then
+			if type(v) ~= c[2] or (c[3] and not c[3](v)) then
+				return nil, k .. " must be " .. (c[4] or "a " .. c[2]), k
+			end
+			r[k] = c[2] == "number" and math.tointeger(v) or v
+		end
+	end
+	if not edit and r.strength then
+		return nil, "strength is for edits only", "strength"
+	end
+	local size = b.size or "auto"
+	if size ~= "auto" then
+		r.width, r.height = image_size(tostring(size))
+		if not r.width then
+			return nil, ("size must be auto or WxH, with sides that are multiples of %d from %d to %d")
+			    :format(M.IMAGE_MULTIPLE, M.IMAGE_MULTIPLE, M.IMAGE_MAX_SIDE), "size"
+		end
+	elseif not edit then
+		r.width, r.height = 1024, 1024
+	end
+	if (b.response_format or "b64_json") ~= "b64_json" then
+		return nil, "response_format must be b64_json", "response_format"
+	elseif (b.output_format or "png") ~= "png" then
+		return nil, "output_format must be png", "output_format"
+	end
+	return r
+end
+
+-- Runs the request on eng and sends the OpenAI image reply.
+local function run_image(eng, res, ireq)
+	local t0 = uv.hrtime()
+	local model = ireq.model or default_model(eng)
+	local r, msg, status = eng:generate(ireq, {
+		cancelled = function()
+			return res.s:gone()
+		end,
+	})
+	if res.s:gone() then
+		res.close = true
+		return
+	end
+	metrics.request(model, "image", r ~= nil)
+	if not r then
+		return res:error(status or 500, msg or "image generation failed")
+	end
+	local secs = (uv.hrtime() - t0) / 1e9
+	local data = json.array()
+	for i, png in ipairs(r.images) do
+		data[i] = { b64_json = base64.encode(png), seed = r.seeds and r.seeds[i] }
+	end
+	metrics.add("images_total", "images made", model, #r.images)
+	metrics.add("image_steps_total", "image sampling steps run", model, r.steps)
+	metrics.add("image_seconds_total", "time spent making images", model, secs)
+	local fields = {
+		elapsed_ms = secs * 1000, images = #r.images, steps = r.steps,
+		seed = r.seeds and r.seeds[1], sample_ms = r.sample_ms,
+	}
+	if r.sample_ms and (r.steps or 0) > 0 then
+		fields.ms_per_step = r.sample_ms / r.steps
+	end
+	return res:json(200, {
+		created = os.time(), data = data, output_format = "png",
+		size = r.width and ("%dx%d"):format(r.width, r.height),
+	}, metrics.headers(fields))
+end
+
+local function images(eng, req, res)
+	if type(eng.generate) ~= "function" then
+		return res:error(404, "this server does not serve images")
+	end
+	local body, err = json.decode(req.body)
+	if not body then
+		return res:error(400, "bad JSON: " .. err)
+	end
+	local ireq, msg, param = M.check_image(body)
+	if not ireq then
+		return res:error(400, msg, nil, param)
+	end
+	return run_image(eng, res, ireq)
+end
+
+local function image_edits(eng, req, res)
+	if type(eng.generate) ~= "function" then
+		return res:error(404, "this server does not serve images")
+	end
+	local form, err = multipart.from_request(req)
+	if not form then
+		return res:error(400, err)
+	end
+	local file = form.files.image or form.files["image[]"]
+	if not file or #file.data == 0 then
+		return res:error(400, "image is required", nil, "image")
+	elseif form.files.mask or form.fields.mask then
+		return res:error(400, "mask is not supported", nil, "mask")
+	end
+	local ireq, msg, param = M.check_image(form.fields, true)
+	if not ireq then
+		return res:error(400, msg, nil, param)
+	end
+	ireq.image = file.data
+	return run_image(eng, res, ireq)
+end
+
 --- Adds the OpenAI routes for eng to srv.
 -- The routes are `/health`, `/v1/health`, `/models`, `/v1/models`,
 -- `/props`, `/chat/completions`, `/audio/speech`,
--- `/audio/transcriptions` and `/systemone`, the last four also under
--- `/v1`. A route for a method that eng does not have gives 404.
+-- `/audio/transcriptions`, `/systemone`, `/images/generations` and
+-- `/images/edits`, the last six also under `/v1`. A route for a method that eng does not have gives 404.
 -- `/v1/systemone` is Jev's System One API (see `lgml.systemone`): a
 -- bad request gives 422 with a FastAPI `detail` list, and other errors
 -- give `{ detail = message }`.
@@ -698,6 +873,16 @@ function M.install(srv, eng)
 	end
 	srv:route("POST", "/v1/systemone", decide)
 	srv:route("POST", "/systemone", decide)
+	local function gen(req, res)
+		return images(eng, req, res)
+	end
+	local function edit(req, res)
+		return image_edits(eng, req, res)
+	end
+	srv:route("POST", "/v1/images/generations", gen)
+	srv:route("POST", "/images/generations", gen)
+	srv:route("POST", "/v1/images/edits", edit)
+	srv:route("POST", "/images/edits", edit)
 end
 
 return M

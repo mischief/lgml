@@ -41,7 +41,7 @@ end
 
 --- Count one request.
 -- @tparam string model the model id
--- @tparam string kind "chat", "transcription", "speech" or "decide"
+-- @tparam string kind "chat", "transcription", "speech", "decide" or "image"
 -- @tparam boolean ok false when the request failed
 function M.request(model, kind, ok)
 	M.add(kind .. "_requests_total", kind .. " requests", model, 1)

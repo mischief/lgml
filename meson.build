@@ -132,6 +132,9 @@ if lua_bin.found()
   test('gemma4', lua_bin, args : [files('test/test_gemma4.lua')],
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
     timeout : 120)
+  test('zimage', lua_bin, args : [files('test/test_zimage.lua')],
+    env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
+    timeout : 120)
   test('image', lua_bin, args : [files('test/test_image.lua')],
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
     timeout : 120)
@@ -153,6 +156,9 @@ if lua_bin.found()
   # LGML_DIFFUSION_GEMMA (a gguf path) comes from the environment.
   test('diffusion_gemma_model', lua_bin, args : [files('test/test_diffusion_gemma_model.lua')],
     suite : 'model', is_parallel : false, timeout : 3600)
+  # LGML_ZIMAGE (a directory with the Z-Image files) comes from the environment.
+  test('zimage_model', lua_bin, args : [files('test/test_zimage_model.lua')],
+    suite : 'model', is_parallel : false, timeout : 600)
   # LGML_ZIMAGE_VAE (ae.safetensors) and optional LGML_VAE_REF come from the environment.
   test('image_model', lua_bin, args : [files('test/test_image_model.lua')],
     suite : 'model', is_parallel : false, timeout : 600)

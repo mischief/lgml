@@ -34,6 +34,17 @@ ok(r:pick("whisper", "transcribe") == stt and r:pick(nil, "chat") ~= stt,
     "chat skips transcribe-only engines")
 ok(r:props().n_ctx == 111, "props from first chat engine")
 ok(r:transcribe({ model = "whisper" }, "").text == "from stt", "transcribe routes")
+-- An engine that only makes images.
+local img = {}
+function img.models() return { { id = "zimage", context_length = 0 } } end
+function img.props() return { n_ctx = 0, total_slots = 1 } end
+function img.generate(_, req) return { seeds = { req.seed } } end
+local r2 = router.new({ stt, img })
+ok(r2:pick(nil, "generate") == img and r2:pick("whisper", "generate") == img,
+    "generate skips engines without generate")
+ok(r2:generate({ model = "zimage", seed = 9 }).seeds[1] == 9, "generate routes")
+ok(select(3, router.new({ stt }):generate({ prompt = "x" })) == 400,
+    "no image engine gives 400")
 
 print("1.." .. n)
 os.exit(failed == 0 and 0 or 1)

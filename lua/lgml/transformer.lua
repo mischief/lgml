@@ -627,8 +627,10 @@ end
 -- @tparam[opt] table opts options:
 -- opts.flash_attn: true for flash attention (f16 masks).
 -- opts.logits: "all" or "last" (default "all").
+-- opts.hidden: a layer count; `forward` stops after that many layers
+-- and gives the hidden state in place of the logits (default nil).
 -- @treturn table fields n, n_past, n_kv, n_attn, n_swa_attn, cache,
--- flash_attn, logits, and the tensors ids, pos, mask, mask_swa (with
+-- flash_attn, logits, hidden, and the tensors ids, pos, mask, mask_swa (with
 -- sliding layers), rows and rows_swa (with a cache)
 -- @raise when the pass does not fit the cache, or n_past is not where
 -- the recurrent state is
@@ -648,6 +650,7 @@ function M:inputs(ids, cache, opts)
 	local inp = {
 		n = n, n_attn = n_attn, n_swa_attn = n_swa_attn, cache = cache,
 		flash_attn = opts.flash_attn, logits = opts.logits or "all",
+		hidden = opts.hidden,
 		ids = be:tensor("i32", { n }, ids),
 		pos = be:tensor("i32", { n }),
 		mask = be:tensor(mt, { n, n_attn }),
@@ -673,8 +676,8 @@ end
 -- @treturn string the key
 function M:replay_key(cache, n, opts)
 	local n_attn, n_swa_attn = spans(cache, cache.n_past + n)
-	return ("%d:%d:%d:%s:%s"):format(n, n_attn, n_swa_attn, tostring(opts.flash_attn),
-	    opts.logits or "all")
+	return ("%d:%d:%d:%s:%s:%s"):format(n, n_attn, n_swa_attn, tostring(opts.flash_attn),
+	    opts.logits or "all", tostring(opts.hidden))
 end
 
 --- Load new ids into the inputs of an earlier pass with the same key.
@@ -1047,7 +1050,8 @@ end
 -- them.
 -- @param g the graph
 -- @tparam table inp inputs from `inputs`
--- @return logits (n, n_vocab), or (1, n_vocab) when inp.logits is "last"
+-- @return logits (n, n_vocab), or (1, n_vocab) when inp.logits is "last";
+-- with inp.hidden, the hidden state (n, n_embd) after that many layers
 -- @treturn table named nodes for comparison, such as "embd",
 -- "ffn_out-0", "l_out-0" and "result_norm"
 function M:forward(g, inp)
@@ -1081,6 +1085,9 @@ function M:forward(g, inp)
 			x = g:mul(x, L.out_scale)
 		end
 		taps["l_out" .. sfx] = x
+		if il == inp.hidden then
+			return x, taps
+		end
 	end
 	if inp.logits == "last" and n > 1 then
 		local row = lgml.row_size("f32", hp.n_embd)

@@ -50,8 +50,8 @@ local function environ(extra)
 end
 
 --- A worker engine. It implements `lgml.server.engine.Engine`.
--- It has `chat`, `transcribe`, `speak` and `decide`. The worker gives
--- the methods that its engine has in `ready().caps`.
+-- It has `chat`, `transcribe`, `speak`, `decide` and `generate`. The
+-- worker gives the methods that its engine has in `ready().caps`.
 -- @type Remote
 
 function R:start()
@@ -398,6 +398,65 @@ function R:decide(req, ctl)
 			if ev.t == ipc.DONE then
 				if ev.v.ok then
 					return ev.v.result
+				end
+				return nil, ev.v.msg, ev.v.status
+			end
+		end
+	end
+end
+
+--- Runs an image job on the worker.
+-- The input image of an edit goes as an `IMAGE` message; each result
+-- image comes back as one. Messages too large give 413.
+-- @tparam table req the image request
+-- @tparam[opt] lgml.server.engine.Control ctl the cancel control
+-- @treturn[1] table the result of `Engine:generate`
+-- @treturn[2] nil
+-- @treturn[2] string an error message
+-- @treturn[2] int an HTTP status
+function R:generate(req, ctl)
+	local hello = self:ready()
+	if hello.caps and not hello.caps.generate then
+		return nil, "model does not support images", 400
+	end
+	if not self.ch then
+		return nil, "worker not running", 503
+	end
+	local id = self.next_id
+	self.next_id = id + 1
+	local job = setmetatable({ q = {} }, Job)
+	self.jobs[id] = job
+	local body = {}
+	for k, v in pairs(req) do
+		body[k] = v
+	end
+	body.image, body.has_image = nil, req.image ~= nil or nil
+	local ok, err = self.ch:send(ipc.GENERATE, id, body)
+	if ok and req.image then
+		ok, err = self.ch:send(ipc.IMAGE, id, req.image)
+	end
+	if not ok then
+		self.jobs[id] = nil
+		return nil, "send to worker: " .. tostring(err), err == "message too large" and 413 or 503
+	end
+	local images, cancelled = {}, false
+	while true do
+		job:wait()
+		if not cancelled and ctl and ctl.cancelled and ctl.cancelled() then
+			cancelled = true
+			if self.ch then
+				self.ch:send(ipc.CANCEL, id)
+			end
+		end
+		while #job.q > 0 do
+			local ev = table.remove(job.q, 1)
+			if ev.t == ipc.IMAGE then
+				images[#images + 1] = ev.v
+			elseif ev.t == ipc.DONE then
+				if ev.v.ok then
+					local r = ev.v.result or {}
+					r.images = images
+					return r
 				end
 				return nil, ev.v.msg, ev.v.status
 			end

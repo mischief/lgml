@@ -632,6 +632,70 @@ sampler_sample(lua_State *L)
 	return 1;
 }
 
+/*
+ * Philox 4x32-10 normal draws, as the torch CUDA generator makes them
+ * and stable-diffusion.cpp copies on the CPU: draw i takes counter
+ * (offset, 0, i, 0) and the seed as key, then Box-Muller in f32.
+ */
+static void
+philox(uint32_t c[4], uint32_t k0, uint32_t k1)
+{
+	uint64_t a, b;
+	int r;
+
+	for (r = 0; r < 10; r++) {
+		a = (uint64_t)c[0] * 0xD2511F53u;
+		b = (uint64_t)c[2] * 0xCD9E8D57u;
+		c[0] = (uint32_t)(b >> 32) ^ c[1] ^ k0;
+		c[1] = (uint32_t)b;
+		c[2] = (uint32_t)(a >> 32) ^ c[3] ^ k1;
+		c[3] = (uint32_t)a;
+		k0 += 0x9E3779B9u;
+		k1 += 0xBB67AE85u;
+	}
+}
+
+/*** Normal random numbers from the Philox generator.
+ * Draw i uses counter (offset, 0, i, 0). The values match the "cuda"
+ * RNG of stable-diffusion.cpp and of the AUTOMATIC1111 web UI.
+ * @tparam int seed the seed, 64 bits
+ * @tparam int n the count, 1 to 2^28
+ * @tparam[opt=0] int offset the call count of the generator
+ * @treturn string n f32 values as raw bytes
+ * @raise if n or offset is out of range
+ * @function randn_philox
+ */
+static int
+l_randn_philox(lua_State *L)
+{
+	uint64_t seed = (uint64_t)luaL_checkinteger(L, 1);
+	lua_Integer n = luaL_checkinteger(L, 2);
+	lua_Integer off = luaL_optinteger(L, 3, 0);
+	const float inv = 2.3283064e-10f, inv2pi = 2.3283064e-10f * 6.2831855f;
+	uint32_t c[4];
+	luaL_Buffer b;
+	float *out, u, v, s;
+	lua_Integer i;
+
+	luaL_argcheck(L, n >= 1 && n <= (1 << 28), 2, "count out of range");
+	luaL_argcheck(L, off >= 0 && off <= UINT32_MAX, 3, "offset out of range");
+	out = (float *)(void *)luaL_buffinitsize(L, &b, (size_t)n * sizeof(float));
+	for (i = 0; i < n; i++) {
+		c[0] = (uint32_t)off;
+		c[1] = 0;
+		c[2] = (uint32_t)i;
+		c[3] = 0;
+		philox(c, (uint32_t)seed, (uint32_t)(seed >> 32));
+		u = (float)c[0] * inv + inv / 2;
+		v = (float)c[1] * inv2pi + inv2pi / 2;
+		/* The reference rounds only s to f32. */
+		s = (float)sqrt(-2.0 * log(u));
+		out[i] = (float)(s * sin(v));
+	}
+	luaL_pushresultsize(&b, (size_t)n * sizeof(float));
+	return 1;
+}
+
 static const luaL_Reg sampler_meta[] = {
 	{ "__gc", sampler_close },
 	{ "__close", sampler_close },
@@ -657,4 +721,6 @@ lgml_open_sample(lua_State *L)
 	lua_pop(L, 1);
 	lua_pushcfunction(L, l_sampler);
 	lua_setfield(L, -2, "sampler");
+	lua_pushcfunction(L, l_randn_philox);
+	lua_setfield(L, -2, "randn_philox");
 }

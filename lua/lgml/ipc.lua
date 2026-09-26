@@ -1,13 +1,13 @@
 --- imsg channel between the front and a worker, driven by luv.
--- Payloads are JSON, except for `AUDIO`, which carries raw bytes. One
--- poll handle per fd watches reads, and writes while the output queue
--- is not empty.
+-- Payloads are JSON, except for `AUDIO` and `IMAGE`, which carry raw
+-- bytes. One poll handle per fd watches reads, and writes while the
+-- output queue is not empty.
 --
 -- Each message has a type, a job id and a payload. The worker sends
 -- `HELLO` once, with id 0. Then the front starts jobs with `JOB`,
--- `TRANSCRIBE`, `SPEAK` or `DECIDE`, each with a new id. The worker
--- answers each job with zero or more `DELTA` or `AUDIO` messages and
--- one `DONE`. The front sends `CANCEL` to stop a job; the job still
+-- `TRANSCRIBE`, `SPEAK`, `DECIDE` or `GENERATE`, each with a new id.
+-- The worker answers each job with zero or more `DELTA`, `AUDIO` or
+-- `IMAGE` messages and one `DONE`. The front sends `CANCEL` to stop a job; the job still
 -- ends with `DONE`.
 -- @module lgml.ipc
 local uv = require("luv")
@@ -19,7 +19,7 @@ local M = {}
 --- Worker to front: the worker is ready.
 -- Payload: `{ models, props, caps }`. models and props are the results
 -- of `Engine:models` and `Engine:props`. caps is `{ chat, transcribe,
--- speak, decide }`, with true for each method the engine has.
+-- speak, decide, generate }`, with true for each method the engine has.
 M.HELLO = 1
 --- Front to worker: start a chat job.
 -- Payload: the chat request for `Engine:chat`.
@@ -38,7 +38,8 @@ M.DELTA = 4
 -- success. msg and status give the error otherwise. finish is the
 -- `{ reason, usage, timings }` of `Sink:finish` for a chat job. result
 -- is the transcription for a transcribe job, `{ sample_rate }` for a
--- speech job, or the result of `Engine:decide` for a decide job.
+-- speech job, the result of `Engine:decide` for a decide job, or the
+-- result of `Engine:generate` without images for a generate job.
 M.DONE = 5
 --- Front to worker: start a transcription job.
 -- Payload: the request for `Engine:transcribe`. An `AUDIO` message with
@@ -55,9 +56,19 @@ M.SPEAK = 8
 --- Front to worker: start a decide job.
 -- Payload: the request for `Engine:decide`. The worker sends `DONE`.
 M.DECIDE = 9
+--- Front to worker: start an image job.
+-- Payload: the request for `Engine:generate` without its image bytes.
+-- When the payload has `has_image`, an `IMAGE` message with the same id
+-- follows, and the job starts when it arrives. The worker sends one
+-- `IMAGE` for each result image, then `DONE`.
+M.GENERATE = 10
+--- Raw image bytes for a job, in either direction.
+-- Front to worker: the input file of an edit. Worker to front: one PNG
+-- file of the result, in order.
+M.IMAGE = 11
 
 -- These types carry raw bytes, not JSON.
-local RAW = { [M.AUDIO] = true }
+local RAW = { [M.AUDIO] = true, [M.IMAGE] = true }
 
 --- The largest imsg message in bytes: 256 MiB.
 M.MAXSIZE = 256 << 20
@@ -67,7 +78,7 @@ C.__index = C
 
 --- Opens a channel on a socket.
 -- on_message(type, id, value) runs for each message. value is a string
--- for `AUDIO` and the decoded JSON for the other types. on_close(err)
+-- for `AUDIO` and `IMAGE` and the decoded JSON for the other types. on_close(err)
 -- runs once, at EOF or error.
 -- @tparam int fd the socket file descriptor; the channel owns it
 -- @tparam function on_message the message callback

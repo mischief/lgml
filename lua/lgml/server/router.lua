@@ -42,7 +42,8 @@ end
 
 --- Picks the engine for a model id and a method.
 -- @tparam ?string id the model id
--- @tparam string what `"chat"`, `"transcribe"`, `"speak"` or `"decide"`
+-- @tparam string what `"chat"`, `"transcribe"`, `"speak"`, `"decide"` or
+-- `"generate"`
 -- @treturn ?lgml.server.engine.Engine the engine that serves id with
 -- what, else the first engine with what, else nil
 function R:pick(id, what)
@@ -121,6 +122,19 @@ function R:decide(req, ctl)
 		return nil, "no model serves decisions", 400
 	end
 	return e:decide(req, ctl)
+end
+
+--- Makes images on the engine for `req.model`.
+-- @tparam table req the image request
+-- @tparam lgml.server.engine.Control ctl the cancel control
+-- @return the results of `Engine:generate`, or nil, a message and 400
+-- when no engine makes images
+function R:generate(req, ctl)
+	local e = self:pick(req.model, "generate")
+	if not e then
+		return nil, "no model serves images", 400
+	end
+	return e:generate(req, ctl)
 end
 
 --- Stops each engine that has a `stop` method.

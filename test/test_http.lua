@@ -8,6 +8,7 @@ local openai = require("lgml.server.openai")
 local fake = require("lgml.server.fake_engine")
 local stream = require("lgml.server.stream")
 local multipart = require("lgml.server.multipart")
+local base64 = require("lgml.base64")
 
 local n, failed = 0, 0
 
@@ -478,6 +479,73 @@ local function test_transcribe(port, bare_port)
 	    "engine without transcribe gives 404")
 end
 
+local PNG_SIG = "\137PNG\r\n\26\n"
+
+local function gen_json(port, body)
+	return roundtrip(port, request("POST", "/v1/images/generations", json.encode(body),
+	    { ["Content-Type"] = "application/json" }))
+end
+
+local function edit(port, parts)
+	return roundtrip(port, request("POST", "/v1/images/edits", form(parts),
+	    { ["Content-Type"] = "multipart/form-data; boundary=B0" }))
+end
+
+local function test_images(port, bare_port)
+	local r = gen_json(port, { prompt = "a fox", n = 2, size = "512x256", seed = 7, steps = 4 })
+	local b = body_json(r)
+	local png = b and b.data and b.data[1] and base64.decode(b.data[1].b64_json)
+	ok(r.status == 200 and #b.data == 2 and png and png:sub(1, 8) == PNG_SIG,
+	    "generations gives two base64 PNGs")
+	ok(b.data[1].seed == 7 and b.data[2].seed == 8 and b.size == "512x256" and
+	    b.output_format == "png" and type(b.created) == "number",
+	    "generations gives seeds, size and format")
+	ok(r.headers["x-lgml-steps"] == "8" and r.headers["x-lgml-images"] == "2" and
+	    r.headers["x-lgml-seed"] == "7" and tonumber(r.headers["x-lgml-elapsed-ms"]) and
+	    r.headers["x-lgml-ms-per-step"], "generations sets x-lgml headers")
+	b = body_json(gen_json(port, { prompt = "a fox" }))
+	ok(b.size == "1024x1024" and b.data[1].seed == 42, "generations defaults")
+	local bad = {
+		{ { n = 2 }, "prompt" }, { { prompt = "x", size = "1000x1000" }, "size" },
+		{ { prompt = "x", size = "4096x16" }, "size" },
+		{ { prompt = "x", response_format = "url" }, "response_format" },
+		{ { prompt = "x", n = 11 }, "n" }, { { prompt = "x", steps = 0 }, "steps" },
+		{ { prompt = "x", strength = 0.5 }, "strength" },
+		{ { prompt = "x", output_format = "jpeg" }, "output_format" },
+	}
+	for _, c in ipairs(bad) do
+		r = gen_json(port, c[1])
+		ok(r.status == 400 and body_json(r).error.param == c[2], "generations rejects bad " .. c[2])
+	end
+	r = gen_json(port, { prompt = "fail" })
+	ok(r.status == 500 and body_json(r).error.message == "fake failure",
+	    "generations engine error forwarded")
+	local pngin = base64.decode(b.data[1].b64_json)
+	r = edit(port, { { "image", pngin, "in.png" }, { "prompt", "a wolf" }, { "strength", "0.6" },
+	    { "seed", "3" }, { "n", "1" } })
+	b = body_json(r)
+	ok(r.status == 200 and #b.data == 1 and b.data[1].seed == 3 and
+	    base64.decode(b.data[1].b64_json):sub(1, 8) == PNG_SIG, "edits gives a PNG")
+	r = edit(port, { { "image[]", pngin, "in.png" }, { "prompt", "a wolf" }, { "size", "256x256" } })
+	ok(r.status == 200 and body_json(r).size == "256x256", "edits takes image[] and size")
+	r = edit(port, { { "prompt", "a wolf" } })
+	ok(r.status == 400 and body_json(r).error.param == "image", "edits needs an image")
+	r = edit(port, { { "image", pngin, "in.png" }, { "prompt", "a wolf" }, { "mask", pngin, "m.png" } })
+	ok(r.status == 400 and body_json(r).error.param == "mask", "edits rejects a mask")
+	r = edit(port, { { "image", pngin, "in.png" }, { "prompt", "a wolf" }, { "strength", "2" } })
+	ok(r.status == 400 and body_json(r).error.param == "strength", "edits checks strength")
+	r = edit(port, { { "image", "GIF89a", "in.gif" }, { "prompt", "a wolf" } })
+	ok(r.status == 400 and body_json(r).error.message:find("PNG"), "edits forwards image errors")
+	r = gen_json(bare_port, { prompt = "a fox" })
+	ok(r.status == 404, "engine without generate gives 404")
+	r = roundtrip(port, request("GET", "/metrics"))
+	local n = r.body:match('lgml_image_requests_total{model="fake"} (%d+)')
+	local imgs = r.body:match('lgml_images_total{model="fake"} (%d+)')
+	local errs = r.body:match('lgml_image_errors_total{model="fake"} (%d+)')
+	ok(tonumber(n) and tonumber(n) >= 5 and tonumber(imgs) >= 5 and tonumber(errs) == 2,
+	    "metrics count image requests")
+end
+
 local function main()
 	local eng = fake.new({ delay = 2 })
 	local srv = server.new({ limits = { max_body = 1 << 20, idle_ms = 500 },
@@ -493,10 +561,12 @@ local function main()
 	test_keepalive(port)
 	test_cancel(port, eng)
 	test_multipart()
-	local bare = setmetatable({ transcribe = false }, { __index = eng })
+	local bare = setmetatable({ transcribe = false, generate = false }, { __index = eng })
 	local srv2 = server.new({ log = function() end })
 	openai.install(srv2, bare)
-	test_transcribe(port, assert(srv2:listen("127.0.0.1", 0)))
+	local bare_port = assert(srv2:listen("127.0.0.1", 0))
+	test_transcribe(port, bare_port)
+	test_images(port, bare_port)
 	srv2:close()
 	srv:close()
 	print("1.." .. n)

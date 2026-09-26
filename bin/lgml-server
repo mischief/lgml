@@ -16,7 +16,7 @@ local USAGE = [[
 usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b backend]
                    [-c n_ctx] [--no-fa] [--ctk type] [--ctv type] [--alias id]
                    [--recipe file] [--cache-ram MiB] [--ctx-checkpoints n]
-                   [--inproc] [--stt]
+                   [--inproc] [--stt] [--engine module]
   -l, --listen addr   address to listen on (default 127.0.0.1)
   -p, --port port     port to listen on (default 8080)
   -C, --config file   Lua file returning { listen, port, models = { spec, ... } };
@@ -44,6 +44,8 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
       --inproc        run the model in this process, not in a worker
       --stt           the model is speech-to-text (found from config.json
                       when not given)
+      --engine module Lua engine module for the model, such as
+                      lgml.image.engine with -m a Z-Image directory
       --fake          serve the fake test engine
   -h, --help          show this help
 ]]
@@ -142,6 +144,7 @@ local function make_engine(opts)
 			flash_attn = not opts["no-fa"], stt = opts.stt, inproc = opts.inproc,
 			cache_type_k = opts.ctk, cache_type_v = opts.ctv, recipe = opts.recipe,
 			cache_ram = opts["cache-ram"], ctx_checkpoints = opts["ctx-checkpoints"],
+			engine = opts.engine,
 		})
 	end
 	die("no engine: give -m model, -C config or --fake")
@@ -151,7 +154,7 @@ local function main(args)
 	local opts, rest = getopt.parse(args, "hl:p:m:b:c:C:", {
 		config = "C", help = "h", listen = "l", port = "p", model = "m", backend = "b",
 		ctx = "c", fake = false, ["no-fa"] = false, ["alias="] = false,
-		inproc = false, stt = false, ["ctk="] = false, ["ctv="] = false,
+		inproc = false, stt = false, ["ctk="] = false, ["ctv="] = false, ["engine="] = false,
 		["recipe="] = false, ["cache-ram="] = false, ["ctx-checkpoints="] = false,
 	})
 	if not opts then

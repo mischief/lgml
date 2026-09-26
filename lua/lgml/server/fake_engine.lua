@@ -1,11 +1,15 @@
 --- A fake engine for tests.
 -- It streams a canned reply with reasoning, content and, when the
 -- request has tools, one tool call. Each piece waits a few milliseconds
--- on a luv timer. It also transcribes, speaks and decides with canned
--- rules.
+-- on a luv timer. It also transcribes, speaks, decides and makes images
+-- with canned rules.
 -- @module lgml.server.fake_engine
 
 local sleep = require("lgml.server.stream").sleep
+local base64 = require("lgml.base64")
+
+-- A 1x1 PNG.
+local PNG = base64.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
 
 local M = {}
 local F = {}
@@ -263,6 +267,35 @@ function F:decide(req, ctl)
 		model = self.model, answers = answers,
 		usage = { input_tokens = #req.state // 4 + 16 * #req.questions, output_tokens = nout },
 	}
+end
+
+--- Returns n copies of a 1x1 PNG.
+-- Prompt `"fail"` gives status 500, and an input image that is not a
+-- PNG gives 400. The seed defaults to 42; steps to 8 per image. It
+-- waits one delay, so ctl can cancel; a cancel gives status 499.
+-- @tparam table req the image request
+-- @tparam[opt] lgml.server.engine.Control ctl the cancel control
+-- @treturn[1] table `{ images, seeds, width, height, steps, sample_ms }`
+-- @treturn[2] nil
+-- @treturn[2] string an error message
+-- @treturn[2] int an HTTP status
+function F:generate(req, ctl)
+	sleep(self.delay)
+	if ctl and ctl.cancelled and ctl.cancelled() then
+		return nil, "cancelled", 499
+	end
+	if req.prompt == "fail" then
+		return nil, "fake failure", 500
+	elseif req.image and req.image:sub(1, 8) ~= PNG:sub(1, 8) then
+		return nil, "image: not a PNG file", 400
+	end
+	local n, seed, steps = req.n or 1, req.seed or 42, req.steps or 8
+	local r = { images = {}, seeds = {}, width = req.width or 1024, height = req.height or 1024,
+	    steps = n * steps, sample_ms = n * steps }
+	for i = 1, n do
+		r.images[i], r.seeds[i] = PNG, seed + i - 1
+	end
+	return r
 end
 
 return M

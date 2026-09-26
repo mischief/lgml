@@ -61,6 +61,7 @@ local function caps(engine)
 	return {
 		chat = engine.chat ~= nil, transcribe = engine.transcribe ~= nil,
 		speak = engine.speak ~= nil, decide = engine.decide ~= nil,
+		generate = engine.generate ~= nil,
 	}
 end
 
@@ -156,6 +157,36 @@ function M.serve(fd, engine)
 			ch:send(ipc.DONE, id, { ok = r ~= nil, msg = msg, status = status, result = r })
 		end)()
 	end
+	-- The result images go out as IMAGE messages; DONE has the rest.
+	local function generate(id, req)
+		local ctl = { stopped = false }
+		function ctl.cancelled()
+			return ctl.stopped
+		end
+		jobs[id] = ctl
+		coroutine.wrap(function()
+			local r, msg, status
+			if engine.generate then
+				r, msg, status = engine:generate(req, ctl)
+			else
+				msg, status = "model does not support images", 400
+			end
+			jobs[id] = nil
+			if r then
+				for _, png in ipairs(r.images) do
+					local ok, err = ch:send(ipc.IMAGE, id, png)
+					if not ok then
+						r, msg, status = nil, "send image: " .. tostring(err), 500
+						break
+					end
+				end
+			end
+			if r then
+				r.images = nil
+			end
+			ch:send(ipc.DONE, id, { ok = r ~= nil, msg = msg, status = status, result = r })
+		end)()
+	end
 	ch = ipc.channel(fd, function(t, id, v)
 		if t == ipc.JOB then
 			chat(id, v)
@@ -167,6 +198,16 @@ function M.serve(fd, engine)
 			speak(id, v)
 		elseif t == ipc.DECIDE then
 			decide(id, v)
+		elseif t == ipc.GENERATE and v.has_image then
+			v.has_image = nil
+			pending[id] = v
+		elseif t == ipc.GENERATE then
+			generate(id, v)
+		elseif t == ipc.IMAGE and pending[id] then
+			local req = pending[id]
+			pending[id] = nil
+			req.image = v
+			generate(id, req)
 		elseif t == ipc.CANCEL and jobs[id] then
 			jobs[id].stopped = true
 		end

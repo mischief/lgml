@@ -133,6 +133,20 @@ in_co(function()
 	ok(res == nil and msg == "fake failure" and status == 500, "decide error forwarded")
 end)
 
+-- Images: the input and each result PNG go as raw IMAGE messages.
+in_co(function()
+	local r = eng:generate({ prompt = "a fox", n = 3, seed = 5, width = 64, height = 32 })
+	ok(r and #r.images == 3 and r.images[3]:sub(2, 4) == "PNG" and r.seeds[3] == 7 and
+	    r.width == 64 and r.steps == 24, "generate returns PNGs and seeds")
+	local png = r.images[1]
+	r = eng:generate({ prompt = "a wolf", image = png .. string.rep("\0", 5 << 20), strength = 0.5 })
+	ok(r and #r.images == 1, "edit sends a 5 MB input image")
+	local res, msg, status = eng:generate({ prompt = "a wolf", image = "GIF89a" })
+	ok(res == nil and status == 400 and msg:find("PNG"), "edit error forwarded")
+	res, msg, status = eng:generate({ prompt = "fail" })
+	ok(res == nil and msg == "fake failure" and status == 500, "generate error forwarded")
+end)
+
 eng:stop()
 print("1.." .. n)
 os.exit(failed == 0 and 0 or 1)

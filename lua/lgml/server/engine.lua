@@ -1,7 +1,8 @@
 --- The engine interface that `lgml.server.openai` calls.
 -- An engine is a table with methods. It has `models` and `props`. It
--- also has `chat`, `transcribe`, `speak`, `decide`, or several of them.
--- `lgml.engine`, `lgml.stt_engine`, `lgml.diffusion_engine`,
+-- also has `chat`, `transcribe`, `speak`, `decide`, `generate`, or
+-- several of them. `lgml.engine`, `lgml.stt_engine`,
+-- `lgml.diffusion_engine`, `lgml.image.engine`,
 -- `lgml.server.router`, `lgml.server.remote_engine` and
 -- `lgml.server.fake_engine` are engines.
 --
@@ -20,7 +21,7 @@ M.reasons = { stop = true, length = true, tool_calls = true }
 -- @tparam Engine e the engine to check
 -- @treturn Engine e
 -- @raise when e has no `models` or `props` method, or when e has none
--- of `chat`, `transcribe`, `speak` and `decide`.
+-- of `chat`, `transcribe`, `speak`, `decide` and `generate`.
 function M.check(e)
 	for _, name in ipairs({ "models", "props" }) do
 		if type(e[name]) ~= "function" then
@@ -28,14 +29,15 @@ function M.check(e)
 		end
 	end
 	if type(e.chat) ~= "function" and type(e.transcribe) ~= "function" and
-	    type(e.speak) ~= "function" and type(e.decide) ~= "function" then
-		error("engine has no method chat, transcribe, speak or decide", 2)
+	    type(e.speak) ~= "function" and type(e.decide) ~= "function" and
+	    type(e.generate) ~= "function" then
+		error("engine has no method chat, transcribe, speak, decide or generate", 2)
 	end
 	return e
 end
 
---- The cancel control for `Engine:transcribe`, `Engine:speak` and
--- `Engine:decide`.
+--- The cancel control for `Engine:transcribe`, `Engine:speak`,
+-- `Engine:decide` and `Engine:generate`.
 -- The server makes a new control for each request.
 -- @table Control
 -- @field cancelled a function with no arguments. It returns true when
@@ -113,6 +115,21 @@ end
 -- @treturn[2] string an error message
 -- @treturn[2] int an HTTP status
 -- @function decide
+
+--- Makes images from a prompt, and from an input image for edits.
+-- This method is optional. `lgml.server.openai.check_image` makes req.
+-- Its fields are `model`, `prompt`, `negative_prompt`, `n`, `width` and
+-- `height` (nil for an edit: the input size), `steps`, `seed` (nil:
+-- random), `cfg_scale`, and for an edit `image` (the file bytes) and
+-- `strength`. Image i uses seed + i - 1.
+-- @tparam table req the request
+-- @tparam Control ctl the cancel control
+-- @treturn[1] table `{ images = { png, ... }, seeds, width, height,
+-- steps }`; it can also have `encode_ms`, `sample_ms` and `decode_ms`
+-- @treturn[2] nil
+-- @treturn[2] string an error message
+-- @treturn[2] int an HTTP status
+-- @function generate
 
 --- Stops the engine and its worker processes. This method is optional.
 -- `lgml-server` calls it at exit.
