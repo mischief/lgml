@@ -227,9 +227,11 @@ function M.model(spec, budget, gpu)
 				n = math.min(n, math.max(math.tointeger(fit) or 256, 256))
 			end
 			r.n_ctx = n
-			r.kv = per * n + fixed
+			-- Each slot holds a cache; count every slot at its largest.
+			local slots = math.max(1, math.tointeger(tonumber(spec.slots)) or 1)
+			r.kv = (per * n + fixed) * slots
 			if cpu then
-				r.extra.cpu = r.extra.cpu + cper * n + cfixed
+				r.extra.cpu = r.extra.cpu + (cper * n + cfixed) * slots
 			end
 		end
 	end

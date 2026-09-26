@@ -34,6 +34,10 @@ local M = {}
 
 -- Rows the full-attention KV cache gets at load; it grows on demand.
 local KV_INITIAL = 4096
+
+-- A prompt that shares fewer tokens with every slot takes the least
+-- recently used slot instead of the one with the longest match.
+local SLOT_MIN_SHARED = 32
 local E = {}
 E.__index = E
 
@@ -147,6 +151,9 @@ end
 -- - `kv_initial`: rows the full-attention KV cache gets at load
 --   (default 4096); the cache grows when a prompt needs more, up to
 --   `n_ctx`. 0 gives all `n_ctx` rows at load.
+-- - `slots`: KV caches kept on the device (default 1). Each request
+--   takes the slot that shares the longest prefix with its prompt, so
+--   clients that take turns keep their caches; see `E:pick_slot`.
 -- - `ctx_checkpoints`: the most state checkpoints per slot, for models
 --   with recurrent layers or a sliding ring (default 8; 0 turns them off)
 -- - `lora`: LoRA adapters, a list of { path, scale } (scale default 1);
@@ -210,7 +217,12 @@ function M.new(opts)
 		copts.initial = initial
 	end
 	local cache = model:cache(n_ctx, copts)
+	local slots = { { cache = cache, tokens = {}, ckpts = {}, used = 0 } }
+	for i = 2, math.max(1, opts.slots or 1) do
+		slots[i] = { cache = model:cache(n_ctx, copts), tokens = {}, ckpts = {}, used = 0 }
+	end
 	local e = setmetatable({
+		slots = slots, slot = slots[1], tick = 0,
 		be = be, model = model, family = family, family_name = family_name,
 		tk = assert(tokenizer.open(opts.model)),
 		n_ctx = n_ctx, flash_attn = fa,
@@ -275,7 +287,7 @@ function E:models()
 	return { { id = self.id, context_length = self.n_ctx, vision = self.vision ~= nil } }
 end
 
---- Returns the properties: `{ n_ctx, total_slots = 1, lora, modalities }`.
+--- Returns the properties: `{ n_ctx, total_slots, lora, modalities }`.
 -- lora lists the adapters as llama-server does: `{ id, path, scale }`,
 -- with the global scales.
 -- modalities is `{ vision = true }` with an mmproj, else `{ vision = false }`.
@@ -285,7 +297,7 @@ function E:props()
 	for i, a in ipairs(self.adapters) do
 		list[i] = { id = i - 1, path = a.path, scale = a.scale }
 	end
-	return { n_ctx = self.n_ctx, total_slots = 1, lora = list,
+	return { n_ctx = self.n_ctx, total_slots = #self.slots, lora = list,
 	    modalities = { vision = self.vision ~= nil } }
 end
 
@@ -416,10 +428,77 @@ local function span_start(prompt, n)
 	return n
 end
 
+--- Make the slot for a prompt the active one.
+-- The slot with the longest shared prefix wins. When no slot shares
+-- at least `SLOT_MIN_SHARED` tokens, an empty slot or the least recently
+-- used one is taken. The active slot's cache and tokens are `self.cache`
+-- and `self.tokens`; the prompt cache follows the active slot. A slot
+-- made under other adapter scales starts empty.
+-- @tparam {integer,...} prompt the token ids
+-- @return the slot
+function E:pick_slot(prompt)
+	self.tick = self.tick + 1
+	local cur = self.slot
+	cur.tokens = self.tokens
+	if self.pc then
+		cur.ckpts = self.pc.ckpts
+	end
+	local best, best_n = cur, -1
+	if #self.slots > 1 then
+		for _, s in ipairs(self.slots) do
+			local t, n = s.tokens, 0
+			while n < #t and n < #prompt and t[n + 1] == prompt[n + 1] do
+				n = n + 1
+			end
+			if n > best_n or (n == best_n and s == cur) then
+				best, best_n = s, n
+			end
+		end
+		if best_n < math.min(SLOT_MIN_SHARED, #prompt) then
+			-- An empty slot, else the least recently used one.
+			best = nil
+			for _, s in ipairs(self.slots) do
+				if #s.tokens == 0 then
+					best = s
+					break
+				end
+				if not best or s.used < best.used then
+					best = s
+				end
+			end
+		end
+	end
+	if best ~= cur then
+		self.slot, self.cache, self.tokens = best, best.cache, best.tokens
+		if self.pc then
+			self.pc.cache, self.pc.ckpts = best.cache, best.ckpts
+		end
+		L:debug("slot", "index", self:slot_index(best), "shared", math.max(best_n, 0))
+	end
+	if best.key ~= self.lora_key then
+		if self.pc then
+			self.pc:trim(-1)
+		end
+		self.tokens, self.cache.n_past, best.key = {}, 0, self.lora_key
+	end
+	best.used = self.tick
+	return best
+end
+
+-- The 1-based index of a slot.
+function E:slot_index(slot)
+	for i, s in ipairs(self.slots) do
+		if s == slot then
+			return i
+		end
+	end
+end
+
 -- Keep the longest shared prefix of the cached tokens. At least one
 -- prompt token must run to get logits. An image runs whole or not at
 -- all.
 function E:reuse(prompt)
+	self:pick_slot(prompt)
 	local n = 0
 	local old = self.tokens
 	while n < #old and n < #prompt - 1 and old[n + 1] == prompt[n + 1] do

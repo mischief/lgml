@@ -70,6 +70,18 @@ a large part of its GPU speed: on a Ryzen 9 7950X with a 32 GB GPU,
 gemma-4-26B-A4B Q4_K_M runs 24 tokens/s from 3 GB of GPU memory, and
 34 tokens/s from 10 GB with `--n-cpu-moe 15`.
 
+### KV cache and slots
+
+The KV cache of a chat model starts with `--kv-initial` rows (default
+4096) and grows as prompts need, up to `-c`. `--kv-initial 0` gives all
+rows at load. `-np N` (`--parallel`, config key `slots`) keeps N caches
+on the device. A request takes the slot that shares the longest prefix
+with its prompt; a prompt that shares less than 32 tokens with every
+slot takes an empty slot or the least recently used one. Clients that
+take turns keep their caches, and the RAM prompt store (`--cache-ram`)
+holds what the slots cannot. Requests still run one at a time. The
+model pool counts each slot at `-c` positions.
+
 ## Logs
 
 The server and its workers write one line per event to stderr, in

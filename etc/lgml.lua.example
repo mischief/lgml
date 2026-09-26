@@ -38,10 +38,12 @@ return {
 			preload = true, ctx = 16384,
 			-- lora = { "/home/you/adapters/tuned.gguf:1.0" },
 		},
-		-- mmproj adds image input: image_url parts with data URLs.
+		-- mmproj adds image input: image_url parts with data URLs. slots
+		-- keeps a KV cache per client on the device (each starts at
+		-- kv_initial rows and grows to ctx).
 		{ id = "gemma-4-26b", model = "/home/you/models/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
 			mmproj = "/home/you/models/gemma-4-26B-A4B-it-mmproj-F16.gguf", backend = "Vulkan0",
-			ctx = 16384 },
+			ctx = 16384, slots = 2 },
 		-- n_cpu_moe keeps the routed experts of the first N layers in host
 		-- memory, where the CPU runs them; "auto" picks the fewest layers
 		-- that fit vram. That part counts against ram. cpu_moe = true
