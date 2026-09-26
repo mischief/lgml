@@ -9,6 +9,7 @@ local json = require("lgml.json")
 local chat_request = require("lgml.server.chat_request")
 local translate = require("lgml.server.translate")
 local media = require("lgml.chat.media")
+local sse = require("lgml.server.sse")
 local log = require("lgml.log")
 
 local L = log.new("responses")
@@ -832,13 +833,159 @@ local function prepare(eng, opts, req, res)
 	return r, chat
 end
 
+-- streaming
+
+-- The handler of the block sink for a stream. Each event has a
+-- sequence number from 0; the numbers are given in the writer lock, so
+-- they follow the order on the wire.
+local function stream_handler(r, w)
+	local h, sink, seq = {}, nil, 0
+	local function ev(name, fields)
+		fields.type, fields.sequence_number = name, seq
+		seq = seq + 1
+		return sse.event(name, fields)
+	end
+	local function first()
+		return ev("response.created", { response = response_object(r, "in_progress") }) ..
+		    ev("response.in_progress", { response = response_object(r, "in_progress") })
+	end
+	local function send(fn)
+		return w:send(fn, first, r.ctx:headers({}))
+	end
+	-- The status of block b as it closes: incomplete for the last item
+	-- of a reply that hit the token limit.
+	local function status_of(b)
+		local f = sink.final
+		if f and b.kind ~= "reasoning" and end_status(r, f, #sink.calls) == "incomplete" then
+			return "incomplete"
+		end
+		return nil
+	end
+	function h.bind(_, s)
+		sink = s
+	end
+	function h.prompt()
+		return send("")
+	end
+	function h.keepalive()
+		return send(": keepalive\n\n")
+	end
+	function h.open(_, b)
+		return send(function()
+			local id, t = item_id(b), ev("response.output_item.added", { output_index = b.index,
+				item = item_of(r, b, false) })
+			if b.kind == "text" then
+				t = t .. ev("response.content_part.added", { item_id = id, output_index = b.index,
+					content_index = 0, part = text_part("") })
+			elseif b.kind == "reasoning" then
+				t = t .. ev("response.reasoning_summary_part.added", { item_id = id, output_index = b.index,
+					summary_index = 0, part = { type = "summary_text", text = "" } })
+			end
+			return t
+		end)
+	end
+	function h.delta(_, b, text)
+		return send(function()
+			local id = item_id(b)
+			if b.kind == "text" then
+				return ev("response.output_text.delta", { item_id = id, output_index = b.index, content_index = 0,
+					delta = text, logprobs = json.array() })
+			elseif b.kind == "reasoning" then
+				return ev("response.reasoning_summary_text.delta", { item_id = id, output_index = b.index,
+					summary_index = 0, delta = text })
+			end
+			return ev("response.function_call_arguments.delta", { item_id = id, output_index = b.index,
+				delta = text })
+		end)
+	end
+	function h.close(_, b)
+		local status = status_of(b)
+		return send(function()
+			local id, text, t = item_id(b), translate.text(b), nil
+			if b.kind == "text" then
+				t = ev("response.output_text.done", { item_id = id, output_index = b.index, content_index = 0,
+					text = text, logprobs = json.array() }) ..
+				    ev("response.content_part.done", { item_id = id, output_index = b.index, content_index = 0,
+					part = text_part(text) })
+			elseif b.kind == "reasoning" then
+				local part = { type = "summary_text", text = text }
+				t = ev("response.reasoning_summary_text.done", { item_id = id, output_index = b.index,
+					summary_index = 0, text = text }) ..
+				    ev("response.reasoning_summary_part.done", { item_id = id, output_index = b.index,
+					summary_index = 0, part = part })
+			else
+				t = ev("response.function_call_arguments.done", { item_id = id, output_index = b.index,
+					arguments = text })
+			end
+			return t .. ev("response.output_item.done", { output_index = b.index,
+				item = item_of(r, b, true, status) })
+		end)
+	end
+	function h.finish()
+		local o = final_object(r, sink)
+		r.final = o
+		return send(function()
+			return ev(o.status == "incomplete" and "response.incomplete" or "response.completed", { response = o })
+		end)
+	end
+	function h.fail(_, status, msg)
+		local e = require("lgml.server.http").error_object(status, msg).error
+		local code = status >= 500 and "server_error" or "invalid_request"
+		local o = response_object(r, "failed")
+		o.error = { code = code, message = msg }
+		for i, b in ipairs(sink.list) do
+			o.output[i] = item_of(r, b, true, "incomplete")
+		end
+		return send(function()
+			return ev("error", { code = code, message = msg, param = json.null,
+				error = { type = e.type, code = code, message = msg, param = json.null } }) ..
+			    ev("response.failed", { response = o })
+		end)
+	end
+	return h
+end
+
+--- Milliseconds without bytes out before a keepalive comment in a
+-- stream.
+M.KEEPALIVE_MS = 10000
+
+-- Runs a streamed request. The stream starts when the engine tells the
+-- prompt size, at the first item, or at the first keepalive.
+local function run_stream(eng, r, chat)
+	local w = translate.writer(r.res)
+	local h = stream_handler(r, w)
+	local sink = translate.blocks(r.res, h)
+	h:bind(sink)
+	w:keepalive(function()
+		h:keepalive()
+	end, M.KEEPALIVE_MS)
+	local ok, msg, status = translate.run(eng, chat, sink, r.model)
+	w:stop()
+	if sink:cancelled() then
+		r.res.close = true
+		return
+	elseif not ok and not w.started then
+		return send_error(r, status or 500, { msg = msg or "engine failed" })
+	end
+	r.res.err = not ok and (msg or "engine failed") or nil
+	local sent
+	if ok then
+		sent = h:finish()
+	else
+		sent = h:fail(status or 500, msg or "engine failed")
+	end
+	if not sent or not w:finish() then
+		r.res.close = true
+	end
+end
+
 local function create(eng, opts, req, res)
 	local r, chat = prepare(eng, opts, req, res)
 	if not r then
 		return
 	end
 	if r.body.stream then
-		return send_error(r, 400, { msg = "stream: not supported by this server yet", param = "stream" })
+		return run_stream(eng, r, chat)
 	end
 	local sink = translate.blocks(res)
 	local ok, msg, status = translate.run(eng, chat, sink, r.model)

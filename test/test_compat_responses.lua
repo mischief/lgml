@@ -281,9 +281,170 @@ local function test_errors()
 	end
 end
 
+-- The event patterns of one item, after output_item.added.
+local ITEM_EVENTS = {
+	message = { "response.content_part.added", "response.output_text.delta*", "response.output_text.done",
+		"response.content_part.done", "response.output_item.done" },
+	reasoning = { "response.reasoning_summary_part.added", "response.reasoning_summary_text.delta*",
+		"response.reasoning_summary_text.done", "response.reasoning_summary_part.done",
+		"response.output_item.done" },
+	function_call = { "response.function_call_arguments.delta*", "response.function_call_arguments.done",
+		"response.output_item.done" },
+}
+
+-- Checks a Responses stream: framing, sequence numbers from 0, the
+-- start and end events, and the event order of each item. Returns the
+-- events, the output built from output_item.done, and the comment count.
+local function check_stream(text, name)
+	local list, framed, comments = inproc.events(text)
+	ok(framed and #list >= 3, name .. ": each event is an event line, a data line and a blank line")
+	local good, why = true, ""
+	local function bad(s)
+		if good then
+			good, why = false, s
+		end
+	end
+	for i, ev in ipairs(list) do
+		if ev.data.type ~= ev.name or ev.data.sequence_number ~= i - 1 then
+			bad(("event %d: type %s, sequence %s"):format(i, tostring(ev.data.type),
+			    tostring(ev.data.sequence_number)))
+		end
+		if ev.name ~= "error" and ev.data.error ~= nil then
+			bad("a top-level error key on " .. ev.name)
+		end
+	end
+	if not (list[1] and list[1].name == "response.created" and list[2].name == "response.in_progress") then
+		bad("the stream does not start with response.created and response.in_progress")
+	end
+	local output, i = {}, 3
+	while list[i] and list[i].name == "response.output_item.added" do
+		local d = list[i].data
+		local item = d.item
+		if d.output_index ~= #output then
+			bad("output_index out of order")
+		end
+		if item.type == "function_call" and not (item.name and item.call_id and item.arguments == "") then
+			bad("output_item.added of a call lacks name, call_id or empty arguments")
+		end
+		i = i + 1
+		for _, want in ipairs(ITEM_EVENTS[item.type] or {}) do
+			local many = want:sub(-1) == "*"
+			want = many and want:sub(1, -2) or want
+			if many then
+				while list[i] and list[i].name == want do
+					if list[i].data.output_index ~= d.output_index or list[i].data.item_id ~= item.id then
+						bad("a delta for another item")
+					end
+					i = i + 1
+				end
+			elseif not list[i] or list[i].name ~= want then
+				bad(("want %s, got %s"):format(want, tostring(list[i] and list[i].name)))
+				break
+			else
+				i = i + 1
+			end
+		end
+		output[#output + 1] = list[i - 1].data.item
+	end
+	local last = list[i]
+	if not (last and (last.name == "response.completed" or last.name == "response.incomplete" or
+	    last.name == "error" or last.name == "response.failed") ) then
+		bad("an unexpected event: " .. tostring(last and last.name))
+	elseif last.name == "error" and not (list[i + 1] and list[i + 1].name == "response.failed") then
+		bad("error without response.failed")
+	end
+	if last and last.name ~= "error" and list[i + 1] then
+		bad("events after the end")
+	end
+	ok(good, name .. ": the event order" .. (good and "" or ": " .. why))
+	return list, output, comments
+end
+
+local function stream_post(b)
+	b.stream = true
+	return inproc.request(srv, "POST", "/v1/responses", b, HEADERS)
+end
+
+local function test_stream()
+	local status, h, text = stream_post(example("plain_text"))
+	ok(status == 200 and h["content-type"] == "text/event-stream" and not text:find("[DONE]", 1, true),
+	    "stream: an event stream with no [DONE]")
+	local list, output = check_stream(text, "text stream")
+	local done = list[#list].data.response
+	ok(list[#list].name == "response.completed" and done.status == "completed" and done.usage.total_tokens > 0,
+	    "response.completed has the usage")
+	ok(#output == 2 and output[1].type == "reasoning" and output[2].content[1].text == "Let me check the weather." and
+	    json.encode(output[2]) == json.encode(done.output[2]), "output_item.done items are those of the response")
+	ok(list[1].data.response.status == "in_progress" and list[1].data.response.usage == json.null,
+	    "response.created is in progress with no usage")
+
+	local _, _, ttext = stream_post(example("tool_turn_1"))
+	local tl, tout = check_stream(ttext, "tool stream")
+	local names = {}
+	for _, ev in ipairs(tl) do
+		if ev.data.output_index == 2 or ev.name:find("^response%.[ci][on]") then
+			names[#names + 1] = ev.name
+		end
+	end
+	local want = EX.stream_tool
+	ok(table.concat(names, ","):find(table.concat({ want[3], want[4], want[5], want[6], want[7] }, ","), 1, true),
+	    "a function call streams as the reference transcript: " .. table.concat(names, ","))
+	ok(tout[3].type == "function_call" and json.decode(tout[3].arguments).city == "Paris",
+	    "the call item has the arguments")
+
+	_, _, text = stream_post(body({ max_output_tokens = 3 }))
+	list = check_stream(text, "incomplete stream")
+	ok(list[#list].name == "response.incomplete" and
+	    list[#list].data.response.incomplete_details.reason == "max_output_tokens", "response.incomplete")
+
+	local st, _, etext = stream_post(body({ input = { { role = "user", content = "fail" } } }))
+	ok(st == 500 and json.decode(etext).error.message == "fake failure", "a failure before the stream is JSON")
+end
+
+local function scripted(fn)
+	local s = httpd.new()
+	openai.install(s, {
+		models = function() return { { id = "script" } } end,
+		props = function() return {} end,
+		chat = function(_, req, sink)
+			return fn(req, sink)
+		end,
+	}, { key = KEY })
+	return s
+end
+
+local function test_stream_events()
+	local sleep = require("lgml.server.stream").sleep
+	local s = scripted(function(_, sink)
+		sink:prompt(10, 0)
+		sink:content("Hi")
+		return nil, "boom", 500
+	end)
+	local _, _, text = inproc.request(s, "POST", "/v1/responses", body({ stream = true }), HEADERS)
+	local list = inproc.events(text)
+	local e, f = list[#list - 1], list[#list]
+	ok(e.name == "error" and e.data.code == "server_error" and e.data.message == "boom" and
+	    e.data.error.message == "boom" and f.name == "response.failed" and f.data.response.status == "failed" and
+	    f.data.response.error.message == "boom", "an error after the start: error, then response.failed")
+	local keep = responses.KEEPALIVE_MS
+	responses.KEEPALIVE_MS = 20
+	s = scripted(function(_, sink)
+		sleep(120)
+		sink:content("Hi")
+		sink:finish("stop", { prompt_tokens = 5, completion_tokens = 1 })
+		return true
+	end)
+	_, _, text = inproc.request(s, "POST", "/v1/responses", body({ stream = true }), HEADERS)
+	responses.KEEPALIVE_MS = keep
+	local _, output, comments = check_stream(text, "keepalive stream")
+	ok(comments >= 2 and output[1].content[1].text == "Hi", ("keepalive comments (%d)"):format(comments))
+end
+
 test_field_table()
 test_examples()
 test_requests()
 test_errors()
+test_stream()
+test_stream_events()
 print("1.." .. n)
 os.exit(failed == 0 and 0 or 1)

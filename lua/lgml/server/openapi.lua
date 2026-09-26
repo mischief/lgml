@@ -364,6 +364,12 @@ local function responses_schemas(c)
 		usage = { anyOf = json.array({ ref("ResponsesUsage"), { type = "null" } }) },
 		previous_response_id = { type = { "string", "null" } }, store = { type = "boolean" },
 	}, nil, "It also echoes the request settings.")
+	c.ResponseStreamEvent = obj({
+		type = str("The event type; the `event:` line has the same name."),
+		sequence_number = int("From 0, one more for each event."),
+		response = ref("Response"), output_index = int(), item = { type = "object" }, item_id = str(),
+		content_index = int(), summary_index = int(), delta = str(), part = { type = "object" },
+	}, { "type", "sequence_number" }, "The data of one event. No `[DONE]`.")
 end
 
 -- images
@@ -623,8 +629,11 @@ local function operations()
 			tag = "openai", summary = "Create a response",
 			requestBody = json_body(ref("ResponsesRequest")),
 			responses = with({ ["200"] = {
-				description = "The response.",
-				content = { ["application/json"] = { schema = ref("Response") } },
+				description = "The response, or with stream an event stream of named events.",
+				content = {
+					["application/json"] = { schema = ref("Response") },
+					["text/event-stream"] = { schema = ref("ResponseStreamEvent") },
+				},
 				headers = { ["x-lgml-ignored"] = { schema = { type = "string" },
 				    description = "Accepted fields with no effect." } },
 			} }, E),

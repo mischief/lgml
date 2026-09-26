@@ -54,10 +54,16 @@ end
 
 --- The named events of an event stream: each is `{ name, data }` with
 -- data decoded. The second result is true when each event is exactly
--- an `event:` line, one `data:` line and a blank line.
+-- an `event:` line, one `data:` line and a blank line. Comment lines
+-- are skipped; the third result counts them.
 function M.events(text)
-	local list, framed, pos = {}, true, 1
+	local list, framed, pos, comments = {}, true, 1, 0
 	while pos <= #text do
+		local skip = text:match("^:[^\n]*\n\n()", pos)
+		if skip then
+			comments, pos = comments + 1, skip
+			goto continue
+		end
 		local name, data, nxt = text:match("^event: ([^\n]+)\ndata: ([^\n]*)\n\n()", pos)
 		if not name then
 			framed = false
@@ -65,8 +71,9 @@ function M.events(text)
 		end
 		list[#list + 1] = { name = name, data = json.decode(data) }
 		pos = nxt
+		::continue::
 	end
-	return list, framed
+	return list, framed, comments
 end
 
 return M

@@ -912,12 +912,68 @@ Content parts:
   `input_tokens_details.cached_tokens` the part reused from the cache.
   `output_tokens` counts the reasoning tokens too.
 
+### Responses streaming
+
+With `stream: true`, the reply is `text/event-stream`. Each event is an
+`event:` line with the event type, one `data:` line with one-line JSON,
+and a blank line. Each data object has `type` and `sequence_number`,
+from 0 and one more for each event. There is no `[DONE]`: the stream
+ends after the last event.
+
+1. `response.created` and `response.in_progress`, with the response in
+   state `in_progress`, `output: []` and `usage: null`.
+2. For each output item, with `output_index` from 0:
+   - reasoning: `response.output_item.added`,
+     `response.reasoning_summary_part.added`,
+     `response.reasoning_summary_text.delta` events,
+     `response.reasoning_summary_text.done`,
+     `response.reasoning_summary_part.done`,
+     `response.output_item.done` (with `content` and
+     `encrypted_content`).
+   - message: `response.output_item.added`,
+     `response.content_part.added`, `response.output_text.delta` events
+     (with `logprobs: []`), `response.output_text.done`,
+     `response.content_part.done`, `response.output_item.done`.
+   - function call: `response.output_item.added` (with `name`,
+     `call_id`, `id` and `arguments: ""`),
+     `response.function_call_arguments.delta` events,
+     `response.function_call_arguments.done`,
+     `response.output_item.done`.
+3. `response.completed`, or `response.incomplete` at the token limit,
+   with the whole response and `usage`.
+
+The raw reasoning streams as summary text: the clm client reads it,
+and Codex shows it. There are no `response.reasoning_text.*` events;
+the final reasoning item has the text in `content` too.
+
+The stream starts when the engine knows the prompt size, before the
+prefill. While no bytes go out for 10 seconds, the server sends an SSE
+comment line (`: keepalive`), which clients skip.
+
+An error before the stream starts is a plain JSON error. An error
+after it is an `error` event, in both the flat openai-python form and
+the nested Open Responses form, then `response.failed` with
+`response.error: {"code", "message"}`:
+
+```
+event: error
+data: {"type": "error", "sequence_number": 7, "code": "server_error", "message": "...",
+  "param": null, "error": {"type": "server_error", "code": "server_error", "message": "...", "param": null}}
+```
+
 ### Responses examples
 
 ```sh
 curl -s localhost:8080/v1/responses -d '{
   "model": "qwen3-14b", "instructions": "Be brief.", "input": "Say hi."}'
+
+curl -sN localhost:8080/v1/responses -d '{
+  "model": "qwen3-14b", "stream": true, "reasoning": {"effort": "none"},
+  "input": "Count to 3."}'
 ```
+
+Codex: a model provider with `base_url = "http://localhost:8080/v1"` and
+`wire_api = "responses"`.
 
 ## Images
 
