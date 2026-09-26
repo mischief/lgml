@@ -11,6 +11,7 @@ local json = require("lgml.json")
 local openai = require("lgml.server.openai")
 local systemone = require("lgml.systemone")
 local detect = require("lgml.detect")
+local anthropic = require("lgml.server.anthropic")
 
 local M = {}
 
@@ -110,7 +111,7 @@ local function add_fields(props, tbl, note, skip)
 				s.description = note[c[1]]
 			end
 			s["x-lgml-status"] = c.status
-			if c.label and c.label ~= "OpenAI" then
+			if c.label and c.label ~= "OpenAI" and c.label ~= "Anthropic" then
 				ext(s)
 			end
 			props[c[1]] = s
@@ -243,6 +244,71 @@ local function chat_schemas(c)
 		})),
 		usage = { anyOf = json.array({ ref("Usage"), { type = "null" } }) }, timings = ref("Timings"),
 	}, nil, "One `data:` event. The stream ends with `data: [DONE]`.")
+end
+
+-- Anthropic Messages
+
+local MESSAGES_NOTES = {
+	model = "Model id. A missing or unknown id goes to the first model that serves chat.",
+	system = "A string or an array of text blocks.",
+	stream = "Stream the reply as named server-sent events.",
+}
+
+local function messages_schemas(c)
+	local props = {
+		messages = arr(ref("AnthropicMessage"), "Messages; consecutive messages of one role merge."),
+		tools = arr(ref("AnthropicTool")),
+		tool_choice = obj({
+			type = { type = "string", enum = json.array({ "auto", "any", "tool", "none" }) },
+			name = str(), disable_parallel_tool_use = { type = "boolean" },
+		}, { "type" }),
+		thinking = obj({
+			type = { type = "string", enum = json.array({ "enabled", "adaptive", "disabled" }) },
+			budget_tokens = int("At least 1024; the most reasoning tokens."),
+			display = { type = "string", enum = json.array({ "summarized", "omitted" }) },
+		}, { "type" }),
+		output_config = obj({
+			effort = str("`none` turns thinking off; other values have no effect."),
+			format = obj({ type = { const = "json_schema" }, schema = { type = "object" } }, { "type", "schema" }),
+		}),
+		max_tokens = int("The most output tokens, reasoning too. 0 runs the prompt only."),
+		top_k = int("Top-k sampling."),
+	}
+	add_fields(props, anthropic.FIELDS, MESSAGES_NOTES)
+	c.MessagesRequest = obj(props, { "model", "messages", "max_tokens" })
+	local block = { type = "object", description = "A content block: text, image (base64 source), " ..
+	    "document (text source), search_result, tool_use, tool_result, thinking or redacted_thinking.",
+	    properties = { type = str() }, required = json.array({ "type" }) }
+	c.AnthropicMessage = obj({
+		role = { type = "string", enum = json.array({ "user", "assistant", "system" }) },
+		content = { oneOf = json.array({ str(), arr(block) }) },
+	}, { "role", "content" })
+	c.AnthropicTool = obj({
+		name = str(), description = str(), input_schema = { type = "object" },
+		type = { const = "custom" }, strict = { type = "boolean" }, cache_control = { type = "object" },
+	}, { "name", "input_schema" })
+	c.AnthropicUsage = obj({
+		input_tokens = int("Prompt tokens not read from the cache."),
+		output_tokens = int(), cache_creation_input_tokens = int(),
+		cache_read_input_tokens = int("Prompt tokens reused from the cache."),
+		cache_creation = obj({ ephemeral_5m_input_tokens = int(), ephemeral_1h_input_tokens = int() }),
+		output_tokens_details = obj({ thinking_tokens = int() }),
+		service_tier = { const = "standard" },
+	})
+	c.Message = obj({
+		id = str("`msg_` and 24 base62 characters."), type = { const = "message" },
+		role = { const = "assistant" }, model = str(),
+		content = arr({ type = "object", description = "text, thinking or tool_use." }),
+		stop_reason = { type = "string", enum = json.array({ "end_turn", "max_tokens", "stop_sequence",
+			"tool_use", "model_context_window_exceeded" }) },
+		stop_sequence = { type = { "string", "null" } }, stop_details = { type = "null" },
+		usage = ref("AnthropicUsage"),
+	})
+	c.AnthropicError = obj({
+		type = { const = "error" },
+		error = obj({ type = str(), message = str() }, { "type", "message" }),
+		request_id = str(),
+	}, { "type", "error" })
 end
 
 -- images
@@ -444,6 +510,26 @@ local CHAT_HEADERS = { "cache-n", "restored-n", "prompt-n", "prompt-ms", "predic
 	"predicted-ms", "predicted-per-second" }
 local IMAGE_HEADERS = { "elapsed-ms", "images", "steps", "seed", "sample-ms", "ms-per-step" }
 
+-- Error replies in the Anthropic shape.
+local function anthropic_errors(responses)
+	for _, code in ipairs({ 400, 404, 500, 503 }) do
+		responses[tostring(code)] = reply("Error.", "application/json", ref("AnthropicError"))
+	end
+	return responses
+end
+
+-- The headers of a Messages reply.
+local function anthropic_headers()
+	local str_schema = { schema = { type = "string" } }
+	return {
+		["request-id"] = { schema = { type = "string" }, description = "`req_` and the lgml request id." },
+		["x-lgml-ignored"] = { schema = { type = "string" }, description = "Accepted fields with no effect." },
+		["x-lgml-ignored-betas"] = str_schema,
+		["x-lgml-thinking-dropped"] = { schema = { type = "integer" },
+		    description = "Thinking blocks with a foreign signature that the server dropped." },
+	}
+end
+
 -- Operations by path without the /v1 prefix, then by method. tag is
 -- openai, llama.cpp or lgml.
 local function operations()
@@ -460,6 +546,15 @@ local function operations()
 				},
 				headers = header_set(CHAT_HEADERS),
 			} }, E),
+		} },
+		["/messages"] = { POST = {
+			tag = "anthropic", summary = "Anthropic Messages",
+			requestBody = json_body(ref("MessagesRequest")),
+			responses = anthropic_errors({ ["200"] = {
+				description = "The message.",
+				content = { ["application/json"] = { schema = ref("Message") } },
+				headers = anthropic_headers(),
+			} }),
 		} },
 		["/images/generations"] = { POST = {
 			tag = "openai", summary = "Make images",
@@ -574,6 +669,7 @@ function M.document(routes)
 	local ops = operations()
 	local schemas = {}
 	chat_schemas(schemas)
+	messages_schemas(schemas)
 	image_schemas(schemas)
 	audio_schemas(schemas)
 	systemone_schemas(schemas)
@@ -612,6 +708,7 @@ function M.document(routes)
 		},
 		tags = json.array({
 			{ name = "openai", description = "OpenAI-compatible, with lgml extensions." },
+			{ name = "anthropic", description = "Anthropic-compatible." },
 			{ name = "llama.cpp", description = "llama-server compatible." },
 			{ name = "lgml", description = "lgml only." },
 		}),

@@ -488,11 +488,13 @@ end
 -- cancel the reply.
 -- @tparam lgml.server.http.Response res the response
 -- @tparam[opt] table handler the handler
+-- @tparam[opt] table opts the options: `tool_id`, the prefix of the
+-- ids that the sink makes for tool calls without one (default `"call_"`)
 -- @treturn Blocks the sink; it implements `lgml.server.engine.Sink`
-function M.blocks(res, handler)
+function M.blocks(res, handler, opts)
 	return setmetatable({
 		res = res, handler = handler, list = {}, calls = {}, cur = nil,
-		finished = nil, broken = false,
+		finished = nil, broken = false, tool_id = opts and opts.tool_id or "call_",
 	}, { __index = M.Blocks })
 end
 
@@ -579,7 +581,7 @@ end
 
 function M.Blocks:tool_call(name, id)
 	assert(type(name) == "string", "tool_call: name must be a string")
-	local b = { kind = "tool", parts = {}, name = name, id = id, call = #self.calls }
+	local b = { kind = "tool", parts = {}, name = name, id = id or M.id(self.tool_id), call = #self.calls }
 	self.calls[#self.calls + 1] = b
 	local ok, err = open(self, b)
 	if not ok then

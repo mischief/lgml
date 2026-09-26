@@ -10,6 +10,7 @@ Labels in this file:
 - **OpenAI**: the route or field has the shape of the OpenAI API.
 - **llama.cpp**: the route or field has the shape of llama-server.
 - **lgml**: an lgml extension. OpenAI clients ignore it.
+- **Anthropic**: the route or field has the shape of the Anthropic API.
 
 ## Contents
 
@@ -19,6 +20,7 @@ Labels in this file:
 - [Response headers](#response-headers)
 - [Compatibility](#compatibility)
 - [Chat completions](#chat-completions)
+- [Anthropic Messages](#anthropic-messages)
 - [Images](#images)
 - [Speech](#speech)
 - [Transcriptions](#transcriptions)
@@ -39,6 +41,7 @@ one row are aliases for one handler.
 | Method | Paths | Label | Section |
 | --- | --- | --- | --- |
 | POST | `/v1/chat/completions`, `/chat/completions` | OpenAI | [Chat completions](#chat-completions) |
+| POST | `/v1/messages` | Anthropic | [Anthropic Messages](#anthropic-messages) |
 | POST | `/v1/images/generations`, `/images/generations` | OpenAI | [Images](#images) |
 | POST | `/v1/images/edits`, `/images/edits` | OpenAI | [Images](#images) |
 | POST | `/v1/audio/speech`, `/audio/speech` | OpenAI | [Speech](#speech) |
@@ -68,10 +71,14 @@ one row are aliases for one handler.
   header block and 60 s for each piece of a body (else 408). An idle
   connection closes after 60 s.
 - `Expect: 100-continue` gets `100 Continue`.
-- There is no authentication. An `Authorization` header has no effect.
+- There is no authentication. An `Authorization` or `x-api-key` header
+  has no effect.
 - A chat request with a field that the server does not know gives
   400 (see [Compatibility](#compatibility)), and so does
-  `/v1/systemone`. The other routes ignore unknown fields.
+  `/v1/systemone`. For `/v1/messages`, `--unknown-fields` (config
+  `unknown_fields`) sets the rule: `reject` (the default) gives 400;
+  `ignore` accepts the field and names it in the `x-lgml-ignored`
+  header. The other routes ignore unknown fields.
 - A JSON `null` at the top level of a chat or image request reads as
   an absent field.
 - When the client closes the connection, the server cancels the work.
@@ -499,6 +506,205 @@ curl -s localhost:8080/v1/chat/completions -d '{
   "messages": [{"role": "user", "content": [
     {"type": "text", "text": "What is in this image?"},
     {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0..."}}]}]}'
+```
+
+## Anthropic Messages
+
+`POST /v1/messages`. Anthropic. The server translates the request into
+a chat request, runs it on the chat engine as
+`/v1/chat/completions` does, and translates the reply. Model
+selection, images and metrics work as for chat. The path takes a query
+string, such as `?beta=true` of the Anthropic SDK beta calls; the
+server ignores it.
+
+### Messages compatibility
+
+The Anthropic SDKs, Claude Code with `ANTHROPIC_BASE_URL` and the clm
+Anthropic provider work with no change:
+
+- The server accepts each request field of the Anthropic reference. A
+  field that changes the output and that lgml cannot do gives 400 with
+  a message that names it. Fields that only label, cache or route a
+  request are accepted and have no effect.
+- A field that the Anthropic API does not know gives 400 with the
+  Anthropic message `<path>: Extra inputs are not permitted`, in the
+  body and in each block. With `--unknown-fields ignore`, the server
+  accepts it and names it in `x-lgml-ignored`.
+- Errors have the Anthropic shape (see [Messages errors](#messages-errors)).
+
+Headers:
+
+- `x-api-key` and `Authorization: Bearer` take any value; the server has
+  no authentication.
+- `anthropic-version`: `2023-06-01`. Another value gives 400. A request
+  without it works.
+- `anthropic-beta`: a comma list, spaces optional, repeats allowed. The
+  server takes any value and changes nothing. The reply header
+  `x-lgml-ignored-betas` lists the values.
+- Other headers, such as `x-stainless-*` and `x-claude-code-*`, have no
+  effect.
+
+`test/test_compat_anthropic.lua` reads the table below and checks it
+against the request checks (`lgml.server.anthropic.FIELDS`). It also
+sends the examples of the Anthropic reference (in
+`test/fixtures/anthropic`) to the server with the fake engine and checks
+the replies.
+
+### Messages request fields
+
+| Field | Label | Status | Notes |
+| --- | --- | --- | --- |
+| `model` | Anthropic | supported | Required. See [Model selection](#model-selection). |
+| `messages` | Anthropic | supported | Required. See [Messages content](#messages-content). |
+| `max_tokens` | Anthropic | supported | Required. An integer from 0; it counts the reasoning tokens too. 0 runs the prompt into the cache and gives no content, with `stop_reason` `max_tokens`. |
+| `system` | Anthropic | supported | A string or an array of text blocks. The blocks join with newlines into one system message. |
+| `stream` | Anthropic | supported | See [Messages streaming](#messages-streaming). |
+| `stop_sequences` | Anthropic | supported | Strings, any number. They apply to the text, as chat `stop`. The reply then has `stop_reason` `stop_sequence` and the string in `stop_sequence`. |
+| `temperature` | Anthropic | supported | A number from 0. Anthropic takes at most 1; lgml takes more. |
+| `top_p` | Anthropic | supported | From 0 to 1. |
+| `top_k` | Anthropic | supported | An integer from 0. |
+| `tools` | Anthropic | limited | Custom tools only; see [Messages tools](#messages-tools). |
+| `tool_choice` | Anthropic | supported | `auto`, `any`, `tool` and `none`, with `disable_parallel_tool_use`. |
+| `thinking` | Anthropic | limited | See [Messages thinking](#messages-thinking). |
+| `output_config` | Anthropic | limited | `format` (`json_schema`) constrains the text with the schema grammar, as chat `response_format`. `effort`: `none` turns thinking off (lgml); other values do not change the reasoning length, and `x-lgml-ignored` names the field. `task_budget` gives 400. |
+| `metadata` | Anthropic | no-op | An object, such as `{"user_id": "..."}`. |
+| `service_tier` | Anthropic | no-op | `auto` or `standard_only`. `usage.service_tier` is `standard`. |
+| `cache_control` | Anthropic | no-op | The server reuses each shared prompt prefix with no marks; see `usage.cache_read_input_tokens`. Blocks and tools also take `cache_control`, with no effect. |
+| `context_management` | Anthropic | no-op | Accepted so Claude Code works; the server does not clear old tool results or thinking. `x-lgml-ignored` names the field. A prompt longer than the context gives 400. |
+| `container` | Anthropic | rejected | No code execution container. |
+| `inference_geo` | Anthropic | rejected | No regions. |
+| `mcp_servers` | Anthropic | rejected | No MCP connector. |
+| `speed` | Anthropic | rejected | No fast mode. |
+
+### Messages content
+
+Each message has `role` (`user`, `assistant` or `system`) and
+`content`, a string or an array of blocks. Consecutive `user`
+messages merge into one turn, and so do consecutive `assistant`
+messages. A `system` message inside `messages` becomes a system turn at
+that place. A final `assistant` message (a prefill) gives 400: the
+server does not continue a turn.
+
+| Block | Roles | Notes |
+| --- | --- | --- |
+| `text` | user, assistant, system | An empty text is accepted. `citations` has no effect. |
+| `image` | user, in `tool_result` | `base64` source: plain base64 and `media_type`. The bytes must match `media_type`: PNG and JPEG work; GIF and WebP give 400. A `url` source takes a base64 `data:` URL (lgml); http and https URLs give 400, as the server does not fetch. A `file` source gives 400. `transformations.oversized_image` `"error"` gives 400. Needs a model with vision. |
+| `document` | user, in `tool_result` | A `text` source (with `title`) or a `content` source becomes text. PDF sources and `citations.enabled` give 400. |
+| `search_result` | user, in `tool_result` | Its title, source and texts become text. |
+| `tool_result` | user | `content` is a string or an array of text, image, document and search_result blocks. `is_error: true` puts `Error:` before the content. The results come first in their message; a result after another block gives 400. |
+| `tool_use` | assistant | `id` matches `^[a-zA-Z0-9_-]+$`; ids of other servers work. `input` is an object. |
+| `thinking` | assistant | See [Messages thinking](#messages-thinking). |
+| `redacted_thinking` | assistant | Dropped and counted in `x-lgml-thinking-dropped`. |
+
+Other block types, such as server tool results or `tool_reference`,
+give 400 that names the type. Each `tool_use` of an assistant turn needs
+a `tool_result` in the next user message, and each `tool_result` needs a
+`tool_use` in the turn before; else the reply is 400 with the Anthropic
+message (`tool_use ids were found without tool_result blocks
+immediately after`). An assistant turn with tool calls and no thinking
+blocks works.
+
+### Messages tools
+
+A tool has `name` (`^[a-zA-Z0-9_-]{1,128}$`), `description`,
+`input_schema` (an object), and optional `type: "custom"`,
+`cache_control` and `strict`. `eager_input_streaming`,
+`input_examples`, `defer_loading` and `allowed_callers` are accepted
+and have no effect; `x-lgml-ignored` names them. A tool with a dated
+`type`, such as `web_search_20260209` or `bash_20250124`, gives 400
+with the message `tools.N: Input tag '<type>' found using 'type' does
+not match any of the expected tags: 'custom'`.
+
+`tool_choice`:
+
+| Value | Chat equivalent |
+| --- | --- |
+| `{"type": "auto"}` | `auto` |
+| `{"type": "any"}` | `required` |
+| `{"type": "tool", "name": "f"}` | `{"type": "function", "function": {"name": "f"}}` |
+| `{"type": "none"}` | `none` |
+
+`disable_parallel_tool_use: true` is `parallel_tool_calls: false`. See
+[Tool choice](#tool-choice) for how each template forces a call. A
+forced call also works with thinking on (Anthropic gives 400 there).
+
+### Messages thinking
+
+- `thinking` absent, or `{"type": "adaptive"}`: thinking is on when the
+  template has it.
+- `{"type": "enabled", "budget_tokens": N}`: N is at least 1024. The
+  engine closes the reasoning block after N reasoning tokens. N can be
+  more than `max_tokens`.
+- `{"type": "disabled"}`: thinking off.
+- `display`: `summarized` (default) gives the reasoning text;
+  `omitted` gives `thinking: ""` and puts the text in the signature.
+  `updates` gives 400. `block_binding` gives 400.
+
+A reply has the reasoning in a `thinking` block before the other
+blocks. The text is the raw reasoning of the model, not a summary.
+
+Signatures: the server signs each thinking block. The signature is
+`lgml1.<payload>.<mac>`: payload is the base64url reasoning text with
+`display: "omitted"`, else empty; mac is the base64url HMAC-SHA256 of
+the model id, a zero byte and the text, with the key in
+`<state dir>/signing.key` (see `--state-dir`), so signatures verify
+after a restart. On input, a thinking block with an lgml signature
+that verifies gives its reasoning to the template, as chat
+`reasoning_content`. One that fails, or one made for another model,
+gives 400 ``messages.N.content.M: Invalid `signature` in `thinking`
+block``. A block with another signature (such as an Anthropic one) and
+each `redacted_thinking` block are dropped; the reply header
+`x-lgml-thinking-dropped` counts them.
+
+### Messages response
+
+```json
+{"id": "msg_4Bq...", "type": "message", "role": "assistant", "model": "qwen3-14b",
+ "content": [
+   {"type": "thinking", "thinking": "The user asks...", "signature": "lgml1..Xk2..."},
+   {"type": "text", "text": "I will check the weather."},
+   {"type": "tool_use", "id": "toolu_9fJ...", "name": "get_weather", "input": {"city": "Paris"}}],
+ "stop_reason": "tool_use", "stop_sequence": null, "stop_details": null,
+ "usage": {"input_tokens": 12, "output_tokens": 40, "cache_creation_input_tokens": 0,
+   "cache_read_input_tokens": 200,
+   "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0},
+   "output_tokens_details": {"thinking_tokens": 25}, "service_tier": "standard"}}
+```
+
+- `id`: `msg_` and 24 base62 characters. Tool ids: `toolu_` and 24.
+- `model`: the id of the model that served the request.
+- `stop_reason`: `end_turn`, `max_tokens`, `stop_sequence`, `tool_use`,
+  or `model_context_window_exceeded` when the context filled before
+  `max_tokens`. Never `pause_turn` or `refusal`. `stop_details` is
+  `null`.
+- `usage.input_tokens` counts the prompt tokens that were not in the
+  cache; `cache_read_input_tokens` those that were. Their sum is the
+  prompt. `cache_creation_input_tokens` is 0. `output_tokens` counts the
+  reasoning tokens too; `output_tokens_details.thinking_tokens` counts
+  them.
+
+Reply headers: `request-id` (`req_` and the `x-lgml-request-id`), and
+when they apply `x-lgml-ignored`, `x-lgml-ignored-betas` and
+`x-lgml-thinking-dropped`.
+
+### Messages errors
+
+```json
+{"type": "error", "error": {"type": "invalid_request_error",
+  "message": "max_tokens: Field required"}, "request_id": "req_0a1b2c3d"}
+```
+
+`error.type` by status: 400 `invalid_request_error`, 404
+`not_found_error`, 413 `request_too_large`, 500 `api_error`, 503
+`overloaded_error`. The status is the one of
+[Errors](#errors).
+
+### Messages examples
+
+```sh
+curl -s localhost:8080/v1/messages -H 'anthropic-version: 2023-06-01' -d '{
+  "model": "qwen3-14b", "max_tokens": 1024,
+  "messages": [{"role": "user", "content": "Name the capital of France."}]}'
 ```
 
 ## Images
