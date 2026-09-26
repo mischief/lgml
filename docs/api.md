@@ -230,6 +230,40 @@ the request checks (`lgml.server.chat_request.FIELDS`).
 | `chat_template_kwargs` | llama.cpp | supported | `enable_thinking`, `reasoning_effort` (a string for the template), `preserve_thinking` (false drops old reasoning). |
 | `lora` | llama.cpp | supported | Adapter scales for this request: `[{"id": 0, "scale": 0.5}]`. Adapters that the list does not name get scale 0. Without `lora`, the global scales apply; see [Server properties and adapters](#server-properties-and-adapters). |
 
+### Reply fields
+
+Each field of the OpenAI reply is in the lgml reply, with the same
+type. The table lists the paths; `[]` is each entry of an array.
+`test/test_compat_openai.lua` checks each path against a reply of the
+fake engine.
+
+| Field | Status | Notes |
+| --- | --- | --- |
+| `id` | supported | `chatcmpl-` and 24 hex digits. The chunks of a stream share it. |
+| `object` | supported | `chat.completion`, or `chat.completion.chunk` for each event of a stream. |
+| `created` | supported | Unix time in seconds. |
+| `model` | supported | The id of the model that served the request. |
+| `system_fingerprint` | limited | Always `null`. |
+| `choices[].index` | supported | From 0. |
+| `choices[].message.role` | supported | `assistant`. |
+| `choices[].message.content` | supported | `null` when the reply has tool calls and no text. |
+| `choices[].message.refusal` | limited | Always `null`. |
+| `choices[].message.tool_calls` | supported | Present when the reply has tool calls. |
+| `choices[].finish_reason` | supported | `stop`, `length` or `tool_calls`. lgml has no content filter, so it never gives `content_filter`. |
+| `choices[].logprobs` | supported | `null` unless the request sets `logprobs`. |
+| `usage.prompt_tokens` | supported | |
+| `usage.completion_tokens` | supported | It counts the reasoning tokens too. |
+| `usage.total_tokens` | supported | |
+| `usage.prompt_tokens_details.cached_tokens` | supported | Prompt tokens reused from the cache. |
+| `usage.prompt_tokens_details.audio_tokens` | limited | Always 0. |
+| `usage.completion_tokens_details.reasoning_tokens` | supported | Tokens of the reasoning block and its tags. |
+| `usage.completion_tokens_details.audio_tokens` | limited | Always 0. |
+| `usage.completion_tokens_details.accepted_prediction_tokens` | limited | Always 0. |
+| `usage.completion_tokens_details.rejected_prediction_tokens` | limited | Always 0. |
+
+The reply has no `service_tier`; the field is optional. The extensions
+are `choices[].message.reasoning_content` and `timings` (llama.cpp).
+
 ### Message fields
 
 | Field | Status | Notes |
@@ -318,12 +352,14 @@ it.
 ```json
 {
   "id": "chatcmpl-...", "object": "chat.completion", "created": 1790414504,
-  "model": "qwen3-14b",
+  "model": "qwen3-14b", "system_fingerprint": null,
   "choices": [{"index": 0, "finish_reason": "stop", "logprobs": null,
-    "message": {"role": "assistant", "content": "Paris.",
+    "message": {"role": "assistant", "content": "Paris.", "refusal": null,
       "reasoning_content": "The user asks..."}}],
   "usage": {"prompt_tokens": 20, "completion_tokens": 9, "total_tokens": 29,
-    "prompt_tokens_details": {"cached_tokens": 12}},
+    "prompt_tokens_details": {"cached_tokens": 12, "audio_tokens": 0},
+    "completion_tokens_details": {"reasoning_tokens": 5, "audio_tokens": 0,
+      "accepted_prediction_tokens": 0, "rejected_prediction_tokens": 0}},
   "timings": {"cache_n": 12, "prompt_n": 8, "prompt_ms": 31.2, "predicted_n": 9,
     "predicted_ms": 140.5, "predicted_per_second": 64.1}
 }
@@ -337,7 +373,9 @@ it.
   `type: "function"` and `function: {name, arguments}`. `arguments` is
   a JSON string. With tool calls and no text, `content` is `null`.
 - `usage.prompt_tokens_details.cached_tokens` counts the prompt tokens
-  reused from the cache.
+  reused from the cache. `usage.completion_tokens_details.reasoning_tokens`
+  counts the tokens of the reasoning block.
+- [Reply fields](#reply-fields) lists each field.
 - `timings` (llama.cpp): `cache_n`, `restored_n`, `prompt_n`,
   `prompt_ms`, `prompt_per_token_ms`, `prompt_per_second`,
   `predicted_n`, `predicted_ms`, `predicted_per_token_ms`,
@@ -348,7 +386,7 @@ it.
 With `stream: true`, the reply is `text/event-stream`. Each event is
 one `data:` line with a `chat.completion.chunk` object:
 
-1. A first chunk with `delta: {"role": "assistant", "content": ""}`.
+1. A first chunk with `delta: {"role": "assistant", "content": "", "refusal": null}`.
 2. Chunks with `delta.reasoning_content` (llama.cpp) or
    `delta.content` text.
 3. For a tool call: a chunk with `delta.tool_calls[0]` that has
@@ -357,7 +395,7 @@ one `data:` line with a `chat.completion.chunk` object:
 4. A last choice chunk with `delta: {}`, `finish_reason` and `timings`
    (llama.cpp).
 5. With `stream_options.include_usage`, a chunk with `choices: []` and
-   `usage`.
+   `usage`. The other chunks then have `usage: null`, as OpenAI sends.
 6. `data: [DONE]`.
 
 When the engine fails before the first event, the reply is a plain

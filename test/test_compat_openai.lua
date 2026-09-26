@@ -2,8 +2,13 @@
 -- against the request checks and the openai-python request fields.
 -- TAP output.
 
+local uv = require("luv")
 local json = require("lgml.json")
 local chat_request = require("lgml.server.chat_request")
+local http = require("lgml.server.http")
+local httpd = require("lgml.server.httpd")
+local openai = require("lgml.server.openai")
+local fake = require("lgml.server.fake_engine")
 
 local n, failed = 0, 0
 
@@ -169,7 +174,85 @@ local function test_messages()
 	end
 end
 
+-- in-process requests
+
+local srv = httpd.new()
+local engine = fake.new({ delay = 0 })
+openai.install(srv, engine)
+
+-- Runs POST /v1/chat/completions with body (a table or JSON text) on
+-- the fake engine, without a socket. Returns the status, the headers
+-- and the body text.
+local function post(body)
+	local out = {}
+	local s = {
+		write = function(_, data)
+			out[#out + 1] = data
+			return true
+		end,
+		gone = function()
+			return false
+		end,
+	}
+	local text = type(body) == "string" and body or assert(json.encode(body))
+	local req = { method = "POST", path = "/v1/chat/completions", version = "1.0", body = text,
+		headers = {} }
+	local res = http.response({ s = s }, req)
+	local done
+	coroutine.wrap(function()
+		srv.routes[req.path].POST(req, res)
+		done = true
+	end)()
+	while not done do
+		uv.run("once")
+	end
+	local raw = table.concat(out)
+	local head, rest = raw:match("^(.-)\r\n\r\n(.*)$")
+	local headers = {}
+	for k, v in head:gmatch("\r\n([^:\r\n]+): ([^\r\n]*)") do
+		headers[k:lower()] = v
+	end
+	return tonumber(head:match("^HTTP/1%.1 (%d+)")), headers, rest
+end
+
+local function post_json(body)
+	local status, headers, text = post(body)
+	return status, json.decode(text), headers
+end
+
+local TOOLS = json.array({ { type = "function", ["function"] = {
+	name = "get_weather", parameters = { type = "object",
+	properties = { city = { type = "string" } }, required = json.array({ "city" }) } } } })
+
+-- The value at a path such as "choices[].message.content"; [] takes
+-- the first entry. nil when a step is missing; json.null stays.
+local function at(v, path)
+	for step in path:gmatch("[^.]+") do
+		local name, arr = step:match("^([%w_]+)(.*)$")
+		if type(v) ~= "table" then
+			return nil
+		end
+		v = v[name]
+		if arr == "[]" then
+			v = type(v) == "table" and v[1] or nil
+		end
+	end
+	return v
+end
+
+local function test_reply_table()
+	local rows = table_rows(read("docs/api.md"), "### Reply fields")
+	local status, b = post_json(body({ tools = TOOLS }))
+	ok(status == 200, "a reply with a tool call")
+	ok(#rows >= 20, "the reply table has rows")
+	for _, r in ipairs(rows) do
+		local path = r[1]:match("^`(.+)`$")
+		ok(path and at(b, path) ~= nil, ("reply has %s"):format(tostring(path)))
+	end
+end
+
 test_field_table()
 test_messages()
+test_reply_table()
 print("1.." .. n)
 os.exit(failed == 0 and 0 or 1)

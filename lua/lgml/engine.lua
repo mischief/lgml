@@ -24,6 +24,7 @@ local prompt_cache = require("lgml.prompt_cache")
 local grammar = require("lgml.grammar")
 local lora = require("lgml.lora")
 local media = require("lgml.chat.media")
+local output = require("lgml.chat.output")
 local log = require("lgml.log")
 
 local L = log.new("engine")
@@ -439,31 +440,6 @@ function E:prefill(prompt, from, sink)
 	return logits
 end
 
-local function deliver(sink, ev, state)
-	local t = ev.type
-	if t == "reasoning" then
-		return sink:reasoning(ev.text)
-	elseif t == "content" then
-		return sink:content(ev.text)
-	elseif t == "tool_call_begin" then
-		local idx = sink:tool_call(ev.name)
-		state[ev.index] = idx
-		return idx
-	elseif t == "tool_call_args" then
-		return sink:tool_arguments(state[ev.index], ev.text)
-	end
-	return true
-end
-
-local function deliver_all(sink, events, state)
-	for _, ev in ipairs(events) do
-		if not deliver(sink, ev, state) then
-			return nil
-		end
-	end
-	return true
-end
-
 --- Runs one chat completion (see `lgml.server.engine.Engine.chat`).
 -- It renders the chat template, reuses the cached prefix, prefills and
 -- samples. It stops at an end token, at the token limit or on cancel.
@@ -712,9 +688,8 @@ function E:run_prompt(req, sink)
 		    "seed", req.seed or "random", "max_tokens", max, "thinking", think,
 		    "grammar", gopts.grammar and first_lines(gopts.grammar, 6), "root", gopts.grammar_root)
 	end
-	local parser = self.family.new_parser({ tools = req.tools, enable_thinking = think })
+	local out = output.new(sink, self.family.new_parser({ tools = req.tools, enable_thinking = think }))
 	local dec = tokenizer.decoder(self.tk, { special = false })
-	local state = {}
 
 	local t0 = lgml.clock()
 	local cached = self:reuse(prompt)
@@ -742,7 +717,7 @@ function E:run_prompt(req, sink)
 		if tracing then
 			L:trace("token", "n", n, "id", id, "text", piece)
 		end
-		if not deliver_all(sink, parser:feed(piece), state) then
+		if not out:token(piece) then
 			return true
 		end
 		if n >= max then
@@ -755,16 +730,13 @@ function E:run_prompt(req, sink)
 			return true
 		end
 	end
-	local rest = parser:feed(dec:flush())
-	for _, ev in ipairs(parser:finish()) do
-		rest[#rest + 1] = ev
-	end
-	if not deliver_all(sink, rest, state) then
+	if not out:finish(dec:flush()) then
 		return true
 	end
 	local t2 = lgml.clock()
 	sink:finish(reason, {
 		prompt_tokens = #prompt, completion_tokens = n, cached_tokens = cached,
+		reasoning_tokens = out.reasoning_tokens,
 	}, {
 		cache_n = cached, restored_n = self.pc and self.pc.restored or 0,
 		prompt_n = #prompt - cached, prompt_ms = (t1 - t0) * 1000,

@@ -62,22 +62,79 @@ M.check_chat = chat_request.check
 
 -- sink
 
-local Sink = {}
-Sink.__index = Sink
+-- One reply: the event stream, the id and the choices. Each choice has
+-- its own Sink.
+local Reply = {}
+Reply.__index = Reply
 
-local function new_sink(res, body, model)
+local function new_reply(res, body, model)
 	local so = body.stream_options
 	return setmetatable({
 		res = res, s = res.s, stream = body.stream == true,
 		include_usage = so and so.include_usage == true,
+		logprobs = body.logprobs == true,
 		id = rand_id("chatcmpl-", 24), created = os.time(), model = model,
+		choices = {}, writer = nil, broken = false,
+	}, Reply)
+end
+
+function Reply:cancelled()
+	return self.broken or self.s:gone()
+end
+
+local function chunk(r, choices, extra)
+	local c = {
+		id = r.id, object = "chat.completion.chunk",
+		created = r.created, model = r.model, system_fingerprint = json.null,
+		choices = json.array(choices),
+	}
+	-- With include_usage, OpenAI sends usage: null in each other chunk.
+	if r.include_usage then
+		c.usage = json.null
+	end
+	for k, v in pairs(extra or {}) do
+		c[k] = v
+	end
+	return c
+end
+
+local function send(r, value)
+	local ok = r.writer:send(value)
+	if not ok then
+		r.broken = true
+		return nil, "cancelled"
+	end
+	return true
+end
+
+-- Starts the event stream.
+local function start(r)
+	if r.writer then
+		return true
+	end
+	local w = sse.start(r.res)
+	if not w then
+		r.broken = true
+		return nil, "cancelled"
+	end
+	r.writer = w
+	return true
+end
+
+local Sink = {}
+Sink.__index = Sink
+
+local function new_sink(reply, index)
+	return setmetatable({
+		reply = reply, index = index,
 		reasoning_parts = {}, content_parts = {}, tools = {},
-		writer = nil, finished = nil, broken = false,
+		lp = reply.logprobs and json.array() or nil,
+		started = false, finished = nil,
 	}, Sink)
 end
 
 function Sink:cancelled()
-	return self.broken or self.s:gone()
+	return self.reply:cancelled()
 end
 
 local function alive(self)
@@ -87,65 +144,41 @@ local function alive(self)
 	return true
 end
 
-local function chunk(self, choices, extra)
-	local c = {
-		id = self.id, object = "chat.completion.chunk",
-		created = self.created, model = self.model,
-		choices = json.array(choices),
-	}
-	for k, v in pairs(extra or {}) do
-		c[k] = v
-	end
-	return c
-end
-
-local function choice(delta, reason)
+local function choice(self, delta, reason, lp)
 	return {
-		index = 0, delta = json.object(delta),
-		logprobs = json.null, finish_reason = reason or json.null,
+		index = self.index, delta = json.object(delta),
+		logprobs = lp or json.null, finish_reason = reason or json.null,
 	}
 end
 
-local function send(self, value)
-	local ok = self.writer:send(value)
-	if not ok then
-		self.broken = true
-		return nil, "cancelled"
+-- Starts the stream and sends the role chunk of the choice.
+local function open(self)
+	local r = self.reply
+	local ok, err = start(r)
+	if not ok or self.started then
+		return ok, err
 	end
-	return true
-end
-
--- Starts the event stream and sends the role chunk.
-local function start(self)
-	if self.writer then
-		return true
-	end
-	local w = sse.start(self.res)
-	if not w then
-		self.broken = true
-		return nil, "cancelled"
-	end
-	self.writer = w
-	return send(self, chunk(self, {
-		choice({ role = "assistant", content = "" }),
+	self.started = true
+	return send(r, chunk(r, {
+		choice(self, { role = "assistant", content = "", refusal = json.null }),
 	}))
 end
 
-local function emit(self, delta)
+local function emit(self, delta, lp)
 	if self.finished then
 		error("sink used after finish", 3)
 	end
 	if self:cancelled() then
 		return nil, "cancelled"
 	end
-	if not self.stream then
+	if not self.reply.stream then
 		return true
 	end
-	local ok, err = start(self)
+	local ok, err = open(self)
 	if not ok then
 		return nil, err
 	end
-	return send(self, chunk(self, { choice(delta) }))
+	return send(self.reply, chunk(self.reply, { choice(self, delta, nil, lp) }))
 end
 
 function Sink:reasoning(text)
@@ -156,12 +189,33 @@ function Sink:reasoning(text)
 	return emit(self, { reasoning_content = text })
 end
 
-function Sink:content(text)
-	if text == "" then
+-- The OpenAI form of logprobs entries from an engine.
+local function lp_entries(list)
+	local out = json.array()
+	for i, e in ipairs(list) do
+		local top = json.array()
+		for j, t in ipairs(e.top_logprobs or {}) do
+			top[j] = { token = t.token, logprob = t.logprob,
+			    bytes = t.bytes and json.array(table.move(t.bytes, 1, #t.bytes, 1, {})) or json.null }
+		end
+		out[i] = { token = e.token, logprob = e.logprob, top_logprobs = top,
+		    bytes = e.bytes and json.array(table.move(e.bytes, 1, #e.bytes, 1, {})) or json.null }
+	end
+	return out
+end
+
+function Sink:content(text, logprobs)
+	local entries = self.lp and logprobs and #logprobs > 0 and lp_entries(logprobs) or nil
+	if text == "" and not entries then
 		return alive(self)
 	end
 	self.content_parts[#self.content_parts + 1] = text
-	return emit(self, { content = text })
+	local lp
+	if entries then
+		table.move(entries, 1, #entries, #self.lp + 1, self.lp)
+		lp = { content = entries, refusal = json.null }
+	end
+	return emit(self, { content = text }, lp)
 end
 
 -- Returns the index of the new call, or nil and "cancelled".
@@ -192,15 +246,6 @@ function Sink:tool_arguments(index, text)
 	} } })
 end
 
-local function usage_object(u)
-	u = u or {}
-	local p, c = u.prompt_tokens or 0, u.completion_tokens or 0
-	return {
-		prompt_tokens = p, completion_tokens = c, total_tokens = p + c,
-		prompt_tokens_details = { cached_tokens = u.cached_tokens or 0 },
-	}
-end
-
 function Sink:finish(reason, usage, timings)
 	assert(engine_api.reasons[reason], "finish: bad reason")
 	if self.finished then
@@ -209,28 +254,50 @@ function Sink:finish(reason, usage, timings)
 	if reason == "stop" and #self.tools > 0 then
 		reason = "tool_calls"
 	end
-	self.finished = { reason = reason, usage = usage_object(usage),
-	    timings = timings }
-	if not self.stream or self:cancelled() then
+	self.finished = { reason = reason, usage = usage or {}, timings = timings }
+	if not self.reply.stream or self:cancelled() then
 		return alive(self)
 	end
-	local ok, err = start(self)
+	local ok, err = open(self)
 	if ok then
-		ok, err = send(self, chunk(self, { choice({}, reason) },
+		ok, err = send(self.reply, chunk(self.reply, { choice(self, {}, reason) },
 		    { timings = timings }))
 	end
-	if ok and self.include_usage then
-		ok, err = send(self, chunk(self, {},
-		    { usage = self.finished.usage }))
-	end
 	return ok, err
+end
+
+-- The OpenAI usage object of the reply. The choices share the prompt,
+-- so the prompt counts come from the first choice.
+local function usage_object(r)
+	local first = r.choices[1] and r.choices[1].finished
+	local u = first and first.usage or {}
+	local p, c, think = u.prompt_tokens or 0, 0, 0
+	for _, s in ipairs(r.choices) do
+		local f = s.finished and s.finished.usage or {}
+		c = c + (f.completion_tokens or 0)
+		think = think + (f.reasoning_tokens or 0)
+	end
+	return {
+		prompt_tokens = p, completion_tokens = c, total_tokens = p + c,
+		prompt_tokens_details = { cached_tokens = u.cached_tokens or 0, audio_tokens = 0 },
+		completion_tokens_details = {
+			reasoning_tokens = think, audio_tokens = 0,
+			accepted_prediction_tokens = 0, rejected_prediction_tokens = 0,
+		},
+	}
+end
+
+-- The timings of the reply: those of the first choice.
+local function timings_of(r)
+	local first = r.choices[1] and r.choices[1].finished
+	return first and first.timings
 end
 
 -- responses
 
 local function message(self)
 	local content = table.concat(self.content_parts)
-	local m = { role = "assistant", content = content }
+	local m = { role = "assistant", content = content, refusal = json.null }
 	if #self.reasoning_parts > 0 then
 		m.reasoning_content = table.concat(self.reasoning_parts)
 	end
@@ -251,85 +318,122 @@ local function message(self)
 	return m
 end
 
-local function reply_whole(self)
-	local f = self.finished
-	return self.res:json(200, {
-		id = self.id, object = "chat.completion", created = self.created,
-		model = self.model,
-		choices = json.array({ {
-			index = 0, message = message(self), logprobs = json.null,
-			finish_reason = f.reason,
-		} }),
-		usage = f.usage, timings = f.timings,
-	}, metrics.headers(f.timings))
+local function reply_whole(r)
+	local choices = json.array()
+	for i, s in ipairs(r.choices) do
+		choices[i] = {
+			index = s.index, message = message(s), finish_reason = s.finished.reason,
+			logprobs = s.lp and { content = s.lp, refusal = json.null } or json.null,
+		}
+	end
+	local timings = timings_of(r)
+	return r.res:json(200, {
+		id = r.id, object = "chat.completion", created = r.created,
+		model = r.model, system_fingerprint = json.null, choices = choices,
+		usage = usage_object(r), timings = timings,
+	}, metrics.headers(timings))
 end
 
 -- Ends the stream with an error event, or sends an error response.
-local function fail(self, status, msg)
-	self.res.err = msg
-	if not self.writer then
-		return self.res:error(status or 500, msg)
+local function fail(r, status, msg)
+	r.res.err = msg
+	if not r.writer then
+		return r.res:error(status or 500, msg)
 	end
-	if send(self, http.error_object(status or 500,
-	    msg)) then
-		self.writer:done()
+	if send(r, http.error_object(status or 500, msg)) then
+		r.writer:done()
 	end
 end
 
 -- Notes for the access line and debug lines on the reply.
-local function log_chat(sink)
-	local f = sink.finished
-	if sink:cancelled() then
+local function log_chat(r)
+	if r:cancelled() then
 		log.note("cancelled", true)
 	end
-	if not f then
+	local first = r.choices[1]
+	if not (first and first.finished) then
 		return
 	end
-	local u, t = f.usage, f.timings or {}
+	local u, t = usage_object(r), timings_of(r) or {}
 	local cached = u.prompt_tokens_details.cached_tokens
+	local ncalls = 0
+	for _, s in ipairs(r.choices) do
+		ncalls = ncalls + #s.tools
+	end
 	log.note("prompt_tokens", u.prompt_tokens)
 	log.note("cached_tokens", cached > 0 and cached or nil)
 	log.note("completion_tokens", u.completion_tokens)
 	log.note("tok_s", t.predicted_per_second)
 	log.note("images", (t.images or 0) > 0 and t.images or nil)
-	log.note("finish", f.reason)
-	log.note("tool_calls", #sink.tools > 0 and #sink.tools or nil)
+	log.note("finish", first.finished.reason)
+	log.note("choices", #r.choices > 1 and #r.choices or nil)
+	log.note("tool_calls", ncalls > 0 and ncalls or nil)
 	if not L:on(log.DEBUG) then
 		return
 	end
-	L:debug("finish", "reason", f.reason, "prompt_tokens", u.prompt_tokens, "cached_tokens", cached,
-	    "completion_tokens", u.completion_tokens, "prompt_ms", t.prompt_ms, "predicted_ms", t.predicted_ms)
-	L:debug("reply", "reasoning", #sink.reasoning_parts > 0 and table.concat(sink.reasoning_parts) or nil,
-	    "content", table.concat(sink.content_parts))
-	for i, tc in ipairs(sink.tools) do
-		L:debug("tool call", "index", i - 1, "id", tc.id, "name", tc.name,
-		    "arguments", table.concat(tc.args))
+	L:debug("finish", "reason", first.finished.reason, "prompt_tokens", u.prompt_tokens,
+	    "cached_tokens", cached, "completion_tokens", u.completion_tokens, "prompt_ms", t.prompt_ms,
+	    "predicted_ms", t.predicted_ms)
+	for _, s in ipairs(r.choices) do
+		L:debug("reply", "choice", s.index,
+		    "reasoning", #s.reasoning_parts > 0 and table.concat(s.reasoning_parts) or nil,
+		    "content", table.concat(s.content_parts))
+		for i, tc in ipairs(s.tools) do
+			L:debug("tool call", "choice", s.index, "index", i - 1, "id", tc.id, "name", tc.name,
+			    "arguments", table.concat(tc.args))
+		end
 	end
 end
 
-local function run_chat(eng, res, body, model)
-	local sink = new_sink(res, body, model)
-	log.note("model", model)
-	local ok, msg, status = eng:chat(body, sink)
-	metrics.request(model, "chat", ok == true)
-	if sink.finished and sink.finished.timings then
-		metrics.chat(model, sink.finished.timings)
+-- The request for choice i: choice i > 1 takes seed + i - 1.
+local function choice_request(body, i)
+	if i == 1 or math.type(body.seed) ~= "integer" then
+		return body
 	end
-	log_chat(sink)
-	if sink:cancelled() then
+	local t = {}
+	for k, v in pairs(body) do
+		t[k] = v
+	end
+	t.seed = body.seed + i - 1
+	return t
+end
+
+-- Runs the engine once for each choice, one after the other.
+local function run_chat(eng, res, body, model)
+	local r = new_reply(res, body, model)
+	log.note("model", model)
+	local ok, msg, status = true, nil, nil
+	for i = 1, body.n or 1 do
+		local sink = new_sink(r, i - 1)
+		r.choices[i] = sink
+		ok, msg, status = eng:chat(choice_request(body, i), sink)
+		if sink.finished and sink.finished.timings then
+			metrics.chat(model, sink.finished.timings)
+		end
+		if not ok or r:cancelled() then
+			break
+		end
+		if not sink.finished then
+			sink:finish("stop")
+		end
+	end
+	metrics.request(model, "chat", ok == true)
+	log_chat(r)
+	if r:cancelled() then
 		res.close = true
 		return
 	end
 	if not ok then
-		return fail(sink, status, msg or "engine failed")
+		return fail(r, status, msg or "engine failed")
 	end
-	if not sink.finished then
-		sink:finish("stop")
+	if not r.stream then
+		return reply_whole(r)
 	end
-	if not sink.stream then
-		return reply_whole(sink)
+	if r.include_usage and not send(r, chunk(r, {}, { usage = usage_object(r) })) then
+		res.close = true
+		return
 	end
-	if sink:cancelled() or not sink.writer:done() then
+	if r:cancelled() or not r.writer:done() then
 		res.close = true
 	end
 end

@@ -296,7 +296,8 @@ end
 -- The server changes reason `stop` to `tool_calls` when the reply has
 -- tool calls.
 -- @tparam string reason `"stop"`, `"length"` or `"tool_calls"`
--- @tparam[opt] table usage `{ prompt_tokens, completion_tokens, cached_tokens }`
+-- @tparam[opt] table usage `{ prompt_tokens, completion_tokens, cached_tokens,
+-- reasoning_tokens }`; completion_tokens counts the reasoning tokens too
 -- @tparam[opt] table timings llama.cpp timings: `cache_n`, `prompt_n`,
 -- `prompt_ms`, `predicted_n`, `predicted_ms` and `predicted_per_second`
 -- @raise when reason is not valid, or on a second call

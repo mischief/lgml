@@ -137,7 +137,7 @@ function F:chat(req, sink)
 	end
 	local max = req.max_completion_tokens or req.max_tokens
 	local usage = { prompt_tokens = prompt_tokens(req),
-	    completion_tokens = 0, cached_tokens = 0 }
+	    completion_tokens = 0, cached_tokens = 0, reasoning_tokens = 0 }
 	if log.want_prompt() then
 		log.prompt(L, "chat", render(req), "model", self.model, "tokens", usage.prompt_tokens)
 	end
@@ -159,6 +159,9 @@ function F:chat(req, sink)
 			index = r
 		end
 		usage.completion_tokens = usage.completion_tokens + 1
+		if piece[1] == "reasoning" then
+			usage.reasoning_tokens = usage.reasoning_tokens + 1
+		end
 	end
 	sink:finish("stop", usage, {
 		prompt_n = usage.prompt_tokens, predicted_n = usage.completion_tokens,

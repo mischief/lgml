@@ -197,7 +197,11 @@ local function chat_schemas(c)
 	}, { "function" })
 	c.Usage = obj({
 		prompt_tokens = int(), completion_tokens = int(), total_tokens = int(),
-		prompt_tokens_details = obj({ cached_tokens = int() }),
+		prompt_tokens_details = obj({ cached_tokens = int(), audio_tokens = int() }),
+		completion_tokens_details = obj({
+			reasoning_tokens = int(), audio_tokens = int(),
+			accepted_prediction_tokens = int(), rejected_prediction_tokens = int(),
+		}),
 	})
 	c.Timings = ext(obj({
 		cache_n = int(), restored_n = int(), prompt_n = int(), prompt_ms = num(),
@@ -205,12 +209,23 @@ local function chat_schemas(c)
 		predicted_ms = num(), predicted_per_token_ms = num(), predicted_per_second = num(),
 	}, nil, "llama.cpp timings."))
 	local finish = { type = "string", enum = json.array({ "stop", "length", "tool_calls" }) }
+	local nullable = { type = { "string", "null" } }
+	local logprob = obj({
+		token = str(), logprob = num(), bytes = { type = { "array", "null" }, items = int() },
+	})
+	logprob.properties.top_logprobs = arr(obj({
+		token = str(), logprob = num(), bytes = { type = { "array", "null" }, items = int() },
+	}))
+	c.ChatLogprobs = obj({ content = arr(logprob), refusal = { type = "null" } }, nil,
+	    "Log probabilities of the content tokens.")
+	local logprobs = { anyOf = json.array({ ref("ChatLogprobs"), { type = "null" } }) }
 	c.ChatCompletion = obj({
 		id = str(), object = { const = "chat.completion" }, created = int(), model = str(),
+		system_fingerprint = { type = "null" },
 		choices = arr(obj({
-			index = int(), finish_reason = finish, logprobs = { type = "null" },
+			index = int(), finish_reason = finish, logprobs = logprobs,
 			message = obj({
-				role = { const = "assistant" }, content = { type = { "string", "null" } },
+				role = { const = "assistant" }, content = nullable, refusal = { type = "null" },
 				reasoning_content = ext(str()), tool_calls = arr(ref("ToolCall")),
 			}),
 		})),
@@ -218,14 +233,15 @@ local function chat_schemas(c)
 	})
 	c.ChatCompletionChunk = obj({
 		id = str(), object = { const = "chat.completion.chunk" }, created = int(), model = str(),
+		system_fingerprint = { type = "null" },
 		choices = arr(obj({
-			index = int(), finish_reason = { type = { "string", "null" } },
+			index = int(), finish_reason = { type = { "string", "null" } }, logprobs = logprobs,
 			delta = obj({
-				role = str(), content = str(), reasoning_content = ext(str()),
-				tool_calls = arr({ type = "object" }),
+				role = str(), content = str(), refusal = { type = "null" },
+				reasoning_content = ext(str()), tool_calls = arr({ type = "object" }),
 			}),
 		})),
-		usage = ref("Usage"), timings = ref("Timings"),
+		usage = { anyOf = json.array({ ref("Usage"), { type = "null" } }) }, timings = ref("Timings"),
 	}, nil, "One `data:` event. The stream ends with `data: [DONE]`.")
 end
 

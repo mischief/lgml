@@ -9,6 +9,7 @@ local lgml = require("lgml")
 local chat = require("lgml.chat")
 local tokenizer = require("lgml.tokenizer")
 local stream = require("lgml.server.stream")
+local output = require("lgml.chat.output")
 
 local M = {}
 local E = {}
@@ -94,31 +95,6 @@ local function thinking(req)
 	return req.reasoning_effort ~= "none"
 end
 
-local function deliver(sink, ev, state)
-	local t = ev.type
-	if t == "reasoning" then
-		return sink:reasoning(ev.text)
-	elseif t == "content" then
-		return sink:content(ev.text)
-	elseif t == "tool_call_begin" then
-		local idx = sink:tool_call(ev.name)
-		state[ev.index] = idx
-		return idx
-	elseif t == "tool_call_args" then
-		return sink:tool_arguments(state[ev.index], ev.text)
-	end
-	return true
-end
-
-local function deliver_all(sink, events, state)
-	for _, ev in ipairs(events) do
-		if not deliver(sink, ev, state) then
-			return nil
-		end
-	end
-	return true
-end
-
 --- Runs one chat completion (see `lgml.server.engine.Engine.chat`).
 -- The prompt and one canvas must fit in the context. Generation stops
 -- at an end token, at the token limit, at the context end, or after 3
@@ -162,9 +138,8 @@ function E:run(req, sink)
 	local max = req.max_completion_tokens or req.max_tokens
 	max = math.min(max or self.n_ctx, self.n_ctx - #prompt)
 	local seed = math.tointeger(req.seed) or self.seed or math.random(0, 0x7fffffff)
-	local parser = self.family.new_parser({ tools = req.tools })
+	local out = output.new(sink, self.family.new_parser({ tools = req.tools }))
 	local dec = tokenizer.decoder(self.tk, { special = false })
-	local state = {}
 
 	local t0 = lgml.clock()
 	local prefix = table.move(prompt, 1, #prompt, 1, {})
@@ -189,7 +164,7 @@ function E:run(req, sink)
 		local cut, stop = self.model.trim(canvas, self.eog)
 		cut = math.min(cut, max - n)
 		for i = 1, cut do
-			if not deliver_all(sink, parser:feed(dec:push(canvas[i])), state) then
+			if not out:token(dec:push(canvas[i])) then
 				return true
 			end
 		end
@@ -204,16 +179,13 @@ function E:run(req, sink)
 		end
 		table.move(canvas, 1, cut, #prefix + 1, prefix)
 	end
-	local rest = parser:feed(dec:flush())
-	for _, ev in ipairs(parser:finish()) do
-		rest[#rest + 1] = ev
-	end
-	if not deliver_all(sink, rest, state) then
+	if not out:finish(dec:flush()) then
 		return true
 	end
 	local t1 = lgml.clock()
 	sink:finish(reason, {
 		prompt_tokens = #prompt, completion_tokens = n, cached_tokens = cached,
+		reasoning_tokens = out.reasoning_tokens,
 	}, {
 		cache_n = cached, prompt_n = #prompt - cached,
 		predicted_n = n, predicted_ms = (t1 - t0) * 1000,
