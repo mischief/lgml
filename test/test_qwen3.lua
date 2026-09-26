@@ -1,5 +1,5 @@
 -- Qwen3 KV cache and greedy decode. Output is TAP. Set LGML_MODEL to a
--- Qwen3-0.6B gguf (BF16 or Q8_0) to run the model tests.
+-- Qwen3-14B Q4_K_M gguf to run the model tests.
 local lgml = require("lgml")
 
 local n = 0
@@ -62,18 +62,13 @@ end
 
 -- "The capital of France is", tokenized by llama-tokenize.
 local prompt = { 785, 6722, 315, 9625, 374 }
--- llama.cpp greedy output, 32 tokens, BF16 and Q8_0 without flash attn.
+-- llama.cpp CPU greedy output, with and without flash attn and with
+-- q8_0 and q4_0 caches. Token 26 is a near tie (" located" or " a"), so
+-- the tests stop before it.
 local want = {
-	12095, 13, 576, 6722, 315, 15344, 374, 21718, 13, 576, 6722, 315,
-	17689, 374, 24081, 13, 576, 6722, 315, 5616, 374, 26549, 13, 576,
-	6722, 315, 6323, 374, 26194, 13, 576, 6722,
-}
--- llama.cpp Q8_0 CPU with flash attn. Token 6 is a near tie (0.01 to 0.2
--- logits) between " Italy" and " France".
-local want_fa = {
-	12095, 13, 576, 6722, 315, 9625, 374, 1083, 279, 6722, 315, 279,
-	5429, 315, 9625, 13, 576, 6722, 315, 9625, 374, 1083, 279, 6722,
-	315, 279, 7513, 9145, 13, 576, 6722, 315,
+	12095, 13, 3555, 374, 279, 6722, 315, 279, 3639, 4180, 30, 576,
+	6722, 315, 279, 3639, 4180, 374, 6515, 11, 422, 727, 13, 1084,
+	374,
 }
 
 local path = os.getenv("LGML_MODEL")
@@ -95,20 +90,16 @@ else
 		local m = transformer.load(be, path)
 
 		local c = m:cache(64)
-		local ids = gen.greedy(m, c, prompt, 32)
+		local ids = gen.greedy(m, c, prompt, #want)
 		check(ids, want, tag .. "greedy matches llama.cpp")
-		ok(c.n_past == #prompt + 31, tag .. "cache advanced")
+		ok(c.n_past == #prompt + #want - 1, tag .. "cache advanced")
 
 		c = m:cache(64)
-		ids = gen.greedy(m, c, prompt, 32, { flash_attn = true })
-		local good = same(ids, want) or same(ids, want_fa)
-		if not good then
-			io.stderr:write("flash_attn: got {", table.concat(ids, ", "), "}\n")
-		end
-		ok(good, tag .. "flash_attn greedy matches llama.cpp")
+		ids = gen.greedy(m, c, prompt, #want, { flash_attn = true })
+		check(ids, want, tag .. "flash_attn greedy matches llama.cpp")
 
 		-- A full pass without a cache (f32 k and v) predicts the same
-		-- tokens up to the near tie at token 6.
+		-- tokens.
 		local seq = table.move(prompt, 1, #prompt, 1, {})
 		table.move(want, 1, 4, #seq + 1, seq)
 		local inp = m:inputs(seq)
@@ -118,11 +109,10 @@ else
 		local got = table.move(best:get(), #prompt, #seq, 1, {})
 		check(got, table.move(want, 1, 5, 1, {}), tag .. "no-cache pass agrees")
 
-		-- Quantized caches round K and V after the Hadamard rotation. q8_0
-		-- keeps the f16 tokens up to the near tie at token 6; q4_0 gives
-		-- llama.cpp's q4_0 tokens (", and the capital").
+		-- Quantized caches round K and V after the Hadamard rotation.
+		-- llama.cpp's q8_0 and q4_0 caches keep the first tokens.
 		for ty, w in pairs({ q8_0 = table.move(want, 1, 5, 1, {}),
-		    q4_0 = { 12095, 11, 323, 279, 6722 } }) do
+		    q4_0 = table.move(want, 1, 5, 1, {}) }) do
 			c = m:cache(64, { type = ty })
 			ids = gen.greedy(m, c, prompt, 5, { flash_attn = true })
 			check(ids, w, tag .. ty .. " cache greedy matches llama.cpp")
