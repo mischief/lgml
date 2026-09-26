@@ -13,6 +13,7 @@ local replay = require("lgml.replay")
 local transformer = require("lgml.transformer")
 local decide = require("lgml.decide")
 local prompt_cache = require("lgml.prompt_cache")
+local grammar = require("lgml.grammar")
 
 local M = {}
 local E = {}
@@ -23,6 +24,13 @@ local UBATCH = 512
 -- Device memory kept free for compute buffers when the engine sizes the
 -- context to fit.
 local RESERVE = 1536 << 20
+
+-- Reasoning block tags by chat family, for constrained answers.
+local THINK = {
+	qwen3 = { "<think>", "</think>" },
+	qwen35 = { "<think>", "</think>" },
+	gemma4 = { "<|channel>thought", "<channel|>" },
+}
 
 -- The largest context, in steps of 256, whose cache fits in the free
 -- memory of the model's device. nil when the device does not report it.
@@ -70,7 +78,7 @@ end
 function M.new(opts)
 	local be = assert(lgml.backend(opts.backend))
 	local info = assert(lgml.gguf(opts.model))
-	local family = chat.load(info.meta)
+	local family, family_name = chat.load(info.meta)
 	local arch = info.meta["general.architecture"]
 	local model = (transformer.supports(arch) and transformer or require("lgml." .. arch))
 	    .load(be, opts.model)
@@ -90,7 +98,7 @@ function M.new(opts)
 	end
 	local cache = model:cache(n_ctx, copts)
 	local e = setmetatable({
-		be = be, model = model, family = family,
+		be = be, model = model, family = family, family_name = family_name,
 		tk = assert(tokenizer.open(opts.model)),
 		n_ctx = n_ctx, flash_attn = fa,
 		id = opts.id or info.meta["general.name"] or "lgml",
@@ -158,8 +166,8 @@ local function thinking(req)
 	return req.reasoning_effort ~= "none"
 end
 
-local function sampler_opts(req, think)
-	local o = {}
+local function sampler_opts(req, think, extra)
+	local o = extra or {}
 	for _, k in ipairs({ "temperature", "top_p", "top_k", "min_p", "seed",
 	    "presence_penalty", "frequency_penalty", "repeat_penalty" }) do
 		if type(req[k]) == "number" then
@@ -269,8 +277,10 @@ end
 -- The request can set sampler settings, `seed`, `max_tokens`,
 -- `max_completion_tokens`, `tools`, `reasoning_effort = "none"` and
 -- `chat_template_kwargs` `enable_thinking`, `reasoning_effort` and
--- `preserve_thinking`. A Lua error resets the cache and returns status
--- 500.
+-- `preserve_thinking`. `grammar` (GBNF) or `response_format` (see
+-- `lgml.grammar.from_request`) constrain the answer; a reasoning block
+-- before it stays free. A bad grammar returns status 400. A Lua error
+-- resets the cache and returns status 500.
 -- @tparam table req the chat request
 -- @tparam lgml.server.engine.Sink sink the reply
 -- @treturn[1] boolean true
@@ -317,6 +327,21 @@ function E:decide(req, ctl)
 	return a, b, c
 end
 
+-- Sampler options for the grammar of req: {} when it has none, or nil
+-- and an error. With thinking on, the grammar applies after the block.
+function E:grammar_opts(req, think, prompt)
+	local text, err = grammar.from_request(req)
+	if not text then
+		return err == nil and {} or nil, err
+	end
+	local root, tags = "root", THINK[self.family_name]
+	if think and tags then
+		local opened = prompt:gsub("%s+$", ""):sub(-#tags[1]) == tags[1]
+		text, root = grammar.reasoning(text, tags[1], tags[2], opened)
+	end
+	return { grammar = text, grammar_root = root, tokenizer = self.tk }
+end
+
 function E:run(req, sink)
 	local think = thinking(req)
 	local kw = type(req.chat_template_kwargs) == "table" and req.chat_template_kwargs or {}
@@ -332,7 +357,15 @@ function E:run(req, sink)
 	end
 	local max = req.max_completion_tokens or req.max_tokens
 	max = math.min(max or self.n_ctx, self.n_ctx - #prompt)
-	local smp <close> = sampler_opts(req, think)
+	local gopts, gerr = self:grammar_opts(req, think, text)
+	if not gopts then
+		return nil, gerr, 400
+	end
+	local good, smp = pcall(sampler_opts, req, think, gopts)
+	if not good then
+		return nil, tostring(smp):gsub("^.-grammar: ", "grammar: "), 400
+	end
+	local _ <close> = smp
 	local parser = self.family.new_parser({ tools = req.tools, enable_thinking = think })
 	local dec = tokenizer.decoder(self.tk, { special = false })
 	local state = {}

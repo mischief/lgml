@@ -13,6 +13,7 @@ local engine_api = require("lgml.server.engine")
 local multipart = require("lgml.server.multipart")
 local metrics = require("lgml.server.metrics")
 local systemone = require("lgml.systemone")
+local grammar = require("lgml.grammar")
 local base64 = require("lgml.base64")
 
 local M = {}
@@ -131,13 +132,16 @@ local CHECKS = {
 -- It removes top-level nulls and nulls in each message. It checks the
 -- messages and the types of `model`, `stream`, `stream_options`,
 -- `temperature`, `top_p`, `max_tokens`, `max_completion_tokens`,
--- `tools` and `n` (only 1).
+-- `tools` and `n` (only 1). It turns `grammar`, `response_format` or
+-- `json_schema` into GBNF text in `grammar` and checks it (see
+-- `lgml.grammar`); with raw, schema properties keep their order.
 -- @tparam any b the decoded body
+-- @tparam[opt] string raw the body text
 -- @treturn[1] boolean true
 -- @treturn[2] nil
 -- @treturn[2] string an error message
 -- @treturn[2] ?string the bad parameter name
-function M.check_chat(b)
+function M.check_chat(b, raw)
 	if type(b) ~= "table" or json.isarray(b) then
 		return nil, "request body must be a JSON object"
 	end
@@ -151,6 +155,23 @@ function M.check_chat(b)
 		if not ok then
 			return nil, err, c[1]
 		end
+	end
+	if raw and type(b.response_format) == "table" then
+		local o = require("lgml.json_schema").decode(raw)
+		if type(o) == "table" and type(o.response_format) == "table" then
+			b.response_format = o.response_format
+		end
+	end
+	local text, param
+	text, err, param = grammar.from_request(b)
+	if err then
+		return nil, err, param
+	elseif text then
+		ok, err = grammar.check(text)
+		if not ok then
+			return nil, err, b.grammar and "grammar" or "response_format"
+		end
+		b.grammar, b.response_format, b.json_schema = text, nil, nil
 	end
 	return true
 end
@@ -434,7 +455,7 @@ local function chat(eng, req, res)
 	if not body then
 		return res:error(400, "bad JSON: " .. err)
 	end
-	local ok, msg, param = M.check_chat(body)
+	local ok, msg, param = M.check_chat(body, req.body)
 	if not ok then
 		return res:error(400, msg, nil, param)
 	end

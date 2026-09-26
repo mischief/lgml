@@ -134,3 +134,15 @@ put("image", "cmyk.jpg", "\0" .. samples.CMYK_JPEG)
 put("image", "progressive.jpg", "\0" .. samples.PROGRESSIVE_JPEG)
 put("image", "restart.jpg", "\0" .. samples.RESTART_JPEG)
 
+-- grammar: GBNF, NUL, matcher input; or a JSON schema.
+put("grammar", "json", 'root ::= "{" ws (pair ("," ws pair)*)? "}"\npair ::= str ":" ws val ws\n' ..
+    'val ::= str | [0-9]+ | "true" | "null" | root\nstr ::= "\\"" ([^"\\\\] | "\\\\" .)* "\\""\n' ..
+    'ws ::= [ \\n]{0,3}\0\1{\2"a\1"\1:\0001\1}')
+put("grammar", "tokens", "root ::= <[26]> (!<[31]>)* <s> x\nx ::= [\\u00e4\\x30-\\x39]+ | \"😀\"?\0\3<s>ä\0010")
+put("grammar", "repeat", "root ::= (\"ab\" | [^a-c]{2,4} . ){1,3} # c\r\n\0\5ab x yab")
+put("grammar", "think", "root ::= lgml-think-0\nlgml-think-0 ::= \"\\x3C\" lgml-think-1 | [^\\x3C] lgml-think-0\n" ..
+    "lgml-think-1 ::= \"\\x3E\" \"{}\" | \"\\x3C\" lgml-think-1 | [^\\x3C\\x3E] lgml-think-0\0\4ab<<>{}")
+put("grammar", "schema", '{"type":"object","properties":{"a":{"type":"integer","minimum":-5,"maximum":300},' ..
+    '"b":{"type":"array","items":{"$ref":"#/$defs/s"},"minItems":1,"maxItems":3},"c":{"anyOf":[{"const":1},' ..
+    '{"type":"string","pattern":"^[a-z]{2}(x|y)?$"}]},"d":{"type":"string","format":"date"}},' ..
+    '"required":["a"],"additionalProperties":{"type":"number"},"$defs":{"s":{"type":"string","maxLength":4}}}')

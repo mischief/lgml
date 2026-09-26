@@ -624,6 +624,88 @@ local function prompt_cache_check(arch, path)
 	fresh.pc = nil
 end
 
+-- One request through the engine. Returns the result, the error, the
+-- status, the content text and the finish reason.
+local function engine_req(e, req)
+	local parts, reason = {}, nil
+	local sink = {}
+	function sink.content(_, t)
+		parts[#parts + 1] = t
+		return true
+	end
+	sink.reasoning, sink.tool_arguments = sink.content, sink.content
+	function sink.tool_call()
+		return 0
+	end
+	function sink.finish(_, r)
+		reason = r
+	end
+	function sink.cancelled()
+		return false
+	end
+	local res, err, status, done
+	coroutine.wrap(function()
+		res, err, status = e:chat(req, sink)
+		done = true
+	end)()
+	while not done do
+		require("luv").run("once")
+	end
+	return res, err, status, table.concat(parts), reason
+end
+
+-- Random weights give adversarial output: the grammar must hold anyway.
+local function grammar_engine_check(arch, path)
+	local json = require("lgml.json")
+	local e = require("lgml.engine").new({ model = path, backend = "CPU", n_ctx = 512 })
+	local tag = arch .. " grammar: "
+	local msgs = { { role = "user", content = "Give JSON." } }
+	local schema = {
+		type = "object",
+		properties = {
+			a = { type = "integer", minimum = 0, maximum = 99 },
+			b = { enum = { "x", "y" } },
+			c = { type = "array", items = { type = "boolean" }, minItems = 1, maxItems = 3 },
+		},
+		required = { "a", "b", "c" },
+	}
+	local good = 0
+	for seed = 1, 8 do
+		local res, err, _, text, reason = engine_req(e, {
+			messages = msgs, max_tokens = 300, seed = seed, temperature = 1.5,
+			chat_template_kwargs = { enable_thinking = false },
+			response_format = { type = "json_schema", json_schema = { schema = schema } },
+		})
+		local v = res and json.decode(text)
+		if v and reason == "stop" and math.type(v.a) == "integer" and v.a >= 0 and v.a <= 99 and
+		    (v.b == "x" or v.b == "y") and #v.c >= 1 and #v.c <= 3 and type(v.c[1]) == "boolean" then
+			good = good + 1
+		else
+			io.stderr:write(("seed %d: %s %s %q\n"):format(seed, tostring(err), tostring(reason), text))
+		end
+	end
+	ok(good == 8, tag .. good .. " of 8 random-weight answers match the schema")
+	local res, _, _, text, reason = engine_req(e, {
+		messages = msgs, max_tokens = 50, seed = 3, temperature = 1.5,
+		chat_template_kwargs = { enable_thinking = false },
+		grammar = 'root ::= "ab" [0-9]{2} "!"',
+	})
+	ok(res and text:match("^ab%d%d!$") and reason == "stop", tag .. "raw GBNF: " .. text)
+	res, _, _, text = engine_req(e, {
+		messages = msgs, max_tokens = 40, seed = 3, temperature = 1.5,
+		response_format = { type = "json_object" },
+	})
+	ok(res and (#text == 0 or text:match("^%s*{")), tag .. "json_object with thinking starts an object")
+	local _, err, status = engine_req(e, { messages = msgs, grammar = "root ::= nope" })
+	ok(status == 400 and err:find("undefined rule"), tag .. "bad grammar is 400: " .. tostring(err))
+	_, err, status = engine_req(e, { messages = msgs,
+	    response_format = { type = "json_schema", json_schema = { schema = { type = "nope" } } } })
+	ok(status == 400, tag .. "bad schema is 400: " .. tostring(err):gsub("%c", " "))
+	local r2 = engine_req(e, { messages = msgs, max_tokens = 3, top_k = 1,
+	    chat_template_kwargs = { enable_thinking = false } })
+	ok(r2, tag .. "the engine serves after errors")
+end
+
 local be <close> = assert(lgml.backend(os.getenv("LGML_DEVICE") or "CPU"))
 local bin = os.getenv("LGML_LLAMA_LOGITS")
 
@@ -679,6 +761,9 @@ for _, arch in ipairs({ "llama", "qwen3", "qwen3moe", "qwen3next", "qwen35moe", 
 	snapshot_check(arch, m)
 	if arch == "qwen35moe" or arch == "qwen3" then
 		prompt_cache_check(arch, path)
+	end
+	if arch == "qwen3" then
+		grammar_engine_check(arch, path)
 	end
 	m:close()
 	os.remove(path)

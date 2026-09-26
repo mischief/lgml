@@ -18,9 +18,11 @@
 #include <lauxlib.h>
 
 #include "lgml.h"
+#include "grammar.h"
 
 #define SAMPLER_MT	"lgml_sampler"
 #define TOP_P_START	256	/* first partial sort size for top_p */
+#define MASK_TOP	512	/* tokens checked first against a grammar */
 
 struct cand {
 	float		 logit;
@@ -51,6 +53,11 @@ struct sampler {
 	int32_t		*hist;
 	int32_t		 hist_len;
 	int32_t		 hist_pos;
+
+	/* Grammar; the vocab is in the first uservalue. */
+	struct grammar	*g;
+	struct gvocab	*gv;
+	uint8_t		*mask;
 
 	int		 closed;
 };
@@ -188,9 +195,12 @@ ensure_vocab(lua_State *L, struct sampler *s, int64_t vocab)
  * <= 0 picks the largest logit), `top_k` (40; 0 is off), `top_p` (0.95),
  * `min_p` (0.05), `repeat_penalty` (1), `frequency_penalty` (0),
  * `presence_penalty` (0), `repeat_last_n` (64), seed (from the clock).
+ * grammar is GBNF text; tokens must then fit it (see `sampler:sample`).
+ * It needs tokenizer, an object with `n_vocab`, `token` and `special`
+ * methods; `grammar_root` names the start rule (default "root").
  * @tparam[opt] table opts options
  * @treturn sampler the sampler
- * @raise if an option has the wrong type or range
+ * @raise if an option has the wrong type or range, or the grammar is bad
  * @function sampler
  */
 static int
@@ -199,13 +209,16 @@ l_sampler(lua_State *L)
 	struct sampler *s;
 	lua_Integer seed;
 	int isint;
+	const char *text, *root = "root";
+	char err[160];
+	size_t len;
 
 	if (lua_isnoneornil(L, 1)) {
 		lua_settop(L, 0);
 		lua_newtable(L);
 	}
 	luaL_checktype(L, 1, LUA_TTABLE);
-	s = lua_newuserdatauv(L, sizeof(*s), 0);
+	s = lua_newuserdatauv(L, sizeof(*s), 1);
 	memset(s, 0, sizeof(*s));
 	s->closed = 1;
 	luaL_setmetatable(L, SAMPLER_MT);
@@ -239,6 +252,21 @@ l_sampler(lua_State *L)
 			return luaL_error(L, "out of memory");
 	}
 	s->closed = 0;
+	if (lua_getfield(L, 1, "grammar") == LUA_TNIL) {
+		lua_pop(L, 1);
+		return 1;
+	}
+	text = luaL_checklstring(L, -1, &len);
+	if (lua_getfield(L, 1, "grammar_root") != LUA_TNIL)
+		root = luaL_checkstring(L, -1);
+	if (lua_getfield(L, 1, "tokenizer") == LUA_TNIL)
+		return luaL_error(L, "option 'grammar' needs 'tokenizer'");
+	s->gv = gvocab_push(L, -1);
+	lua_setiuservalue(L, 2, 1);
+	if ((s->g = grammar_new(text, len, root, s->gv, 0, err,
+	    sizeof(err))) == NULL)
+		return luaL_error(L, "grammar: %s", err);
+	lua_settop(L, 2);
 	return 1;
 }
 
@@ -261,14 +289,19 @@ sampler_close(lua_State *L)
 	free_buffers(s);
 	free(s->hist);
 	s->hist = NULL;
+	grammar_free(s->g);
+	s->g = NULL;
+	free(s->mask);
+	s->mask = NULL;
 	s->closed = 1;
 	return 0;
 }
 
 /*** Add a token id to the penalty history.
- * The history keeps the last `repeat_last_n` ids.
+ * The history keeps the last `repeat_last_n` ids. With a grammar, the
+ * token also advances the grammar.
  * @tparam int id token id, from 0
- * @raise if the id is negative or too large
+ * @raise if the id is negative or too large, or does not fit the grammar
  * @function sampler:accept
  */
 static int
@@ -280,6 +313,8 @@ sampler_accept(lua_State *L)
 
 	luaL_argcheck(L, v >= 0 && v <= INT32_MAX, 2, "bad token id");
 	id = (int32_t)v;
+	if (s->g != NULL && grammar_accept_token(s->g, s->gv, id) == -1)
+		return luaL_error(L, "grammar: %s", grammar_error(s->g));
 	if (s->last_n == 0)
 		return 0;
 	if (s->hist_len == s->last_n) {
@@ -519,19 +554,23 @@ draw(struct sampler *s, struct cand *c, int64_t n)
 {
 	float m = max_logit(c, n);
 	double sum = 0, run = 0, tgt;
-	int64_t i;
+	int64_t i, last = 0;
 
 	for (i = 0; i < n; i++) {
 		c[i].logit = expf(c[i].logit - m);
 		sum += c[i].logit;
 	}
 	tgt = sum * rng_double(s->rng);
+	/* A zero weight, as from a grammar mask, never wins. */
 	for (i = 0; i < n; i++) {
+		if (c[i].logit <= 0)
+			continue;
 		run += c[i].logit;
+		last = i;
 		if (run >= tgt)
 			return c[i].id;
 	}
-	return c[n - 1].id;
+	return c[last].id;
 }
 
 /* Read one row of the logits tensor into s->logits. */
@@ -583,30 +622,18 @@ argmax(const float *l, int64_t n)
 	return (int32_t)best;
 }
 
-/*** Sample a token id from one row of logits.
- * The innermost dimension of logits is the vocabulary. Penalties from the
- * history apply first.
- * @tparam tensor logits computed, contiguous f32, f16 or bf16 tensor
- * @tparam[opt] int row row number from 1; the default is the last row
- * @treturn int token id, from 0
- * @raise on a bad tensor or row
- * @function sampler:sample
- */
-static int
-sampler_sample(lua_State *L)
+/* Run the chain on s->logits. It leaves s->logits as it is. */
+static int32_t
+chain(struct sampler *s)
 {
-	struct sampler *s = check_sampler(L, 1);
 	struct cand *c;
 	int64_t i, n;
 	int sorted = 0;
 
-	read_row(L, s, 2);
-	apply_penalties(s);
 	n = s->vocab;
 	if (s->temp <= 0.0f) {
 		/* top_k, top_p and min_p always keep the maximum. */
-		lua_pushinteger(L, argmax(s->logits, n));
-		return 1;
+		return argmax(s->logits, n);
 	}
 	c = s->cand;
 	if (s->top_k > 0 && s->top_k < n) {
@@ -628,7 +655,142 @@ sampler_sample(lua_State *L)
 	if (s->temp != 1.0f)
 		for (i = 0; i < n; i++)
 			c[i].logit /= s->temp;
-	lua_pushinteger(L, draw(s, c, n));
+	return draw(s, c, n);
+}
+
+/*
+ * With top_k, the chain sees only the k best tokens that fit. Find them
+ * in the best m tokens and mask the rest. Returns 0 when fewer fit.
+ */
+static int
+mask_top(lua_State *L, struct sampler *s, int64_t k)
+{
+	int32_t ids[MASK_TOP];
+	uint8_t ok[MASK_TOP];
+	float keep[MASK_TOP];
+	int64_t i, m, nok = 0;
+
+	m = s->vocab < MASK_TOP ? s->vocab : MASK_TOP;
+	if (k < 1 || k > m / 4)
+		return 0;
+	heap_top(s->logits, s->vocab, s->cand, m);
+	for (i = 0; i < m; i++)
+		ids[i] = s->cand[i].id;
+	if (grammar_check(s->g, s->gv, ids, (size_t)m, ok) == -1)
+		luaL_error(L, "grammar: %s", grammar_error(s->g));
+	for (i = 0; i < m; i++) {
+		keep[i] = ok[i] ? s->logits[ids[i]] : -INFINITY;
+		nok += ok[i];
+	}
+	if (nok < k)
+		return 0;
+	for (i = 0; i < s->vocab; i++)
+		s->logits[i] = -INFINITY;
+	for (i = 0; i < m; i++)
+		s->logits[ids[i]] = keep[i];
+	return 1;
+}
+
+/*
+ * Keep id when it fits the grammar, as llama.cpp does. Else mask each
+ * token that does not fit and run the chain again.
+ */
+static int32_t
+constrain(lua_State *L, struct sampler *s, int32_t id)
+{
+	int64_t i, nok = 0;
+	int r;
+
+	if (id < s->gv->n) {
+		if ((r = grammar_fits(s->g, s->gv, id)) == -1)
+			luaL_error(L, "grammar: %s", grammar_error(s->g));
+		if (r == 1)
+			return id;
+	}
+	if (mask_top(L, s, s->temp <= 0.0f ? 1 : s->top_k))
+		return chain(s);
+	if (s->mask == NULL &&
+	    (s->mask = malloc(s->gv->n > 0 ? (size_t)s->gv->n : 1)) == NULL)
+		luaL_error(L, "out of memory");
+	if (grammar_mask(s->g, s->gv, s->mask) == -1)
+		luaL_error(L, "grammar: %s", grammar_error(s->g));
+	for (i = 0; i < s->vocab; i++) {
+		if (i < s->gv->n && s->mask[i])
+			nok++;
+		else
+			s->logits[i] = -INFINITY;
+	}
+	if (nok == 0)
+		luaL_error(L, "grammar: no token fits");
+	return chain(s);
+}
+
+/*** Sample a token id from one row of logits.
+ * The innermost dimension of logits is the vocabulary. Penalties from the
+ * history apply first. With a grammar, the chain runs first; when its
+ * token does not fit, each token that does not fit is masked and the
+ * chain runs again. An end-of-generation token fits only where the
+ * grammar can end.
+ * @tparam tensor logits computed, contiguous f32, f16 or bf16 tensor
+ * @tparam[opt] int row row number from 1; the default is the last row
+ * @treturn int token id, from 0
+ * @raise on a bad tensor or row, or when no token fits the grammar
+ * @function sampler:sample
+ */
+static int
+sampler_sample(lua_State *L)
+{
+	struct sampler *s = check_sampler(L, 1);
+	int32_t id;
+
+	read_row(L, s, 2);
+	apply_penalties(s);
+	id = chain(s);
+	if (s->g != NULL)
+		id = constrain(L, s, id);
+	lua_pushinteger(L, id);
+	return 1;
+}
+
+/*** List the token ids that fit the grammar now.
+ * @treturn {int,...} token ids, from 0, ascending
+ * @raise without a grammar
+ * @function sampler:allowed
+ */
+static int
+sampler_allowed(lua_State *L)
+{
+	struct sampler *s = check_sampler(L, 1);
+	lua_Integer k = 0;
+	int32_t i;
+
+	if (s->g == NULL)
+		return luaL_error(L, "sampler has no grammar");
+	if (s->mask == NULL &&
+	    (s->mask = malloc(s->gv->n > 0 ? (size_t)s->gv->n : 1)) == NULL)
+		return luaL_error(L, "out of memory");
+	if (grammar_mask(s->g, s->gv, s->mask) == -1)
+		return luaL_error(L, "grammar: %s", grammar_error(s->g));
+	lua_newtable(L);
+	for (i = 0; i < s->gv->n; i++) {
+		if (s->mask[i]) {
+			lua_pushinteger(L, i);
+			lua_rawseti(L, -2, ++k);
+		}
+	}
+	return 1;
+}
+
+/*** Test whether the grammar can end here.
+ * @treturn boolean true without a grammar, or when the grammar can end
+ * @function sampler:can_end
+ */
+static int
+sampler_can_end(lua_State *L)
+{
+	struct sampler *s = check_sampler(L, 1);
+
+	lua_pushboolean(L, s->g == NULL || grammar_can_end(s->g));
 	return 1;
 }
 
@@ -706,6 +868,8 @@ static const luaL_Reg sampler_methods[] = {
 	{ "sample", sampler_sample },
 	{ "accept", sampler_accept },
 	{ "reset", sampler_reset },
+	{ "allowed", sampler_allowed },
+	{ "can_end", sampler_can_end },
 	{ "close", sampler_close },
 	{ NULL, NULL }
 };
@@ -721,6 +885,7 @@ lgml_open_sample(lua_State *L)
 	lua_pop(L, 1);
 	lua_pushcfunction(L, l_sampler);
 	lua_setfield(L, -2, "sampler");
+	lgml_open_grammar(L);
 	lua_pushcfunction(L, l_randn_philox);
 	lua_setfield(L, -2, "randn_philox");
 }

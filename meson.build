@@ -64,6 +64,7 @@ lgml = shared_module('lgml',
   'src/ops_vibevoice.c',
   'src/ops_nn.c',
   'src/sample.c',
+  'src/grammar.c',
   'src/tokenize.c',
   'src/json.c',
   'src/safetensors.c',
@@ -120,6 +121,8 @@ if lua_bin.found()
   test('worker', lua_bin, args : [files('test/test_worker.lua')], timeout : 60)
   test('chat', lua_bin, args : [files('test/test_chat.lua')], timeout : 60)
   test('sample', lua_bin, args : [files('test/test_sample.lua')], timeout : 120)
+  test('grammar', lua_bin, args : [files('test/test_grammar.lua')], timeout : 60)
+  test('json_schema', lua_bin, args : [files('test/test_json_schema.lua')], timeout : 60)
   test('ops', lua_bin, args : [files('test/test_ops.lua')],
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
     timeout : 60)
@@ -172,7 +175,7 @@ lfuzz = executable('lfuzz', 'fuzz/lfuzz.c',
   dependencies : [ggml, lua, m, png, jpeg, cc.find_library('dl', required : false)],
   export_dynamic : true,
 )
-foreach t : ['json', 'chat', 'http', 'safetensors', 'vocab', 'wav', 'tokenize', 'image']
+foreach t : ['json', 'chat', 'http', 'safetensors', 'vocab', 'wav', 'tokenize', 'image', 'grammar']
   test('fuzz_' + t, lfuzz,
     args : [files('fuzz' / t + '.lua'), meson.current_source_dir() / 'fuzz' / 'corpus' / t],
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },

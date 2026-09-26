@@ -1,0 +1,1 @@
+{"type":"object","properties":{"a":{"type":"integer","minimum":-5,"maximum":300},"b":{"type":"array","items":{"$ref":"#/$defs/s"},"minItems":1,"maxItems":3},"c":{"anyOf":[{"const":1},{"type":"string","pattern":"^[a-z]{2}(x|y)?$"}]},"d":{"type":"string","format":"date"}},"required":["a"],"additionalProperties":{"type":"number"},"$defs":{"s":{"type":"string","maxLength":4}}}

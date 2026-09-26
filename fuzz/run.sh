@@ -46,7 +46,7 @@ fi
 
 secs=${1:-600}
 [ $# -gt 0 ] && shift
-targets=${*:-json chat http safetensors vocab wav tokenize image}
+targets=${*:-json chat http safetensors vocab wav tokenize image grammar}
 
 for t in $targets; do
 	mkdir -p "$b/out"
