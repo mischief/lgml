@@ -99,6 +99,7 @@ end
 -- changes nothing, if any.
 local NEUTRAL = {
 	{ "temperature" }, { "top_p" }, { "top_k" }, { "min_p" }, { "grammar" }, { "lora" },
+	{ "reasoning_budget" },
 	{ "presence_penalty", 0 }, { "frequency_penalty", 0 }, { "repeat_penalty", 1 },
 	{ "logprobs", false },
 }
@@ -133,9 +134,10 @@ end
 -- "none"` and `chat_template_kwargs.enable_thinking`. The sampler
 -- fields (temperature, `top_p`, `top_k`, `min_p`, the penalties,
 -- `logit_bias` and `logprobs`), a grammar or JSON schema, `lora`, other
--- template kwargs and a `tool_choice` that forces a call give status
--- 400. A Lua error resets the cache and returns
--- status 500.
+-- template kwargs, `reasoning_budget` and a `tool_choice` that forces a
+-- call give status 400. A Lua error resets the cache and returns
+-- status 500. `count_only`, `sink:prompt` and the `stop_sequence` of
+-- the usage work as in `lgml.engine`.
 -- @tparam table req the chat request
 -- @tparam lgml.server.engine.Sink sink the reply
 -- @treturn[1] boolean true
@@ -169,6 +171,11 @@ function E:run(req, sink)
 		tools = req.tools, add_generation_prompt = true, enable_thinking = thinking(req),
 	})
 	local prompt = self.tk:encode(text)
+	if req.count_only then
+		sink:finish("stop", { prompt_tokens = #prompt, completion_tokens = 0, cached_tokens = 0,
+		    reasoning_tokens = 0 })
+		return true
+	end
 	if #prompt + C > self.n_ctx then
 		return nil, ("prompt (%d tokens) + canvas (%d tokens) exceeds the context (%d tokens)")
 		    :format(#prompt, C, self.n_ctx), 400
@@ -186,6 +193,9 @@ function E:run(req, sink)
 	while cached < self.cache.n and cached < #prompt and
 	    self.cache.tokens[cached + 1] == prompt[cached + 1] do
 		cached = cached + 1
+	end
+	if sink.prompt and not sink:prompt(#prompt, cached) then
+		return true
 	end
 	local n, cuts, reason, stopped = 0, 0, "length", false
 	while n < max and #prefix + C <= self.n_ctx do
@@ -237,7 +247,7 @@ function E:run(req, sink)
 	local t1 = lgml.clock()
 	sink:finish(reason, {
 		prompt_tokens = #prompt, completion_tokens = n, cached_tokens = cached,
-		reasoning_tokens = out.reasoning_tokens,
+		reasoning_tokens = out.reasoning_tokens, stop_sequence = out.stop_sequence,
 	}, {
 		cache_n = cached, prompt_n = #prompt - cached,
 		predicted_n = n, predicted_ms = (t1 - t0) * 1000,

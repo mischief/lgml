@@ -7,7 +7,8 @@
 -- Stop strings apply to the content only. The output holds back
 -- content that can be the start of a stop string. When the content
 -- holds a stop string, the output sends the text before it and ends
--- the reply; the stop string does not go out.
+-- the reply; the stop string does not go out. The field
+-- `stop_sequence` then holds that stop string.
 --
 -- A token can carry a logprobs entry (see `lgml.server.engine.Sink`).
 -- The output keeps the entries of content tokens, and sends them with
@@ -80,15 +81,15 @@ function O:content(text)
 		return self:send(text)
 	end
 	local s = self.hold .. text
-	local cut
+	local cut, which
 	for _, st in ipairs(self.stops) do
 		local i = s:find(st, 1, true)
 		if i and (not cut or i < cut) then
-			cut = i
+			cut, which = i, st
 		end
 	end
 	if cut then
-		self.hold = ""
+		self.hold, self.stop_sequence = "", which
 		return self:send(s:sub(1, cut - 1), true) and "stop" or nil
 	end
 	local k = partial(s, self.stops)
@@ -170,6 +171,12 @@ end
 -- @treturn boolean
 function O:in_content()
 	return CONTENT[self.parser.state] == true
+end
+
+--- True when the parser reads a reasoning block.
+-- @treturn boolean
+function O:in_reasoning()
+	return self.parser ~= nil and self.parser.state == "reasoning"
 end
 
 --- Ends the output: feeds the rest of the text, ends the parser and

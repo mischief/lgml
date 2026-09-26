@@ -182,6 +182,12 @@ local function emit(self, delta, lp)
 	return send(self.reply, chunk(self.reply, { choice(self, delta, nil, lp) }))
 end
 
+-- A chat stream starts at the first output, so the prompt size is not
+-- needed here.
+function Sink:prompt()
+	return alive(self)
+end
+
 function Sink:reasoning(text)
 	if text == "" then
 		return alive(self)

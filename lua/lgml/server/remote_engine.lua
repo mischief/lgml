@@ -332,6 +332,8 @@ local function forward(sink, map, v)
 		return idx
 	elseif k == "tool_args" then
 		return sink:tool_arguments(map[v.index], v.text)
+	elseif k == "prompt" and sink.prompt then
+		return sink:prompt(v.n, v.cached)
 	end
 	return true
 end

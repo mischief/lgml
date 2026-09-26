@@ -51,6 +51,10 @@ local function proxy(ch, id)
 		return delta({ k = "tool_args", index = index, text = text })
 	end
 
+	function s.prompt(_, n, cached)
+		return delta({ k = "prompt", n = n, cached = cached })
+	end
+
 	function s.finish(_, reason, usage, timings)
 		s.done = { reason = reason, usage = usage, timings = timings }
 	end

@@ -146,7 +146,11 @@ end
 -- `max_tokens`, `max_completion_tokens`, `stream`, sampler settings,
 -- `seed`, `stop`, `logprobs`, `top_logprobs`, `logit_bias`,
 -- `reasoning_effort` and `chat_template_kwargs`. An engine that
--- cannot do a field of the request returns status 400.
+-- cannot do a field of the request returns status 400. The server can
+-- also set `reasoning_budget`, the most reasoning tokens before the
+-- engine closes the reasoning block, and `count_only`: the engine then
+-- renders the prompt and finishes with reason `stop` and the prompt
+-- size in `usage.prompt_tokens`, with no prefill and no output.
 -- @tparam Sink sink the reply
 -- @treturn[1] boolean true
 -- @treturn[2] nil
@@ -301,12 +305,23 @@ end
 -- @raise when no call has that index, or when the reply is finished
 -- @function tool_arguments
 
+--- Tells the prompt size before the prefill. This method is optional
+-- for a sink; an engine calls it when the sink has it.
+-- @tparam int n the prompt tokens
+-- @tparam int cached the prompt tokens reused from the cache
+-- @treturn[1] boolean true
+-- @treturn[2] nil
+-- @treturn[2] string `"cancelled"`
+-- @function prompt
+
 --- Ends the reply. Call it once.
 -- The server changes reason `stop` to `tool_calls` when the reply has
 -- tool calls.
 -- @tparam string reason `"stop"`, `"length"` or `"tool_calls"`
 -- @tparam[opt] table usage `{ prompt_tokens, completion_tokens, cached_tokens,
--- reasoning_tokens }`; completion_tokens counts the reasoning tokens too
+-- reasoning_tokens, stop_sequence }`; completion_tokens counts the
+-- reasoning tokens too; stop_sequence is the stop string that ended
+-- the reply, if one did
 -- @tparam[opt] table timings llama.cpp timings: `cache_n`, `prompt_n`,
 -- `prompt_ms`, `predicted_n`, `predicted_ms` and `predicted_per_second`
 -- @raise when reason is not valid, or on a second call

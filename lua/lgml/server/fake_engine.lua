@@ -54,21 +54,61 @@ function F:props()
 	return { n_ctx = self.n_ctx, total_slots = self.total_slots }
 end
 
+-- The text of message content: a string, or its text parts joined.
+local function text_of(content)
+	if type(content) == "string" then
+		return content
+	end
+	local t = {}
+	for _, p in ipairs(type(content) == "table" and content or {}) do
+		if type(p) == "table" and p.type == "text" then
+			t[#t + 1] = p.text
+		end
+	end
+	return table.concat(t, "\n")
+end
+
+-- The number of image parts of message content.
+local function images_of(content)
+	local k = 0
+	for _, p in ipairs(type(content) == "table" and content or {}) do
+		if type(p) == "table" and p.type == "image_url" then
+			k = k + 1
+		end
+	end
+	return k
+end
+
 local function last_user(req)
 	for i = #req.messages, 1, -1 do
 		local m = req.messages[i]
-		if m.role == "user" and type(m.content) == "string" then
-			return m.content
+		if m.role == "user" then
+			return text_of(m.content)
 		end
 	end
 	return ""
 end
 
+local function thinking(req)
+	local k = req.chat_template_kwargs
+	if type(k) == "table" and k.enable_thinking ~= nil then
+		return k.enable_thinking ~= false
+	end
+	return req.reasoning_effort ~= "none"
+end
+
 local function plan(req)
-	local p = {
-		{ "reasoning", "The user asks " }, { "reasoning", "about Paris." },
-		{ "content", "Let me " }, { "content", "check the weather." },
-	}
+	local p = {}
+	if thinking(req) then
+		local budget = math.tointeger(req.reasoning_budget) or 2
+		for i, text in ipairs({ "The user asks ", "about Paris." }) do
+			if i <= budget then
+				p[#p + 1] = { "reasoning", text }
+			end
+		end
+	end
+	p[#p + 1] = { "content", "Let me " }
+	p[#p + 1] = { "content", "check the weather." }
 	local tool = req.tools and req.tools[1]
 	local name = tool and tool["function"] and tool["function"].name
 	local tc = req.tool_choice
@@ -86,7 +126,7 @@ end
 local function prompt_tokens(req)
 	local n = 0
 	for _, m in ipairs(req.messages) do
-		n = n + #(type(m.content) == "string" and m.content or "") // 4 + 4
+		n = n + #text_of(m.content) // 4 + 4 + 16 * images_of(m.content)
 	end
 	return n
 end
@@ -95,7 +135,7 @@ end
 local function render(req)
 	local t = {}
 	for _, m in ipairs(req.messages) do
-		t[#t + 1] = ("<|%s|>\n%s\n"):format(m.role, type(m.content) == "string" and m.content or "")
+		t[#t + 1] = ("<|%s|>\n%s\n"):format(m.role, text_of(m.content))
 	end
 	t[#t + 1] = "<|assistant|>\n"
 	return table.concat(t)
@@ -137,10 +177,16 @@ function F:cancel()
 end
 
 --- Streams the canned reply.
--- With tools, the reply calls the first tool, or the tool that
--- `tool_choice` names.
--- The user message `"fail"` makes the call fail before any output. The
--- reply counts one token per piece and stops at `max_tokens`. `stop`
+-- The reply has two reasoning pieces, unless thinking is off
+-- (`reasoning_effort` `"none"` or `chat_template_kwargs.enable_thinking`
+-- false); `reasoning_budget` keeps that many of them. With tools, the
+-- reply calls the first tool, or the tool that `tool_choice` names.
+-- It calls `sink:prompt` before the first piece. `count_only` finishes
+-- at once with the prompt size.
+-- The last user message `"fail"` makes the call fail before any output.
+-- The prompt counts a quarter token per byte of text, 4 per message and
+-- 16 per image part. The reply counts one token per piece and stops at
+-- `max_tokens`. `stop`
 -- strings apply to the content, as `lgml.chat.output` applies them. With
 -- `logprobs`, each content piece is one token with logprob -0.5; its
 -- `top_logprobs` alternatives are the piece and then "x", "y", ...
@@ -161,8 +207,15 @@ function F:chat(req, sink)
 	local max = req.max_completion_tokens or req.max_tokens
 	local usage = { prompt_tokens = prompt_tokens(req),
 	    completion_tokens = 0, cached_tokens = 0, reasoning_tokens = 0 }
+	if req.count_only then
+		sink:finish("stop", usage)
+		return true
+	end
 	if log.want_prompt() then
 		log.prompt(L, "chat", render(req), "model", self.model, "tokens", usage.prompt_tokens)
+	end
+	if sink.prompt and not sink:prompt(usage.prompt_tokens, 0) then
+		return self:cancel()
 	end
 	local out = output.new(sink, nil, { stop = req.stop })
 	for _, piece in ipairs(plan(req)) do
@@ -186,6 +239,7 @@ function F:chat(req, sink)
 			usage.reasoning_tokens = usage.reasoning_tokens + 1
 		end
 		if r == "stop" then
+			usage.stop_sequence = out.stop_sequence
 			sink:finish("stop", usage)
 			return true
 		end

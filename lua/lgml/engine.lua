@@ -49,6 +49,14 @@ local THINK = {
 	gemma4 = { "<|channel>thought", "<channel|>" },
 }
 
+-- The text that closes a reasoning block at the reasoning budget, as
+-- the chat template renders the end of the block.
+local THINK_END = {
+	qwen3 = "\n</think>\n\n",
+	qwen35 = "\n</think>\n\n",
+	gemma4 = "<channel|>",
+}
+
 -- The largest context, in steps of 256, whose cache fits in the free
 -- memory of the model's device. nil when the device does not report it.
 local function fit_ctx(be, model, max, copts)
@@ -453,7 +461,11 @@ end
 -- `preserve_thinking`. `grammar` (GBNF) or `response_format` (see
 -- `lgml.grammar.from_request`) constrain the answer; a reasoning block
 -- before it stays free. A bad grammar returns status 400. A Lua error
--- resets the cache and returns status 500.
+-- resets the cache and returns status 500. `reasoning_budget` closes
+-- the reasoning block after that many reasoning tokens. `count_only`
+-- renders and tokenizes the prompt and ends with its size, with no
+-- prefill. The sink gets `prompt` before the prefill, and the finish
+-- usage has `stop_sequence` when a stop string ended the reply.
 -- @tparam table req the chat request
 -- @tparam lgml.server.engine.Sink sink the reply
 -- @treturn[1] boolean true
@@ -735,6 +747,11 @@ function E:run_prompt(req, sink)
 			return nil, err, 400
 		end
 	end
+	if req.count_only then
+		sink:finish("stop", { prompt_tokens = #prompt, completion_tokens = 0, cached_tokens = 0,
+		    reasoning_tokens = 0 })
+		return true
+	end
 	if log.want_prompt() then
 		log.prompt(L, "chat", self:shown_prompt(text, images), "model", self.id, "tokens", #prompt,
 		    "images", #images > 0 and #images or nil, "thinking", think)
@@ -773,6 +790,9 @@ function E:run_prompt(req, sink)
 	local cached = self:reuse(prompt)
 	L:debug("prefill", "tokens", #prompt, "cached", cached, "restored", self.pc and self.pc.restored or 0,
 	    "compute", #prompt - cached)
+	if sink.prompt and not sink:prompt(#prompt, cached) then
+		return true
+	end
 	local logits = self:prefill(prompt, cached + 1, sink)
 	if not logits then
 		return true
@@ -780,8 +800,16 @@ function E:run_prompt(req, sink)
 	local t1 = lgml.clock()
 	local n, reason, stopped = 0, "length", false
 	local tracing = log.level >= log.TRACE
+	-- At the reasoning budget, the tokens of the block end replace sampling.
+	local budget = think and THINK_END[self.family_name] and math.tointeger(req.reasoning_budget)
+	local forced
 	while n < max do
-		local id = smp:sample(logits)
+		local id
+		if forced and #forced > 0 then
+			id = table.remove(forced, 1)
+		else
+			id = smp:sample(logits)
+		end
 		smp:accept(id)
 		n = n + 1
 		if self.eog[id] then
@@ -801,6 +829,10 @@ function E:run_prompt(req, sink)
 			break
 		elseif not r then
 			return true
+		end
+		if budget and not forced and out:in_reasoning() and out.reasoning_tokens >= budget then
+			forced = self.tk:encode(THINK_END[self.family_name])
+			L:debug("reasoning budget", "tokens", out.reasoning_tokens)
 		end
 		if n >= max then
 			break
@@ -824,7 +856,7 @@ function E:run_prompt(req, sink)
 	local t2 = lgml.clock()
 	sink:finish(reason, {
 		prompt_tokens = #prompt, completion_tokens = n, cached_tokens = cached,
-		reasoning_tokens = out.reasoning_tokens,
+		reasoning_tokens = out.reasoning_tokens, stop_sequence = out.stop_sequence,
 	}, {
 		cache_n = cached, restored_n = self.pc and self.pc.restored or 0,
 		prompt_n = #prompt - cached, prompt_ms = (t1 - t0) * 1000,

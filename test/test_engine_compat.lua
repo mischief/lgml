@@ -259,12 +259,69 @@ local function test_tool_choice()
 	ok(r.res and #r.tools == 0, "none: no calls")
 end
 
+-- The id of the vocab entry with text t.
+local function token_id(t)
+	for id = 0, e.tk:n_vocab() - 1 do
+		if e.tk:token(id) == t then
+			return id
+		end
+	end
+	error("no token " .. t)
+end
+
+-- The stop string in the usage, the prompt size before the prefill,
+-- count_only and the reasoning budget.
+local function test_request_extras()
+	local base = chat()
+	local c = text(base.content)
+	local stop = c:match("[%w%p ][%w%p ]", 3)
+	if stop then
+		local r = chat({ stop = { "\0never", stop } })
+		ok(r.usage.stop_sequence == stop, ("usage names the stop string %q"):format(stop))
+	end
+	ok(base.usage.stop_sequence == nil, "no stop string, no stop_sequence")
+	local r = recorder()
+	local seen
+	function r.sink.prompt(_, n, cached)
+		seen = { n = n, cached = cached, content = #r.content }
+		return true
+	end
+	local done
+	coroutine.wrap(function()
+		e:chat({ messages = { { role = "user", content = "Hi there" } }, max_tokens = 4,
+			temperature = 0, chat_template_kwargs = { enable_thinking = false } }, r.sink)
+		done = true
+	end)()
+	while not done do
+		uv.run("once")
+	end
+	ok(seen and seen.n == r.usage.prompt_tokens and seen.cached == r.usage.cached_tokens and
+	    seen.content == 0, "the sink gets the prompt size before any output")
+	local count = chat({ count_only = true, max_tokens = 5 })
+	ok(count.res and count.reason == "stop" and count.usage.prompt_tokens == base.usage.prompt_tokens and
+	    count.usage.completion_tokens == 0 and #count.content == 0, "count_only gives the prompt size only")
+	local think = { [tostring(token_id("<think>"))] = 100 }
+	local long = chat({ max_tokens = 30, logit_bias = think, chat_template_kwargs = { enable_thinking = true } })
+	ok(long.usage.reasoning_tokens == 30, "a biased model reasons to the token limit")
+	local close = #e.tk:encode("\n</think>\n\n")
+	local cut = chat({ max_tokens = 30, logit_bias = think, reasoning_budget = 5,
+		chat_template_kwargs = { enable_thinking = true } })
+	ok(cut.usage.reasoning_tokens >= 5 and cut.usage.reasoning_tokens <= 5 + close,
+	    ("the reasoning budget closes the block: %d reasoning tokens"):format(cut.usage.reasoning_tokens))
+	ok(#text(cut.content) > 0, "the reply goes on after the block")
+	local off = chat({ max_tokens = 30, logit_bias = think, reasoning_budget = 5 })
+	local plain = chat({ max_tokens = 30, logit_bias = think })
+	ok(off.usage.reasoning_tokens == plain.usage.reasoning_tokens and
+	    text(off.content) == text(plain.content), "with thinking off the budget does nothing")
+end
+
 test_output()
 test_tool_grammars()
 test_stop()
 test_logprobs()
 test_logit_bias()
 test_tool_choice()
+test_request_extras()
 os.remove(path)
 print("1.." .. n)
 os.exit(failed == 0 and 0 or 1)

@@ -703,7 +703,7 @@ local function test_logging(port)
 	    req_line:find("<data image/png 370B sha256:", 1, true) and not req_line:find("iVBOR", 1, true),
 	    "debug logs the body with the data URL elided")
 	local prompt = find_line(got, 'msg="chat prompt"')
-	ok(prompt and prompt:find('text="<|system|>\\nBe brief.\\n<|user|>\\n\\n<|user|>\\nweather in Paris?\\n' ..
+	ok(prompt and prompt:find('text="<|system|>\\nBe brief.\\n<|user|>\\nwhat is this?\\n<|user|>\\nweather in Paris?\\n' ..
 	    '<|assistant|>\\n"', 1, true), "debug logs the rendered prompt")
 	ok(find_line(got, "msg=finish reason=stop") and find_line(got, 'msg=reply ') and
 	    find_line(got, "msg=access "), "debug logs the finish reason and the reply")
