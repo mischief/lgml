@@ -46,8 +46,8 @@ one row are aliases for one handler.
 | GET | `/v1/models`, `/models` | OpenAI | [Models](#models) |
 | POST | `/models/load`, `/v1/models/load` | lgml | [Load and unload](#load-and-unload) |
 | POST | `/models/unload`, `/v1/models/unload` | lgml | [Load and unload](#load-and-unload) |
-| GET | `/props` | llama.cpp | [Server properties and adapters](#server-properties-and-adapters) |
-| GET | `/lora-adapters` | llama.cpp | [Server properties and adapters](#server-properties-and-adapters) |
+| GET | `/props`, `/v1/props` | llama.cpp | [Server properties and adapters](#server-properties-and-adapters) |
+| GET | `/lora-adapters`, `/v1/lora-adapters` | llama.cpp | [Server properties and adapters](#server-properties-and-adapters) |
 | GET | `/health`, `/v1/health` | llama.cpp | [Health](#health) |
 | GET | `/metrics` | lgml | [Metrics](#metrics) |
 | GET | `/openapi.json`, `/v1/openapi.json` | lgml | [OpenAPI document](#openapi-document) |
@@ -596,7 +596,7 @@ curl -s localhost:8080/models/unload -d '{"model": "qwen3-14b"}'
 
 ## Server properties and adapters
 
-`GET /props`. llama.cpp. It gives a subset of the llama-server fields:
+`GET /props` (alias `/v1/props`). llama.cpp. It gives a subset of the llama-server fields:
 
 ```json
 {"default_generation_settings": {"n_ctx": 16384, "params": {}},
@@ -608,7 +608,7 @@ With several models, the fields come from the first chat model.
 `model_path` is the model id. `modalities` is absent when the engine
 does not give it.
 
-`GET /lora-adapters`. llama.cpp. It lists the adapters of the first
+`GET /lora-adapters` (alias `/v1/lora-adapters`). llama.cpp. It lists the adapters of the first
 chat model, as llama-server does:
 
 ```json
@@ -632,7 +632,8 @@ models.
 
 ## Metrics
 
-`GET /metrics`. lgml. It gives Prometheus text
+`GET /metrics`. lgml. It has no `/v1` alias: `/metrics` is the path
+that Prometheus scrapes by default. It gives Prometheus text
 (`text/plain; version=0.0.4`). Each metric has the prefix `lgml_` and
 the label `model`, the id of the model that served the request. An
 unknown id in a request does not make a new label value. A request

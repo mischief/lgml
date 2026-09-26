@@ -976,12 +976,18 @@ local function image_edits(eng, req, res)
 end
 
 --- Adds the OpenAI routes for eng to srv.
--- The routes are `/health`, `/v1/health`, `/models`, `/v1/models`,
--- `/props`, `/openapi.json` (also under `/v1`; see
--- `lgml.server.openapi`), `/lora-adapters` (the adapters from the `lora` field of
--- the engine props, as llama-server lists them), `/chat/completions`, `/audio/speech`,
--- `/audio/transcriptions`, `/systemone`, `/images/generations` and
--- `/images/edits`, the last six also under `/v1`. A route for a method that eng does not have gives 404.
+-- Each route below is also under `/v1`, except `/metrics`:
+--
+-- - `/health`, `/models`, `/props` and `/openapi.json` (see
+--   `lgml.server.openapi`)
+-- - `/lora-adapters`: the adapters from the `lora` field of the engine
+--   props, as llama-server lists them
+-- - `/metrics`: Prometheus text (see `lgml.server.metrics`), at the path
+--   that Prometheus scrapes by default
+-- - `/chat/completions`, `/audio/speech`, `/audio/transcriptions`,
+--   `/systemone`, `/images/generations` and `/images/edits`
+--
+-- A route for a method that eng does not have gives 404.
 -- `/v1/systemone` is Jev's System One API (see `lgml.systemone`): a
 -- bad request gives 422 with a FastAPI `detail` list (400 for an http
 -- image URL in `attachments`), and other errors give `{ detail =
@@ -1035,13 +1041,17 @@ function M.install(srv, eng)
 	srv:route("GET", "/v1/health", health)
 	srv:route("GET", "/v1/models", list)
 	srv:route("GET", "/models", list)
-	srv:route("GET", "/props", function(_, res)
+	local function get_props(_, res)
 		return props(eng, res)
-	end)
-	srv:route("GET", "/lora-adapters", function(_, res)
+	end
+	srv:route("GET", "/props", get_props)
+	srv:route("GET", "/v1/props", get_props)
+	local function adapters(_, res)
 		local lora = eng:props().lora or {}
 		return res:json(200, #lora > 0 and lora or json.array())
-	end)
+	end
+	srv:route("GET", "/lora-adapters", adapters)
+	srv:route("GET", "/v1/lora-adapters", adapters)
 	srv:route("POST", "/v1/chat/completions", completions)
 	srv:route("POST", "/chat/completions", completions)
 	local function transcribe(req, res)

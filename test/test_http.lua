@@ -179,6 +179,12 @@ local function test_basic(port)
 	ok(b.default_generation_settings.n_ctx == 4096 and b.total_slots == 2,
 	    "props n_ctx and total_slots")
 
+	local v1 = body_json(roundtrip(port, request("GET", "/v1/props")))
+	ok(v1 and v1.total_slots == 2, "/v1/props is an alias")
+	r = roundtrip(port, request("GET", "/v1/lora-adapters"))
+	ok(r.status == 200 and r.body:match("^%[%]%s*$"), "/v1/lora-adapters is an alias")
+	ok(roundtrip(port, request("GET", "/v1/metrics")).status == 404, "/metrics has no /v1 alias")
+
 	r = roundtrip(port, request("GET", "/health"))
 	ok(r.status == 200 and body_json(r).status == "ok", "health")
 
