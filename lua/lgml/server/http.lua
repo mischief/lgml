@@ -29,10 +29,12 @@ M.reasons = {
 	[100] = "Continue", [200] = "OK", [204] = "No Content",
 	[400] = "Bad Request", [401] = "Unauthorized", [403] = "Forbidden",
 	[404] = "Not Found", [405] = "Method Not Allowed",
-	[408] = "Request Timeout", [411] = "Length Required",
+	[408] = "Request Timeout", [409] = "Conflict", [411] = "Length Required",
 	[413] = "Content Too Large", [415] = "Unsupported Media Type",
-	[429] = "Too Many Requests",
+	[422] = "Unprocessable Content", [429] = "Too Many Requests",
 	[431] = "Request Header Fields Too Large",
+	-- nginx uses 499 when the client closes the connection first.
+	[499] = "Client Closed Request",
 	[500] = "Internal Server Error", [501] = "Not Implemented",
 	[503] = "Service Unavailable", [505] = "HTTP Version Not Supported",
 }

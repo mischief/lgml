@@ -4,6 +4,7 @@
 local uv = require("luv")
 local json = require("lgml.json")
 local server = require("lgml.server.httpd")
+local http = require("lgml.server.http")
 local openai = require("lgml.server.openai")
 local fake = require("lgml.server.fake_engine")
 local stream = require("lgml.server.stream")
@@ -95,7 +96,7 @@ local function read_response(c, on_chunk, head)
 		return nil
 	end
 	local r = { status = tonumber(status_line:match("^HTTP/1%.%d (%d+)")),
-	    headers = {} }
+	    reason = status_line:match("^HTTP/1%.%d %d+ (.*)$"), headers = {} }
 	for l in function() return line(c) end do
 		if l == "" then
 			break
@@ -209,6 +210,12 @@ local function test_errors(port)
 	r = roundtrip(port, request("GET", "/nope"))
 	ok(r.status == 404 and body_json(r).error.type == "not_found_error",
 	    "unknown path gives 404")
+	ok(r.reason == "Not Found", "status line has the reason phrase")
+
+	r = roundtrip(port, request("POST", "/v1/systemone", "{bad"))
+	ok(r.status == 422 and r.reason == "Unprocessable Content", "422 has its reason phrase")
+	ok(http.reasons[409] == "Conflict" and http.reasons[499] == "Client Closed Request",
+	    "409 and 499 have reason phrases")
 
 	r = roundtrip(port, request("DELETE", "/v1/models"))
 	ok(r.status == 405 and r.headers.allow == "GET", "wrong method gives 405")
