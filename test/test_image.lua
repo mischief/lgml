@@ -430,5 +430,28 @@ do
 	m2:close()
 end
 
+-- The engine gives 499 only for a cancel; other pipeline failures give 500.
+do
+	local pipeline = require("lgml.image.pipeline")
+	local load = pipeline.load
+	local fail
+	pipeline.load = function()
+		return { generate = function(_, req)
+			if req.step(1, 1) == false then
+				return nil, "cancelled"
+			end
+			return nil, fail
+		end }
+	end
+	local eng = require("lgml.image.engine").new({ dit = "d.gguf", llm = "q.gguf", vae = "ae.safetensors" })
+	pipeline.load = load
+	fail = "out of memory"
+	local r, msg, status = eng:generate({ prompt = "x", width = 64, height = 64 })
+	ok(r == nil and msg == "out of memory" and status == 500, "a pipeline failure gives 500")
+	r, msg, status = eng:generate({ prompt = "x", width = 64, height = 64 },
+	    { cancelled = function() return true end })
+	ok(r == nil and msg == "cancelled" and status == 499, "a cancel gives 499")
+end
+
 print("1.." .. n)
 os.exit(failed == 0 and 0 or 1)

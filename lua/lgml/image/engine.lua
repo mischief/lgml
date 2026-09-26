@@ -109,6 +109,7 @@ function E:run(req, ctl)
 	    "negative_prompt", req.negative_prompt)
 	local out = { images = {}, seeds = {}, width = w, height = h, steps = 0, sample_ms = 0,
 	    decode_ms = 0, encode_ms = 0 }
+	local stopped = false
 	for i = 1, req.n or 1 do
 		local img, tm = self.p:generate({
 			prompt = req.prompt, negative_prompt = req.negative_prompt, width = w, height = h,
@@ -118,11 +119,16 @@ function E:run(req, ctl)
 				if coroutine.isyieldable() then
 					stream.sleep(0)
 				end
-				return not (ctl and ctl.cancelled and ctl.cancelled())
+				stopped = ctl and ctl.cancelled and ctl.cancelled() or false
+				return not stopped
 			end,
 		})
 		if not img then
-			return nil, tm, 499
+			if image then
+				image:close()
+			end
+			-- 499 only for a cancel; any other failure is a server error.
+			return nil, tostring(tm or "image generation failed"), stopped and 499 or 500
 		end
 		L:debug("image", "index", i, "seed", seed + i - 1, "steps", tm.steps, "encode_ms", tm.encode_ms,
 		    "sample_ms", tm.sample_ms, "decode_ms", tm.decode_ms)
