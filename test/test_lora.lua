@@ -1,10 +1,11 @@
--- LoRA adapters on tiny models: inference against merged weights,
--- replay, and training a tiny adapter to overfit one sequence. Output
--- is TAP.
+-- LoRA adapters on tiny models: inference against merged weights, file
+-- round trips (gguf and PEFT), replay, and training a tiny adapter to
+-- overfit one sequence. Output is TAP.
 local lgml = require("lgml")
 local transformer = require("lgml.transformer")
 local lora = require("lgml.lora")
 local optim = require("lgml.optim")
+local json = require("lgml.json")
 
 local here = debug.getinfo(1, "S").source:match("^@(.*/)") or "./"
 package.path = here .. "?.lua;" .. package.path
@@ -74,8 +75,8 @@ end
 
 local ids = { 104, 101, 108, 108, 111, 32, 119, 111, 114, 108, 100 }
 
--- Inference: a new adapter changes nothing, and a trained one matches
--- the merged weights.
+-- Inference: a new adapter changes nothing, a trained one matches the
+-- merged weights, and files round trip.
 do
 	local path = tmp(".gguf")
 	local byname = tiny.write(path, "qwen3")
@@ -98,11 +99,19 @@ do
 	ok(d < 1e-3, ("adapter matches merged weights (%.2e)"):format(d))
 	merged:close()
 
-	ad.scale = 0
-	m:set_adapters({ ad })
+	local apath = tmp(".gguf")
+	assert(ad:save(apath, { ["general.name"] = "test" }))
+	local meta = lgml.gguf(apath).meta
+	ok(meta["general.type"] == "adapter" and meta["adapter.type"] == "lora" and
+	    meta["adapter.lora.alpha"] == 8 and meta["general.architecture"] == "qwen3",
+	    "saved gguf has the llama.cpp adapter keys")
+	local back = lora.load(m, apath)
+	m:set_adapters({ back })
+	ok(maxdiff(logits_of(m, ids), with) == 0, "saved adapter loads back")
+
+	back.scale = 0
+	m:set_adapters({ back })
 	ok(maxdiff(logits_of(m, ids), base) == 0, "scale 0 gives the base logits")
-	ad.scale = 1
-	m:set_adapters({ ad })
 
 	-- Two adapters add up.
 	local ad2 = lora.new(m, { rank = 2, alpha = 2, targets = { "attn_v", "ffn_down" }, seed = 9 })
@@ -150,6 +159,85 @@ do
 	ok(not good and tostring(err):find("ffn_gate_exps", 1, true), "unknown target raises")
 	m:set_adapters({})
 	ok(maxdiff(logits_of(m, ids), base) == 0, "an empty list removes the adapters")
+	m:close()
+end
+
+-- Write a PEFT adapter: safetensors with Hugging Face names, and the config.
+local HF = {
+	attn_q = "self_attn.q_proj", attn_k = "self_attn.k_proj", attn_v = "self_attn.v_proj",
+	attn_output = "self_attn.o_proj", ffn_gate = "mlp.gate_proj", ffn_up = "mlp.up_proj",
+	ffn_down = "mlp.down_proj",
+}
+local function write_peft(dir, ad, hp, arch)
+	os.execute("mkdir -p '" .. dir .. "'")
+	local header, blobs, off = {}, {}, 0
+	local function put(name, t, rows)
+		local v = t:get()
+		local sh = t:shape()
+		if rows then
+			-- gguf row order back to Hugging Face order for llama Q and K.
+			local d, r, out = sh[1] // rows, sh[2], {}
+			for h = 0, rows - 1 do
+				for j = 0, d // 2 - 1 do
+					for x = 0, 1 do
+						local src, dst = h * d + j * 2 + x, h * d + x * (d // 2) + j
+						for c = 1, r do
+							out[dst * r + c] = v[src * r + c]
+						end
+					end
+				end
+			end
+			v = out
+		end
+		local parts = {}
+		for i, x in ipairs(v) do
+			parts[i] = string.pack("<f", x)
+		end
+		local data = table.concat(parts)
+		header[name] = { dtype = "F32", shape = sh, data_offsets = { off, off + #data } }
+		blobs[#blobs + 1] = data
+		off = off + #data
+	end
+	for _, name in ipairs(ad.names) do
+		local il, t = name:match("^blk%.(%d+)%.(.-)%.weight$")
+		local mod = "base_model.model.model.layers." .. il .. "." .. HF[t]
+		local rows
+		if arch == "llama" and t == "attn_q" then
+			rows = hp.n_head
+		elseif arch == "llama" and t == "attn_k" then
+			rows = hp.n_head_kv
+		end
+		put(mod .. ".lora_A.weight", ad.pairs[name].a)
+		put(mod .. ".lora_B.weight", ad.pairs[name].b, rows)
+	end
+	local h = json.encode(header)
+	local f = assert(io.open(dir .. "/adapter_model.safetensors", "wb"))
+	f:write(string.pack("<I8", #h), h, table.concat(blobs))
+	f:close()
+	f = assert(io.open(dir .. "/adapter_config.json", "w"))
+	f:write(json.encode({ r = 4, lora_alpha = ad.alpha, peft_type = "LORA" }))
+	f:close()
+end
+
+for _, arch in ipairs({ "llama", "qwen3" }) do
+	local path = tmp(".gguf")
+	tiny.write(path, arch)
+	local m = transformer.load(be, path)
+	local ad = lora.new(m, { rank = 4, alpha = 16 })
+	for i, name in ipairs(ad.names) do
+		ad.pairs[name].b:fill("normal", 0, 0.2, 300 + i)
+	end
+	m:set_adapters({ ad })
+	local want = logits_of(m, ids)
+	local dir = tmp("-peft")
+	write_peft(dir, ad, m.hp, arch)
+	local pa = lora.load(m, dir)
+	m:set_adapters({ pa })
+	local d = maxdiff(logits_of(m, ids), want)
+	ok(d < 1e-5 and #pa.names == #ad.names, ("%s: PEFT adapter loads (%.2e)"):format(arch, d))
+	os.remove(dir .. "/adapter_model.safetensors")
+	os.remove(dir .. "/adapter_config.json")
+	os.remove(dir)
 	m:close()
 end
 
