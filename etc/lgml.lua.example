@@ -19,6 +19,15 @@ return {
 	-- CPU threads of each model (default: the LGML_THREADS environment
 	-- variable, else the physical cores). A model spec can set its own.
 	threads = 16,
+	-- Log level: error, warn, info, debug or trace (default: LGML_LOG, else
+	-- info). -v and --log-level override it. debug shows each prompt as the
+	-- model sees it.
+	-- log_level = "debug",
+	-- Append log lines to this file, not stderr; SIGHUP opens it again.
+	-- log_file = "/home/you/lgml.log",
+	-- Write each rendered chat and decision prompt to this directory, in
+	-- files named by request id.
+	-- dump_prompts = "/home/you/prompts",
 	models = {
 		-- lora adds LoRA adapters, "file[:scale]", from lgml-finetune or
 		-- llama.cpp; a request can change their scales.

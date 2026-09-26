@@ -72,6 +72,9 @@ one row are aliases for one handler.
 - A JSON `null` at the top level of a chat or image request reads as
   an absent field.
 - When the client closes the connection, the server cancels the work.
+- Each reply has the header `x-lgml-request-id`, an id of 8 hex
+  digits. The log lines of the request, in the server and in the
+  worker, carry it as `rid=<id>`. See the Logs section of README.md.
 
 ### Model selection
 
@@ -124,6 +127,9 @@ A streamed chat reply that fails after the first event ends with an
 error event and `[DONE]`; see [Streaming](#streaming).
 
 ## Response headers
+
+Every reply, errors too, has `x-lgml-request-id`: the id of the request
+in the server log (`rid=<id>`).
 
 Replies carry `x-lgml-*` headers with numbers for the request. The
 header name is `x-lgml-` plus the field name, with `_` as `-`.
