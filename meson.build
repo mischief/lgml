@@ -176,6 +176,10 @@ if lua_bin.found()
   # LGML_ZIMAGE (a directory with the Z-Image files) comes from the environment.
   test('zimage_model', lua_bin, args : [files('test/test_zimage_model.lua')],
     suite : 'model', is_parallel : false, timeout : 600)
+  # LGML_GEMMA4_VISION, LGML_VISION_IMAGE, LGML_MTMD_EMBD and LGML_MTMD_CLI come
+  # from the environment; see the test file.
+  test('vision_model', lua_bin, args : [files('test/test_vision_model.lua')],
+    suite : 'model', is_parallel : false, timeout : 3600)
   # LGML_ZIMAGE_VAE (ae.safetensors) and optional LGML_VAE_REF come from the environment.
   test('image_model', lua_bin, args : [files('test/test_image_model.lua')],
     suite : 'model', is_parallel : false, timeout : 600)
