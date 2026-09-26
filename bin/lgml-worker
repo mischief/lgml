@@ -7,6 +7,7 @@ package.path = root .. "/lua/?.lua;" .. root .. "/lua/?/init.lua;" ..
     root .. "/lua_modules/share/lua/5.4/?.lua;" .. package.path
 package.cpath = root .. "/" .. (os.getenv("LGML_BUILD") or "build") .. "/?.so;" .. root .. "/lua_modules/lib/lua/5.4/?.so;" ..
     package.cpath
+require("lgml.strict").on()
 
 local getopt = require("lgml.getopt")
 

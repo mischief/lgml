@@ -92,6 +92,8 @@ lua_env.prepend('LUA_PATH', meson.current_source_dir() / 'lua' / '?' / 'init.lua
 lua_env.prepend('LUA_PATH', meson.current_source_dir() / 'lua' / '?.lua', separator : ';')
 lua_env.append('LUA_PATH', ';', separator : ';')
 meson.add_devenv(lua_env)
+# Tests run with strict globals: see lgml.strict.
+lua_env.set('LUA_INIT_5_4', 'require("lgml.strict").on()')
 add_test_setup('default', is_default : true, env : lua_env)
 # meson test --setup cpu: the Vulkan loader finds no driver, so tests use only the CPU.
 cpu_env = lua_env
@@ -111,6 +113,7 @@ lua_bin = find_program('lua5.4', 'lua', required : false)
 if lua_bin.found()
   test('basic', lua_bin, args : [files('test/test_basic.lua')], timeout : 60)
   test('json', lua_bin, args : [files('test/test_json.lua')], timeout : 60)
+  test('strict', lua_bin, args : [files('test/test_strict.lua')], timeout : 30)
   test('http', lua_bin, args : [files('test/test_http.lua')], timeout : 60)
   test('tokenize', lua_bin, args : [files('test/test_tokenize.lua')],
     env : { 'LGML_VOCAB_DIR' : get_option('vocab_dir'),
