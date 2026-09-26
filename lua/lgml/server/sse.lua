@@ -27,6 +27,16 @@ function M.start(res, headers)
 	return setmetatable({ res = res }, W)
 end
 
+--- Formats one named event: an `event:` line, a `data:` line with value
+-- as one-line JSON, and a blank line.
+-- @tparam string name the event name
+-- @param value the value
+-- @treturn string the event text
+-- @raise when value cannot be encoded as JSON
+function M.event(name, value)
+	return "event: " .. name .. "\ndata: " .. assert(json.encode(value)) .. "\n\n"
+end
+
 --- An event stream writer.
 -- @type Writer
 

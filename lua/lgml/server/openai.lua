@@ -22,13 +22,10 @@ local L = log.new("openai")
 
 local M = {}
 
-local function rand_id(prefix, n)
-	local t = {}
-	for i = 1, n do
-		t[i] = string.format("%x", math.random(0, 15))
-	end
-	return prefix .. table.concat(t)
-end
+local translate = require("lgml.server.translate")
+
+local rand_id = translate.hex_id
+local served_model = translate.served_model
 
 -- request checks
 
@@ -277,16 +274,16 @@ end
 -- so the prompt counts come from the first choice.
 local function usage_object(r)
 	local first = r.choices[1] and r.choices[1].finished
-	local u = first and first.usage or {}
-	local p, c, think = u.prompt_tokens or 0, 0, 0
+	local u = translate.counts(first and first.usage)
+	local p, c, think = u.prompt, 0, 0
 	for _, s in ipairs(r.choices) do
-		local f = s.finished and s.finished.usage or {}
-		c = c + (f.completion_tokens or 0)
-		think = think + (f.reasoning_tokens or 0)
+		local f = translate.counts(s.finished and s.finished.usage)
+		c = c + f.output
+		think = think + f.reasoning
 	end
 	return {
 		prompt_tokens = p, completion_tokens = c, total_tokens = p + c,
-		prompt_tokens_details = { cached_tokens = u.cached_tokens or 0, audio_tokens = 0 },
+		prompt_tokens_details = { cached_tokens = u.cached, audio_tokens = 0 },
 		completion_tokens_details = {
 			reasoning_tokens = think, audio_tokens = 0,
 			accepted_prediction_tokens = 0, rejected_prediction_tokens = 0,
@@ -446,26 +443,6 @@ local function run_chat(eng, res, body, model)
 end
 
 -- handlers
-
-local function default_model(eng)
-	local list = eng:models()
-	return list[1] and list[1].id or "lgml"
-end
-
--- The id of the model that serves a request for id with method what,
--- for the reply and the metrics label. An unknown id gives the serving
--- model, so it makes no new metrics series.
-local function served_model(eng, id, what, images)
-	if eng.model_for then
-		return eng:model_for(id, what, images) or default_model(eng)
-	end
-	for _, m in ipairs(eng:models()) do
-		if m.id == id then
-			return id
-		end
-	end
-	return default_model(eng)
-end
 
 local function models(eng, res)
 	local data = json.array()
