@@ -354,8 +354,52 @@ local function test_tool_choice()
 	ok(status == 200 and #b.choices[1].message.tool_calls == 1, "parallel_tool_calls false")
 end
 
+local function test_n()
+	local status, b = post_json(body({ n = 3, tools = TOOLS }))
+	local idx = {}
+	for i, ch in ipairs(b.choices) do
+		idx[i] = ch.index .. ":" .. ch.finish_reason
+	end
+	ok(status == 200 and table.concat(idx, ",") == "0:tool_calls,1:tool_calls,2:tool_calls",
+	    "n gives that many choices")
+	ok(b.usage.completion_tokens == 21 and b.usage.completion_tokens_details.reasoning_tokens == 6,
+	    "usage counts the tokens of each choice")
+	local _, _, text = post(body({ n = 2, stream = true, stream_options = { include_usage = true } }))
+	local list = events(text)
+	local c = collect(list)
+	local roles = 0
+	for _, ev in ipairs(list) do
+		if type(ev) == "table" and ev.choices[1] and ev.choices[1].delta.role then
+			roles = roles + 1
+		end
+	end
+	ok(c.finish[0] == "stop" and c.finish[1] == "stop" and roles == 2 and c.usage.completion_tokens == 8,
+	    "a stream with n = 2 has a role and a finish for each choice, and one usage")
+	-- The seed of each choice, from an engine that records them.
+	local seeds = {}
+	local rec = httpd.new()
+	openai.install(rec, {
+		models = function() return { { id = "rec" } } end,
+		props = function() return {} end,
+		chat = function(_, req, sink)
+			seeds[#seeds + 1] = req.seed
+			sink:content("x")
+			sink:finish("stop", { prompt_tokens = 1, completion_tokens = 1 })
+			return true
+		end,
+	})
+	local route = srv.routes["/v1/chat/completions"].POST
+	srv.routes["/v1/chat/completions"].POST = rec.routes["/v1/chat/completions"].POST
+	post_json(body({ n = 3, seed = 7 }))
+	srv.routes["/v1/chat/completions"].POST = route
+	ok(table.concat(seeds, ",") == "7,8,9", "choice i takes seed + i")
+	status, b = post_json(body({ n = 0 }))
+	ok(status == 400 and b.error.param == "n", "n 0 gives 400")
+end
+
 test_field_table()
 test_messages()
+test_n()
 test_tool_choice()
 test_reply_table()
 test_stop()

@@ -197,7 +197,7 @@ the request checks (`lgml.server.chat_request.FIELDS`).
 | `frequency_penalty` | OpenAI | supported | From -2 to 2. |
 | `seed` | OpenAI | supported | Sampler seed. The same seed and request give the same reply on the same build. |
 | `stop` | OpenAI | supported | A string or up to 4 strings. They apply to the content, not to the reasoning or the tool calls. The reply ends before the first stop string, with `finish_reason` `stop`; the stop string is not in it. An empty string has no effect. |
-| `n` | OpenAI | planned | Only 1. |
+| `n` | OpenAI | supported | From 1 to 128. The engine makes the choices one after the other; each reuses the cached prompt. With `seed`, choice i takes seed + i. `usage` counts the prompt once and the tokens of all choices. A stream sends the chunks of choice 0, then those of choice 1, and so on. |
 | `logprobs` | OpenAI | supported | `choices[].logprobs.content` lists the content tokens, in the stream too; see [Log probabilities](#log-probabilities). |
 | `top_logprobs` | OpenAI | supported | From 0 to 20. It needs `logprobs: true`. |
 | `logit_bias` | OpenAI | supported | Token ids of the model's tokenizer to a bias from -100 to 100. An id that the tokenizer does not have gives 400. |
@@ -441,7 +441,8 @@ one `data:` line with a `chat.completion.chunk` object:
    `index`, `id`, `type` and `function: {name, arguments: ""}`, then
    chunks with `index` and `function.arguments` text.
 4. A last choice chunk with `delta: {}`, `finish_reason` and `timings`
-   (llama.cpp).
+   (llama.cpp). With `n` above 1, steps 1 to 4 repeat for each choice,
+   with its `index`.
 5. With `stream_options.include_usage`, a chunk with `choices: []` and
    `usage`. The other chunks then have `usage: null`, as OpenAI sends.
 6. `data: [DONE]`.
