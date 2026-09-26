@@ -15,7 +15,9 @@ local USAGE = "usage: lgml-worker --fd n (-m model | --fake) [-b backend] [-c n_
     "                   [--ctk type] [--ctv type] [--alias id] [--stt] [--engine module]\n" ..
     "                   [--recipe file] [--cache-ram MiB] [--ctx-checkpoints n]\n" ..
     "                   [--lora file[:scale]]...\n" ..
-    "                   [--mmproj file] [--image-min-tokens n] [--image-max-tokens n]\n"
+    "                   [--mmproj file] [--image-min-tokens n] [--image-max-tokens n]\n" ..
+    "                   [--fake-size MiB] [--fake-load-ms n] [--fake-delay ms] [--fake-fail]\n" ..
+    "       lgml-worker --devices\n"
 
 local opts, rest = getopt.parse(arg, "m:b:c:", {
 	model = "m", backend = "b", ctx = "c", ["fd="] = false,
@@ -23,28 +25,56 @@ local opts, rest = getopt.parse(arg, "m:b:c:", {
 	["engine="] = false, ["ctk="] = false, ["ctv="] = false, ["recipe="] = false,
 	["cache-ram="] = false, ["ctx-checkpoints="] = false, ["lora="] = false,
 	["mmproj="] = false, ["image-min-tokens="] = false, ["image-max-tokens="] = false,
+	["fake-size="] = false, ["fake-load-ms="] = false, ["fake-delay="] = false,
+	["fake-fail"] = false, devices = false,
 }, { lora = true })
+-- --devices prints the ggml devices as JSON, for the memory budget of
+-- the front.
+if opts and opts.devices then
+	local list = require("lgml").devices()
+	io.stdout:write(require("lgml.json").encode(list), "\n")
+	os.exit(0)
+end
 if not opts or #rest > 0 or not (opts.m or opts.fake) or not tonumber(opts.fd) then
 	io.stderr:write("lgml-worker: ", tostring(rest), "\n", USAGE)
 	os.exit(2)
 end
-local lora = {}
-for i, spec in ipairs(opts.lora or {}) do
-	local path, scale = require("lgml.lora").parse_spec(spec)
-	lora[i] = { path = path, scale = scale }
-end
-local engine
-if opts.fake then
-	engine = require("lgml.server.fake_engine").new({ delay = 5 })
-elseif opts.engine then
-	engine = require(opts.engine).new({
-		model = opts.m, backend = opts.b, id = opts.alias,
-		n_ctx = opts.c and tonumber(opts.c),
+local fd = math.tointeger(tonumber(opts.fd))
+local worker = require("lgml.worker")
+
+-- The fake engine for tests: --fake-size is the device MiB it reports,
+-- --fake-load-ms the load time, --fake-fail makes the load fail.
+local function fake()
+	local ms = tonumber(opts["fake-load-ms"])
+	if ms and ms > 0 then
+		local uv = require("luv")
+		local t = uv.new_timer()
+		t:start(math.floor(ms), 0, function() t:close() end)
+		uv.run()
+	end
+	if opts["fake-fail"] then
+		error("fake load failure", 0)
+	end
+	return require("lgml.server.fake_engine").new({
+		delay = tonumber(opts["fake-delay"]) or 5, model = opts.alias,
 	})
-elseif opts.stt or require("lgml.detect").is_whisper(opts.m) then
-	engine = require("lgml.stt_engine").new({ model = opts.m, backend = opts.b, id = opts.alias })
-else
-	engine = require("lgml.engine").new({
+end
+
+local function load()
+	local lora = {}
+	for i, spec in ipairs(opts.lora or {}) do
+		local path, scale = require("lgml.lora").parse_spec(spec)
+		lora[i] = { path = path, scale = scale }
+	end
+	if opts.engine then
+		return require(opts.engine).new({
+			model = opts.m, backend = opts.b, id = opts.alias,
+			n_ctx = opts.c and tonumber(opts.c),
+		})
+	elseif opts.stt or require("lgml.detect").is_whisper(opts.m) then
+		return require("lgml.stt_engine").new({ model = opts.m, backend = opts.b, id = opts.alias })
+	end
+	return require("lgml.engine").new({
 		model = opts.m, backend = opts.b, n_ctx = opts.c and tonumber(opts.c),
 		flash_attn = not opts["no-fa"], id = opts.alias,
 		cache_type_k = opts.ctk, cache_type_v = opts.ctv,
@@ -57,4 +87,21 @@ else
 		image_max_tokens = math.tointeger(tonumber(opts["image-max-tokens"])),
 	})
 end
-require("lgml.worker").serve(math.tointeger(tonumber(opts.fd)), engine)
+
+local mem
+local before = not opts.fake and worker.device_used()
+local ok, engine = pcall(opts.fake and fake or load)
+if not ok then
+	io.stderr:write("lgml-worker: ", tostring(engine), "\n")
+	worker.fail(fd, tostring(engine))
+	os.exit(1)
+end
+if opts.fake and opts["fake-size"] then
+	mem = { used = math.floor(tonumber(opts["fake-size"]) * 1048576) }
+elseif before then
+	local after = worker.device_used()
+	if after and after > before then
+		mem = { used = after - before }
+	end
+end
+worker.serve(fd, engine, mem)

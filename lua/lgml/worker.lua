@@ -65,13 +65,44 @@ local function caps(engine)
 	}
 end
 
+--- Tells the front that the engine did not load.
+-- It sends `FAIL` with msg and waits until the message is out.
+-- @tparam int fd the imsg socket to the front
+-- @tparam string msg the error message
+function M.fail(fd, msg)
+	local ch = ipc.channel(fd, function() end)
+	ch:send(ipc.FAIL, 0, { msg = msg })
+	while ch.buf and ch.buf:queuelen() > 0 do
+		uv.run("once")
+	end
+	ch:close()
+end
+
+--- The device bytes in use on the non-CPU devices.
+-- It sums total minus free over them. Other processes change it too.
+-- @treturn ?int the bytes, or nil with no such device
+function M.device_used()
+	local ok, lgml = pcall(require, "lgml")
+	if not ok then
+		return nil
+	end
+	local used
+	for _, d in ipairs(lgml.devices()) do
+		if d.type ~= "cpu" and d.total > 0 then
+			used = (used or 0) + d.total - d.free
+		end
+	end
+	return used
+end
+
 --- Serves the engine on fd until the front closes it.
 -- It sends `HELLO`, then runs the luv loop. It returns when the channel
 -- closes. A job for a method that the engine does not have ends with
 -- status 400.
 -- @tparam int fd the imsg socket to the front
 -- @tparam lgml.server.engine.Engine engine the engine
-function M.serve(fd, engine)
+-- @tparam[opt] table mem the `mem` field of `HELLO`: `{ used }`
+function M.serve(fd, engine, mem)
 	local jobs, pending = {}, {}
 	local ch
 	local function chat(id, req)
@@ -214,7 +245,9 @@ function M.serve(fd, engine)
 	end, function()
 		uv.stop()
 	end)
-	ch:send(ipc.HELLO, 0, { models = engine:models(), props = engine:props(), caps = caps(engine) })
+	ch:send(ipc.HELLO, 0, {
+		models = engine:models(), props = engine:props(), caps = caps(engine), mem = mem,
+	})
 	uv.run()
 end
 

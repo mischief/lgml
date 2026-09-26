@@ -1,7 +1,8 @@
 --- An engine that runs in a worker process (`lgml-worker`).
 -- It speaks imsg over a socketpair; the messages are in `lgml.ipc`.
 -- When the worker dies, open jobs fail with 503 and a new worker starts
--- after one second. The front polls for client cancel every 250 ms.
+-- after one second, unless `opts.restart` is false. The front polls for
+-- client cancel every 250 ms.
 -- @module lgml.server.remote_engine
 local uv = require("luv")
 local ipc = require("lgml.ipc")
@@ -26,11 +27,15 @@ local RESTART_MS = 1000
 -- - `log`: a function for messages (default: write to stderr)
 -- - `modes`: the mode names of the model (default: from the worker's
 --   `HELLO`)
+-- - `restart`: false to start no new worker when the worker exits
+--   (default true)
+-- - `on_exit`: a function called with the exit code and signal each
+--   time the worker exits
 -- @treturn Remote the engine
 -- @raise when the worker does not start
 function M.new(opts)
 	local r = setmetatable({
-		opts = opts, jobs = {}, next_id = 1, hello = nil, waiting = {},
+		opts = opts, jobs = {}, next_id = 1, hello = nil, waiting = {}, exit_waiting = {},
 		log = opts.log or function(msg)
 			io.stderr:write("lgml-server: ", msg, "\n")
 		end,
@@ -59,6 +64,7 @@ end
 
 function R:start()
 	local o = self.opts
+	self.failed = nil
 	local pair = assert(uv.socketpair("stream", 0, { nonblock = true }, {}))
 	local args = { o.script, "--fd", "3" }
 	table.move(o.args, 1, #o.args, #args + 1, args)
@@ -81,6 +87,17 @@ function R:start()
 	end)
 end
 
+-- Wake each function in list, then empty it.
+local function wake(list)
+	local fns = table.move(list, 1, #list, 1, {})
+	for i = #list, 1, -1 do
+		list[i] = nil
+	end
+	for _, f in ipairs(fns) do
+		f()
+	end
+end
+
 function R:exited(code, sig)
 	self.proc:close()
 	self.proc = nil
@@ -88,7 +105,17 @@ function R:exited(code, sig)
 	if self.ch then
 		self.ch:close("exit")
 	end
-	if not self.stopping then
+	local restart = self.opts.restart ~= false and not self.stopping
+	if self.opts.on_exit then
+		self.opts.on_exit(code, sig)
+	end
+	if not self.hello and not restart then
+		self.failed = self.failed or ("worker exited before it was ready, code %s signal %s")
+		    :format(code, sig)
+		wake(self.waiting)
+	end
+	wake(self.exit_waiting)
+	if restart then
 		local t = uv.new_timer()
 		t:start(RESTART_MS, 0, function()
 			t:close()
@@ -108,10 +135,10 @@ end
 function R:message(t, id, v)
 	if t == ipc.HELLO then
 		self.hello = v
-		for _, w in ipairs(self.waiting) do
-			w()
-		end
-		self.waiting = {}
+		wake(self.waiting)
+		return
+	elseif t == ipc.FAIL then
+		self.failed = tostring(v.msg)
 		return
 	end
 	local job = self.jobs[id]
@@ -125,9 +152,16 @@ end
 
 --- Waits until the worker has sent `HELLO`.
 -- It yields in a coroutine. Outside a coroutine, it runs the luv loop.
--- @treturn table the `HELLO` payload: `{ models, props, caps }`
+-- With `opts.restart` false, a worker that exits first makes it fail.
+-- @treturn[1] table the `HELLO` payload: `{ models, props, caps, mem }`
+-- @treturn[2] nil
+-- @treturn[2] string the reason: the `FAIL` message of the worker, or
+-- its exit status
 function R:ready()
 	while not self.hello do
+		if self.failed and not self.proc and (self.opts.restart == false or self.stopping) then
+			return nil, self.failed
+		end
 		if coroutine.isyieldable() then
 			stream.await(function(done)
 				self.waiting[#self.waiting + 1] = done
@@ -169,6 +203,29 @@ function R:stop()
 	if self.proc then
 		self.proc:kill("sigterm")
 	end
+end
+
+--- Stops the worker and waits until it exits.
+-- It sends SIGTERM, and SIGKILL when the worker still runs after
+-- kill_ms. The process exit frees the device memory of the worker.
+-- It yields the calling coroutine. No new worker starts.
+-- @tparam[opt] int kill_ms the time before SIGKILL (default 5000)
+function R:shutdown(kill_ms)
+	self:stop()
+	if not self.proc then
+		return
+	end
+	local t = uv.new_timer()
+	t:start(kill_ms or 5000, 0, function()
+		if self.proc then
+			self.log("worker did not exit; sending SIGKILL")
+			self.proc:kill("sigkill")
+		end
+	end)
+	stream.await(function(done)
+		self.exit_waiting[#self.exit_waiting + 1] = done
+	end)
+	t:close()
 end
 
 local Job = {}
@@ -226,7 +283,10 @@ end
 -- @treturn[2] string an error message
 -- @treturn[2] int an HTTP status
 function R:chat(req, sink)
-	self:ready()
+	local hello, rerr = self:ready()
+	if not hello then
+		return nil, rerr, 503
+	end
 	if not self.ch then
 		return nil, "worker not running", 503
 	end
@@ -290,7 +350,10 @@ end
 -- @treturn[2] string an error message
 -- @treturn[2] int an HTTP status
 function R:transcribe(req, audio, ctl)
-	local hello = self:ready()
+	local hello, rerr = self:ready()
+	if not hello then
+		return nil, rerr, 503
+	end
 	if hello.caps and not hello.caps.transcribe then
 		return nil, "model does not support transcription", 400
 	end
@@ -334,7 +397,10 @@ end
 -- @treturn[2] string an error message
 -- @treturn[2] int an HTTP status
 function R:speak(req, ctl)
-	local hello = self:ready()
+	local hello, rerr = self:ready()
+	if not hello then
+		return nil, rerr, 503
+	end
 	if hello.caps and not hello.caps.speak then
 		return nil, "model does not support speech", 400
 	end
@@ -383,7 +449,10 @@ end
 -- @treturn[2] string an error message
 -- @treturn[2] int an HTTP status
 function R:decide(req, ctl)
-	local hello = self:ready()
+	local hello, rerr = self:ready()
+	if not hello then
+		return nil, rerr, 503
+	end
 	if hello.caps and not hello.caps.decide then
 		return nil, "model does not support decisions", 400
 	end
@@ -430,7 +499,10 @@ end
 -- @treturn[2] string an error message
 -- @treturn[2] int an HTTP status
 function R:generate(req, ctl)
-	local hello = self:ready()
+	local hello, rerr = self:ready()
+	if not hello then
+		return nil, rerr, 503
+	end
 	if hello.caps and not hello.caps.generate then
 		return nil, "model does not support images", 400
 	end

@@ -148,5 +148,27 @@ in_co(function()
 end)
 
 eng:stop()
+
+-- A worker whose engine does not load sends FAIL and exits.
+in_co(function()
+	local exits = 0
+	local bad = remote.new({
+		lua = "lua5.4", script = src .. "/bin/lgml-worker", args = { "--fake", "--fake-fail" },
+		restart = false, log = function() end, on_exit = function() exits = exits + 1 end,
+	})
+	local h, msg = bad:ready()
+	ok(h == nil and msg == "fake load failure" and exits == 1, "a failed load gives its message")
+	local res, m2, status = bad:chat({ messages = {} }, recorder())
+	ok(res == nil and status == 503 and m2 == "fake load failure", "a job on a failed worker gives 503")
+	local good = remote.new({
+		lua = "lua5.4", script = src .. "/bin/lgml-worker",
+		args = { "--fake", "--alias", "sized", "--fake-size", "12" }, restart = false,
+		log = function() end,
+	})
+	h = good:ready()
+	ok(h and h.models[1].id == "sized" and h.mem.used == 12 * 1048576, "hello has the measured size")
+	good:shutdown()
+	ok(good.proc == nil, "shutdown waits for the exit")
+end)
 print("1.." .. n)
 os.exit(failed == 0 and 0 or 1)

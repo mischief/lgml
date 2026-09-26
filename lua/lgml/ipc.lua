@@ -17,9 +17,11 @@ local json = require("lgml.json")
 local M = {}
 
 --- Worker to front: the worker is ready.
--- Payload: `{ models, props, caps }`. models and props are the results
--- of `Engine:models` and `Engine:props`. caps is `{ chat, transcribe,
--- speak, decide, generate }`, with true for each method the engine has.
+-- Payload: `{ models, props, caps, mem }`. models and props are the
+-- results of `Engine:models` and `Engine:props`. caps is `{ chat,
+-- transcribe, speak, decide, generate }`, with true for each method the
+-- engine has. mem is `{ used }`: the device bytes that the load took,
+-- when the worker can measure them.
 M.HELLO = 1
 --- Front to worker: start a chat job.
 -- Payload: the chat request for `Engine:chat`.
@@ -66,6 +68,9 @@ M.GENERATE = 10
 -- Front to worker: the input file of an edit. Worker to front: one PNG
 -- file of the result, in order.
 M.IMAGE = 11
+--- Worker to front: the engine did not load. The worker then exits.
+-- Payload: `{ msg }`, the error message.
+M.FAIL = 12
 
 -- These types carry raw bytes, not JSON.
 local RAW = { [M.AUDIO] = true, [M.IMAGE] = true }
