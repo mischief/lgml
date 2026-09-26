@@ -122,7 +122,7 @@ local function check_type(b, key, want, pred)
 	return true
 end
 
--- cjson decodes every number as a float; 5.0 counts as an integer.
+-- lgml.json decodes whole numbers as integers, so 5 and 5.0 both pass.
 local function positive_int(v)
 	local i = math.tointeger(v)
 	return i ~= nil and i > 0

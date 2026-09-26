@@ -202,6 +202,12 @@ local function test_errors(port)
 	    chat_body({ max_tokens = "x" })))
 	ok(r.status == 400 and body_json(r).error.param == "max_tokens",
 	    "bad max_tokens")
+	r = roundtrip(port, request("POST", "/v1/chat/completions",
+	    '{"messages": [{"role": "user", "content": "hi"}], "max_tokens": 2.0}'))
+	ok(r.status == 200, "max_tokens 2.0 counts as an integer")
+	r = roundtrip(port, request("POST", "/v1/chat/completions",
+	    '{"messages": [{"role": "user", "content": "hi"}], "max_tokens": 2.5}'))
+	ok(r.status == 400 and body_json(r).error.param == "max_tokens", "max_tokens 2.5 gives 400")
 
 	r = roundtrip(port, request("POST", "/v1/chat/completions", json.encode({ messages = {
 		{ role = "user", content = { { type = "image_url", image_url = { detail = "low" } } } } } })))
