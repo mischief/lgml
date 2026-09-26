@@ -10,6 +10,7 @@ local chat_request = require("lgml.server.chat_request")
 local translate = require("lgml.server.translate")
 local media = require("lgml.chat.media")
 local sse = require("lgml.server.sse")
+local http = require("lgml.server.http")
 local log = require("lgml.log")
 
 local L = log.new("responses")
@@ -307,9 +308,14 @@ local ITEM_KEYS = {
 }
 local ROLES = { user = "user", system = "system", developer = "system", assistant = "assistant" }
 
--- The reasoning text of a reasoning item.
+-- The reasoning text of a reasoning item. Items of stored responses
+-- (ctx.stored) give their content first: their signature can be for
+-- another model.
 local function reasoning_text(ctx, it, at)
 	local enc = it.encrypted_content
+	if ctx.stored and json.isarray(it.content) and #it.content > 0 then
+		enc = nil
+	end
 	if enc ~= nil then
 		if type(enc) ~= "string" or not translate.ours(enc) then
 			return fail(at .. ".encrypted_content: not made by this server", at .. ".encrypted_content",
@@ -599,8 +605,9 @@ local PARAMS = { response_format = "text.format", tools = "tools", tool_choice =
 -- call; it gets `items`, the input items in order.
 -- @tparam table body the decoded body
 -- @tparam lgml.server.translate.Context ctx the request context
--- @tparam[opt] table history chat messages of earlier responses, put
--- after the instructions and before the input
+-- @tparam[opt] table history the items of earlier responses (see
+-- `previous_response_id`), put after the instructions and before the
+-- input; ctx.items does not get them
 -- @treturn[1] table the chat request
 -- @treturn[2] nil
 -- @treturn[2] table `{ msg, param, code }`
@@ -609,8 +616,13 @@ function M.translate(body, ctx, history)
 	if type(body.instructions) == "string" and body.instructions ~= "" then
 		out[1] = { role = "system", content = body.instructions }
 	end
-	for _, m in ipairs(history or {}) do
-		out[#out + 1] = m
+	if history then
+		ctx.stored = true
+		local ok, err = M.convert_items(ctx, history, out, "previous_response_id")
+		ctx.stored, ctx.items = nil, {}
+		if not ok then
+			return nil, err
+		end
 	end
 	local input = body.input
 	if type(input) == "string" then
@@ -770,13 +782,46 @@ local function final_object(r, sink)
 end
 
 local function send_error(r, status, e)
-	return r.res:json(status, require("lgml.server.http").error_object(status, e.msg, nil, e.param, e.code),
+	return r.res:json(status, http.error_object(status, e.msg, nil, e.param, e.code),
 	    r.ctx:headers({}))
 end
 
+-- A deep copy that keeps the JSON array marks.
+local function copy(v)
+	if type(v) ~= "table" then
+		return v
+	end
+	local t = {}
+	for k, x in pairs(v) do
+		t[k] = copy(x)
+	end
+	return setmetatable(t, getmetatable(v))
+end
+
+-- The items of the stored chain that ends at id: the input and the
+-- output of each response, oldest first. Instructions are not items,
+-- so they do not carry over.
+local function history(store, id)
+	local chain, missing = store:chain(id)
+	if not chain then
+		return fail(("Previous response with id '%s' not found."):format(missing), "previous_response_id",
+		    "previous_response_not_found")
+	end
+	local items = json.array()
+	for _, e in ipairs(chain) do
+		for _, list in ipairs({ e.input, e.output }) do
+			for _, it in ipairs(list) do
+				items[#items + 1] = copy(it)
+			end
+		end
+	end
+	return items
+end
+
 -- Reads and translates the request. Returns the reply state and the
--- chat request, or sends an error and returns nil.
-local function prepare(eng, opts, req, res)
+-- chat request, or sends an error and returns nil. With count, the
+-- chat request only counts the prompt.
+local function prepare(eng, opts, req, res, count)
 	local ctx = translate.context()
 	local r = { res = res, ctx = ctx, key = opts.key, id = translate.id("resp_"), created = os.time() }
 	if type(eng.chat) ~= "function" then
@@ -807,21 +852,32 @@ local function prepare(eng, opts, req, res)
 	end
 	r.body, r.store = body, body.store ~= false
 	ctx.key, ctx.calls, ctx.items = opts.key, {}, {}
+	local store = opts.store
+	local past
 	if body.previous_response_id ~= nil then
-		send_error(r, 400, { msg = ("Previous response with id '%s' not found."):format(body.previous_response_id),
-			param = "previous_response_id", code = "previous_response_not_found" })
-		return nil
+		past, err = history(store, body.previous_response_id)
+		if not past then
+			send_error(r, 400, err)
+			return nil
+		end
+	end
+	ctx.resolve = function(id, at)
+		local it = type(id) == "string" and store:item(id)
+		if not it then
+			return fail(("%s.id: no stored item with id %s"):format(at, tostring(id)), at .. ".id")
+		end
+		return copy(it)
 	end
 	-- Reasoning items need the model to check their signatures; the
-	-- model needs to know of images. Images come from the input only.
+	-- model needs to know of images.
 	ctx.model = translate.served_model(eng, body.model, "chat", false)
 	local chat
-	chat, err = M.translate(body, ctx)
+	chat, err = M.translate(body, ctx, past)
 	if chat and media.has_images(chat.messages) then
 		local model = translate.served_model(eng, body.model, "chat", true)
 		if model ~= ctx.model then
 			ctx.model, ctx.calls, ctx.items = model, {}, {}
-			chat, err = M.translate(body, ctx)
+			chat, err = M.translate(body, ctx, past)
 		end
 	end
 	if not chat then
@@ -830,7 +886,29 @@ local function prepare(eng, opts, req, res)
 		return nil
 	end
 	r.model, r.max = ctx.model, chat.max_completion_tokens
+	if count then
+		chat.count_only = true
+	end
 	return r, chat
+end
+
+local ITEM_PREFIX = { message = "msg_", function_call = "fc_", function_call_output = "fco_", reasoning = "rs_" }
+
+-- Keeps a finished response in the store, unless the request has
+-- store: false. Input items get ids for input_items.
+local function save(r, opts)
+	if not (r.store and r.final and opts.store) then
+		return
+	end
+	local input = json.array()
+	for i, it in ipairs(r.ctx.items) do
+		local c = copy(it)
+		c.type = c.type or "message"
+		c.id = c.id or translate.id(ITEM_PREFIX[c.type] or "item_")
+		input[i] = c
+	end
+	opts.store:put({ id = r.id, prev = r.body.previous_response_id, input = input, output = r.final.output,
+		response = r.final })
 end
 
 -- streaming
@@ -929,7 +1007,7 @@ local function stream_handler(r, w)
 		end)
 	end
 	function h.fail(_, status, msg)
-		local e = require("lgml.server.http").error_object(status, msg).error
+		local e = http.error_object(status, msg).error
 		local code = status >= 500 and "server_error" or "invalid_request"
 		local o = response_object(r, "failed")
 		o.error = { code = code, message = msg }
@@ -951,7 +1029,7 @@ M.KEEPALIVE_MS = 10000
 
 -- Runs a streamed request. The stream starts when the engine tells the
 -- prompt size, at the first item, or at the first keepalive.
-local function run_stream(eng, r, chat)
+local function run_stream(eng, opts, r, chat)
 	local w = translate.writer(r.res)
 	local h = stream_handler(r, w)
 	local sink = translate.blocks(r.res, h)
@@ -971,6 +1049,7 @@ local function run_stream(eng, r, chat)
 	local sent
 	if ok then
 		sent = h:finish()
+		save(r, opts)
 	else
 		sent = h:fail(status or 500, msg or "engine failed")
 	end
@@ -985,7 +1064,7 @@ local function create(eng, opts, req, res)
 		return
 	end
 	if r.body.stream then
-		return run_stream(eng, r, chat)
+		return run_stream(eng, opts, r, chat)
 	end
 	local sink = translate.blocks(res)
 	local ok, msg, status = translate.run(eng, chat, sink, r.model)
@@ -995,17 +1074,141 @@ local function create(eng, opts, req, res)
 	elseif not ok then
 		return send_error(r, status or 500, { msg = msg or "engine failed" })
 	end
-	return res:json(200, final_object(r, sink), r.ctx:headers({}))
+	r.final = final_object(r, sink)
+	save(r, opts)
+	return res:json(200, r.final, r.ctx:headers({}))
 end
 
---- Adds the Responses routes for eng to srv: `POST /v1/responses`.
+-- POST /v1/responses/input_tokens: the prompt size of a request.
+local function input_tokens(eng, opts, req, res)
+	local r, chat = prepare(eng, opts, req, res, true)
+	if not r then
+		return
+	end
+	log.note("model", r.model)
+	local sink = translate.blocks(res)
+	local ok, msg, status = eng:chat(chat, sink)
+	if sink:cancelled() then
+		res.close = true
+		return
+	elseif not ok or not sink.finished then
+		return send_error(r, status or 500, { msg = msg or "engine failed" })
+	end
+	local n = translate.counts(sink.finished.usage).prompt
+	log.note("prompt_tokens", n)
+	return res:json(200, { object = "response.input_tokens", input_tokens = n }, r.ctx:headers({}))
+end
+
+local function not_found(res, id)
+	return res:error(404, ("No response found with id '%s'."):format(tostring(id)), nil, "response_id",
+	    "not_found")
+end
+
+-- GET /v1/responses/{response_id}
+local function retrieve(opts, req, res)
+	local id = req.params.response_id
+	local e = opts.store:get(id)
+	if not e then
+		return not_found(res, id)
+	elseif http.parse_query(req.query).stream == "true" then
+		return res:error(400, "stream: only background responses stream again; this server has none", nil,
+		    "stream", "unsupported_value")
+	end
+	return res:json(200, e.response)
+end
+
+-- DELETE /v1/responses/{response_id}
+local function delete(opts, req, res)
+	local id = req.params.response_id
+	if not opts.store:delete(id) then
+		return not_found(res, id)
+	end
+	return res:json(200, { id = id, object = "response.deleted", deleted = true })
+end
+
+-- POST /v1/responses/{response_id}/cancel: no response runs in the
+-- background, so none can be cancelled.
+local function cancel(opts, req, res)
+	local id = req.params.response_id
+	if not opts.store:get(id) then
+		return not_found(res, id)
+	end
+	return res:error(400, "Only responses created with background: true can be cancelled.", nil,
+	    "response_id", "unsupported_value")
+end
+
+--- The most input items of one `input_items` page.
+M.MAX_PAGE = 100
+
+-- GET /v1/responses/{response_id}/input_items
+local function input_items(opts, req, res)
+	local id = req.params.response_id
+	local e = opts.store:get(id)
+	if not e then
+		return not_found(res, id)
+	end
+	local q = http.parse_query(req.query)
+	local limit = math.tointeger(tonumber(q.limit or "20"))
+	if not limit or limit < 1 or limit > M.MAX_PAGE then
+		return res:error(400, "limit: must be an integer from 1 to 100", nil, "limit", "invalid_value")
+	end
+	local order = q.order or "desc"
+	if order ~= "asc" and order ~= "desc" then
+		return res:error(400, "order: must be asc or desc", nil, "order", "invalid_value")
+	end
+	local list = {}
+	for i, it in ipairs(e.input) do
+		list[order == "asc" and i or #e.input - i + 1] = it
+	end
+	local from = 1
+	if q.after then
+		from = nil
+		for i, it in ipairs(list) do
+			if it.id == q.after then
+				from = i + 1
+			end
+		end
+		if not from then
+			return res:error(400, ("after: no input item with id '%s'"):format(q.after), nil, "after",
+			    "invalid_value")
+		end
+	end
+	local data = json.array(table.move(list, from, math.min(#list, from + limit - 1), 1, {}))
+	return res:json(200, { object = "list", data = data,
+		first_id = data[1] and data[1].id or json.null, last_id = data[#data] and data[#data].id or json.null,
+		has_more = from + limit - 1 < #list })
+end
+
+--- Adds the Responses routes for eng to srv.
+-- `POST /v1/responses` and `POST /v1/responses/input_tokens`, and for
+-- stored responses `GET` and `DELETE /v1/responses/{response_id}`,
+-- `GET /v1/responses/{response_id}/input_items` and
+-- `POST /v1/responses/{response_id}/cancel`.
 -- @tparam lgml.server.httpd.Server srv the server
 -- @tparam lgml.server.engine.Engine eng the engine
 -- @tparam table opts the options: `key`, the server key for reasoning
--- signatures (see `lgml.server.translate.load_key`)
+-- signatures (see `lgml.server.translate.load_key`), and `store`, a
+-- `lgml.server.response_store` (default: a new one with the default
+-- limits)
 function M.install(srv, eng, opts)
+	local o = { key = opts.key, store = opts.store or require("lgml.server.response_store").new() }
 	srv:route("POST", "/v1/responses", function(req, res)
-		return create(eng, opts, req, res)
+		return create(eng, o, req, res)
+	end)
+	srv:route("POST", "/v1/responses/input_tokens", function(req, res)
+		return input_tokens(eng, o, req, res)
+	end)
+	srv:route("GET", "/v1/responses/{response_id}", function(req, res)
+		return retrieve(o, req, res)
+	end)
+	srv:route("DELETE", "/v1/responses/{response_id}", function(req, res)
+		return delete(o, req, res)
+	end)
+	srv:route("GET", "/v1/responses/{response_id}/input_items", function(req, res)
+		return input_items(o, req, res)
+	end)
+	srv:route("POST", "/v1/responses/{response_id}/cancel", function(req, res)
+		return cancel(o, req, res)
 	end)
 end
 

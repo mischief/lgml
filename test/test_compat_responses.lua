@@ -440,11 +440,110 @@ local function test_stream_events()
 	ok(comments >= 2 and output[1].content[1].text == "Hi", ("keepalive comments (%d)"):format(comments))
 end
 
+local function get(path)
+	return inproc.json(srv, "GET", path, nil, HEADERS)
+end
+
+local function test_store()
+	local _, r1 = post(body({ instructions = "Be brief.", input = "Hi" }))
+	local status, r2 = post(body({ previous_response_id = r1.id, input = "And then?" }))
+	local m = last.messages
+	ok(status == 200 and #m == 3 and m[1].role == "user" and m[1].content == "Hi" and m[2].role == "assistant" and
+	    m[2].content == "Let me check the weather." and m[2].reasoning_content == "The user asks about Paris." and
+	    m[3].content == "And then?" and r2.previous_response_id == r1.id,
+	    "previous_response_id puts the stored input and output first, without the old instructions")
+	status = post(body({ previous_response_id = r2.id, input = "Last." }))
+	ok(status == 200 and #last.messages == 5, "a chain of three responses")
+
+	local _, t1 = post(body({ tools = TOOLS, input = "Weather?" }))
+	local call = t1.output[#t1.output]
+	status = post(body({ tools = TOOLS, previous_response_id = t1.id,
+		input = { { type = "function_call_output", call_id = call.call_id, output = "sunny" } } }))
+	m = last.messages
+	ok(status == 200 and m[2].tool_calls[1].id == call.call_id and m[3].role == "tool" and m[3].content == "sunny",
+	    "a function_call_output after a stored call, as the clm client sends it")
+
+	local _, nostore = post(body({ store = false }))
+	local e
+	status, e = post(body({ previous_response_id = nostore.id }))
+	ok(status == 400 and e.error.code == "previous_response_not_found" and e.error.param == "previous_response_id" and
+	    e.error.message:find("previous_response", 1, true) == nil and e.error.message:find(nostore.id, 1, true),
+	    "store false keeps nothing; its id gives previous_response_not_found")
+	ok(nostore.store == false and r1.store == true, "the response echoes store")
+
+	local got
+	status, got = get("/v1/responses/" .. r1.id)
+	ok(status == 200 and got.id == r1.id and got.output[2].content[1].text == r1.output[2].content[1].text,
+	    "GET gives the stored response")
+	status, got = get("/v1/responses/" .. r2.id .. "/input_items")
+	ok(status == 200 and got.object == "list" and #got.data == 1 and got.data[1].id:match("^msg_") and
+	    got.data[1].content == "And then?" and got.has_more == false and got.first_id == got.data[1].id,
+	    "input_items lists the input of that response only")
+	local _, many = post(body({ input = { { role = "user", content = "a" }, { role = "user", content = "b" },
+		{ role = "user", content = "c" } } }))
+	status, got = get("/v1/responses/" .. many.id .. "/input_items?limit=2&order=asc")
+	ok(#got.data == 2 and got.data[1].content == "a" and got.has_more == true, "input_items: limit and order")
+	status, got = get(("/v1/responses/%s/input_items?after=%s"):format(many.id, got.data[2].id))
+	ok(#got.data == 1 and got.data[1].content == "a", "input_items: after, newest first by default")
+
+	local ref = r1.output[2].id
+	status = post(body({ input = { { type = "item_reference", id = ref }, { role = "user", content = "Go on." } } }))
+	ok(status == 200 and last.messages[1].role == "assistant" and last.messages[1].content ==
+	    "Let me check the weather.", "item_reference takes a stored item")
+
+	status, got = inproc.json(srv, "POST", "/v1/responses/" .. r1.id .. "/cancel", {}, HEADERS)
+	ok(status == 400 and got.error.message:find("background", 1, true), "cancel: no background responses")
+	status, got = inproc.json(srv, "DELETE", "/v1/responses/" .. r1.id, nil, HEADERS)
+	ok(status == 200 and got.deleted == true and got.object == "response.deleted" and got.id == r1.id, "DELETE")
+	status, got = get("/v1/responses/" .. r1.id)
+	ok(status == 404 and got.error.type == "not_found_error", "a deleted response is gone")
+	status, e = post(body({ previous_response_id = r2.id }))
+	ok(status == 400 and e.error.code == "previous_response_not_found", "a chain with a deleted link fails")
+
+	local _, _, text = inproc.request(srv, "POST", "/v1/responses", body({ stream = true, input = "S" }), HEADERS)
+	local list = inproc.events(text)
+	local sid = list[#list].data.response.id
+	status, got = get("/v1/responses/" .. sid)
+	ok(status == 200 and got.status == "completed", "a streamed response is stored")
+
+	local _, made = post(body({ input = example("image_data_url").input }))
+	local _, count = post(body({ input = example("image_data_url").input }), "/v1/responses/input_tokens")
+	ok(count.object == "response.input_tokens" and count.input_tokens == made.usage.input_tokens,
+	    ("input_tokens counts the prompt: %s"):format(tostring(count.input_tokens)))
+end
+
+local function test_store_limits()
+	local store = require("lgml.server.response_store")
+	local now = 1000
+	local s = store.new({ entries = 2, age = 60 }, function() return now end)
+	local function put(id, prev)
+		s:put({ id = id, prev = prev, input = { { type = "message", id = "i" .. id, role = "user", content = id } },
+			output = {}, response = { id = id } })
+	end
+	put("a")
+	put("b", "a")
+	s:get("a")
+	put("c", "b")
+	ok(s:get("b") == nil and s:get("a") and s:get("c"), "the least recently used entry goes first")
+	local chain, missing = s:chain("c")
+	ok(chain == nil and missing == "b", "a chain with a gap names the missing id")
+	ok(s:item("ia") and s:item("ic") and not s:item("ib"), "stored items by id")
+	now = now + 61
+	ok(s:get("a") == nil and s:get("c") == nil and s.count == 0, "entries past the age limit are gone")
+	local b = store.new({ bytes = 300 })
+	for i = 1, 5 do
+		b:put({ id = "r" .. i, input = { { content = ("x"):rep(100) } }, output = {}, response = {} })
+	end
+	ok(b.bytes <= 300 and b:get("r5") and not b:get("r1"), "the byte limit drops old entries")
+end
+
 test_field_table()
 test_examples()
 test_requests()
 test_errors()
 test_stream()
 test_stream_events()
+test_store()
+test_store_limits()
 print("1.." .. n)
 os.exit(failed == 0 and 0 or 1)

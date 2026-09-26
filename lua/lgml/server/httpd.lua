@@ -52,14 +52,46 @@ end
 -- After `listen`, the fields `host` and `port` hold the address.
 -- @type Server
 
---- Adds a handler for method and exact path.
--- A GET handler also serves HEAD.
+--- Adds a handler for method and path.
+-- A GET handler also serves HEAD. A path segment `{name}` is a
+-- parameter: it matches one segment, and the handler finds its value
+-- in `req.params.name`. An exact path wins over a path with
+-- parameters.
 -- @tparam string method the method, such as `"GET"`
 -- @tparam string path the path, with no query
 -- @tparam function fn the handler: fn(req, res)
 function Srv:route(method, path, fn)
+	if not self.routes[path] and path:find("{", 1, true) then
+		local names = {}
+		local pat = "^" .. path:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%0"):gsub("{([%w_]+)}", function(name)
+			names[#names + 1] = name
+			return "([^/]+)"
+		end) .. "$"
+		self.templates = self.templates or {}
+		self.templates[#self.templates + 1] = { path = path, pattern = pat, names = names }
+	end
 	self.routes[path] = self.routes[path] or {}
 	self.routes[path][method] = fn
+end
+
+-- The methods for a request path: those of the exact path, else those
+-- of the first template that matches it. A template sets req.params.
+local function methods_for(self, req)
+	local methods = self.routes[req.path]
+	if methods then
+		return methods
+	end
+	for _, t in ipairs(self.templates or {}) do
+		local caps = { req.path:match(t.pattern) }
+		if #caps > 0 then
+			req.params = {}
+			for i, name in ipairs(t.names) do
+				req.params[name] = http.unescape(caps[i])
+			end
+			return self.routes[t.path]
+		end
+	end
+	return nil
 end
 
 local function allowed(methods)
@@ -78,7 +110,7 @@ end
 -- @tparam table req the request
 -- @tparam lgml.server.http.Response res the response
 function Srv:dispatch(req, res)
-	local methods = self.routes[req.path]
+	local methods = methods_for(self, req)
 	if not methods then
 		return res:error(404, "no route for " .. req.path)
 	end

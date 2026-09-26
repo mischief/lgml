@@ -596,6 +596,8 @@ local function anthropic_headers()
 	}
 end
 
+local RESPONSE_ID = { { name = "response_id", ["in"] = "path", required = true, schema = { type = "string" } } }
+
 -- Operations by path without the /v1 prefix, then by method. tag is
 -- openai, llama.cpp or lgml.
 local function operations()
@@ -637,6 +639,39 @@ local function operations()
 				headers = { ["x-lgml-ignored"] = { schema = { type = "string" },
 				    description = "Accepted fields with no effect." } },
 			} }, E),
+		} },
+		["/responses/input_tokens"] = { POST = {
+			tag = "openai", summary = "Count the prompt tokens of a Responses request",
+			requestBody = json_body(ref("ResponsesRequest")),
+			responses = with({ ["200"] = reply("The prompt size.", "application/json", obj({
+				object = { const = "response.input_tokens" }, input_tokens = int() })) }, E),
+		} },
+		["/responses/{response_id}"] = {
+			GET = {
+				tag = "openai", summary = "Get a stored response", parameters = RESPONSE_ID,
+				responses = with({ ["200"] = reply("The response.", "application/json", ref("Response")) },
+				    { 400, 404 }),
+			},
+			DELETE = {
+				tag = "openai", summary = "Delete a stored response", parameters = RESPONSE_ID,
+				responses = with({ ["200"] = reply("Deleted.", "application/json", obj({
+					id = str(), object = { const = "response.deleted" }, deleted = { const = true } })) }, { 404 }),
+			},
+		},
+		["/responses/{response_id}/input_items"] = { GET = {
+			tag = "openai", summary = "List the input items of a stored response",
+			parameters = { RESPONSE_ID[1],
+				{ name = "limit", ["in"] = "query", schema = { type = "integer", minimum = 1, maximum = 100 } },
+				{ name = "order", ["in"] = "query", schema = { type = "string", enum = json.array({ "asc", "desc" }) } },
+				{ name = "after", ["in"] = "query", schema = { type = "string" } } },
+			responses = with({ ["200"] = reply("A page of items.", "application/json", obj({
+				object = { const = "list" }, data = arr({ type = "object" }), first_id = { type = { "string", "null" } },
+				last_id = { type = { "string", "null" } }, has_more = { type = "boolean" } })) }, { 400, 404 }),
+		} },
+		["/responses/{response_id}/cancel"] = { POST = {
+			tag = "openai", summary = "Cancel a background response (there are none)", parameters = RESPONSE_ID,
+			requestBody = { required = false, content = { ["application/json"] = { schema = { type = "object" } } } },
+			responses = errors({ 400, 404 }),
 		} },
 		["/messages/count_tokens"] = { POST = {
 			tag = "anthropic", summary = "Count the prompt tokens of a Messages request",

@@ -36,8 +36,9 @@ Labels in this file:
 
 ## Routes
 
-Each route below is exact. There is no prefix matching. The paths in
-one row are aliases for one handler.
+Each route below is exact. There is no prefix matching. A segment
+`{name}` matches one path segment. The paths in one row are aliases
+for one handler.
 
 | Method | Paths | Label | Section |
 | --- | --- | --- | --- |
@@ -45,6 +46,10 @@ one row are aliases for one handler.
 | POST | `/v1/messages` | Anthropic | [Anthropic Messages](#anthropic-messages) |
 | POST | `/v1/messages/count_tokens` | Anthropic | [Messages token count](#messages-token-count) |
 | POST | `/v1/responses` | OpenAI | [OpenAI Responses](#openai-responses) |
+| POST | `/v1/responses/input_tokens` | OpenAI | [Responses token count](#responses-token-count) |
+| GET, DELETE | `/v1/responses/{response_id}` | OpenAI | [Stored responses](#stored-responses) |
+| GET | `/v1/responses/{response_id}/input_items` | OpenAI | [Stored responses](#stored-responses) |
+| POST | `/v1/responses/{response_id}/cancel` | OpenAI | [Stored responses](#stored-responses) |
 | POST | `/v1/images/generations`, `/images/generations` | OpenAI | [Images](#images) |
 | POST | `/v1/images/edits`, `/images/edits` | OpenAI | [Images](#images) |
 | POST | `/v1/audio/speech`, `/audio/speech` | OpenAI | [Speech](#speech) |
@@ -960,6 +965,44 @@ event: error
 data: {"type": "error", "sequence_number": 7, "code": "server_error", "message": "...",
   "param": null, "error": {"type": "server_error", "code": "server_error", "message": "...", "param": null}}
 ```
+
+### Stored responses
+
+The front process keeps responses in memory, so `previous_response_id`
+works:
+
+- A response is stored unless the request has `store: false`. The
+  store keeps its input items (with ids; `instructions` are not items)
+  and its output items. It holds at most 1024 responses and 256 MiB of
+  JSON, and drops the least recently used ones first. A response older
+  than 24 hours is gone. A restart empties the store.
+- `previous_response_id` puts the input and output of each response of
+  the chain, oldest first, before the new input. The `instructions` of
+  earlier responses do not carry over. Reasoning items of the chain give
+  their raw reasoning to the template. An id that the store does not
+  have, or a chain with a missing link, gives 400 with code
+  `previous_response_not_found` and `param: "previous_response_id"`;
+  the clm client then sends the whole history.
+- `item_reference` input items take a stored input or output item by
+  id.
+- `GET /v1/responses/{response_id}` gives the stored Response.
+  `?stream=true` gives 400: no response runs in the background.
+- `DELETE /v1/responses/{response_id}` removes it:
+  `{"id": "resp_...", "object": "response.deleted", "deleted": true}`.
+- `GET /v1/responses/{response_id}/input_items` lists its input items:
+  `{"object": "list", "data", "first_id", "last_id", "has_more"}`, with
+  `limit` (1 to 100, default 20), `order` (`desc`, the default, or
+  `asc`) and `after` (an item id).
+- `POST /v1/responses/{response_id}/cancel` gives 400: only background
+  responses can be cancelled.
+- An unknown id gives 404 with code `not_found`.
+
+### Responses token count
+
+`POST /v1/responses/input_tokens`. OpenAI. The body is that of
+`/v1/responses`, `previous_response_id` too. The server renders and
+tokenizes the prompt with no prefill and gives
+`{"object": "response.input_tokens", "input_tokens": 123}`.
 
 ### Responses examples
 

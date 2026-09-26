@@ -87,6 +87,15 @@ local function pdecode(s)
 	end))
 end
 
+--- Decodes the `%XX` escapes of a path segment.
+-- @tparam string s the segment
+-- @treturn string the decoded text
+function M.unescape(s)
+	return (s:gsub("%%(%x%x)", function(h)
+		return string.char(tonumber(h, 16))
+	end))
+end
+
 --- Decodes a query string into a table. The last value of a key wins.
 -- @tparam ?string q the query string
 -- @treturn table the keys and values

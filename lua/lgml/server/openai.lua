@@ -1005,12 +1005,13 @@ end
 -- @tparam[opt] table opts the options: `state_dir`, the directory of
 -- the key file for reasoning signatures (see
 -- `lgml.server.translate.load_key`; default: a key in memory), or
--- `key`, the key itself
+-- `key`, the key itself; `store`, the store of Responses responses (see
+-- `lgml.server.response_store`)
 -- @raise when eng does not implement the interface
 function M.install(srv, eng, opts)
 	engine_api.check(eng)
 	opts = opts or {}
-	local shared = { key = opts.key or translate.load_key(opts.state_dir) }
+	local shared = { key = opts.key or translate.load_key(opts.state_dir), store = opts.store }
 	require("lgml.server.anthropic").install(srv, eng, shared)
 	require("lgml.server.responses").install(srv, eng, shared)
 	local function health(_, res)
