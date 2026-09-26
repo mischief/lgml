@@ -1,0 +1,210 @@
+#!/usr/bin/env lua5.4
+-- lgml-finetune: train a LoRA adapter on a JSONL chat dataset.
+
+local root = ((arg and arg[0] or ""):match("^(.*)/[^/]*$") or ".") .. "/.."
+package.path = root .. "/lua/?.lua;" .. root .. "/lua/?/init.lua;" ..
+    root .. "/lua_modules/share/lua/5.4/?.lua;" .. package.path
+package.cpath = root .. "/" .. (os.getenv("LGML_BUILD") or "build") .. "/?.so;" .. root .. "/lua_modules/lib/lua/5.4/?.so;" ..
+    package.cpath
+
+local lgml = require("lgml")
+local getopt = require("lgml.getopt")
+local chat = require("lgml.chat")
+local tokenizer = require("lgml.tokenizer")
+local transformer = require("lgml.transformer")
+local lora = require("lgml.lora")
+local finetune = require("lgml.finetune")
+
+local USAGE = [[
+usage: lgml-finetune [-h] -m model -d data [-o out] [-b backend] [-r rank]
+                     [--alpha a] [--targets list] [--lr x] [--warmup n]
+                     [--wd x] [--optimizer name] [-e epochs] [-c ctx]
+                     [--batch n] [--grad-accum n] [--eval file]
+                     [--eval-split f] [--eval-every n] [--save-every n]
+                     [--init adapter] [--seed n] [--think]
+  -m, --model file     base gguf model: a dense llama or qwen3; its
+                       weights may be quantized
+  -d, --data file      JSONL training data, one {"messages": [...]} per
+                       line in OpenAI chat form; the loss is on the
+                       assistant turns only
+  -o, --out file       adapter gguf to write (default adapter.gguf); it
+                       loads in llama.cpp with --lora
+  -b, --backend name   ggml backend, for example Vulkan0 or CPU (default
+                       best)
+  -r, --rank n         LoRA rank (default 8)
+      --alpha a        LoRA alpha; the scale is alpha / rank (default
+                       2 * rank)
+      --targets list   comma-separated weights to adapt (default
+                       attn_q,attn_k,attn_v,attn_output,ffn_gate,
+                       ffn_up,ffn_down); "output" adds the output
+                       projection
+      --lr x           learning rate (default 1e-4)
+      --warmup n       steps of linear learning rate warmup (default 0)
+      --wd x           weight decay (default 0)
+      --optimizer name adamw or sgd (default adamw)
+  -e, --epochs n       passes over the data (default 1)
+  -c, --ctx n          the most tokens in one micro-batch; longer
+                       samples lose their end (default 512)
+      --batch n        the most samples packed in one micro-batch
+                       (default: as many as fit in ctx)
+      --grad-accum n   micro-batches in one optimizer step (default 1)
+      --eval file      JSONL eval data
+      --eval-split f   hold out this fraction of the data for eval
+                       (default 0)
+      --eval-every n   eval every n steps (default: after each epoch)
+      --save-every n   write a checkpoint every n steps, to the out
+                       file with -stepN before .gguf (default 0: off)
+      --init adapter   start from this adapter (gguf or PEFT)
+      --seed n         seed for the adapter and the order (default 1)
+      --think          render the chat template with thinking on
+  -h, --help           show this help
+]]
+
+local function die(msg)
+	io.stderr:write("lgml-finetune: ", msg, "\n")
+	os.exit(1)
+end
+
+local function num(opts, k, def, int)
+	local v = opts[k]
+	if v == nil then
+		return def
+	end
+	local n = tonumber(v)
+	if not n or (int and not math.tointeger(n)) then
+		die(("bad value for %s: %s"):format(k, v))
+	end
+	return int and math.tointeger(n) or n
+end
+
+local function main(args)
+	local opts, rest = getopt.parse(args, "hm:d:o:b:r:e:c:", {
+		help = "h", model = "m", data = "d", out = "o", backend = "b", rank = "r",
+		epochs = "e", ctx = "c", ["alpha="] = false, ["targets="] = false, ["lr="] = false,
+		["warmup="] = false, ["wd="] = false, ["optimizer="] = false, ["batch="] = false,
+		["grad-accum="] = false, ["eval="] = false, ["eval-split="] = false,
+		["eval-every="] = false, ["save-every="] = false, ["init="] = false,
+		["seed="] = false, think = false,
+	})
+	if not opts then
+		io.stderr:write("lgml-finetune: ", rest, "\n", USAGE)
+		os.exit(2)
+	end
+	if opts.h then
+		io.stdout:write(USAGE)
+		return
+	end
+	if #rest > 0 or not opts.m or not opts.d then
+		io.stderr:write(USAGE)
+		os.exit(2)
+	end
+	local out = opts.o or "adapter.gguf"
+	local rank = num(opts, "r", 8, true)
+	local ctx = num(opts, "c", 512, true)
+	local split = num(opts, "eval-split", 0)
+	local seed = num(opts, "seed", 1, true)
+	local optimizer = opts.optimizer or "adamw"
+	if optimizer ~= "adamw" and optimizer ~= "sgd" then
+		die("optimizer must be adamw or sgd")
+	end
+	if rank < 1 or ctx < 2 or split < 0 or split >= 1 then
+		die("rank, ctx or eval split out of range")
+	end
+
+	local be = assert(lgml.backend(opts.b))
+	local info = assert(lgml.gguf(opts.m))
+	local family = chat.load(info.meta)
+	local tk = assert(tokenizer.open(opts.m))
+	local model = transformer.load(be, opts.m)
+	local ok, err = pcall(finetune.check, model)
+	if not ok then
+		die(tostring(err))
+	end
+
+	local function samples(path)
+		local list = {}
+		for _, msgs in ipairs(finetune.read_jsonl(path)) do
+			for _, s in ipairs(finetune.encode(tk, family, msgs, { enable_thinking = opts.think })) do
+				list[#list + 1] = s
+			end
+		end
+		return list
+	end
+	local train = samples(opts.d)
+	local eval = opts.eval and samples(opts.eval) or {}
+	if split > 0 then
+		local k = math.max(1, math.floor(#train * split + 0.5))
+		for _ = 1, k do
+			eval[#eval + 1] = table.remove(train)
+		end
+	end
+	local batch = num(opts, "batch", nil, true)
+	local tmb, cut = finetune.pack(train, ctx, batch)
+	local emb = finetune.pack(eval, ctx, batch)
+	if cut > 0 then
+		io.stderr:write(("lgml-finetune: %d samples longer than %d tokens lose their end\n"):format(
+		    cut, ctx))
+	end
+	if #tmb == 0 then
+		die(opts.d .. ": no sample has assistant tokens")
+	end
+
+	local ad
+	if opts.init then
+		ad = lora.load(model, opts.init)
+		for _, p in ipairs(ad:params()) do
+			p:requires_grad()
+		end
+	else
+		local targets
+		if opts.targets then
+			targets = {}
+			for t in opts.targets:gmatch("[^,%s]+") do
+				targets[#targets + 1] = t
+			end
+		end
+		ad = lora.new(model, { rank = rank, alpha = num(opts, "alpha", 2 * rank), targets = targets,
+		    seed = seed })
+	end
+	local m = 0
+	for _, mb in ipairs(tmb) do
+		m = m + mb.m
+	end
+	io.stderr:write(("lgml-finetune: %s on %s; %d adapter weights, %d values; %d micro-batches, " ..
+	    "%d loss tokens; eval %d micro-batches\n"):format(model.hp.arch, be:name(), #ad.names,
+	    ad:numel(), #tmb, m, #emb))
+
+	local base = out:gsub("%.gguf$", "")
+	local function save(path)
+		local good, serr = ad:save(path, { ["general.name"] = info.meta["general.name"] or "lgml" })
+		if not good then
+			die(path .. ": " .. tostring(serr))
+		end
+	end
+	local t0 = lgml.clock()
+	local res = finetune.train({
+		model = model, adapter = ad, train = tmb, eval = emb,
+		epochs = num(opts, "e", 1, true), accum = num(opts, "grad-accum", 1, true),
+		lr = num(opts, "lr", 1e-4), warmup = num(opts, "warmup", 0, true),
+		weight_decay = num(opts, "wd", 0), optimizer = optimizer, seed = seed,
+		eval_every = num(opts, "eval-every", nil, true),
+		save_every = num(opts, "save-every", 0, true),
+		save = function(step)
+			save(("%s-step%d.gguf"):format(base, step))
+		end,
+		log = function(ev)
+			if ev.kind == "step" then
+				io.stdout:write(("step %d epoch %d loss %.4f lr %.3g tokens %d %.1fs\n"):format(
+				    ev.step, ev.epoch, ev.loss, ev.lr, ev.tokens, ev.seconds))
+			else
+				io.stdout:write(("eval step %d loss %.4f\n"):format(ev.step, ev.loss))
+			end
+			io.stdout:flush()
+		end,
+	})
+	save(out)
+	io.stderr:write(("lgml-finetune: %d steps in %.1fs; wrote %s\n"):format(res.steps,
+	    lgml.clock() - t0, out))
+end
+
+main(arg)
