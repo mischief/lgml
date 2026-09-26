@@ -253,6 +253,7 @@ end
 -- no. State `"fail"` gives status 500. It waits one delay, so ctl can
 -- cancel; a cancel gives status 499. Images do not change the
 -- answers; an image that is not a PNG or JPEG file gives status 400.
+-- A recipe that `lgml.decide.recipe` rejects gives status 422.
 -- `timings` has `images` and `image_bytes`, their count and size.
 -- @tparam table req the decision request
 -- @tparam[opt] lgml.server.engine.Control ctl the cancel control
@@ -267,6 +268,13 @@ function F:decide(req, ctl)
 	end
 	if req.state == "fail" then
 		return nil, "fake failure", 500
+	end
+	if req.recipe then
+		local decide = require("lgml.decide")
+		local rc, err = decide.recipe(decide.default_recipe(), req.recipe)
+		if not rc then
+			return nil, err, 422
+		end
 	end
 	local nbytes = 0
 	for i, img in ipairs(req.images or {}) do

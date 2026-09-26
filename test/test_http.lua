@@ -207,6 +207,10 @@ local function test_errors(port)
 		{ role = "user", content = { { type = "image_url", image_url = { detail = "low" } } } } } })))
 	ok(r.status == 400 and body_json(r).error.param == "messages", "image part without a URL")
 
+	r = roundtrip(port, request("POST", "/models/load", '{"model": "fake"}'))
+	ok(r.status == 400 and body_json(r).error.message:find("start it with %-C config"),
+	    "load on a server without a pool gives 400")
+
 	r = roundtrip(port, request("GET", "/nope"))
 	ok(r.status == 404 and body_json(r).error.type == "not_found_error",
 	    "unknown path gives 404")

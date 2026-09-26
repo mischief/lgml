@@ -115,8 +115,8 @@ Status codes:
 
 | Code | When |
 | --- | --- |
-| 400 | Bad JSON, a field that fails a check, a bad grammar or schema, a prompt longer than the context, image input to a model without vision, an engine that rejects the request, a load request for a model that does not load on demand. |
-| 404 | No route for the path. The engine does not serve this kind of request (for example `/v1/audio/speech` with a chat model only). `/models/load` on a server without a config. An unknown model id on load or unload. |
+| 400 | Bad JSON, a field that fails a check, a bad grammar or schema, a prompt longer than the context, image input to a model without vision, an engine that rejects the request, a load or unload request to a server started without `-C config`, or with `--inproc`. |
+| 404 | No route for the path. The engine does not serve this kind of request (for example `/v1/audio/speech` with a chat model only). An unknown model id on load or unload. |
 | 405 | The path exists, the method does not. The `Allow` header lists the methods. |
 | 408, 411, 413, 431, 505 | HTTP errors; see [Common behavior](#common-behavior). |
 | 409 | `/models/unload` while the model loads or has requests in flight. |
@@ -485,7 +485,8 @@ JSON.
   - `mode` must be `index`, `state_last` must be false, and `prompt`
     must be `jevify`, when given.
 
-  A recipe that fails these rules gives 422 `{"detail": "message"}`.
+  A recipe that fails these rules gives 422 with a `detail` list, and
+  `loc` is `["body", "lgml", "recipe"]`.
 
 ### Response
 
@@ -519,7 +520,8 @@ and `x-jevify-latency-ms`.
 - 422 for a body that fails a check, as FastAPI gives it:
   `{"detail": [{"loc": ["body", "questions", "q", "criteria"], "msg":
   "...", "type": "value_error"}]}`. Bad JSON has type `json_invalid`.
-- 422 `{"detail": "message"}` for a bad `lgml.recipe`.
+- 422 for a bad `lgml.recipe`, in the same shape, with `loc`
+  `["body", "lgml", "recipe"]`.
 - 404 `{"detail": "this server does not serve decisions"}` when no
   model decides.
 - 400, 500 and 503 give `{"detail": "message"}`. For example, a prompt
@@ -583,8 +585,9 @@ worker. A worker also starts on the first request for its model.
 - Unload stops the worker. It gives 409 while the model loads or has
   requests in flight. An unloaded model gives success.
 - A missing `model` gives 400. An unknown id gives 404.
-- A server with `-m` or `--fake` gives 404. A config with `--inproc`
-  gives 400: its models do not load on demand.
+- A server started with `-m`, `--fake` or `--inproc` does not load
+  models on demand. Load and unload give 400 with the message "this
+  server does not load models on demand; start it with -C config".
 
 ```sh
 curl -s localhost:8080/models/load -d '{"model": "qwen3-14b"}'

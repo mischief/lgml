@@ -512,7 +512,7 @@ end
 -- POST /models/load and /models/unload: { "model": id }.
 local function load_route(eng, req, res, what)
 	if type(eng[what]) ~= "function" then
-		return res:error(404, "this server does not load or unload models")
+		return res:error(400, engine_api.NO_LOAD)
 	end
 	local body, err = json.decode(req.body)
 	if type(body) ~= "table" then
@@ -763,6 +763,10 @@ local function systemone_route(eng, req, res)
 	end
 	metrics.request(model, "decide", r ~= nil)
 	if not r then
+		if status == 422 then
+			-- Only a bad lgml.recipe gets past systemone.check to give 422.
+			return res:json(422, systemone.error_body({ "body", "lgml", "recipe" }, msg or "bad recipe"))
+		end
 		return res:json(status or 500, { detail = msg or "decision failed" })
 	end
 	if r.usage then
@@ -1002,8 +1006,8 @@ end
 --
 -- `POST /models/load` and `POST /models/unload` (also under `/v1`)
 -- take `{ "model": id }` and call `Engine:load` or `Engine:unload`.
--- They give `{ "success": true }`, or an error; 404 when eng has no
--- such method.
+-- They give `{ "success": true }`, or an error; 400 with
+-- `lgml.server.engine.NO_LOAD` when eng has no such method.
 -- @tparam lgml.server.httpd.Server srv the server
 -- @tparam lgml.server.engine.Engine eng the engine
 -- @raise when eng does not implement the interface

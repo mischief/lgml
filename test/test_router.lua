@@ -34,6 +34,10 @@ ok(r:pick("whisper", "transcribe") == stt and r:pick(nil, "chat") ~= stt,
     "chat skips transcribe-only engines")
 ok(r:props().n_ctx == 111, "props from first chat engine")
 ok(r:transcribe({ model = "whisper" }, "").text == "from stt", "transcribe routes")
+local _, lmsg, lcode = r:load("a")
+local _, umsg, ucode = r:unload("nope")
+ok(lcode == 400 and ucode == 400 and lmsg == require("lgml.server.engine").NO_LOAD and umsg == lmsg,
+    "load and unload give 400 when no model loads on demand")
 ok(r:model_for(nil, "chat") == "a" and r:model_for("nope", "chat") == "a" and
     r:model_for("b", "chat") == "b" and r:model_for("whisper", "chat") == "a",
     "model_for gives the model that serves chat")

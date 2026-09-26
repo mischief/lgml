@@ -10,6 +10,7 @@
 local media = require("lgml.chat.media")
 local detect = require("lgml.detect")
 local log = require("lgml.log")
+local engine_api = require("lgml.server.engine")
 
 local L = log.new("router")
 
@@ -302,19 +303,36 @@ function R:generate(req, ctl)
 	return e:generate(req, ctl)
 end
 
+-- The engine of model id for a load or unload, or nil, a message and a
+-- status. A router with no engine that loads on demand gives 400.
+local function loader(self, id, what)
+	local any = false
+	for _, e in ipairs(self.engines) do
+		any = any or e[what] ~= nil
+	end
+	if not any then
+		return nil, engine_api.NO_LOAD, 400
+	end
+	local e = find(self, id)
+	if not e then
+		return nil, "unknown model " .. tostring(id), 404
+	elseif not e[what] then
+		return nil, ("model %s does not load on demand"):format(id), 400
+	end
+	return e
+end
+
 --- Loads a model by id, or waits for its load under way.
 -- @tparam string id the model id
 -- @treturn[1] boolean true when the model is loaded
 -- @treturn[2] nil
 -- @treturn[2] string an error message
--- @treturn[2] int 404 for an unknown id, 400 for a model that does not
--- load on demand, 503 when the load fails
+-- @treturn[2] int 400 when the router or the model does not load on
+-- demand, 404 for an unknown id, 503 when the load fails
 function R:load(id)
-	local e = find(self, id)
+	local e, err, code = loader(self, id, "load")
 	if not e then
-		return nil, "unknown model " .. tostring(id), 404
-	elseif not e.load then
-		return nil, ("model %s does not load on demand"):format(id), 400
+		return nil, err, code
 	end
 	local ok, msg, status = e:load()
 	if not ok then
@@ -328,14 +346,12 @@ end
 -- @treturn[1] boolean true, also when the model was not loaded
 -- @treturn[2] nil
 -- @treturn[2] string an error message
--- @treturn[2] int 404 for an unknown id, 400 for a model that does not
--- load on demand, 409 while it has requests in flight or loads
+-- @treturn[2] int 400 when the router or the model does not load on
+-- demand, 404 for an unknown id, 409 while it has requests in flight or loads
 function R:unload(id)
-	local e = find(self, id)
+	local e, err, code = loader(self, id, "unload")
 	if not e then
-		return nil, "unknown model " .. tostring(id), 404
-	elseif not e.unload then
-		return nil, ("model %s does not load on demand"):format(id), 400
+		return nil, err, code
 	end
 	return e:unload()
 end

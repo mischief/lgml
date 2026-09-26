@@ -17,6 +17,10 @@ local M = {}
 -- The keys are `stop`, `length` and `tool_calls`. Each value is true.
 M.reasons = { stop = true, length = true, tool_calls = true }
 
+--- The message of a load or unload request to a server whose models do
+-- not load on demand. Such a request gives status 400.
+M.NO_LOAD = "this server does not load models on demand; start it with -C config"
+
 --- Checks that e has the methods of the interface.
 -- @tparam Engine e the engine to check
 -- @treturn Engine e

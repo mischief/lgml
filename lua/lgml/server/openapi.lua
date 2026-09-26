@@ -455,8 +455,8 @@ local function operations()
 			responses = {
 				["200"] = reply("Answers.", "application/json", ref("SystemOneResponse"), { "elapsed-ms" }),
 				["404"] = reply("No model decides.", "application/json", ref("SystemOneError")),
-				["422"] = reply("Bad request, or a bad recipe.", "application/json", {
-					oneOf = json.array({ ref("SystemOneValidationError"), ref("SystemOneError") }) }),
+				["422"] = reply("Bad request, or a bad recipe.", "application/json",
+				    ref("SystemOneValidationError")),
 				["500"] = reply("Engine error.", "application/json", ref("SystemOneError")),
 				["503"] = reply("Worker or load failure.", "application/json", ref("SystemOneError")),
 			},

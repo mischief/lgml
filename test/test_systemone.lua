@@ -367,6 +367,12 @@ local function test_http(port, bare_port)
 	ok(status == 422 and json.decode(rb).detail[1].type == "json_invalid", "bad JSON gives 422")
 	status, rb = post(port, "/v1/systemone", body("fail", { { "q", NOUL } }))
 	ok(status == 500 and json.decode(rb).detail == "fake failure", "engine error")
+	status, rb = post(port, "/v1/systemone", '{"state": "x", "questions": {"q": ' .. NOUL ..
+	    '}, "lgml": {"recipe": {"mode": "label"}}}')
+	b = json.decode(rb)
+	local d = b and type(b.detail) == "table" and b.detail[1]
+	ok(status == 422 and d and d.loc[2] == "lgml" and d.loc[3] == "recipe" and
+	    d.msg == "recipe mode must be index" and d.type == "value_error", "bad recipe gives a FastAPI detail list")
 	status, rb, raw = post(port, "/v1/systemone", '{"state": "x", "questions": {"q": ' .. NOUL ..
 	    '}, "attachments": ["' .. PNG_URL .. '", "' .. JPEG_URL .. '"]}')
 	ok(status == 200 and raw:find("x%-lgml%-images: 2\r\n"), "attachments reach the engine; images header")
