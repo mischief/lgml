@@ -196,13 +196,13 @@ end
 -- no limit)
 -- @treturn {table,...} micro-batches: { samples, n (tokens), m (loss
 -- tokens) }
--- @treturn integer the count of samples cut to ctx
+-- @treturn integer the count of samples that lost their end
 function M.pack(samples, ctx, batch)
-	local out, cur, cut = {}, nil, 0
+	local out, cur, trimmed = {}, nil, 0
 	for _, s in ipairs(samples) do
 		if #s.ids > ctx then
 			s = { ids = table.move(s.ids, 1, ctx, 1, {}), train = table.move(s.train, 1, ctx, 1, {}) }
-			cut = cut + 1
+			trimmed = trimmed + 1
 		end
 		local m = targets_of(s)
 		if m > 0 then
@@ -214,7 +214,7 @@ function M.pack(samples, ctx, batch)
 			cur.n, cur.m = cur.n + #s.ids, cur.m + m
 		end
 	end
-	return out, cut
+	return out, trimmed
 end
 
 local NEG, ZERO = string.pack("<f", -math.huge), string.pack("<f", 0)

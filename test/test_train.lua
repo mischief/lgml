@@ -48,7 +48,10 @@ end
 -- Compare the gradient of each param with central differences of the
 -- loss. build(g, params, extra) returns the output node. Returns the
 -- largest error, scaled by max(1, |numeric|).
-local EPS, TOL = 1e-2, 1e-2
+-- GPU backends round some matmul inputs to f16, so their differences
+-- take a larger step and tolerance.
+local GPU = (os.getenv("LGML_DEVICE") or "CPU") ~= "CPU"
+local EPS, TOL = GPU and 5e-2 or 1e-2, GPU and 1e-1 or 1e-2
 local function fdcheck(name, params, build, opts)
 	opts = opts or {}
 	for _, p in ipairs(params) do

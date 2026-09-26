@@ -82,9 +82,9 @@ do
 		end
 		return t
 	end
-	local mbs, cut = finetune.pack({ s(10, 3), s(10, 3), s(10, 3), s(40, 30) }, 32)
-	ok(#mbs == 2 and mbs[1].n == 30 and mbs[1].m == 9 and mbs[2].n == 32 and cut == 1,
-	    "pack fills micro-batches and cuts long samples")
+	local mbs, trimmed = finetune.pack({ s(10, 3), s(10, 3), s(10, 3), s(40, 30) }, 32)
+	ok(#mbs == 2 and mbs[1].n == 30 and mbs[1].m == 9 and mbs[2].n == 32 and trimmed == 1,
+	    "pack fills micro-batches and trims long samples")
 	mbs = finetune.pack({ s(10, 3), s(10, 3), s(10, 3) }, 64, 2)
 	ok(#mbs == 2 and #mbs[1].samples == 2, "pack keeps the batch limit")
 end

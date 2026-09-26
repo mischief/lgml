@@ -165,11 +165,11 @@ local function main(args)
 		end
 	end
 	local batch = num(opts, "batch", nil, true)
-	local tmb, cut = finetune.pack(train, ctx, batch)
+	local tmb, trimmed = finetune.pack(train, ctx, batch)
 	local emb = finetune.pack(eval, ctx, batch)
-	if cut > 0 then
+	if trimmed > 0 then
 		io.stderr:write(("lgml-finetune: %d samples longer than %d tokens lose their end\n"):format(
-		    cut, ctx))
+		    trimmed, ctx))
 	end
 	if #tmb == 0 then
 		die(opts.d .. ": no sample has loss tokens")

@@ -22,6 +22,8 @@ local function ok(cond, name)
 end
 
 local be <close> = assert(lgml.backend(os.getenv("LGML_DEVICE") or "CPU"))
+-- GPU backends accumulate in f16, so whole-pass comparisons get more room.
+local LOOSE = (os.getenv("LGML_DEVICE") or "CPU") == "CPU" and 1e-3 or 3e-2
 local files = {}
 local function tmp(suffix)
 	local p = tiny.tmp(suffix)
@@ -96,7 +98,7 @@ do
 	tiny.write(mpath, "qwen3", { override = merge(byname, { ad }) })
 	local merged = transformer.load(be, mpath)
 	local d = maxdiff(with, logits_of(merged, ids))
-	ok(d < 1e-3, ("adapter matches merged weights (%.2e)"):format(d))
+	ok(d < LOOSE, ("adapter matches merged weights (%.2e)"):format(d))
 	merged:close()
 
 	local apath = tmp(".gguf")
@@ -125,7 +127,7 @@ do
 	tiny.write(mpath2, "qwen3", { override = merge(byname, { ad, ad2 }) })
 	local merged2 = transformer.load(be, mpath2)
 	d = maxdiff(both, logits_of(merged2, ids))
-	ok(d < 1e-3, ("two adapters match merged weights (%.2e)"):format(d))
+	ok(d < LOOSE, ("two adapters match merged weights (%.2e)"):format(d))
 	merged2:close()
 
 	-- Decode with replay against a new graph per pass.
