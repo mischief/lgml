@@ -34,7 +34,11 @@ return {
 		{ id = "whisper", model = "/home/you/models/whisper-large-v3-turbo", backend = "Vulkan0",
 			idle = 0 },
 		-- mem sets the MiB a model takes, in place of the estimate.
-		{ id = "zimage", model = "/home/you/models/zimage", engine = "lgml.image.engine", mem = 12000 },
+		-- text_backend = "CPU" keeps the text encoder (4 GiB) out of GPU
+		-- memory; it counts against ram, and mem counts the GPU part: about
+		-- 7.5 GiB at 512x512 and 9.6 GiB at 1024x1024.
+		{ id = "zimage", model = "/home/you/models/zimage", engine = "lgml.image.engine",
+			backend = "Vulkan0", text_backend = "CPU", mem = 10000 },
 		{ id = "orpheus", model = "/home/you/models/orpheus", engine = "lgml.tts.orpheus" },
 		{ id = "qwen3-tts", model = "/home/you/models/qwen3-tts", engine = "lgml.tts.qwen3tts" },
 		-- Models on the CPU do not count against vram.

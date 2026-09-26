@@ -26,7 +26,8 @@ local ALL = { "completion", "decide", "transcription", "speech", "image_generati
 local quiet = function() end
 
 -- Adds a fake model to pool. o: size (MiB, the estimate), measured
--- (MiB, what the worker reports), load_ms, delay, fail, idle.
+-- (MiB, what the worker reports), extra (MiB of each other kind),
+-- load_ms, delay, fail, idle.
 local function add(pool, id, o)
 	o = o or {}
 	local args = { "--fake", "--alias", id, "--fake-size", tostring(o.measured or o.size or 40) }
@@ -36,10 +37,14 @@ local function add(pool, id, o)
 	if o.fail then
 		args[#args + 1] = "--fake-fail"
 	end
+	local extra = {}
+	for kind, mb in pairs(o.extra or {}) do
+		extra[kind] = mb * MiB
+	end
 	local m
 	m = pool:add({
 		id = id, modes = o.modes or ALL, kind = o.kind or "gpu", size = (o.size or 40) * MiB,
-		idle = o.idle,
+		idle = o.idle, extra = extra,
 		start = function(on_exit)
 			m.starts = (m.starts or 0) + 1
 			return remote.new({
@@ -169,6 +174,27 @@ local function test_in_flight()
 	ok(chat(d) == true and states(p) == "a=loaded,b=unloaded,d=loaded",
 	    "a model with a request in flight stays")
 	ok(wait(long) == true, "the request in flight ends well")
+	cleanup(p)
+end
+
+-- A model with parts on two kinds counts each part against its budget.
+local function test_parts()
+	local p = pool_mod.new({ budget = { gpu = 100 * MiB, cpu = 100 * MiB }, log = quiet })
+	local g = add(p, "g", { size = 50 })
+	local c = add(p, "c", { size = 60, kind = "cpu" })
+	local s = add(p, "s", { size = 40, measured = 30, extra = { cpu = 50 } })
+	chat(g)
+	chat(c)
+	ok(chat(s) == true and states(p) == "g=loaded,c=unloaded,s=loaded",
+	    "the cpu part of a split model unloads a cpu model")
+	ok(p:used("gpu") == 80 * MiB and p:used("cpu") == 50 * MiB and s.size == 30 * MiB,
+	    "each part counts against its budget; the measure changes the main part")
+	ok(chat(c) == true and states(p) == "g=loaded,c=loaded,s=unloaded" and p:used("gpu") == 50 * MiB,
+	    "unloading the split model for its cpu part frees its gpu part too")
+	local big = add(p, "big", { size = 10, extra = { cpu = 120 } })
+	local r, msg, status = chat(big)
+	ok(r == nil and status == 503 and msg:find("needs 120 MiB; the cpu budget is 100 MiB", 1, true),
+	    "a part larger than its budget gives 503")
 	cleanup(p)
 end
 
@@ -340,6 +366,27 @@ local function test_estimate()
 	ok(estimate.id({ model = path }) == "tiny qwen3" and estimate.id({ model = "/m/x.gguf", id = "y" }) == "y" and
 	    estimate.id({ model = "/m/w/", engine = "lgml.stt_engine" }) == "w" and
 	    estimate.id({ model = "/m/o", engine = "lgml.tts.orpheus" }) == "orpheus", "estimate: model ids")
+	ok(estimate.kind("CPU") == "cpu" and estimate.kind("Vulkan0") == "gpu" and
+	    estimate.kind(nil) == "gpu" and estimate.kind(nil, false) == "cpu", "estimate: backend kinds")
+	-- An image model with its text encoder on the CPU has a cpu part.
+	local idir = tiny.tmp()
+	os.execute("mkdir -p " .. idir)
+	for name, len in pairs({ ["z_image_turbo.gguf"] = 100, ["Qwen3-4B.gguf"] = 40, ["ae.safetensors"] = 7 }) do
+		local f = assert(io.open(idir .. "/" .. name, "wb"))
+		f:write(string.rep("x", len))
+		f:close()
+	end
+	local ispec = { model = idir, engine = "lgml.image.engine", backend = "Vulkan0" }
+	e = estimate.model(ispec)
+	ok(e.files == 147 and next(e.extra) == nil, "estimate: an image model on one backend")
+	ispec.text_backend = "CPU"
+	e = estimate.model(ispec)
+	ok(e.files == 107 and e.bytes == 107 + estimate.MARGIN and e.kind == "gpu" and
+	    e.extra.cpu == 40 + estimate.TEXT_MARGIN, "estimate: the text encoder counts against cpu")
+	for _, name in ipairs({ "z_image_turbo.gguf", "Qwen3-4B.gguf", "ae.safetensors" }) do
+		os.remove(idir .. "/" .. name)
+	end
+	os.remove(idir)
 	local dir = tiny.tmp()
 	os.execute("mkdir -p " .. dir .. "/sub")
 	for name, len in pairs({ a = 10, b = 5, ["sub/c"] = 100 }) do
@@ -363,6 +410,7 @@ local function main()
 	test_shared_load()
 	test_lru()
 	test_in_flight()
+	test_parts()
 	test_no_room()
 	test_idle()
 	test_failure()

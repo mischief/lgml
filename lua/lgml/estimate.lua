@@ -13,6 +13,9 @@ local MiB = 1048576
 
 --- Bytes added to each estimate for compute buffers: 1 GiB.
 M.MARGIN = 1024 * MiB
+--- Bytes added to a text encoder on its own backend, for its compute
+-- buffers: 256 MiB.
+M.TEXT_MARGIN = 256 * MiB
 
 -- Default ids of engine modules that do not take them from a file.
 local ENGINE_IDS = {
@@ -58,6 +61,19 @@ local function gguf_meta(path)
 	end
 	local info = lgml.gguf(path)
 	return info and info.meta
+end
+
+--- The memory kind of a backend: `"cpu"` or `"gpu"`.
+-- A name that starts with "CPU" is a CPU backend. With no name, the
+-- best backend is a GPU when the machine has one.
+-- @tparam[opt] string backend the backend name
+-- @tparam[opt] boolean gpu false when the machine has no GPU (default true)
+-- @treturn string the kind
+function M.kind(backend, gpu)
+	if backend then
+		return backend:upper():match("^CPU") and "cpu" or "gpu"
+	end
+	return gpu == false and "cpu" or "gpu"
 end
 
 --- The model id of a spec.
@@ -117,18 +133,35 @@ end
 
 --- The memory estimate of a spec.
 -- It is the bytes of the model files and the mmproj, plus the KV cache
--- of a chat model, plus `MARGIN`. For a chat model with no `ctx`, the
--- context is the trained one, or less so that the model fits budget
--- alone, in steps of 256 and at least 256. The cache types follow
--- `lgml.engine`: q8_0 with flash attention when it fits, else f16.
+-- of a chat model, plus `MARGIN`. An image model (`lgml.image.engine`)
+-- with a `text_backend` of another kind than its `backend` has two
+-- parts: the text encoder file plus `TEXT_MARGIN` goes in `extra`, under
+-- the kind of `text_backend`, and the other files in `files`. For a
+-- chat model with no `ctx`, the context is the trained one, or less so
+-- that the model fits budget alone, in steps of 256 and at least 256.
+-- The cache types follow `lgml.engine`: q8_0 with flash attention when
+-- it fits, else f16.
 -- @tparam table spec the model spec: `model`, `engine`, `stt`, `mmproj`,
--- `ctx`, `flash_attn`, `cache_type_k` and `cache_type_v`
--- @tparam[opt] number budget the memory budget in bytes
--- @treturn table `{ bytes, files, kv, margin, n_ctx }`; n_ctx is the
--- context for the worker, or nil when the estimate does not know it
-function M.model(spec, budget)
+-- `ctx`, `flash_attn`, `cache_type_k`, `cache_type_v`, `backend` and
+-- `text_backend`
+-- @tparam[opt] number budget the memory budget in bytes of the kind of
+-- `backend`
+-- @tparam[opt] boolean gpu false when the machine has no GPU (see `kind`)
+-- @treturn table `{ bytes, files, kv, margin, n_ctx, kind, extra }`; bytes
+-- is the part on the kind of `backend`; n_ctx is the context for the
+-- worker, or nil when the estimate does not know it; extra is
+-- `{ [kind] = bytes }` for the parts on other kinds
+function M.model(spec, budget, gpu)
 	local files = M.files(spec.model) + (spec.mmproj and M.files(spec.mmproj) or 0)
-	local r = { files = files, kv = 0, margin = M.MARGIN }
+	local kind = M.kind(spec.backend, gpu)
+	local r = { files = files, kv = 0, margin = M.MARGIN, kind = kind, extra = {} }
+	if spec.engine == "lgml.image.engine" and spec.text_backend and
+	    M.kind(spec.text_backend, gpu) ~= kind then
+		local _, llm = detect.image_files(spec.model)
+		local text = M.files(llm)
+		r.files = files - text
+		r.extra[M.kind(spec.text_backend, gpu)] = text + M.TEXT_MARGIN
+	end
 	local meta = not spec.engine and not spec.stt and gguf_meta(spec.model)
 	if meta and not detect.is_whisper(spec.model) then
 		local per, fixed, n_train = cache_size(meta, spec)

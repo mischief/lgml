@@ -41,15 +41,16 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       list of them or of { path, scale }, mmproj,
                       image_min_tokens, image_max_tokens,
                       text_backend = backend of the text encoder of
-                      lgml.image.engine, such as CPU,
+                      lgml.image.engine, such as CPU; its part counts
+                      against the budget of that backend,
                       engine = Lua module with new(opts), such as a TTS engine,
                       modes = list of completion, multimodal, decide,
                       transcription, speech, image_generation (default: from
                       the engine and files; needed for other engine modules),
                       preload = true to load at startup, idle = seconds for
-                      this model, mem = MiB the model takes (default: an
-                      estimate from its files and KV cache plus 1024, then
-                      the measure of its worker) }
+                      this model, mem = MiB the model takes on backend
+                      (default: an estimate from its files and KV cache
+                      plus 1024, then the measure of its worker) }
   -m, --model file    gguf model file, or a Whisper model directory
   -b, --backend name  ggml backend, for example Vulkan0 or CPU (default best)
   -t, --threads n     CPU threads of each model (default: LGML_THREADS, else
@@ -292,7 +293,8 @@ local function managed_engines(path, cfg, opts)
 		local m = pool:add({
 			id = spec.id, modes = modes, kind = kind,
 			size = mem and mem * MiB or est.bytes, fixed = mem ~= nil,
-			files = est.files, margin = est.margin, context_length = est.n_ctx,
+			files = est.files, margin = est.margin, extra = est.extra,
+			context_length = est.n_ctx,
 			idle = number_key(spec, "idle"),
 			props = { n_ctx = est.n_ctx or 0, total_slots = 1, lora = list,
 			    modalities = { vision = spec.mmproj ~= nil } },
@@ -300,8 +302,13 @@ local function managed_engines(path, cfg, opts)
 				return start({ restart = false, on_exit = on_exit })
 			end,
 		})
-		io.stderr:write(("lgml-server: model %s: %s, %d MiB%s%s\n"):format(m.id, kind,
-		    m.size // MiB, mem and " (mem)" or " (estimate)", spec.preload and ", preload" or ""))
+		local extra = {}
+		for k, bytes in pairs(est.extra) do
+			extra[#extra + 1] = (", %d MiB %s"):format(bytes // MiB, k)
+		end
+		io.stderr:write(("lgml-server: model %s: %s, %d MiB%s%s%s\n"):format(m.id, kind,
+		    m.size // MiB, mem and " (mem)" or " (estimate)", table.concat(extra),
+		    spec.preload and ", preload" or ""))
 		if spec.preload then
 			preload[#preload + 1] = m
 		end
@@ -309,11 +316,8 @@ local function managed_engines(path, cfg, opts)
 	end
 	local engines = {}
 	for i, spec in ipairs(cfg.models) do
-		local kind = "gpu"
-		if (spec.backend and spec.backend:upper():match("^CPU")) or (not spec.backend and not gpu) then
-			kind = "cpu"
-		end
-		local est = estimate.model(spec, budget[kind])
+		local kind = estimate.kind(spec.backend, gpu ~= nil)
+		local est = estimate.model(spec, budget[kind], gpu ~= nil)
 		-- Under a budget, the worker gets the context of the estimate, not
 		-- one that fits the free memory at its load.
 		if not spec.ctx and est.n_ctx and budget[kind] < math.huge then

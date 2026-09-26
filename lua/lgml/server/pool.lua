@@ -2,9 +2,12 @@
 -- A pool holds models of several workers. Each model starts its worker
 -- on the first request, and the requests that arrive during the load
 -- wait for the same load. Each model has a size in bytes, and each
--- memory kind (`"gpu"` or `"cpu"`) has a budget. When a load does not
--- fit, the pool unloads idle models of that kind, least recently used
--- first. A model with requests in flight or a load under way stays.
+-- memory kind (`"gpu"` or `"cpu"`) has a budget. A model with parts on
+-- more than one kind, such as an image model with its text encoder on
+-- the CPU, counts each part against the budget of its kind. When a load
+-- does not fit, the pool unloads idle models of that kind, least
+-- recently used first. A model with requests in flight or a load under
+-- way stays.
 -- When the idle models do not free enough room, the load waits for
 -- requests to end, for at most `load_wait` seconds, and then fails
 -- with status 503.
@@ -80,6 +83,9 @@ end
 --   (default 0)
 -- - `margin`: bytes added to a measured size, for compute buffers
 --   (default 0)
+-- - `extra`: `{ [kind] = bytes }`, parts of the model that count against
+--   the budgets of other kinds, such as a text encoder on the CPU of a
+--   GPU model; the measure of the worker does not change them
 -- - `fixed`: true to keep `size` and not use the measure of the worker
 -- - `context_length`: the context size, when known before the load
 -- - `props`: the props to give while the model is not loaded
@@ -92,8 +98,9 @@ function P:add(o)
 	local m = setmetatable({
 		pool = self, id = o.id, mode_list = o.modes, kind = o.kind or "gpu",
 		estimate = o.size or 0, size = o.size or 0, files = o.files or 0,
-		margin = o.margin or 0, fixed = o.fixed, context_length = o.context_length,
-		static_props = o.props, idle = o.idle, start = o.start,
+		margin = o.margin or 0, extra = o.extra or {}, fixed = o.fixed,
+		context_length = o.context_length, static_props = o.props, idle = o.idle,
+		start = o.start,
 		state = "unloaded", inflight = 0, last = 0, waiters = {}, counted = false,
 	}, Model)
 	self.models[#self.models + 1] = m
@@ -120,8 +127,8 @@ end
 function P:used(kind)
 	local n = 0
 	for _, m in ipairs(self.models) do
-		if m.counted and m.kind == kind then
-			n = n + m.size
+		if m.counted then
+			n = n + m:need(kind)
 		end
 	end
 	return n
@@ -152,16 +159,21 @@ function P:notify()
 	wake(self.events)
 end
 
--- Take the load lock of a kind; loads of one kind run one at a time.
-function P:take_lock(kind)
-	while self.lock[kind] do
-		self:wait_event()
+-- Take the load locks of the kinds of m, in name order; loads of one
+-- kind run one at a time.
+function P:take_lock(m)
+	for _, kind in ipairs(m:kinds()) do
+		while self.lock[kind] do
+			self:wait_event()
+		end
+		self.lock[kind] = true
 	end
-	self.lock[kind] = true
 end
 
-function P:drop_lock(kind)
-	self.lock[kind] = nil
+function P:drop_lock(m)
+	for _, kind in ipairs(m:kinds()) do
+		self.lock[kind] = nil
+	end
 	self:notify()
 end
 
@@ -169,7 +181,7 @@ end
 function P:idle_models(kind, except)
 	local list = {}
 	for _, m in ipairs(self.models) do
-		if m ~= except and m.kind == kind and m.state == "loaded" and m.inflight == 0 then
+		if m ~= except and m:need(kind) > 0 and m.state == "loaded" and m.inflight == 0 then
 			list[#list + 1] = m
 		end
 	end
@@ -179,40 +191,40 @@ function P:idle_models(kind, except)
 	return list
 end
 
--- Makes room for m and counts it. It holds the load lock of the kind.
--- Returns true, or nil and the reason.
-function P:reserve(m)
-	local budget = self.budget[m.kind] or math.huge
-	local deadline = now() + self.load_wait
-	if m.size > budget then
-		return nil, ("model %s needs %s; the %s budget is %s"):format(m.id, mib(m.size),
-		    m.kind, mib(budget))
+-- Makes room for the part of m of one kind. Room of other kinds that
+-- earlier calls made stays, since m holds their load locks. Returns
+-- true, or nil and the reason.
+function P:reserve_kind(m, kind, deadline)
+	local budget = self.budget[kind] or math.huge
+	local need = m:need(kind)
+	if need > budget then
+		return nil, ("model %s needs %s; the %s budget is %s"):format(m.id, mib(need),
+		    kind, mib(budget))
 	end
 	while true do
-		local used = self:used(m.kind)
-		if used + m.size <= budget then
-			m.counted = true
+		local used = self:used(kind)
+		if used + need <= budget then
 			return true
 		end
-		local idle = self:idle_models(m.kind, m)
+		local idle = self:idle_models(kind, m)
 		local room = budget - used
 		for _, o in ipairs(idle) do
-			room = room + o.size
+			room = room + o:need(kind)
 		end
-		if room >= m.size then
+		if room >= need then
 			local o = idle[1]
 			self.log(("unloading %s (least recently used) to load %s"):format(o.id, m.id))
 			o:unload()
 		else
 			local busy = {}
 			for _, o in ipairs(self.models) do
-				if o ~= m and o.kind == m.kind and o.counted and
+				if o ~= m and o:need(kind) > 0 and o.counted and
 				    (o.inflight > 0 or o.state ~= "loaded") then
 					busy[#busy + 1] = o.id
 				end
 			end
 			local why = ("model %s needs %s; the %s budget is %s, %s in use"):format(m.id,
-			    mib(m.size), m.kind, mib(budget), mib(used))
+			    mib(need), kind, mib(budget), mib(used))
 			if #busy == 0 then
 				return nil, why
 			elseif now() >= deadline or not self:wait_event(deadline) then
@@ -221,6 +233,20 @@ function P:reserve(m)
 			end
 		end
 	end
+end
+
+-- Makes room for m in the budget of each of its kinds and counts it. It
+-- holds the load locks of m. Returns true, or nil and the reason.
+function P:reserve(m)
+	local deadline = now() + self.load_wait
+	for _, kind in ipairs(m:kinds()) do
+		local ok, err = self:reserve_kind(m, kind, deadline)
+		if not ok then
+			return nil, err
+		end
+	end
+	m.counted = true
+	return true
 end
 
 --- Loads the models with preload, in order.
@@ -290,6 +316,40 @@ end
 function Model:set_state(s)
 	self.state = s
 	self.pool:notify()
+end
+
+--- The bytes of the model that count against the budget of a kind.
+-- @tparam string kind `"gpu"` or `"cpu"`
+-- @treturn integer the bytes
+function Model:need(kind)
+	return (self.kind == kind and self.size or 0) + (self.extra[kind] or 0)
+end
+
+--- The kinds whose budgets the model counts against, in name order.
+-- @treturn {string,...} the kinds
+function Model:kinds()
+	local list = { self.kind }
+	for kind, bytes in pairs(self.extra) do
+		if kind ~= self.kind and bytes > 0 then
+			list[#list + 1] = kind
+		end
+	end
+	table.sort(list)
+	return list
+end
+
+-- The size for a log line, with the part of each kind when it has more
+-- than one.
+function Model:describe()
+	local kinds = self:kinds()
+	if #kinds == 1 then
+		return mib(self:need(kinds[1]))
+	end
+	local parts = {}
+	for i, kind in ipairs(kinds) do
+		parts[i] = mib(self:need(kind)) .. " " .. kind
+	end
+	return table.concat(parts, ", ")
 end
 
 -- Start the idle timer when the model has nothing in flight.
@@ -367,7 +427,7 @@ function Model:do_load()
 	local pool = self.pool
 	self:set_state("loading")
 	local t0 = now()
-	pool:take_lock(self.kind)
+	pool:take_lock(self)
 	-- A failed load keeps its measure out: start from the estimate.
 	if not self.fixed then
 		self.size = self.measured or self.estimate
@@ -375,7 +435,7 @@ function Model:do_load()
 	local ok, err = pool:reserve(self)
 	local eng
 	if ok then
-		pool.log(("loading %s (%s)"):format(self.id, mib(self.size)))
+		pool.log(("loading %s (%s)"):format(self.id, self:describe()))
 		ok, eng = pcall(self.start, function()
 			self:exited(eng)
 		end)
@@ -390,7 +450,7 @@ function Model:do_load()
 	end
 	if not ok then
 		self.counted = false
-		pool:drop_lock(self.kind)
+		pool:drop_lock(self)
 		self:set_state("unloaded")
 		metrics.add("model_load_failures_total", "model loads that failed", self.id, 1)
 		err = ("model %s did not load: %s"):format(self.id, tostring(err))
@@ -404,13 +464,13 @@ function Model:do_load()
 		self.size = self.measured
 	end
 	local secs = now() - t0
-	pool.log(("loaded %s in %.2f s (%s)"):format(self.id, secs, mib(self.size)))
+	pool.log(("loaded %s in %.2f s (%s)"):format(self.id, secs, self:describe()))
 	self.engine, self.last = eng, now()
 	self.state = "loaded"
 	metrics.add("model_loads_total", "model loads", self.id, 1)
 	metrics.add("model_load_seconds_total", "time spent loading models", self.id, secs)
 	metrics.set("model_loaded_bytes", "device or host bytes of the loaded model", self.id, self.size)
-	pool:drop_lock(self.kind)
+	pool:drop_lock(self)
 	wake(self.waiters, true)
 	self:arm_idle()
 	return true
