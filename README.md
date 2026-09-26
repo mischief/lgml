@@ -49,7 +49,17 @@ bin/lgml-server -m model.gguf -ngl 30          # the last 30 layers on the GPU
 bin/lgml-server -m moe.gguf -ot 'blk%.[0-9]%.ffn_.*exps=CPU'
 ```
 
-`-ot` takes a Lua pattern, not a regular expression. Model specs in a
+`-ot` takes a Lua pattern (as `string.find` uses), not the regular
+expression that llama.cpp's `-ot` takes. A plain name such as `exps`
+works in both. For a llama.cpp recipe, change these:
+
+- The escape character is `%`, not `\`: `blk\.1` becomes `blk%.1`.
+- `%d` replaces `\d`; there are no `{n,m}` counts.
+- There is no alternation. Write one rule for each branch:
+  `-ot 'ffn_(up|down)_exps=CPU'` becomes
+  `-ot 'ffn_up_exps=CPU,ffn_down_exps=CPU'`.
+
+Model specs in a
 config take the keys `cpu_moe`, `n_cpu_moe`, `n_gpu_layers` and
 `override`. The host part counts against `ram`, the rest against
 `vram`; with `n_cpu_moe = "auto"` the server picks the count that fits

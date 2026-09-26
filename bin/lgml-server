@@ -114,7 +114,8 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       the token embeddings and, when n is at most the
                       layer count, the output layer in host memory
       -ot, --override-tensor pattern=backend
-                      put the tensors whose names match a Lua pattern,
+                      put the tensors whose names match a Lua pattern
+                      (% escapes, no alternation; not a regex),
                       such as exps or blk%.[0-9]%.ffn_, on backend: CPU,
                       or any other name for the -b backend; the first
                       match wins, before --n-cpu-moe and -ngl; repeat, or
