@@ -82,15 +82,24 @@ take turns keep their caches, and the RAM prompt store (`--cache-ram`)
 holds what the slots cannot. The model pool counts each slot at `-c`
 positions.
 
-With two or more slots, requests run at the same time: a prompt
-prefills alone, then its decode steps join the steps of the other
-requests in one batched pass. Decode is bound by memory bandwidth, so a
-pass of several slots costs little more than one: gemma-4-26B-A4B on a
-32 GB Radeon gives 89 tokens/s alone and about 155 tokens/s over three
-requests. On a GPU, a batched pass can round differently from a single
-one, so a greedy reply can change at a near tie, as in llama.cpp.
-Models with recurrent layers (qwen35, qwen3next) keep their slots but
-run one request at a time.
+With two or more slots, requests run at the same time: prompt chunks
+(up to 512 tokens) and decode steps of all requests go into one batched
+pass. Matmuls and experts run on all rows; attention runs per slot on
+its cache, and recurrent layers (qwen35, qwen3next) per slot on their
+states. A request that runs alone takes its slot's own graph, at the
+same speed as one slot. Decode is bound by memory bandwidth, so a pass
+of several slots costs little more than one. On a 32 GB Radeon, with
+200 tokens per request:
+
+| model | 1 request | 2 at once | 3 at once |
+|---|---|---|---|
+| gemma-4-26B-A4B | 89 tokens/s | ~120 total | ~155 total |
+| Ornith-1.5-35B (qwen35moe) | 114 | 149 | 168 |
+
+Prefill is bound by compute, so batched prompts finish about as fast as
+queued ones; they only progress together. On a GPU, a batched pass can
+round differently from a single one, so a greedy reply can change at a
+near tie, as in llama.cpp. A prompt with images prefills alone.
 
 ## Logs
 

@@ -21,16 +21,15 @@ local be <close> = assert(lgml.backend("CPU"))
 local m = transformer.load(be, path)
 local vocab = m.hp.n_vocab
 
--- The argmax of each row of an (S, vocab) logits node.
-local function argmax_rows(node, S)
-	local v = node:get()
+-- The argmax of each logits row node.
+local function argmax_rows(rows)
 	local out = {}
-	for s = 1, S do
+	for s, node in ipairs(rows) do
+		local v = node:get()
 		local best, bi = -math.huge, 0
 		for j = 1, vocab do
-			local x = v[(s - 1) * vocab + j]
-			if x > best then
-				best, bi = x, j - 1
+			if v[j] > best then
+				best, bi = v[j], j - 1
 			end
 		end
 		out[s] = bi
@@ -65,7 +64,7 @@ for i, p in ipairs(prompts) do
 	got[i] = { ids[i] }
 end
 for _ = 2, steps do
-	local next_ids = argmax_rows(m:decode_batch(caches, ids), #caches)
+	local next_ids = argmax_rows(m:decode_batch(caches, ids))
 	for i = 1, #caches do
 		got[i][#got[i] + 1] = next_ids[i]
 	end
@@ -87,7 +86,7 @@ ok(m.batch_replay.g == g1, "a step with the same spans replays the batch graph")
 
 -- A slot set in another order is another graph and still correct.
 local rev = { caches[3], caches[1] }
-local r = argmax_rows(m:decode_batch(rev, { ids[3], ids[1] }), 2)
+local r = argmax_rows(m:decode_batch(rev, { ids[3], ids[1] }))
 ok(#r == 2 and m.batch_replay.g ~= g1, "a new slot set builds a new graph")
 m:close()
 os.remove(path)

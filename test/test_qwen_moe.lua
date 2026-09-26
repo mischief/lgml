@@ -459,6 +459,53 @@ end
 
 -- Snapshots on the model: a full snapshot and a state checkpoint go
 -- back to their position, and the next pass gives the same logits.
+-- Batched passes: three slots prefill their prompts in one pass, then
+-- decode in one pass per step; each slot's logits match the slot run
+-- alone, and so do its greedy tokens.
+local function batch_check(arch, m)
+	local prompts = { { 11, 12, 13, 14, 15 }, { 40, 41, 42, 43, 44, 45, 46, 47, 48 }, { 7 } }
+	local steps = 10
+	local want, first = {}, {}
+	for i, p in ipairs(prompts) do
+		local c = m:cache(128)
+		local rows = eval(m, c, p)
+		first[i] = rows[#rows]
+		local id = argmax(rows[#rows])
+		want[i] = { id }
+		for _ = 2, steps do
+			id = argmax(eval(m, c, { id })[1])
+			want[i][#want[i] + 1] = id
+		end
+	end
+	local caches, got = {}, {}
+	for i = 1, #prompts do
+		caches[i] = m:cache(128)
+	end
+	local rows = m:run_batch(caches, prompts)
+	local err, ids = 0, {}
+	for i = 1, #prompts do
+		local v = rows[i]:get()
+		err = math.max(err, maxdiff(v, first[i]))
+		ids[i] = argmax(v)
+		got[i] = { ids[i] }
+	end
+	for _ = 2, steps do
+		local r = m:decode_batch(caches, ids)
+		for i = 1, #prompts do
+			ids[i] = argmax(r[i]:get())
+			got[i][#got[i] + 1] = ids[i]
+		end
+	end
+	local same = true
+	for i = 1, #prompts do
+		for j = 1, steps do
+			same = same and got[i][j] == want[i][j]
+		end
+	end
+	ok(err < 1e-3, ("%s: batched prefill logits match each slot alone (max error %.3g)"):format(arch, err))
+	ok(same, arch .. ": batched decode gives the same tokens as each slot alone")
+end
+
 local function snapshot_check(arch, m)
 	local replay = require("lgml.replay")
 	local c = m:cache(64)
@@ -487,9 +534,10 @@ end
 -- A request through the engine outside the server. Returns the reply.
 local function engine_chat(e, messages)
 	local uv = require("luv")
-	local r = {}
+	local r = { parts = {} }
 	local sink = {}
-	function sink.content()
+	function sink.content(_, t)
+		r.parts[#r.parts + 1] = t
 		return true
 	end
 	sink.reasoning, sink.tool_arguments = sink.content, sink.content
@@ -512,6 +560,7 @@ local function engine_chat(e, messages)
 		uv.run("once")
 	end
 	assert(r.res, r.err)
+	r.text = table.concat(r.parts)
 	return r
 end
 
@@ -559,6 +608,46 @@ end
 -- Checkpoints and the RAM store through the engine. Without flash
 -- attention, passes split at other positions give the same logits, so
 -- a restore must give them exactly.
+-- Concurrent chats on a two-slot engine: the prompts prefill and decode
+-- in batched passes and give the same replies as one engine per chat.
+local function concurrent_check(arch, path)
+	local engine = require("lgml.engine")
+	local uv = require("luv")
+	local convs = {
+		{ { role = "system", content = "You are a test. " .. long_text(4, 40) },
+		  { role = "user", content = long_text(5, 20) } },
+		{ { role = "user", content = long_text(6, 30) } },
+	}
+	local want = {}
+	for i, m in ipairs(convs) do
+		local one = engine.new({ model = path, backend = "CPU", n_ctx = 512, flash_attn = false })
+		want[i] = engine_chat(one, m).text
+	end
+	local e = engine.new({ model = path, backend = "CPU", n_ctx = 512, flash_attn = false, slots = 2 })
+	local got, done = {}, 0
+	for i, m in ipairs(convs) do
+		local text = {}
+		local sink = {
+			content = function(_, t) text[#text + 1] = t return true end,
+			reasoning = function() return true end, tool_arguments = function() return true end,
+			tool_call = function() return 0 end, finish = function() end,
+			cancelled = function() return false end,
+		}
+		coroutine.wrap(function()
+			e:chat({ messages = m, max_tokens = 3, top_k = 1,
+			    chat_template_kwargs = { enable_thinking = false } }, sink)
+			got[i] = table.concat(text)
+			done = done + 1
+		end)()
+	end
+	while done < #convs do
+		uv.run("once")
+	end
+	ok(got[1] == want[1] and got[2] == want[2], arch .. ": concurrent chats match one engine each")
+	ok((e.batch_rows or 0) > (e.batch_passes or 0), ("%s: prompts and steps shared passes (%d rows in %d passes, %d tokens)")
+	    :format(arch, e.batch_rows or 0, e.batch_passes or 0, e.batch_tokens or 0))
+end
+
 local function prompt_cache_check(arch, path)
 	local engine = require("lgml.engine")
 	local tag = arch .. " prompt cache: "
@@ -821,11 +910,13 @@ for _, arch in ipairs({ "llama", "qwen3", "qwen3moe", "qwen3next", "qwen35moe", 
 		rc.restart(ok, arch .. ": ", m)
 	end
 	snapshot_check(arch, m)
+	batch_check(arch, m)
 	if ref and (arch == "qwen3moe" or arch == "qwen3next" or arch == "qwen35moe") then
 		offload_check(arch, path, m, ref, long)
 	end
 	if arch == "qwen35moe" or arch == "qwen3" then
 		prompt_cache_check(arch, path)
+		concurrent_check(arch, path)
 	end
 	if arch == "qwen3" then
 		grammar_engine_check(arch, path)

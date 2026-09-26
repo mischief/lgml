@@ -465,7 +465,28 @@ end
 -- @tparam integer id the token id
 -- @return the logits node of this slot, valid until the next batch pass
 function E:decode_step(slot, id)
-	local entry = { slot = slot, id = id }
+	return self:batch_step(slot, { id })
+end
+
+--- Run tokens of a slot that a request owns in the next batched pass:
+-- one decode token, or a chunk of a prompt.
+-- @tparam table slot the slot
+-- @tparam {integer,...} ids the token ids
+-- @return the logits node of the slot's last token, valid until the next
+-- batch pass
+function E:batch_step(slot, ids)
+	-- Alone: run at once, with no trip through the event loop.
+	if #self.pending == 0 and not self.busy and self:owned() == 1 then
+		self:acquire()
+		local ok, logits = pcall(replay.run, self.model, slot.cache, ids,
+		    { logits = "last", flash_attn = self.flash_attn })
+		self:release()
+		if not ok then
+			error(logits, 0)
+		end
+		return logits
+	end
+	local entry = { slot = slot, ids = ids }
 	self.pending[#self.pending + 1] = entry
 	if not self.flush_scheduled then
 		self.flush_scheduled = true
@@ -498,13 +519,25 @@ function E:flush()
 	end
 	local caches, ids = {}, {}
 	for i, e in ipairs(list) do
-		caches[i], ids[i] = e.slot.cache, e.id
+		caches[i], ids[i] = e.slot.cache, e.ids
 	end
-	local ok, rows = pcall(self.model.decode_batch, self.model, caches, ids,
-	    { flash_attn = self.flash_attn, rows = true })
+	local ok, rows
+	if #list == 1 then
+		-- One request: its slot's own replayed graph is the fast path.
+		ok, rows = pcall(function()
+			return { replay.run(self.model, caches[1], ids[1],
+			    { logits = "last", flash_attn = self.flash_attn }) }
+		end)
+	else
+		ok, rows = pcall(self.model.run_batch, self.model, caches, ids,
+		    { flash_attn = self.flash_attn })
+	end
 	self:release()
 	self.batch_passes = (self.batch_passes or 0) + 1
 	self.batch_rows = (self.batch_rows or 0) + #list
+	for _, e in ipairs(list) do
+		self.batch_tokens = (self.batch_tokens or 0) + #e.ids
+	end
 	if L:on(log.TRACE) then
 		L:trace("batch", "slots", #list)
 	end
@@ -689,6 +722,59 @@ end
 
 -- Prefill prompt[from..] in chunks. Returns the last logits node. An
 -- image runs as one non-causal pass of its embeddings.
+-- Take a prompt cache checkpoint of a slot that is not the active one:
+-- the prompt cache points at the slot for the call. Needs the lock.
+function E:checkpoint_slot(slot)
+	local pc = self.pc
+	if slot == self.slot then
+		pc:checkpoint()
+		return
+	end
+	local cache, ckpts = pc.cache, pc.ckpts
+	pc.cache, pc.ckpts = slot.cache, slot.ckpts
+	pc:checkpoint()
+	slot.ckpts = pc.ckpts
+	pc.cache, pc.ckpts = cache, ckpts
+end
+
+--- Prefill a prompt on a slot that a request owns, in batched passes.
+-- Chunks of at most UBATCH tokens join the decode steps and prompt
+-- chunks of other requests in one pass. Checkpoints come at the prompt
+-- cache's planned stops, as in `prefill`.
+-- @tparam table slot the slot
+-- @tparam {integer,...} prompt the token ids
+-- @tparam integer from the first token to run
+-- @tparam {integer,...} stops the checkpoint positions, from the plan
+-- @param sink the reply sink; a cancelled sink stops the prefill
+-- @return the logits node of the last token, or nil when cancelled
+function E:prefill_batched(slot, prompt, from, stops, sink)
+	local logits
+	local i, c = from, 1
+	while i <= #prompt do
+		local j = math.min(#prompt, i + UBATCH - 1)
+		if stops[c] and stops[c] <= j then
+			j = stops[c]
+		end
+		local ids = table.move(prompt, i, j, 1, {})
+		logits = self:batch_step(slot, ids)
+		table.move(prompt, i, j, #slot.tokens + 1, slot.tokens)
+		if j == stops[c] then
+			self:acquire()
+			local ok, err = pcall(self.checkpoint_slot, self, slot)
+			self:release()
+			if not ok then
+				error(err, 0)
+			end
+			c = c + 1
+		end
+		i = j + 1
+		if sink:cancelled() then
+			return nil
+		end
+	end
+	return logits
+end
+
 function E:prefill(prompt, from, sink)
 	local logits
 	local i = from
@@ -1107,12 +1193,21 @@ function E:run_prompt(req, sink, st)
 	if sink.prompt and not sink:prompt(#prompt, cached) then
 		return true
 	end
-	local logits = self:prefill(prompt, cached + 1, sink)
+	-- Concurrent engines: the request owns its slot, and prefill and
+	-- decode run in batched passes with other requests. A prompt with
+	-- images prefills alone first.
+	local logits, slot
+	if st and self.concurrent and #images == 0 and cached < #prompt then
+		local stops = self.pc and self.pc:plan(prompt, cached + 1) or {}
+		slot = self:own_slot(st)
+		logits = self:prefill_batched(slot, prompt, cached + 1, stops, sink)
+	else
+		logits = self:prefill(prompt, cached + 1, sink)
+		slot = logits and st and self.concurrent and self:own_slot(st)
+	end
 	if not logits then
 		return true
 	end
-	-- Concurrent engines: decode on the owned slot in batched passes.
-	local slot = st and self.concurrent and self:own_slot(st)
 	local toks = slot and slot.tokens or self.tokens
 	local t1 = lgml.clock()
 	local n, reason, stopped = 0, "length", false
