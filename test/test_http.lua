@@ -564,6 +564,28 @@ local function test_images(port, bare_port)
 	    "metrics count image requests")
 end
 
+-- A router with a transcribe-only engine first: chat replies and
+-- metrics name the model that served the request.
+local function test_served_model(eng)
+	local stt = {}
+	function stt.models() return { { id = "whisper", context_length = 448 } } end
+	function stt.props() return { n_ctx = 448, total_slots = 1 } end
+	function stt.transcribe() return { text = "x" } end
+	local srv = server.new()
+	openai.install(srv, require("lgml.server.router").new({ stt, eng }))
+	local port = assert(srv:listen("127.0.0.1", 0))
+	local b = body_json(roundtrip(port, request("POST", "/v1/chat/completions", chat_body())))
+	ok(b.model == "fake", "chat with no model names the model that served it")
+	b = body_json(roundtrip(port, request("POST", "/v1/chat/completions", chat_body({ model = "nope" }))))
+	ok(b.model == "fake", "chat with an unknown model names the model that served it")
+	local m = roundtrip(port, request("GET", "/metrics")).body
+	ok(not m:find('model="nope"', 1, true) and not m:find('lgml_chat_requests_total{model="whisper"}', 1, true),
+	    "metrics use the serving model, not the request id or the first model")
+	b = body_json(roundtrip(port, request("GET", "/props")))
+	ok(b.model_path == "fake", "props model_path is the chat model")
+	srv:close()
+end
+
 -- CORS: headers on every response and preflight answers, only when the
 -- server has an origin.
 local function test_cors(eng, plain_port)
@@ -672,6 +694,7 @@ local function main()
 	local bare_port = assert(srv2:listen("127.0.0.1", 0))
 	test_transcribe(port, bare_port)
 	test_images(port, bare_port)
+	test_served_model(eng)
 	test_cors(eng, port)
 	test_logging(port)
 	srv2:close()

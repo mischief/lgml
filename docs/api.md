@@ -88,8 +88,9 @@ A chat request with images and no `model` (or an unknown one) goes to
 the first model with vision. A request with images for a named model
 without vision gives 400, and the message names the models with vision.
 
-The `model` field of a chat reply echoes the request `model`, or the
-id of the first model of the server when the request has none.
+The `model` field of a chat reply is the id of the model that served
+the request. With no `model` or an unknown id, it is the id of the
+model that the server picked, not the id in the request.
 
 ## Errors
 
@@ -630,8 +631,10 @@ models.
 
 `GET /metrics`. lgml. It gives Prometheus text
 (`text/plain; version=0.0.4`). Each metric has the prefix `lgml_` and
-the label `model`, the request model id (or the first model id). A
-metric appears after its first event.
+the label `model`, the id of the model that served the request. An
+unknown id in a request does not make a new label value. A request
+that no model serves uses the first model id. A metric appears after
+its first event.
 
 | Metric | Type | Meaning |
 | --- | --- | --- |

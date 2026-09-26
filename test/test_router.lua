@@ -34,6 +34,11 @@ ok(r:pick("whisper", "transcribe") == stt and r:pick(nil, "chat") ~= stt,
     "chat skips transcribe-only engines")
 ok(r:props().n_ctx == 111, "props from first chat engine")
 ok(r:transcribe({ model = "whisper" }, "").text == "from stt", "transcribe routes")
+ok(r:model_for(nil, "chat") == "a" and r:model_for("nope", "chat") == "a" and
+    r:model_for("b", "chat") == "b" and r:model_for("whisper", "chat") == "a",
+    "model_for gives the model that serves chat")
+ok(r:model_for(nil, "transcribe") == "whisper" and router.new({ stt }):model_for(nil, "chat") == nil,
+    "model_for gives nil when no model serves the method")
 -- An engine that only makes images.
 local img = {}
 function img.models() return { { id = "zimage", context_length = 0 } } end
@@ -61,6 +66,8 @@ local r3 = router.new({ vis("text", false), vis("eyes", true) })
 ok(r3:chat({ messages = img_msgs }) == "eyes", "images with no model go to a vision model")
 ok(r3:chat({ model = "nope", messages = img_msgs }) == "eyes", "images with an unknown model go to a vision model")
 ok(r3:chat({ messages = { { role = "user", content = "hi" } } }) == "text", "text stays on the first chat model")
+ok(r3:model_for(nil, "chat", true) == "eyes" and r3:model_for("text", "chat", true) == nil,
+    "model_for follows images to a vision model")
 local _, msg, code = r3:chat({ model = "text", messages = img_msgs })
 ok(code == 400 and msg:find("models with vision: eyes", 1, true), "a named model without vision names the vision models")
 _, msg, code = router.new({ vis("text", false) }):chat({ messages = img_msgs })

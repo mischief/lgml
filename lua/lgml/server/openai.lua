@@ -13,6 +13,7 @@ local engine_api = require("lgml.server.engine")
 local multipart = require("lgml.server.multipart")
 local metrics = require("lgml.server.metrics")
 local detect = require("lgml.detect")
+local media = require("lgml.chat.media")
 local systemone = require("lgml.systemone")
 local grammar = require("lgml.grammar")
 local base64 = require("lgml.base64")
@@ -473,6 +474,21 @@ local function default_model(eng)
 	return list[1] and list[1].id or "lgml"
 end
 
+-- The id of the model that serves a request for id with method what,
+-- for the reply and the metrics label. An unknown id gives the serving
+-- model, so it makes no new metrics series.
+local function served_model(eng, id, what, images)
+	if eng.model_for then
+		return eng:model_for(id, what, images) or default_model(eng)
+	end
+	for _, m in ipairs(eng:models()) do
+		if m.id == id then
+			return id
+		end
+	end
+	return default_model(eng)
+end
+
 local function models(eng, res)
 	local data = json.array()
 	for i, m in ipairs(eng:models()) do
@@ -517,7 +533,7 @@ local function props(eng, res)
 		default_generation_settings = { n_ctx = p.n_ctx,
 		    params = json.object() },
 		total_slots = p.total_slots,
-		model_path = p.model_path or default_model(eng),
+		model_path = p.model_path or served_model(eng, nil, "chat"),
 		modalities = p.modalities,
 		build_info = "lgml",
 	})
@@ -535,7 +551,7 @@ local function chat(eng, req, res)
 	if not ok then
 		return res:error(400, msg, nil, param)
 	end
-	return run_chat(eng, res, body, body.model or default_model(eng))
+	return run_chat(eng, res, body, served_model(eng, body.model, "chat", media.has_images(body.messages)))
 end
 
 -- transcriptions
@@ -596,7 +612,7 @@ local function transcriptions(eng, req, res)
 		return res:error(400, file, nil, param)
 	end
 	local t0 = uv.hrtime()
-	local model = treq.model or default_model(eng)
+	local model = served_model(eng, treq.model, "transcribe")
 	log.note("model", model)
 	L:debug("transcribe", "bytes", #file, "language", treq.language, "format", treq.response_format)
 	local r, msg, status = eng:transcribe(treq, file, {
@@ -683,7 +699,7 @@ local function speech(eng, req, res)
 		return res:error(400, msg, nil, param)
 	end
 	local t0 = uv.hrtime()
-	local model = body.model or default_model(eng)
+	local model = served_model(eng, body.model, "speak")
 	log.note("model", model)
 	L:debug("speak", "voice", body.voice, "speed", body.speed, "format", body.response_format,
 	    "input", body.input)
@@ -732,7 +748,7 @@ local function systemone_route(eng, req, res)
 		return res:json(bstatus or 422, body)
 	end
 	local t0 = uv.hrtime()
-	local model = dreq.model or default_model(eng)
+	local model = served_model(eng, dreq.model, "decide", #(dreq.images or {}) > 0)
 	log.note("model", model)
 	log.note("questions", #dreq.questions)
 	log.note("images", #(dreq.images or {}) > 0 and #dreq.images or nil)
@@ -878,7 +894,7 @@ end
 -- Runs the request on eng and sends the OpenAI image reply.
 local function run_image(eng, res, ireq)
 	local t0 = uv.hrtime()
-	local model = ireq.model or default_model(eng)
+	local model = served_model(eng, ireq.model, "generate")
 	log.note("model", model)
 	local r, msg, status = eng:generate(ireq, {
 		cancelled = function()

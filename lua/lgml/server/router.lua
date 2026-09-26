@@ -173,23 +173,45 @@ local function to_vision(self, e, id, what)
 end
 
 -- The engine for a request: by id and method, then by vision when the
--- request has images. It logs the choice and notes the model for the
--- access line. Returns the engine, or nil, a message and a status.
-local function route(self, id, what, images, none)
+-- request has images. Returns the engine, the model id and why, or nil,
+-- a message, a status and why.
+local function resolve(self, id, what, images)
 	local e, mid, why = self:pick(id, what)
 	if not e then
-		L:debug("route", "what", what, "requested", id, "why", "none")
-		return nil, none, 400
+		return nil, nil, 400, "none"
 	end
 	if images then
 		local v, vid, status = to_vision(self, e, id, what)
 		if not v then
-			L:debug("route", "what", what, "requested", id, "why", "vision", "err", vid)
-			return nil, vid, status
+			return nil, vid, status, "vision"
 		end
 		if v ~= e or vid ~= mid then
 			e, mid, why = v, vid, "vision"
 		end
+	end
+	return e, mid, why
+end
+
+--- The id of the model that serves a request.
+-- It picks as the request methods do, so it does not start a model.
+-- @tparam ?string id the model id of the request
+-- @tparam string what the method, as for `pick`
+-- @tparam[opt] boolean images true when the request has images
+-- @treturn ?string the model id, or nil when no model serves the request
+function R:model_for(id, what, images)
+	local e, mid = resolve(self, id, what, images)
+	return e and mid or nil
+end
+
+-- The engine for a request, as resolve gives it. It logs the choice and
+-- notes the model for the access line. Returns the engine, or nil, a
+-- message and a status.
+local function route(self, id, what, images, none)
+	local e, mid, why, how = resolve(self, id, what, images)
+	if not e then
+		-- On failure mid is the message, why the status.
+		L:debug("route", "what", what, "requested", id, "why", how, "err", mid)
+		return nil, mid or none, why
 	end
 	L:debug("route", "what", what, "requested", id, "model", mid, "why", why,
 	    "images", images or nil)

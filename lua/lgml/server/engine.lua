@@ -160,6 +160,16 @@ end
 -- @treturn[2] int an HTTP status
 -- @function unload
 
+--- The id of the model that serves a request. This method is optional.
+-- `lgml.server.router` has it. Without it, the server uses the request
+-- id when a model has it, else the first model id.
+-- @tparam ?string id the request `model`
+-- @tparam string what `"chat"`, `"transcribe"`, `"speak"`, `"decide"` or
+-- `"generate"`
+-- @tparam[opt] boolean images true when the request has images
+-- @treturn ?string the model id
+-- @function model_for
+
 --- Stops the engine and its worker processes. This method is optional.
 -- `lgml-server` calls it at exit.
 -- @function stop
