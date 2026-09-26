@@ -108,3 +108,29 @@ put("tokenize", "chat", "<|im_start|>user\nhello world 123 xyz<|im_end|>\n<think
 put("tokenize", "mixed", "Việt 我想 😶‍🌫️ \r\n\t  1234567 it's don't I'LL")
 put("tokenize", "bad", "a\xffb\xc3")
 put("tokenize", "gemma4", "<|turn>user\nhello world\n\n\n\n<turn|>\u{2581}Q \u{e9}\u{6211}<|\"|>")
+
+-- image: first byte is the mode (see fuzz/image.lua)
+package.path = (debug.getinfo(1, "S").source:match("^@(.*/)") or "./") .. "../test/?.lua;" .. package.path
+local png = require("png")
+local samples = require("image_samples")
+local function ramp(x, y, k)
+	return (x * 37 + y * 11 + k * 5) % 256
+end
+put("image", "gray8", "\0" .. png.encode({ w = 7, h = 5, depth = 8, ctype = 0, sample = ramp }))
+put("image", "rgba16-adam7", "\0" .. png.encode({ w = 9, h = 6, depth = 16, ctype = 6, interlace = true,
+	sample = function(x, y, k) return ramp(x, y, k) * 257 end }))
+put("image", "gray1-adam7", "\0" .. png.encode({ w = 11, h = 9, depth = 1, ctype = 0, interlace = true,
+	sample = function(x, y) return (x + y) % 2 end }))
+put("image", "pal2-trns", "\1" .. png.encode({ w = 5, h = 4, depth = 2, ctype = 3,
+	palette = "\255\0\0\0\255\0\0\0\255\9\9\9", trns = "\0\128",
+	sample = function(x, y) return (x * y) % 4 end }))
+put("image", "ga8", "\0" .. png.encode({ w = 3, h = 3, depth = 8, ctype = 4, sample = ramp }))
+put("image", "rgb-key", "\0" .. png.encode({ w = 4, h = 2, depth = 8, ctype = 2, trns = "\0\1\0\2\0\3",
+	sample = function(x, _, k) return x == 0 and k + 1 or 200 end }))
+put("image", "wrap-rgb", "\2" .. string.char(2, 1, 8, 2, 0) .. png.zlib(string.rep("\1\5\6\7\8\9\10\11\12\13", 2)))
+put("image", "wrap-pal", "\3" .. string.char(2, 2, 8, 3, 0) .. png.zlib(string.rep("\0\1\2\3", 3)))
+put("image", "dynamic", "\0" .. samples.DYNAMIC_PNG)
+put("image", "cmyk.jpg", "\0" .. samples.CMYK_JPEG)
+put("image", "progressive.jpg", "\0" .. samples.PROGRESSIVE_JPEG)
+put("image", "restart.jpg", "\0" .. samples.RESTART_JPEG)
+

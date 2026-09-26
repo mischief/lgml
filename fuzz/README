@@ -12,15 +12,19 @@ bug: the harness aborts. Targets catch expected errors themselves.
   wav          WAV decode, encode, resample and mel
   tokenize     all pre-tokenizers (qwen2, llama-bpe, gemma4) on tiny
                vocabs; round trips
+  image        PNG and JPEG decode (libpng, libjpeg-turbo), then
+               encode, resize, crop and tensors; a mode byte can fix
+               PNG CRCs or wrap raw zlib data
 
 Run all targets for 10 minutes (needs afl-clang-fast and luarocks):
 
   fuzz/run.sh 600
 
 This builds build-fuzz with afl-clang-fast, ASan and UBSan, and builds
-lua-cjson and picohttpparser the same way. The harness uses only the
-CPU backend; no Vulkan driver loads. Crashes land in
-build-fuzz/out/<target>/default/crashes. Replay one:
+lua-cjson and picohttpparser the same way. libpng, libjpeg-turbo and
+zlib build from their wraps, so coverage and the sanitizers include
+them. The harness uses only the CPU backend; no Vulkan driver loads.
+Crashes land in build-fuzz/out/<target>/default/crashes. Replay one:
 
   fuzz/run.sh replay json build-fuzz/out/json/default/crashes/id:...
 

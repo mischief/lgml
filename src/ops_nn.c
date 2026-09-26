@@ -468,12 +468,15 @@ op_upscale(lua_State *L)
 }
 
 /*** 2-D convolution, as torch conv2d without bias.
- * stride, pad and dilation apply to both axes.
+ * stride, pad and dilation apply to both axes. By default the op runs
+ * as im2col and a matrix product; its columns hold IC * KH * KW values
+ * for each output position. The direct op needs no columns.
  * @tparam tensor w contiguous (OC, IC, KH, KW)
  * @tparam tensor x contiguous f32 (N, IC, H, W)
  * @tparam[opt=1] int stride 1 to 1024
  * @tparam[opt=0] int pad zeros on each side, 0 to 1024
  * @tparam[opt=1] int dilation 1 to 1024
+ * @tparam[opt=false] boolean direct use the direct convolution op
  * @treturn tensor (N, OC, OH, OW) node
  * @raise on bad shapes, types or ranges, or if the kernel is larger than
  * the padded input
@@ -488,6 +491,7 @@ op_conv2d(lua_State *L)
 	lua_Integer s = luaL_optinteger(L, 4, 1);
 	lua_Integer p = luaL_optinteger(L, 5, 0);
 	lua_Integer d = luaL_optinteger(L, 6, 1);
+	int direct = lua_toboolean(L, 7);
 	const struct ggml_tensor *tw = w->t, *tx = x->t;
 	int i;
 
@@ -501,6 +505,9 @@ op_conv2d(lua_State *L)
 		if (tx->ne[i] + 2 * p - d * (tw->ne[i] - 1) - 1 < 0)
 			return luaL_error(L, "conv2d: kernel larger than padded input");
 	lgml_reserve(L, g, 8);
+	if (direct)
+		return lgml_push_node(L, g, ggml_conv_2d_direct(g->ctx, w->t, x->t, (int)s, (int)s,
+		    (int)p, (int)p, (int)d, (int)d), 4);
 	return lgml_push_node(L, g, ggml_conv_2d(g->ctx, w->t, x->t, (int)s, (int)s, (int)p,
 	    (int)p, (int)d, (int)d), 4);
 }

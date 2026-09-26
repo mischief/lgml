@@ -49,6 +49,14 @@ else
   ggml = dependency('ggml', method : 'cmake', modules : ['ggml::ggml', 'ggml::ggml-base'])
 endif
 
+# System libraries when found, else the wraps in subprojects/, built
+# with their own C dialect and warnings.
+wrap_opts = ['c_std=gnu17', 'werror=false', 'warning_level=0', 'default_library=static']
+# zlib first, so a zlib wrap for libpng gets these options too.
+zlib = dependency('zlib', default_options : wrap_opts)
+png = dependency('libpng', default_options : wrap_opts)
+jpeg = dependency('libjpeg', default_options : wrap_opts)
+
 lgml = shared_module('lgml',
   'src/lgml.c',
   'src/ops_orpheus.c',
@@ -61,8 +69,10 @@ lgml = shared_module('lgml',
   'src/safetensors.c',
   'src/audio.c',
   'src/laudio.c',
+  'src/image.c',
+  'src/limage.c',
   'src/vocab.c',
-  dependencies : [ggml, lua, m],
+  dependencies : [ggml, lua, m, png, jpeg],
   name_prefix : '',
   install : true,
   install_dir : get_option('prefix') / 'lib' / 'lua' / '5.4',
@@ -122,6 +132,9 @@ if lua_bin.found()
   test('gemma4', lua_bin, args : [files('test/test_gemma4.lua')],
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
     timeout : 120)
+  test('image', lua_bin, args : [files('test/test_image.lua')],
+    env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
+    timeout : 120)
 
   # Tests that load large models run one at a time, in the 'model'
   # suite. Each skips when its option is empty.
@@ -140,6 +153,9 @@ if lua_bin.found()
   # LGML_DIFFUSION_GEMMA (a gguf path) comes from the environment.
   test('diffusion_gemma_model', lua_bin, args : [files('test/test_diffusion_gemma_model.lua')],
     suite : 'model', is_parallel : false, timeout : 3600)
+  # LGML_ZIMAGE_VAE (ae.safetensors) and optional LGML_VAE_REF come from the environment.
+  test('image_model', lua_bin, args : [files('test/test_image_model.lua')],
+    suite : 'model', is_parallel : false, timeout : 600)
 endif
 
 # Fuzz harness. Built with afl-clang-fast it runs under afl-fuzz. The
@@ -147,10 +163,10 @@ endif
 # fuzz/README.
 lfuzz = executable('lfuzz', 'fuzz/lfuzz.c',
   objects : lgml.extract_all_objects(recursive : true),
-  dependencies : [ggml, lua, m, cc.find_library('dl', required : false)],
+  dependencies : [ggml, lua, m, png, jpeg, cc.find_library('dl', required : false)],
   export_dynamic : true,
 )
-foreach t : ['json', 'chat', 'http', 'safetensors', 'vocab', 'wav', 'tokenize']
+foreach t : ['json', 'chat', 'http', 'safetensors', 'vocab', 'wav', 'tokenize', 'image']
   test('fuzz_' + t, lfuzz,
     args : [files('fuzz' / t + '.lua'), meson.current_source_dir() / 'fuzz' / 'corpus' / t],
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },

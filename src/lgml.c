@@ -850,10 +850,11 @@ static int graph_gelu(lua_State *L) { return unop(L, ggml_gelu); }
  */
 static int graph_gelu_erf(lua_State *L) { return unop(L, ggml_gelu_erf); }
 
-/*** Multiply every element by a number.
+/*** Multiply every element by a number, then add a number.
  * Rows may have a stride. The other dimensions must be contiguous.
  * @tparam tensor a input
  * @tparam number s factor
+ * @tparam[opt=0] number b added after the product
  * @treturn tensor node with the shape of a
  * @raise if a is not contiguous; use `graph:cont`
  * @function graph:scale
@@ -864,12 +865,15 @@ graph_scale(lua_State *L)
 	struct graph *g = check_graph(L, 1);
 	struct tensor *a = operand(L, g, 2);
 	float s = (float)luaL_checknumber(L, 3);
+	float bias = (float)luaL_optnumber(L, 4, 0);
 	const struct ggml_tensor *t = a->t;
 
 	if (t->nb[0] != ggml_type_size(t->type) || t->nb[2] != t->nb[1] * (size_t)t->ne[1] ||
 	    t->nb[3] != t->nb[2] * (size_t)t->ne[2])
 		return luaL_error(L, "tensor not contiguous; use cont");
 	reserve(L, g, 1);
+	if (bias != 0)
+		return push_node(L, g, ggml_scale_bias(g->ctx, a->t, s, bias), a->rank);
 	return push_node(L, g, ggml_scale(g->ctx, a->t, s), a->rank);
 }
 
@@ -1353,6 +1357,8 @@ graph_soft_max(lua_State *L)
  * @tparam[opt=1] number scale factor on the scores
  * @tparam[opt=0] number max_bias ALiBi maximum bias
  * @tparam[opt=0] number softcap score cap
+ * @tparam[opt=false] boolean f32 ask the backend for f32 precision, for
+ * inputs whose scores overflow f16
  * @treturn tensor (tokens, heads, d) node; note the swap of heads and tokens
  * @raise on a shape mismatch or a bad mask
  * @function graph:flash_attn
@@ -1368,7 +1374,9 @@ graph_flash_attn(lua_State *L)
 	float scale = (float)luaL_optnumber(L, 6, 1.0);
 	float max_bias = (float)luaL_optnumber(L, 7, 0.0);
 	float softcap = (float)luaL_optnumber(L, 8, 0.0);
+	int f32 = lua_toboolean(L, 9);
 	const struct ggml_tensor *tq = q->t;
+	struct ggml_tensor *r;
 
 	if (!can_mul_mat(k->t, tq) || tq->ne[3] != k->t->ne[3] || tq->ne[3] != v->t->ne[3] ||
 	    v->t->ne[1] != k->t->ne[1] || v->t->ne[2] != k->t->ne[2])
@@ -1382,8 +1390,11 @@ graph_flash_attn(lua_State *L)
 	} else if (max_bias > 0.0f)
 		return luaL_error(L, "max_bias needs a mask");
 	reserve(L, g, 1);
-	return push_node(L, g, ggml_flash_attn_ext(g->ctx, q->t, k->t, v->t,
-	    m != NULL ? m->t : NULL, scale, max_bias, softcap), max_int(q->rank, 3));
+	r = ggml_flash_attn_ext(g->ctx, q->t, k->t, v->t, m != NULL ? m->t : NULL, scale,
+	    max_bias, softcap);
+	if (f32)
+		ggml_prec_set_acc(r, GGML_PREC_F32);
+	return push_node(L, g, r, max_int(q->rank, 3));
 }
 
 /*** Repeat a to the shape of b.
@@ -1581,6 +1592,21 @@ run:
 	if (st != GGML_STATUS_SUCCESS)
 		return luaL_error(L, "compute: %s", ggml_status_to_string(st));
 	return 0;
+}
+
+/*** Get the size of the compute buffer.
+ * The buffer holds the nodes of the graph. Its size is 0 before the
+ * first `graph:compute`.
+ * @treturn int bytes
+ * @function graph:buffer_size
+ */
+static int
+graph_buffer_size(lua_State *L)
+{
+	struct graph *g = check_graph(L, 1);
+
+	lua_pushinteger(L, (lua_Integer)ggml_gallocr_get_buffer_size(g->galloc, 0));
+	return 1;
 }
 
 /* tensor */
@@ -2612,6 +2638,7 @@ static const luaL_Reg graph_methods[] = {
 	{ "argmax", graph_argmax },
 	{ "top_k", graph_top_k },
 	{ "compute", graph_compute },
+	{ "buffer_size", graph_buffer_size },
 	{ NULL, NULL }
 };
 
@@ -2734,6 +2761,7 @@ luaopen_lgml(lua_State *L)
 	lgml_open_tokenize(L);
 	lgml_open_safetensors(L);
 	lgml_open_audio(L);
+	lgml_open_image(L);
 	lgml_open_vocab(L);
 	lgml_open_ops_orpheus(L);
 	lgml_open_ops_qwen3tts(L);

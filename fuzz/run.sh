@@ -9,9 +9,12 @@ src=$(cd "$(dirname "$0")/.." && pwd)
 b=$src/build-fuzz
 san=-fsanitize=address,undefined
 
+# libpng, libjpeg-turbo and zlib build from the wraps, so AFL and the
+# sanitizers see inside them.
 if [ ! -d "$b" ]; then
 	CC=afl-clang-fast meson setup "$b" "$src" -Dbuildtype=debugoptimized \
-	    -Db_sanitize=address,undefined -Db_lundef=false
+	    -Db_sanitize=address,undefined -Db_lundef=false \
+	    --force-fallback-for=libpng,libjpeg,zlib
 fi
 ninja -C "$b" lfuzz
 
@@ -31,8 +34,8 @@ export LUA_CPATH="$b/rocks/lib/lua/5.4/?.so;;"
 # No Vulkan driver: the harness uses only the CPU backend.
 export VK_DRIVER_FILES=/nonexistent VK_ICD_FILENAMES=/nonexistent
 export AFL_SKIP_CPUFREQ=1 AFL_NO_UI=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1
-# Room above the C edges for Lua line coverage.
-export AFL_MAP_SIZE=65536
+# Room above the C edges, with libpng and libjpeg-turbo, for Lua line coverage.
+export AFL_MAP_SIZE=262144
 
 # Outside afl-fuzz, cjson loads after the fork server check.
 if [ "${1:-}" = replay ]; then
@@ -43,7 +46,7 @@ fi
 
 secs=${1:-600}
 [ $# -gt 0 ] && shift
-targets=${*:-json chat http safetensors vocab wav tokenize}
+targets=${*:-json chat http safetensors vocab wav tokenize image}
 
 for t in $targets; do
 	mkdir -p "$b/out"

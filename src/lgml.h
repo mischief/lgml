@@ -71,6 +71,7 @@ void		 lgml_open_sample(lua_State *);
 void		 lgml_open_tokenize(lua_State *);
 void		 lgml_open_safetensors(lua_State *);
 void		 lgml_open_audio(lua_State *);
+void		 lgml_open_image(lua_State *);
 void		 lgml_open_vocab(lua_State *);
 void		 lgml_open_ops_orpheus(lua_State *);
 void		 lgml_open_ops_qwen3tts(lua_State *);

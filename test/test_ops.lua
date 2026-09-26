@@ -187,6 +187,11 @@ do
 	near(got, { 12, 16, 24, 28 }, "conv2d values")
 	local p = run(function(g) return g:conv2d(w, x, 2, 1) end)
 	near(p, { 1, 5, 11, 28 }, "conv2d stride 2 pad 1")
+	local wf <close> = f32({ 1, 1, 2, 2 }, { 1, 1, 1, 1 })
+	near(run(function(g) return g:conv2d(wf, x, 1, 0, 1, true) end), { 12, 16, 24, 28 },
+	    "conv2d direct")
+	near(run(function(g) return g:conv2d(wf, x, 2, 1, 1, true) end), { 1, 5, 11, 28 },
+	    "conv2d direct stride 2 pad 1")
 end
 
 do
