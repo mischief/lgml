@@ -139,7 +139,16 @@ if not dir or dir == "" then
 end
 
 local orpheus = require("lgml.tts.orpheus")
-local backend = os.getenv("LGML_BACKEND") or "Vulkan0"
+-- Vulkan0 when the loader finds it, else the CPU.
+local backend = os.getenv("LGML_BACKEND")
+if not backend then
+	backend = "CPU"
+	for _, d in ipairs(require("lgml").devices()) do
+		if d.name == "Vulkan0" then
+			backend = d.name
+		end
+	end
+end
 local e = orpheus.new({ model = dir, backend = backend })
 
 -- "tara: Hey there, my name is Tara." from the Orpheus prompt.
