@@ -25,6 +25,7 @@ local grammar = require("lgml.grammar")
 local lora = require("lgml.lora")
 local media = require("lgml.chat.media")
 local output = require("lgml.chat.output")
+local placement = require("lgml.placement")
 local log = require("lgml.log")
 
 local L = log.new("engine")
@@ -80,6 +81,50 @@ local function fit_ctx(be, model, max, copts)
 	return math.min(max, math.max(n, 256))
 end
 
+-- True when the backend name, or the best backend without one, is a CPU.
+local function on_cpu(name)
+	if name then
+		return name:upper():match("^CPU") ~= nil
+	end
+	for _, d in ipairs(lgml.devices()) do
+		if d.type == "gpu" or d.type == "igpu" then
+			return false
+		end
+	end
+	return true
+end
+
+-- Set rules.n_cpu_moe to the fewest expert layers on the CPU so the
+-- weights and the cache of the wanted context fit in free device memory.
+local function auto_moe(be, rules, info, opts)
+	local hp = transformer.config(info.meta)
+	local free
+	for _, d in ipairs(lgml.devices()) do
+		if d.name == be:name() then
+			free = d.free
+		end
+	end
+	local n = 0
+	if free then
+		local shape = { hp = hp, layers = hp.layers }
+		local copts = { type_k = opts.cache_type_k or "f16", type_v = opts.cache_type_v or "f16" }
+		if opts.flash_attn ~= false and not opts.cache_type_k and not opts.cache_type_v and
+		    pcall(transformer.cache_size, shape, { type = "q8_0" }) then
+			copts = { type = "q8_0" }
+		end
+		local per, fixed = transformer.cache_size(shape, copts)
+		local ctx = opts.n_ctx or math.min(hp.n_ctx, placement.AUTO_CTX)
+		local mmproj = 0
+		if opts.mmproj then
+			local st = require("luv").fs_stat(opts.mmproj)
+			mmproj = st and st.size or 0
+		end
+		n = placement.auto(rules, info.tensors, hp.n_layer, free - RESERVE - mmproj - fixed - per * ctx)
+	end
+	L:info("n_cpu_moe auto", "n_cpu_moe", n, "free_mib", free and free // 1048576)
+	rules.n_cpu_moe, rules.auto = n, nil
+end
+
 --- Loads a model and makes an engine.
 -- @tparam table opts the options:
 --
@@ -105,17 +150,37 @@ end
 --   `lgml.vision`
 -- - `image_min_tokens`, `image_max_tokens`: the token range of one
 --   image (default: the encoder's)
+-- - `cpu_moe`, `n_cpu_moe`, `n_gpu_layers`, `override`: weights to keep
+--   in host memory, as `lgml.placement.rules` takes; the ops on them run
+--   on the CPU. `n_cpu_moe = "auto"` picks the fewest expert layers on
+--   the CPU so the weights and the cache of `n_ctx` positions (default:
+--   at most `lgml.placement.AUTO_CTX`) fit in free device memory. They
+--   apply only on a GPU backend.
 -- @treturn Engine the engine
 -- @raise when the backend, the model or its tokenizer does not load,
--- when no chat template fits the model, an adapter does not fit it, or
--- the mmproj does not fit it
+-- when no chat template fits the model, an adapter does not fit it, the
+-- mmproj does not fit it, or a placement key is bad
 function M.new(opts)
-	local be = assert(lgml.backend(opts.backend, { threads = opts.threads }))
 	local info = assert(lgml.gguf(opts.model))
 	local family, family_name = chat.load(info.meta)
 	local arch = info.meta["general.architecture"]
+	local rules = placement.rules(opts)
+	if rules and (on_cpu(opts.backend) or not transformer.supports(arch)) then
+		L:warn("weight placement needs a GPU backend and a transformer model; ignored",
+		    "backend", opts.backend or "best", "arch", arch)
+		rules = nil
+	end
+	local be = assert(lgml.backend(opts.backend, { threads = opts.threads, cpu = rules ~= nil }))
+	if rules and rules.auto then
+		auto_moe(be, rules, info, opts)
+	end
 	local model = (transformer.supports(arch) and transformer or require("lgml." .. arch))
-	    .load(be, opts.model)
+	    .load(be, opts.model, rules and { placement = rules } or nil)
+	if rules then
+		local dev, host = model.w:size()
+		L:info("weights placed", "device_mib", dev // 1048576, "cpu_mib", host // 1048576,
+		    "n_cpu_moe", rules.n_cpu_moe, "n_gpu_layers", rules.n_gpu_layers)
+	end
 	local fa = opts.flash_attn ~= false
 	local copts = { type_k = opts.cache_type_k or "f16", type_v = opts.cache_type_v or "f16" }
 	if fa and not opts.cache_type_k and not opts.cache_type_v and

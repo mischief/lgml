@@ -18,6 +18,8 @@ local USAGE = "usage: lgml-worker --fd n (-m model | --fake) [-b backend] [-t th
     "                   [--recipe file] [--cache-ram MiB] [--ctx-checkpoints n]\n" ..
     "                   [--lora file[:scale]]...\n" ..
     "                   [--mmproj file] [--image-min-tokens n] [--image-max-tokens n]\n" ..
+    "                   [--cpu-moe] [--n-cpu-moe n|auto] [--n-gpu-layers n]\n" ..
+    "                   [--override-tensor pattern=backend]...\n" ..
     "                   [--log-level name] [--log-file path] [--dump-prompts dir]\n" ..
     "                   [--fake-size MiB] [--fake-load-ms n] [--fake-delay ms] [--fake-fail]\n" ..
     "       lgml-worker --devices\n"
@@ -30,8 +32,9 @@ local opts, rest = getopt.parse(arg, "m:b:t:c:", {
 	["mmproj="] = false, ["image-min-tokens="] = false, ["image-max-tokens="] = false,
 	["fake-size="] = false, ["fake-load-ms="] = false, ["fake-delay="] = false,
 	["fake-fail"] = false, devices = false, ["log-level="] = false, ["log-file="] = false,
-	["dump-prompts="] = false,
-}, { lora = true })
+	["dump-prompts="] = false, ["cpu-moe"] = false, ["n-cpu-moe="] = false,
+	["n-gpu-layers="] = false, ["override-tensor="] = false,
+}, { lora = true, ["override-tensor"] = true })
 -- --devices prints the ggml devices as JSON, for the memory budget of
 -- the front.
 if opts and opts.devices then
@@ -110,6 +113,8 @@ local function load()
 		mmproj = opts.mmproj,
 		image_min_tokens = math.tointeger(tonumber(opts["image-min-tokens"])),
 		image_max_tokens = math.tointeger(tonumber(opts["image-max-tokens"])),
+		cpu_moe = opts["cpu-moe"], n_cpu_moe = opts["n-cpu-moe"],
+		n_gpu_layers = opts["n-gpu-layers"], override = opts["override-tensor"],
 	})
 end
 

@@ -22,7 +22,9 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                    [--recipe file] [--cache-ram MiB] [--ctx-checkpoints n]
                    [--lora file[:scale]]... [--mmproj file] [--image-min-tokens n]
                    [--image-max-tokens n] [--inproc] [--stt] [--engine module]
-                   [--text-backend name] [--cors origin] [--vram MiB] [--idle seconds]
+                   [--text-backend name] [--cpu-moe] [--n-cpu-moe n|auto]
+                   [-ngl n] [-ot pattern=backend]... [--cors origin] [--vram MiB]
+                   [--idle seconds]
                    [-v]... [--log-level name] [--log-file path] [--dump-prompts dir]
                    [--state-dir dir] [--unknown-fields rule]
   -l, --listen addr   address to listen on (default 127.0.0.1)
@@ -49,6 +51,11 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       text_backend = backend of the text encoder of
                       lgml.image.engine, such as CPU; its part counts
                       against the budget of that backend,
+                      cpu_moe, n_cpu_moe, n_gpu_layers, override = weights
+                      of a chat model on a GPU to keep in host memory, as
+                      the flags below; override is a list of
+                      "pattern=backend"; that part counts against ram,
+                      and n_cpu_moe = "auto" fits the rest in vram,
                       engine = Lua module with new(opts), such as a TTS engine,
                       modes = list of completion, multimodal, decide,
                       transcription, speech, image_generation (default: from
@@ -97,6 +104,21 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
       --text-backend name
                       with --engine lgml.image.engine: the backend of the
                       text encoder, such as CPU (default: the -b backend)
+      --cpu-moe       keep the routed expert weights of every layer in
+                      host memory; the CPU runs them (llama.cpp --cpu-moe)
+      --n-cpu-moe n   the same for the experts of the first n layers; auto
+                      picks the fewest layers so the rest fits in free GPU
+                      memory, or in vram with -C
+      -ngl, --n-gpu-layers n
+                      keep the last n layers on the GPU, and the others,
+                      the token embeddings and, when n is at most the
+                      layer count, the output layer in host memory
+      -ot, --override-tensor pattern=backend
+                      put the tensors whose names match a Lua pattern,
+                      such as exps or blk%.[0-9]%.ffn_, on backend: CPU,
+                      or any other name for the -b backend; the first
+                      match wins, before --n-cpu-moe and -ngl; repeat, or
+                      join entries with commas
       --cors origin   allow cross-origin requests from origin, such as
                       http://localhost:8000 or * (default: none)
       --vram MiB      with -C: the GPU memory budget (overrides vram)
@@ -195,6 +217,12 @@ local function model_engine(spec, managed)
 	if spec.text_backend and spec.engine ~= "lgml.image.engine" then
 		die("text_backend needs engine lgml.image.engine")
 	end
+	local okp, rules = pcall(require("lgml.placement").rules, spec)
+	if not okp then
+		die(rules)
+	elseif rules and (stt or spec.engine) then
+		die("cpu_moe, n_cpu_moe, n_gpu_layers and override need a chat model")
+	end
 	if spec.inproc and spec.engine then
 		return require(spec.engine).new({
 			model = spec.model, backend = spec.backend, text_backend = spec.text_backend,
@@ -211,6 +239,8 @@ local function model_engine(spec, managed)
 			cache_type_k = spec.cache_type_k, cache_type_v = spec.cache_type_v,
 			recipe = spec.recipe, cache_ram = ram, ctx_checkpoints = ckpt, lora = lora,
 			mmproj = spec.mmproj, image_min_tokens = imin, image_max_tokens = imax,
+			cpu_moe = spec.cpu_moe, n_cpu_moe = spec.n_cpu_moe, n_gpu_layers = spec.n_gpu_layers,
+			override = spec.override,
 		})
 	end
 	local wargs = { "-m", spec.model }
@@ -229,6 +259,20 @@ local function model_engine(spec, managed)
 	end
 	for _, a in ipairs(lora) do
 		table.move({ "--lora", ("%s:%.17g"):format(a.path, a.scale) }, 1, 2, #wargs + 1, wargs)
+	end
+	if rules then
+		for _, o in ipairs(rules.override) do
+			table.move({ "--override-tensor", o.pattern .. (o.cpu and "=CPU" or "=GPU") }, 1, 2,
+			    #wargs + 1, wargs)
+		end
+		if rules.n_cpu_moe == math.huge then
+			wargs[#wargs + 1] = "--cpu-moe"
+		elseif rules.n_cpu_moe or rules.auto then
+			table.move({ "--n-cpu-moe", tostring(rules.n_cpu_moe or "auto") }, 1, 2, #wargs + 1, wargs)
+		end
+		if rules.n_gpu_layers then
+			table.move({ "--n-gpu-layers", tostring(rules.n_gpu_layers) }, 1, 2, #wargs + 1, wargs)
+		end
 	end
 	if stt then
 		wargs[#wargs + 1] = "--stt"
@@ -343,7 +387,14 @@ local function managed_engines(path, cfg, opts)
 	local engines = {}
 	for i, spec in ipairs(cfg.models) do
 		local kind = estimate.kind(spec.backend, gpu ~= nil)
-		local est = estimate.model(spec, budget[kind], gpu ~= nil)
+		local oke, est = pcall(estimate.model, spec, budget[kind], gpu ~= nil)
+		if not oke then
+			die(("%s: %s"):format(spec.id, est))
+		end
+		-- The worker takes the count that the estimate picked.
+		if est.n_cpu_moe then
+			spec.n_cpu_moe = est.n_cpu_moe
+		end
 		-- Under a budget, the worker gets the context of the estimate, not
 		-- one that fits the free memory at its load.
 		if not spec.ctx and est.n_ctx and budget[kind] < math.huge then
@@ -409,6 +460,8 @@ local function make_engine(opts, cfg)
 			engine = opts.engine, lora = opts.lora, mmproj = opts.mmproj,
 			image_min_tokens = opts["image-min-tokens"],
 			image_max_tokens = opts["image-max-tokens"],
+			cpu_moe = opts["cpu-moe"], n_cpu_moe = opts["n-cpu-moe"],
+			n_gpu_layers = opts["n-gpu-layers"], override = opts["override-tensor"],
 		})
 	end
 	die("no engine: give -m model, -C config or --fake")
@@ -465,7 +518,17 @@ local function state_dir(opts, cfg)
 	return nil
 end
 
+-- The llama.cpp spellings -ngl and -ot, as long options.
+local LLAMA_FLAGS = { ["-ngl"] = "--n-gpu-layers", ["-ot"] = "--override-tensor" }
+
 local function main(args)
+	args = table.move(args, 1, #args, 1, {})
+	for i, a in ipairs(args) do
+		if a == "--" then
+			break
+		end
+		args[i] = LLAMA_FLAGS[a] or a
+	end
 	local opts, rest = getopt.parse(args, "hvl:p:m:b:t:c:C:", {
 		config = "C", help = "h", verbose = "v", ["log-level="] = false, ["log-file="] = false,
 		["dump-prompts="] = false, listen = "l", port = "p", model = "m", backend = "b",
@@ -475,7 +538,9 @@ local function main(args)
 		["lora="] = false, ["cors="] = false, ["vram="] = false, ["idle="] = false,
 		["mmproj="] = false, ["image-min-tokens="] = false, ["image-max-tokens="] = false,
 		["text-backend="] = false, ["state-dir="] = false, ["unknown-fields="] = false,
-	}, { lora = true, v = true })
+		["cpu-moe"] = false, ["n-cpu-moe="] = false, ["n-gpu-layers="] = false,
+		["override-tensor="] = false,
+	}, { lora = true, v = true, ["override-tensor"] = true })
 	if not opts then
 		io.stderr:write("lgml-server: ", rest, "\n", USAGE)
 		os.exit(2)

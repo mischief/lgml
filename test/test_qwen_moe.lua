@@ -753,6 +753,19 @@ local function offload_check(arch, path, m, ref, long)
 		rc.decode(ok, tag, s, { n_ctx = 320, prompt = long, n = 12, flash_attn = true, builds = 3 })
 		s:close()
 	end
+	-- The engine places weights only on a GPU backend.
+	local dev = os.getenv("LGML_DEVICE") or "CPU"
+	local e = require("lgml.engine").new({ model = path, backend = dev, n_ctx = 64, n_cpu_moe = 1,
+	    override = { "output=CPU" } })
+	local L1 = e.model.layers[1]
+	if dev == "CPU" then
+		ok(L1.down_exps:backend() == e.be and not e.be:cpu(), arch .. " engine: no placement on the CPU")
+	else
+		ok(L1.down_exps:backend() == e.be:cpu() and e.model.output:backend() == e.be:cpu() and
+		    e.model.layers[2].down_exps:backend() == e.be, arch .. " engine: n_cpu_moe and override")
+	end
+	local r = engine_chat(e, { { role = "user", content = "hi" } })
+	ok(r.usage.completion_tokens >= 1, arch .. " engine: chat with placement")
 end
 
 local be <close> = assert(lgml.backend(os.getenv("LGML_DEVICE") or "CPU"))
