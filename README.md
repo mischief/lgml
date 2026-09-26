@@ -79,8 +79,18 @@ on the device. A request takes the slot that shares the longest prefix
 with its prompt; a prompt that shares less than 32 tokens with every
 slot takes an empty slot or the least recently used one. Clients that
 take turns keep their caches, and the RAM prompt store (`--cache-ram`)
-holds what the slots cannot. Requests still run one at a time. The
-model pool counts each slot at `-c` positions.
+holds what the slots cannot. The model pool counts each slot at `-c`
+positions.
+
+With two or more slots, requests run at the same time: a prompt
+prefills alone, then its decode steps join the steps of the other
+requests in one batched pass. Decode is bound by memory bandwidth, so a
+pass of several slots costs little more than one: gemma-4-26B-A4B on a
+32 GB Radeon gives 89 tokens/s alone and about 155 tokens/s over three
+requests. On a GPU, a batched pass can round differently from a single
+one, so a greedy reply can change at a near tie, as in llama.cpp.
+Models with recurrent layers (qwen35, qwen3next) keep their slots but
+run one request at a time.
 
 ## Logs
 

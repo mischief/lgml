@@ -91,7 +91,8 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
   -np, --parallel n   KV cache slots kept on the device (default 1); a
                       request takes the slot that shares the longest
                       prefix with its prompt, so clients that take turns
-                      keep their caches; requests still run one at a time
+                      keep their caches; with two or more, requests
+                      decode together in batched passes
       --lora file[:scale]
                       apply a LoRA adapter (llama.cpp gguf or PEFT
                       directory) with this scale (default 1); repeat for

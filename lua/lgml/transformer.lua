@@ -452,6 +452,9 @@ end
 -- layers hold now), n_past (0), type_k, type_v, k, v;
 -- ring, ubatch and hi with sliding layers; rs_pos (the position the
 -- states are at), conv and ssm with recurrent layers
+-- Caches get an id, so a batch graph knows which caches it writes.
+local next_cache_id = 0
+
 function M:cache(n_ctx, opts)
 	opts = opts or {}
 	local hp, be = self.hp, self.be
@@ -466,8 +469,9 @@ function M:cache(n_ctx, opts)
 	if opts.initial and opts.initial < n_ctx then
 		cap = math.min(n_ctx, math.max(PAD, (opts.initial + PAD - 1) // PAD * PAD))
 	end
+	next_cache_id = next_cache_id + 1
 	local c = { n_ctx = n_ctx, cap = cap, n_past = 0, be = be, type_k = tk, type_v = tv,
-		k = {}, v = {} }
+		k = {}, v = {}, id = next_cache_id, gen = 0 }
 	if hp.n_swa then
 		c.ubatch = opts.ubatch or UBATCH
 		c.ring = math.min(n_ctx, hp.n_swa - 1 + c.ubatch)
@@ -574,6 +578,7 @@ function M:grow(cache, rows)
 	end
 	LOG:info("cache grew", "rows", cap, "from", cache.cap, "n_ctx", cache.n_ctx, "n_past", cache.n_past)
 	cache.cap = cap
+	cache.gen = (cache.gen or 0) + 1
 	return true
 end
 
@@ -960,6 +965,9 @@ end
 -- Attention of layer il with the cache. shared holds the keys and
 -- values of earlier layers in this graph, for layers that share them.
 local function attention(hp, g, inp, il, L, q, k, v, shared)
+	if inp.batch then
+		return M.attention_batch(hp, g, inp, il, L, q, k, v, shared)
+	end
 	local c, n, D = inp.cache, inp.n, L.D
 	local rk, rv = kv.rot_k(c, D), kv.rot_v(c, D)
 	if c then
@@ -1295,6 +1303,179 @@ function M:forward(g, inp)
 	local logits
 	logits, taps.result_norm = M.head(g, hp, self.output_norm, self.output, x, self.lora_out)
 	return logits, taps
+end
+
+-- One row of a (S, H, D) node as (1, H, D).
+local function row3(g, t, i)
+	local sh = t:shape()
+	local f4 = lgml.row_size(t:type(), 1)
+	return g:view(t, { 1, sh[2], sh[3] }, { sh[2] * sh[3] * f4, sh[3] * f4 }, (i - 1) * sh[2] * sh[3] * f4)
+end
+
+--- Attention of layer il for a batch of slots, one token each.
+-- Row i of q, k and v belongs to slot i: its keys and values go into
+-- that slot's cache, and it attends over that cache only.
+-- @return the output (S, H * D)
+function M.attention_batch(hp, g, inp, il, L, q, k, v, shared)
+	local D, out = L.D, nil
+	shared[il] = shared[il] or {}
+	for i, b in ipairs(inp.batch) do
+		local c = b.cache
+		local rk, rv = kv.rot_k(c, D), kv.rot_v(c, D)
+		local qi = kv.rotate(g, g:cont(row3(g, q, i)), rk)
+		local ki, vi
+		if L.kv_src then
+			ki, vi = shared[L.kv_src][i].k, shared[L.kv_src][i].v
+		else
+			ki = kv.rotate(g, g:cont(row3(g, k, i)), rk)
+			vi = kv.rotate(g, g:cont(row3(g, v, i)), rv)
+			local w = L.Hkv * D
+			local rows = L.swa and b.rows_swa or b.rows
+			local kw = g:set_rows(c.k[il], g:reshape(ki, { 1, w }), rows)
+			local vw = g:set_rows(c.v[il], g:reshape(vi, { 1, w }), rows)
+			ki, vi = kv.views(g, c, kw, vw, L.swa and b.n_swa_attn or b.n_attn, L.Hkv, D)
+		end
+		shared[il][i] = { k = ki, v = vi }
+		local mask = L.swa and b.mask_swa or b.mask
+		local o = M.attend(g, qi, ki, vi, mask, hp.attn_scale or 1 / math.sqrt(D), inp.flash_attn, rv)
+		out = out and g:concat_qwen3tts(out, o, 1) or o
+	end
+	return out
+end
+
+-- Fill the input leaves of a batch pass: slot i gets ids[i] at its
+-- cache.n_past.
+local function fill_batch(hp, inp, ids)
+	if ids then
+		inp.ids:set(ids)
+	end
+	local pos = {}
+	for i, b in ipairs(inp.batch) do
+		local c = b.cache
+		local n_past = c.n_past
+		pos[i] = n_past
+		b.n_past = n_past
+		b.mask:fill_causal(n_past)
+		if b.mask_swa then
+			b.mask_swa:fill_mask({ n_past = n_past, window = hp.n_swa, ring = true, causal = true })
+		end
+		b.rows:fill_range(n_past)
+		if b.rows_swa then
+			b.rows_swa:set({ n_past % c.ring })
+			c.hi = math.max(c.hi, n_past + 1)
+		end
+	end
+	inp.pos:set(pos)
+end
+
+--- Tell if the model can decode several slots in one pass.
+-- Models with recurrent layers cannot: each slot has its own state.
+-- @treturn boolean
+function M:batchable()
+	return not self.recurrent
+end
+
+--- Make the inputs of a decode pass over several slots, one token each.
+-- @tparam {table,...} caches the slot caches, one per token
+-- @tparam {integer,...} ids one token id per cache
+-- @tparam[opt] table opts options: flash_attn
+-- @treturn table inputs for `forward`, with `batch` (one entry per
+-- slot: cache, rows, masks and spans)
+-- @raise when a cache is full, or the model is not batchable
+function M:batch_inputs(caches, ids, opts)
+	opts = opts or {}
+	assert(self:batchable(), "batch: the model has recurrent layers")
+	local be, hp, S = self.be, self.hp, #ids
+	local mt = opts.flash_attn and "f16" or "f32"
+	local inp = {
+		n = S, flash_attn = opts.flash_attn, logits = "all", causal = true,
+		ids = be:tensor("i32", { S }, ids), pos = be:tensor("i32", { S }), batch = {},
+	}
+	for i, c in ipairs(caches) do
+		check_pass(self, c, 1)
+		kv.check(c, opts.flash_attn)
+		local n_attn, n_swa_attn = spans(c, c.n_past + 1)
+		local b = { cache = c, n_attn = n_attn, n_swa_attn = n_swa_attn,
+			rows = be:tensor("i64", { 1 }), mask = be:tensor(mt, { 1, n_attn }) }
+		if hp.n_swa then
+			b.mask_swa = be:tensor(mt, { 1, n_swa_attn })
+		end
+		if c.ring then
+			b.rows_swa = be:tensor("i64", { 1 })
+		end
+		inp.batch[i] = b
+	end
+	fill_batch(hp, inp, nil)
+	return inp
+end
+
+--- The replay key of a batch pass: the slot caches, their sizes and
+-- spans, and the options.
+-- @tparam {table,...} caches the slot caches
+-- @tparam table opts the input options
+-- @treturn string the key
+function M:batch_key(caches, opts)
+	local parts = { tostring(opts.flash_attn), self.lora_key or "" }
+	for _, c in ipairs(caches) do
+		if c.n_past + 1 <= c.n_ctx then
+			self:grow(c, c.n_past + 1)
+		end
+		local a, w = spans(c, c.n_past + 1)
+		parts[#parts + 1] = ("%s.%d/%d/%d"):format(c.id or tostring(c), c.gen or 0, a, w)
+	end
+	return table.concat(parts, ":")
+end
+
+--- Load new ids into the inputs of an earlier batch pass with the same key.
+-- @tparam table inp inputs from `batch_inputs`
+-- @tparam {integer,...} ids one token id per slot
+function M:batch_refill(inp, ids)
+	for _, b in ipairs(inp.batch) do
+		check_pass(self, b.cache, 1)
+	end
+	fill_batch(self.hp, inp, ids)
+end
+
+--- Decode one token for each of several slots in one pass.
+-- The pass reuses the last batch graph when the key matches (the same
+-- caches, sizes and spans). Each cache advances by one position.
+-- @tparam {table,...} caches the slot caches
+-- @tparam {integer,...} ids one token id per cache
+-- @tparam[opt] table opts options: flash_attn; rows true returns one
+-- (1, n_vocab) node per slot instead of one (S, n_vocab) node
+-- @return the logits node (S, n_vocab), or a list of row nodes; valid
+-- until the next batch pass
+function M:decode_batch(caches, ids, opts)
+	opts = opts or {}
+	local key = self:batch_key(caches, opts)
+	local r = self.batch_replay
+	if r and r.key == key then
+		self:batch_refill(r.inp, ids)
+	else
+		if r then
+			r.g:close()
+		end
+		local inp = self:batch_inputs(caches, ids, opts)
+		inp.ids:set(ids)
+		local g = self.be:graph()
+		local out = self:forward(g, inp)
+		r = { key = key, g = g, inp = inp, out = out, rows = {} }
+		local V = out:shape()[2]
+		local rb = lgml.row_size("f32", V)
+		for i = 1, #caches do
+			r.rows[i] = g:cont(g:view(out, { 1, V }, nil, (i - 1) * rb))
+		end
+		self.batch_replay = r
+	end
+	if opts.rows then
+		r.g:compute(table.unpack(r.rows))
+	else
+		r.g:compute(r.out)
+	end
+	for _, c in ipairs(caches) do
+		c.n_past = c.n_past + 1
+	end
+	return opts.rows and r.rows or r.out
 end
 
 --- Run ids through the model at cache.n_past and advance the cache.

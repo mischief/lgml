@@ -84,6 +84,46 @@ local ra2 = chat(e2, a .. "more again")
 ok(rb2.usage.cached_tokens > 60, ("b kept its slot (cached %d)"):format(rb2.usage.cached_tokens))
 ok(ra2.usage.cached_tokens < 20, ("a lost its slot to c (cached %d)"):format(ra2.usage.cached_tokens))
 
+-- Concurrent requests decode together in batched passes and give the
+-- same tokens as one at a time.
+local function chat_async(e, words, n_tok, res)
+	local req = { messages = { { role = "user", content = words } }, max_tokens = n_tok,
+		temperature = 0, chat_template_kwargs = { enable_thinking = false } }
+	local r = sink()
+	coroutine.wrap(function()
+		r.res, r.err = e:chat(req, r.sink)
+		res[#res + 1] = r
+	end)()
+	return r
+end
+local ec = engine.new({ model = path, backend = "CPU", n_ctx = 2048, slots = 3, kv_initial = 256 })
+local seq = {}
+for i, w in ipairs({ a, b, "short prompt" }) do
+	local one = {}
+	local r = chat_async(ec, w .. " seq", 40, one)
+	while #one < 1 do
+		uv.run("once")
+	end
+	seq[i] = table.concat(r.text)
+end
+local fresh = engine.new({ model = path, backend = "CPU", n_ctx = 2048, slots = 3, kv_initial = 256 })
+local done = {}
+local rs = {}
+for i, w in ipairs({ a, b, "short prompt" }) do
+	rs[i] = chat_async(fresh, w .. " seq", 40, done)
+end
+while #done < 3 do
+	uv.run("once")
+end
+local same = true
+for i = 1, 3 do
+	same = same and rs[i].res and table.concat(rs[i].text) == seq[i]
+end
+ok(same, "three concurrent chats give the same text as one at a time")
+ok((fresh.batch_rows or 0) > (fresh.batch_passes or 0),
+    ("decode steps shared passes: %d rows in %d passes"):format(fresh.batch_rows or 0, fresh.batch_passes or 0))
+ok(fresh:owned() == 0, "all slots are free after the requests")
+
 os.remove(path)
 print("1.." .. n)
 os.exit(failed == 0 and 0 or 1)

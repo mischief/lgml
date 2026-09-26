@@ -16,6 +16,7 @@ local chat = require("lgml.chat")
 local sampler = require("lgml.sampler")
 local tokenizer = require("lgml.tokenizer")
 local stream = require("lgml.server.stream")
+local uv = require("luv")
 local engine_api = require("lgml.server.engine")
 local replay = require("lgml.replay")
 local transformer = require("lgml.transformer")
@@ -222,7 +223,9 @@ function M.new(opts)
 		slots[i] = { cache = model:cache(n_ctx, copts), tokens = {}, ckpts = {}, used = 0 }
 	end
 	local e = setmetatable({
-		slots = slots, slot = slots[1], tick = 0,
+		slots = slots, slot = slots[1], tick = 0, pending = {}, slot_waiting = {},
+		-- With several slots, requests decode together: see E:decode_step.
+		concurrent = #slots > 1 and model.batchable ~= nil and model:batchable(),
 		be = be, model = model, family = family, family_name = family_name,
 		tk = assert(tokenizer.open(opts.model)),
 		n_ctx = n_ctx, flash_attn = fa,
@@ -328,7 +331,9 @@ end
 -- @tparam[opt] {table,...} list `{ id, scale }` entries, ids from 0
 -- @treturn[1] nil
 -- @treturn[2] string an error message for a bad list
-function E:set_lora(list)
+-- The adapter scales and key for a request's lora list, or nil and an
+-- error message.
+function E:lora_for(list)
 	local scales = {}
 	for i, a in ipairs(self.adapters) do
 		scales[i] = a.scale
@@ -337,10 +342,17 @@ function E:set_lora(list)
 		local err
 		scales, err = engine_api.lora_scales(list, #self.adapters)
 		if not scales then
-			return err
+			return nil, err
 		end
 	end
-	local key = table.concat(scales, ",")
+	return scales, table.concat(scales, ",")
+end
+
+function E:set_lora(list)
+	local scales, key = self:lora_for(list)
+	if not scales then
+		return key
+	end
 	if key == self.lora_key then
 		return nil
 	end
@@ -381,6 +393,128 @@ function E:release()
 	local w = table.remove(self.waiting, 1)
 	if w then
 		w()
+	end
+end
+
+-- The count of slots that decoding requests own.
+function E:owned()
+	local n = 0
+	for _, s in ipairs(self.slots) do
+		if s.owner then
+			n = n + 1
+		end
+	end
+	return n
+end
+
+-- Wake the requests that wait for a slot.
+function E:slot_freed()
+	local w = self.slot_waiting
+	self.slot_waiting = {}
+	for _, done in ipairs(w) do
+		done()
+	end
+end
+
+-- Take the device lock with a free slot, and with no other request
+-- decoding when the adapter scales must change. Returns with the lock.
+function E:acquire_slot(lora_key)
+	while true do
+		self:acquire()
+		local owned = self:owned()
+		if owned < #self.slots and (owned == 0 or lora_key == self.lora_key) then
+			return
+		end
+		self:release()
+		stream.await(function(done)
+			self.slot_waiting[#self.slot_waiting + 1] = done
+		end)
+	end
+end
+
+-- Give up a request's slot and the device lock if it still holds it.
+function E:end_request(st)
+	if st.lock then
+		st.lock = false
+		self:release()
+	end
+	if st.slot then
+		st.slot.owner = nil
+		st.slot = nil
+		self:slot_freed()
+	end
+end
+
+-- After a prefill: the request owns its slot and lets the device go, so
+-- other requests prefill and decode alongside.
+function E:own_slot(st)
+	local slot = self.slot
+	slot.tokens = self.tokens
+	slot.owner = st
+	st.slot = slot
+	st.lock = false
+	self:release()
+	return slot
+end
+
+--- Decode one token for a slot that a request owns.
+-- The step waits in a queue; one batched pass runs the queued steps of
+-- all slots (`lgml.transformer.decode_batch`), then each request gets
+-- its row of logits.
+-- @tparam table slot the slot
+-- @tparam integer id the token id
+-- @return the logits node of this slot, valid until the next batch pass
+function E:decode_step(slot, id)
+	local entry = { slot = slot, id = id }
+	self.pending[#self.pending + 1] = entry
+	if not self.flush_scheduled then
+		self.flush_scheduled = true
+		local t = uv.new_timer()
+		t:start(0, 0, function()
+			t:close()
+			coroutine.wrap(function()
+				self:flush()
+			end)()
+		end)
+	end
+	stream.await(function(done)
+		entry.done = done
+	end)
+	if entry.err then
+		error(entry.err, 0)
+	end
+	return entry.logits
+end
+
+-- Run the queued decode steps as one batched pass.
+function E:flush()
+	self:acquire()
+	self.flush_scheduled = false
+	local list = self.pending
+	self.pending = {}
+	if #list == 0 then
+		self:release()
+		return
+	end
+	local caches, ids = {}, {}
+	for i, e in ipairs(list) do
+		caches[i], ids[i] = e.slot.cache, e.id
+	end
+	local ok, rows = pcall(self.model.decode_batch, self.model, caches, ids,
+	    { flash_attn = self.flash_attn, rows = true })
+	self:release()
+	self.batch_passes = (self.batch_passes or 0) + 1
+	self.batch_rows = (self.batch_rows or 0) + #list
+	if L:on(log.TRACE) then
+		L:trace("batch", "slots", #list)
+	end
+	for i, e in ipairs(list) do
+		if ok then
+			e.logits = rows[i]
+		else
+			e.err = rows
+		end
+		e.done()
 	end
 end
 
@@ -445,12 +579,13 @@ function E:pick_slot(prompt)
 	end
 	local best, best_n = cur, -1
 	if #self.slots > 1 then
+		best = nil
 		for _, s in ipairs(self.slots) do
-			local t, n = s.tokens, 0
-			while n < #t and n < #prompt and t[n + 1] == prompt[n + 1] do
+			local t, n = s == cur and self.tokens or s.tokens, 0
+			while not s.owner and n < #t and n < #prompt and t[n + 1] == prompt[n + 1] do
 				n = n + 1
 			end
-			if n > best_n or (n == best_n and s == cur) then
+			if not s.owner and (n > best_n or (n == best_n and s == cur)) then
 				best, best_n = s, n
 			end
 		end
@@ -458,11 +593,11 @@ function E:pick_slot(prompt)
 			-- An empty slot, else the least recently used one.
 			best = nil
 			for _, s in ipairs(self.slots) do
-				if #s.tokens == 0 then
+				if not s.owner and #s.tokens == 0 then
 					best = s
 					break
 				end
-				if not best or s.used < best.used then
+				if not s.owner and (not best or s.used < best.used) then
 					best = s
 				end
 			end
@@ -630,18 +765,35 @@ function E:chat(req, sink)
 	if type(req.messages) ~= "table" or #req.messages == 0 then
 		return nil, "messages must be a non-empty array", 400
 	end
-	self:acquire()
+	local st = { lock = true }
+	if self.concurrent then
+		local scales, key = self:lora_for(req.lora)
+		if not scales then
+			return nil, key, 400
+		end
+		self:acquire_slot(key)
+	else
+		self:acquire()
+	end
 	local lerr = self:set_lora(req.lora)
 	if lerr then
-		self:release()
+		self:end_request(st)
 		return nil, lerr, 400
 	end
-	local ok, a, b, c = pcall(self.run, self, req, sink)
+	local ok, a, b, c = pcall(self.run, self, req, sink, st)
 	if not ok then
 		-- The cache may not match the token list now.
-		self.tokens, self.cache.n_past = {}, 0
+		local slot = st.slot
+		if slot then
+			slot.tokens, slot.cache.n_past = {}, 0
+			if slot == self.slot then
+				self.tokens = slot.tokens
+			end
+		else
+			self.tokens, self.cache.n_past = {}, 0
+		end
 	end
-	self:release()
+	self:end_request(st)
 	if not ok then
 		return nil, tostring(a), 500
 	end
@@ -660,7 +812,15 @@ end
 -- @treturn[2] string an error message
 -- @treturn[2] int an HTTP status
 function E:decide(req, ctl)
-	self:acquire()
+	if self.concurrent then
+		local scales, key = self:lora_for(req.lora)
+		if not scales then
+			return nil, key, 400
+		end
+		self:acquire_slot(key)
+	else
+		self:acquire()
+	end
 	local lerr = self:set_lora(req.lora)
 	if lerr then
 		self:release()
@@ -864,9 +1024,9 @@ local function first_lines(text, n)
 	return table.concat(out, "\n")
 end
 
-function E:run(req, sink)
+function E:run(req, sink, st)
 	self.image_ms = 0
-	local ok, a, b, c = pcall(self.run_prompt, self, req, sink)
+	local ok, a, b, c = pcall(self.run_prompt, self, req, sink, st)
 	self:drop_images()
 	if not ok then
 		error(a, 0)
@@ -874,7 +1034,7 @@ function E:run(req, sink)
 	return a, b, c
 end
 
-function E:run_prompt(req, sink)
+function E:run_prompt(req, sink, st)
 	local think = thinking(req)
 	local kw = type(req.chat_template_kwargs) == "table" and req.chat_template_kwargs or {}
 	local effort, keep = kw.reasoning_effort, kw.preserve_thinking
@@ -951,6 +1111,9 @@ function E:run_prompt(req, sink)
 	if not logits then
 		return true
 	end
+	-- Concurrent engines: decode on the owned slot in batched passes.
+	local slot = st and self.concurrent and self:own_slot(st)
+	local toks = slot and slot.tokens or self.tokens
 	local t1 = lgml.clock()
 	local n, reason, stopped = 0, "length", false
 	local tracing = log.level >= log.TRACE
@@ -991,8 +1154,12 @@ function E:run_prompt(req, sink)
 		if n >= max then
 			break
 		end
-		logits = self:eval({ id })
-		self.tokens[#self.tokens + 1] = id
+		if slot then
+			logits = self:decode_step(slot, id)
+		else
+			logits = self:eval({ id })
+		end
+		toks[#toks + 1] = id
 		stream.sleep(0)
 		if sink:cancelled() then
 			return true
