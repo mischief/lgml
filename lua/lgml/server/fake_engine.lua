@@ -8,6 +8,7 @@
 local sleep = require("lgml.server.stream").sleep
 local base64 = require("lgml.base64")
 local log = require("lgml.log")
+local output = require("lgml.chat.output")
 
 local L = log.new("engine")
 
@@ -96,16 +97,15 @@ local function render(req)
 	return table.concat(t)
 end
 
-local function emit(sink, piece, index)
+-- The parser event of a piece of the plan.
+local function event(piece)
 	local kind, text = piece[1], piece[2]
-	if kind == "reasoning" then
-		return sink:reasoning(text)
-	elseif kind == "content" then
-		return sink:content(text)
-	elseif kind == "tool" then
-		return sink:tool_call(text)
+	if kind == "tool" then
+		return { type = "tool_call_begin", index = 0, name = text }
+	elseif kind == "args" then
+		return { type = "tool_call_args", index = 0, text = text }
 	end
-	return sink:tool_arguments(index, text)
+	return { type = kind, text = text }
 end
 
 --- Counts a cancel and calls `on_cancel`.
@@ -121,7 +121,8 @@ end
 
 --- Streams the canned reply.
 -- The user message `"fail"` makes the call fail before any output. The
--- reply counts one token per piece and stops at `max_tokens`. The
+-- reply counts one token per piece and stops at `max_tokens`. `stop`
+-- strings apply to the content, as `lgml.chat.output` applies them. The
 -- prompt log (see `lgml.log.prompt`) shows each message as
 -- `<|role|>\ncontent\n`.
 -- @tparam table req the chat request
@@ -141,7 +142,7 @@ function F:chat(req, sink)
 	if log.want_prompt() then
 		log.prompt(L, "chat", render(req), "model", self.model, "tokens", usage.prompt_tokens)
 	end
-	local index
+	local out = output.new(sink, nil, { stop = req.stop })
 	for _, piece in ipairs(plan(req)) do
 		sleep(self.delay)
 		if sink:cancelled() then
@@ -151,17 +152,21 @@ function F:chat(req, sink)
 			sink:finish("length", usage)
 			return true
 		end
-		local r = emit(sink, piece, index)
+		local r = out:deliver({ event(piece) })
 		if not r then
 			return self:cancel()
-		end
-		if piece[1] == "tool" then
-			index = r
 		end
 		usage.completion_tokens = usage.completion_tokens + 1
 		if piece[1] == "reasoning" then
 			usage.reasoning_tokens = usage.reasoning_tokens + 1
 		end
+		if r == "stop" then
+			sink:finish("stop", usage)
+			return true
+		end
+	end
+	if not out:finish() then
+		return self:cancel()
 	end
 	sink:finish("stop", usage, {
 		prompt_n = usage.prompt_tokens, predicted_n = usage.completion_tokens,

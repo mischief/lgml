@@ -99,7 +99,7 @@ end
 -- The prompt and one canvas must fit in the context. Generation stops
 -- at an end token, at the token limit, at the context end, or after 3
 -- blocks in a row that end in a loop. The request can set `seed`,
--- `max_tokens`, `max_completion_tokens`, `tools`, `reasoning_effort =
+-- `max_tokens`, `max_completion_tokens`, `stop`, `tools`, `reasoning_effort =
 -- "none"` and `chat_template_kwargs.enable_thinking`. A Lua error
 -- resets the cache and returns status 500.
 -- @tparam table req the chat request
@@ -138,7 +138,7 @@ function E:run(req, sink)
 	local max = req.max_completion_tokens or req.max_tokens
 	max = math.min(max or self.n_ctx, self.n_ctx - #prompt)
 	local seed = math.tointeger(req.seed) or self.seed or math.random(0, 0x7fffffff)
-	local out = output.new(sink, self.family.new_parser({ tools = req.tools }))
+	local out = output.new(sink, self.family.new_parser({ tools = req.tools }), { stop = req.stop })
 	local dec = tokenizer.decoder(self.tk, { special = false })
 
 	local t0 = lgml.clock()
@@ -148,7 +148,7 @@ function E:run(req, sink)
 	    self.cache.tokens[cached + 1] == prompt[cached + 1] do
 		cached = cached + 1
 	end
-	local n, cuts, reason = 0, 0, "length"
+	local n, cuts, reason, stopped = 0, 0, "length", false
 	while n < max and #prefix + C <= self.n_ctx do
 		local canvas = self.model:denoise(prefix, {
 			seed = seed, steps = self.steps, kv_cache = true, cache = self.cache,
@@ -164,9 +164,17 @@ function E:run(req, sink)
 		local cut, stop = self.model.trim(canvas, self.eog)
 		cut = math.min(cut, max - n)
 		for i = 1, cut do
-			if not out:token(dec:push(canvas[i])) then
+			local r = out:token(dec:push(canvas[i]))
+			if r == "stop" then
+				n, stopped = n + i, true
+				break
+			elseif not r then
 				return true
 			end
+		end
+		if stopped then
+			reason = "stop"
+			break
 		end
 		n = n + cut
 		if stop and n < max then
@@ -179,8 +187,13 @@ function E:run(req, sink)
 		end
 		table.move(canvas, 1, cut, #prefix + 1, prefix)
 	end
-	if not out:finish(dec:flush()) then
-		return true
+	if not stopped then
+		local r = out:finish(dec:flush())
+		if r == "stop" then
+			reason = "stop"
+		elseif not r then
+			return true
+		end
 	end
 	local t1 = lgml.clock()
 	sink:finish(reason, {

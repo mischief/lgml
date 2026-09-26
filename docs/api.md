@@ -196,7 +196,7 @@ the request checks (`lgml.server.chat_request.FIELDS`).
 | `presence_penalty` | OpenAI | supported | From -2 to 2. |
 | `frequency_penalty` | OpenAI | supported | From -2 to 2. |
 | `seed` | OpenAI | supported | Sampler seed. The same seed and request give the same reply on the same build. |
-| `stop` | OpenAI | planned | A value gives 400. |
+| `stop` | OpenAI | supported | A string or up to 4 strings. They apply to the content, not to the reasoning or the tool calls. The reply ends before the first stop string, with `finish_reason` `stop`; the stop string is not in it. An empty string has no effect. |
 | `n` | OpenAI | planned | Only 1. |
 | `logprobs` | OpenAI | planned | Only `false`. |
 | `top_logprobs` | OpenAI | planned | A value gives 400. |

@@ -220,6 +220,45 @@ local function post_json(body)
 	return status, json.decode(text), headers
 end
 
+-- The events of a streamed reply: each is decoded JSON, or "[DONE]".
+-- Returns the events and true when each is a "data: ...\n\n" line.
+local function events(text)
+	local list, framed, pos = {}, true, 1
+	while pos <= #text do
+		local line, next_pos = text:match("^data: ([^\n]*)\n\n()", pos)
+		if not line then
+			framed = false
+			break
+		end
+		list[#list + 1] = line == "[DONE]" and line or json.decode(line)
+		pos = next_pos
+	end
+	return list, framed
+end
+
+-- The content, finish reasons and chunks of a stream, by choice index.
+local function collect(list)
+	local c = { content = {}, finish = {}, chunks = 0 }
+	for _, ev in ipairs(list) do
+		if type(ev) == "table" and ev.choices then
+			c.chunks = c.chunks + 1
+			for _, ch in ipairs(ev.choices) do
+				local i = ch.index
+				if type(ch.delta.content) == "string" then
+					c.content[i] = (c.content[i] or "") .. ch.delta.content
+				end
+				if ch.finish_reason ~= json.null then
+					c.finish[i] = ch.finish_reason
+				end
+			end
+			if ev.usage and ev.usage ~= json.null then
+				c.usage = ev.usage
+			end
+		end
+	end
+	return c
+end
+
 local TOOLS = json.array({ { type = "function", ["function"] = {
 	name = "get_weather", parameters = { type = "object",
 	properties = { city = { type = "string" } }, required = json.array({ "city" }) } } } })
@@ -251,8 +290,19 @@ local function test_reply_table()
 	end
 end
 
+local function test_stop()
+	local status, b = post_json(body({ stop = "weather" }))
+	local ch = b.choices[1]
+	ok(status == 200 and ch.message.content == "Let me check the " and ch.finish_reason == "stop",
+	    "stop cuts the content: " .. tostring(ch.message.content))
+	local _, _, text = post(body({ stream = true, stop = json.array({ "zzz", "check" }) }))
+	local c = collect(events(text))
+	ok(c.content[0] == "Let me " and c.finish[0] == "stop", "stop in a stream")
+end
+
 test_field_table()
 test_messages()
 test_reply_table()
+test_stop()
 print("1.." .. n)
 os.exit(failed == 0 and 0 or 1)

@@ -444,7 +444,8 @@ end
 -- It renders the chat template, reuses the cached prefix, prefills and
 -- samples. It stops at an end token, at the token limit or on cancel.
 -- The request can set sampler settings, `seed`, `max_tokens`,
--- `max_completion_tokens`, `tools`, `reasoning_effort = "none"` and
+-- `max_completion_tokens`, `stop` (see `lgml.chat.output`), `tools`,
+-- `reasoning_effort = "none"` and
 -- `chat_template_kwargs` `enable_thinking`, `reasoning_effort` and
 -- `preserve_thinking`. `grammar` (GBNF) or `response_format` (see
 -- `lgml.grammar.from_request`) constrain the answer; a reasoning block
@@ -688,7 +689,8 @@ function E:run_prompt(req, sink)
 		    "seed", req.seed or "random", "max_tokens", max, "thinking", think,
 		    "grammar", gopts.grammar and first_lines(gopts.grammar, 6), "root", gopts.grammar_root)
 	end
-	local out = output.new(sink, self.family.new_parser({ tools = req.tools, enable_thinking = think }))
+	local out = output.new(sink, self.family.new_parser({ tools = req.tools, enable_thinking = think }),
+	    { stop = req.stop })
 	local dec = tokenizer.decoder(self.tk, { special = false })
 
 	local t0 = lgml.clock()
@@ -700,7 +702,7 @@ function E:run_prompt(req, sink)
 		return true
 	end
 	local t1 = lgml.clock()
-	local n, reason = 0, "length"
+	local n, reason, stopped = 0, "length", false
 	local tracing = log.level >= log.TRACE
 	while n < max do
 		local id = smp:sample(logits)
@@ -717,7 +719,11 @@ function E:run_prompt(req, sink)
 		if tracing then
 			L:trace("token", "n", n, "id", id, "text", piece)
 		end
-		if not out:token(piece) then
+		local r = out:token(piece)
+		if r == "stop" then
+			reason, stopped = "stop", true
+			break
+		elseif not r then
 			return true
 		end
 		if n >= max then
@@ -730,8 +736,14 @@ function E:run_prompt(req, sink)
 			return true
 		end
 	end
-	if not out:finish(dec:flush()) then
-		return true
+	-- After a stop string, the rest of the output does not go out.
+	if not stopped then
+		local r = out:finish(dec:flush())
+		if r == "stop" then
+			reason = "stop"
+		elseif not r then
+			return true
+		end
 	end
 	local t2 = lgml.clock()
 	sink:finish(reason, {

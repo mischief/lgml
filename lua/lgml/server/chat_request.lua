@@ -271,6 +271,21 @@ local function stream_options(v)
 	return true
 end
 
+-- A string, or an array of at most 4 strings.
+local function stop(v)
+	if type(v) == "string" then
+		return true
+	elseif not json.isarray(v) or #v > 4 then
+		return false
+	end
+	for _, x in ipairs(v) do
+		if type(x) ~= "string" then
+			return false
+		end
+	end
+	return true
+end
+
 local function prompt_cache_options(v)
 	if not is_object(v) then
 		return false
@@ -347,7 +362,8 @@ M.FIELDS = {
 	{ "frequency_penalty", "number", num_in(-2, 2), "a number from -2 to 2", status = "supported",
 	    label = "OpenAI" },
 	{ "seed", "number", int_in(math.mininteger), "an integer", status = "supported", label = "OpenAI" },
-	{ "stop", "string|table", never, "null (planned)", status = "planned", label = "OpenAI" },
+	{ "stop", "string|table", stop, "a string or an array of at most 4 strings", status = "supported",
+	    label = "OpenAI" },
 	{ "n", "number", function(v) return v == 1 end, "1 (planned: more)", status = "planned",
 	    label = "OpenAI" },
 	{ "logprobs", "boolean", function(v) return v == false end, "false (planned)",
@@ -431,7 +447,8 @@ end
 --- Checks a chat request body.
 -- It removes top-level nulls and nulls in each message. It gives an
 -- error for a field that is not in `FIELDS`, for a value that fails
--- the check of its field, and for a bad message. It turns `grammar`,
+-- the check of its field, and for a bad message. A string `stop`
+-- becomes an array of one string. It turns `grammar`,
 -- `response_format` or `json_schema` into GBNF text in `grammar` and
 -- checks it (see `lgml.grammar`); with raw, schema properties keep
 -- their order.
@@ -461,6 +478,9 @@ function M.check(b, raw)
 		if not ok then
 			return nil, err, c[1]
 		end
+	end
+	if type(b.stop) == "string" then
+		b.stop = json.array({ b.stop })
 	end
 	if raw and type(b.response_format) == "table" then
 		local o = require("lgml.json_schema").decode(raw)
