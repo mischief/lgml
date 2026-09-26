@@ -12,6 +12,7 @@ local openai = require("lgml.server.openai")
 local systemone = require("lgml.systemone")
 local detect = require("lgml.detect")
 local anthropic = require("lgml.server.anthropic")
+local responses = require("lgml.server.responses")
 
 local M = {}
 
@@ -319,6 +320,52 @@ local function messages_schemas(c)
 	}, { "type", "error" })
 end
 
+-- OpenAI Responses
+
+local RESPONSES_NOTES = {
+	model = "Model id. A missing or unknown id goes to the first model that serves chat.",
+	stream = "Stream the reply as named server-sent events with sequence numbers.",
+}
+
+local function responses_schemas(c)
+	local item = { type = "object", description = "A message (role and content), function_call, " ..
+	    "function_call_output, reasoning or item_reference item." }
+	local props = {
+		input = { oneOf = json.array({ str(), arr(item) }) },
+		tools = arr(ref("ResponsesTool")),
+		tool_choice = { oneOf = json.array({ { type = "string", enum = json.array({ "none", "auto", "required" }) },
+			obj({ type = { const = "function" }, name = str() }, { "type", "name" }),
+			obj({ type = { const = "allowed_tools" }, mode = str(), tools = arr({ type = "object" }) },
+			    { "type", "mode", "tools" }) }) },
+		reasoning = obj({ effort = str("`none` turns thinking off."), summary = str("No effect.") }),
+		text = obj({ format = obj({ type = { type = "string", enum = json.array({ "text", "json_object",
+			"json_schema" }) }, name = str(), schema = { type = "object" }, strict = { type = "boolean" } },
+			{ "type" }), verbosity = { const = "medium" } }),
+	}
+	add_fields(props, responses.FIELDS, RESPONSES_NOTES)
+	c.ResponsesRequest = obj(props, { "input" })
+	c.ResponsesTool = obj({
+		type = { const = "function" }, name = str(), description = str(),
+		parameters = { type = "object" }, strict = { type = "boolean" },
+	}, { "type", "name" }, "A flat function tool.")
+	c.ResponsesUsage = obj({
+		input_tokens = int("The whole prompt."),
+		input_tokens_details = obj({ cached_tokens = int(), cache_write_tokens = int() }),
+		output_tokens = int(), output_tokens_details = obj({ reasoning_tokens = int() }),
+		total_tokens = int(),
+	})
+	c.Response = obj({
+		id = str("`resp_` and 24 base62 characters."), object = { const = "response" },
+		created_at = int(), completed_at = { type = { "integer", "null" } },
+		status = { type = "string", enum = json.array({ "completed", "incomplete", "in_progress", "failed" }) },
+		error = { type = { "object", "null" } }, incomplete_details = { type = { "object", "null" } },
+		model = str(), instructions = { type = { "string", "null" } },
+		output = arr({ type = "object", description = "reasoning, message or function_call items." }),
+		usage = { anyOf = json.array({ ref("ResponsesUsage"), { type = "null" } }) },
+		previous_response_id = { type = { "string", "null" } }, store = { type = "boolean" },
+	}, nil, "It also echoes the request settings.")
+end
+
 -- images
 
 local IMAGE_NOTES = {
@@ -572,6 +619,16 @@ local function operations()
 				headers = anthropic_headers(),
 			} }),
 		} },
+		["/responses"] = { POST = {
+			tag = "openai", summary = "Create a response",
+			requestBody = json_body(ref("ResponsesRequest")),
+			responses = with({ ["200"] = {
+				description = "The response.",
+				content = { ["application/json"] = { schema = ref("Response") } },
+				headers = { ["x-lgml-ignored"] = { schema = { type = "string" },
+				    description = "Accepted fields with no effect." } },
+			} }, E),
+		} },
 		["/messages/count_tokens"] = { POST = {
 			tag = "anthropic", summary = "Count the prompt tokens of a Messages request",
 			requestBody = json_body(ref("CountTokensRequest")),
@@ -696,6 +753,7 @@ function M.document(routes)
 	local schemas = {}
 	chat_schemas(schemas)
 	messages_schemas(schemas)
+	responses_schemas(schemas)
 	image_schemas(schemas)
 	audio_schemas(schemas)
 	systemone_schemas(schemas)

@@ -998,7 +998,8 @@ end
 -- `lgml.server.engine.NO_LOAD` when eng has no such method.
 --
 -- It also adds the Anthropic Messages routes (see
--- `lgml.server.anthropic`).
+-- `lgml.server.anthropic`) and the OpenAI Responses routes (see
+-- `lgml.server.responses`).
 -- @tparam lgml.server.httpd.Server srv the server
 -- @tparam lgml.server.engine.Engine eng the engine
 -- @tparam[opt] table opts the options: `state_dir`, the directory of
@@ -1011,6 +1012,7 @@ function M.install(srv, eng, opts)
 	opts = opts or {}
 	local shared = { key = opts.key or translate.load_key(opts.state_dir) }
 	require("lgml.server.anthropic").install(srv, eng, shared)
+	require("lgml.server.responses").install(srv, eng, shared)
 	local function health(_, res)
 		return res:json(200, { status = "ok" })
 	end

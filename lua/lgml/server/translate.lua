@@ -501,6 +501,7 @@ end
 --- A sink that groups engine output into blocks.
 -- The field `list` holds the blocks, `calls` the tool blocks by call
 -- index from 1, and `finished` the finish: `{ reason, usage, timings }`.
+-- `final` holds the finish already while the last block closes.
 -- After `prompt`, `prompt_n` and `cached_n` hold the prompt size.
 -- @type Blocks
 M.Blocks = {}
@@ -604,8 +605,10 @@ function M.Blocks:finish(reason, usage, timings)
 	if self.finished then
 		error("sink finished twice", 2)
 	end
+	-- The handler can read the finish while the last block closes.
+	self.final = { reason = reason, usage = usage or {}, timings = timings }
 	close(self)
-	self.finished = { reason = reason, usage = usage or {}, timings = timings }
+	self.finished = self.final
 	if self:cancelled() then
 		return nil, "cancelled"
 	end
@@ -657,9 +660,10 @@ local function unlock(w)
 end
 
 --- Starts the stream when needed and writes text.
+-- @tparam string|function text the events, or a function that returns
+-- them, called in the lock after first
 -- @tparam[opt] function first called once before the first write, in
 -- the lock; it returns text to write first, such as the start events
--- @tparam string text the events
 -- @tparam[opt] table headers headers of the start
 -- @treturn[1] boolean true
 -- @treturn[2] nil
@@ -671,8 +675,15 @@ function M.Writer:send(text, first, headers)
 		self.started = true
 		ok = sse.start(self.res, headers) ~= nil
 		if ok and first then
-			text = first() .. text
+			local head = first()
+			if type(text) == "function" then
+				text = text()
+			end
+			text = head .. text
 		end
+	end
+	if type(text) == "function" then
+		text = ok and text() or ""
 	end
 	if ok and not self.res.done and text ~= "" then
 		ok = self.res:write(text) == true

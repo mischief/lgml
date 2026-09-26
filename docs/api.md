@@ -21,6 +21,7 @@ Labels in this file:
 - [Compatibility](#compatibility)
 - [Chat completions](#chat-completions)
 - [Anthropic Messages](#anthropic-messages)
+- [OpenAI Responses](#openai-responses)
 - [Images](#images)
 - [Speech](#speech)
 - [Transcriptions](#transcriptions)
@@ -43,6 +44,7 @@ one row are aliases for one handler.
 | POST | `/v1/chat/completions`, `/chat/completions` | OpenAI | [Chat completions](#chat-completions) |
 | POST | `/v1/messages` | Anthropic | [Anthropic Messages](#anthropic-messages) |
 | POST | `/v1/messages/count_tokens` | Anthropic | [Messages token count](#messages-token-count) |
+| POST | `/v1/responses` | OpenAI | [OpenAI Responses](#openai-responses) |
 | POST | `/v1/images/generations`, `/images/generations` | OpenAI | [Images](#images) |
 | POST | `/v1/images/edits`, `/images/edits` | OpenAI | [Images](#images) |
 | POST | `/v1/audio/speech`, `/audio/speech` | OpenAI | [Speech](#speech) |
@@ -76,7 +78,8 @@ one row are aliases for one handler.
   has no effect.
 - A chat request with a field that the server does not know gives
   400 (see [Compatibility](#compatibility)), and so does
-  `/v1/systemone`. For `/v1/messages`, `--unknown-fields` (config
+  `/v1/systemone`. For `/v1/messages` and `/v1/responses`,
+  `--unknown-fields` (config
   `unknown_fields`) sets the rule: `reject` (the default) gives 400;
   `ignore` accepts the field and names it in the `x-lgml-ignored`
   header. The other routes ignore unknown fields.
@@ -773,6 +776,148 @@ curl -sN localhost:8080/v1/messages -H 'anthropic-version: 2023-06-01' -d '{
 Claude Code: `ANTHROPIC_BASE_URL=http://localhost:8080
 ANTHROPIC_MODEL=qwen3-14b claude`. `CLAUDE_CODE_ATTRIBUTION_HEADER=0`
 keeps its attribution block out of the prompt.
+
+## OpenAI Responses
+
+`POST /v1/responses`. OpenAI. The server translates the request into a
+chat request, runs it on the chat engine as `/v1/chat/completions`
+does, and translates the reply into a Response object. Model
+selection, images and metrics work as for chat.
+
+### Responses compatibility
+
+openai-python, openai-node, Codex and the clm Responses provider work
+with no change:
+
+- The server accepts each request field of the openai-python
+  `ResponseCreateParams`. A field that changes the output and that lgml
+  cannot do gives 400 with an OpenAI error object: `param` names the
+  field, and `code` is `unsupported_parameter` or `unsupported_value`.
+- A field that the API does not know gives 400 (`Unknown parameter:
+  '<name>'.`, code `unknown_parameter`), in the body, in each item and in
+  each part. With `--unknown-fields ignore`, the server accepts it and
+  names it in `x-lgml-ignored`. Codex `client_metadata` is a known no-op
+  field.
+- Errors have the OpenAI shape of [Errors](#errors).
+
+`test/test_compat_responses.lua` reads the table below and checks it
+against the request checks (`lgml.server.responses.FIELDS`). It also
+sends the examples of the OpenAI reference (in
+`test/fixtures/responses`) to the server with the fake engine and checks
+the replies.
+
+### Responses request fields
+
+| Field | Label | Status | Notes |
+| --- | --- | --- | --- |
+| `model` | OpenAI | supported | See [Model selection](#model-selection). |
+| `input` | OpenAI | supported | A string (one user message) or an array of items; see [Responses input](#responses-input). |
+| `instructions` | OpenAI | supported | A system message before the input. |
+| `stream` | OpenAI | supported | See [Responses streaming](#responses-streaming). |
+| `stream_options` | OpenAI | supported | `include_obfuscation` has no effect: the server sends no `obfuscation` field. It needs `stream: true`. |
+| `max_output_tokens` | OpenAI | supported | A positive integer; it counts the reasoning tokens too. At the limit the response is `incomplete`. |
+| `temperature` | OpenAI | supported | From 0 to 2. |
+| `top_p` | OpenAI | supported | From 0 to 1. |
+| `tools` | OpenAI | limited | Flat function tools only: `{"type": "function", "name", "description", "parameters", "strict"}`. The nested Chat Completions shape gives 400 that shows the flat one. Other tool types (`web_search`, `file_search`, `custom` and the rest) give 400. `defer_loading`, `allowed_callers`, `output_schema` and `async` have no effect; `x-lgml-ignored` names them. |
+| `tool_choice` | OpenAI | supported | `none`, `auto`, `required`, `{"type": "function", "name"}` or `{"type": "allowed_tools", "mode", "tools"}`, as the chat equivalents. |
+| `parallel_tool_calls` | OpenAI | supported | `false` ends the reply after the first call. |
+| `reasoning` | OpenAI | limited | `effort: "none"` turns thinking off; the other values turn it on and do not change its length. `summary` has no effect: the reasoning item always has the raw reasoning. `context` other than `auto` and `mode` other than `standard` give 400. |
+| `text` | OpenAI | limited | `format`: `text`, `json_object` or flat `json_schema` (`name`, `schema`, `strict`), as chat `response_format`. `verbosity`: only `medium`. |
+| `store` | OpenAI | supported | Default true. See [Stored responses](#stored-responses). |
+| `previous_response_id` | OpenAI | supported | See [Stored responses](#stored-responses). |
+| `include` | OpenAI | limited | Only `reasoning.encrypted_content`, which changes nothing: reasoning items always have `encrypted_content`. Other values give 400. |
+| `metadata` | OpenAI | no-op | At most 16 strings. The response echoes it. |
+| `max_tool_calls` | OpenAI | no-op | It limits built-in tools, which lgml does not have. |
+| `prompt_cache_key` | OpenAI | no-op | The server reuses each shared prompt prefix. |
+| `prompt_cache_options` | OpenAI | no-op | `prewarm: true` gives 400. |
+| `prompt_cache_retention` | OpenAI | no-op | `in_memory` or `24h`. |
+| `safety_identifier` | OpenAI | no-op | A string. |
+| `user` | OpenAI | no-op | A string. |
+| `service_tier` | OpenAI | no-op | The response has `service_tier: "default"`. |
+| `client_metadata` | OpenAI | no-op | A string map that Codex sends. |
+| `top_logprobs` | OpenAI | rejected | Only 0: the Responses API of lgml has no log probabilities. |
+| `truncation` | OpenAI | rejected | Only `disabled`: a prompt longer than the context gives 400. |
+| `background` | OpenAI | rejected | Only `false`. |
+| `conversation` | OpenAI | rejected | No conversation objects; use `previous_response_id`. |
+| `prompt` | OpenAI | rejected | No stored prompts. |
+| `moderation` | OpenAI | rejected | No moderation. |
+| `context_management` | OpenAI | rejected | No server-side compaction. |
+
+### Responses input
+
+`input` items:
+
+| Item | Notes |
+| --- | --- |
+| message | `{"role", "content"}`, with or without `"type": "message"`. `role`: `user`, `system`, `developer` (as `system`) or `assistant`. `content` is a string or parts. `id`, `status` and `phase` are accepted. |
+| `function_call` | `call_id`, `name` and `arguments` (a JSON string). `id` and `status` are optional. Calls next to an assistant message join its turn. |
+| `function_call_output` | `call_id` and `output`: a string, or `input_text`, `input_image` and text `input_file` parts. Its `call_id` must be that of an earlier `function_call`, else 400. Images here go into the tool result turn of the template. |
+| `reasoning` | The reasoning of the assistant turn after it. `encrypted_content` made by lgml gives the reasoning; one that the server did not make, or that does not verify, gives 400 (code `invalid_encrypted_content`). Without it, `content` (`reasoning_text`), else `summary`, gives the text. |
+| `item_reference` | An item of a stored response, by id; see [Stored responses](#stored-responses). |
+
+Other item types give 400 with code `unsupported_value`.
+
+Content parts:
+
+- `input_text`: text.
+- `input_image`: `image_url` is a base64 data URL of a PNG or JPEG
+  image. http and https URLs and `file_id` give 400, as the server does
+  not fetch and has no file store. `detail` (`auto`, `low`, `high`,
+  `original`) has no effect. Needs a model with vision.
+- `input_file`: only `file_data` with a text file (a `data:text/...`
+  URL, or base64 of UTF-8 text); it becomes text after its `filename`.
+  PDFs, `file_id` and `file_url` give 400.
+- `output_text` and `refusal` (assistant): text. `annotations` and
+  `logprobs` are accepted.
+
+### Responses output
+
+```json
+{"id": "resp_Ab3...", "object": "response", "created_at": 1790000000,
+ "completed_at": 1790000001, "status": "completed", "error": null,
+ "incomplete_details": null, "model": "qwen3-14b", "instructions": "Be brief.",
+ "output": [
+   {"type": "reasoning", "id": "rs_...", "status": "completed",
+    "summary": [{"type": "summary_text", "text": "The user asks..."}],
+    "content": [{"type": "reasoning_text", "text": "The user asks..."}],
+    "encrypted_content": "lgml1.VGhl...Xk2"},
+   {"type": "message", "id": "msg_...", "status": "completed", "role": "assistant",
+    "content": [{"type": "output_text", "text": "Hi.", "annotations": [], "logprobs": []}]},
+   {"type": "function_call", "id": "fc_...", "call_id": "call_...", "name": "get_weather",
+    "arguments": "{\"city\": \"Paris\"}", "status": "completed"}],
+ "usage": {"input_tokens": 14, "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+   "output_tokens": 30, "output_tokens_details": {"reasoning_tokens": 20}, "total_tokens": 44},
+ "tools": [], "tool_choice": "auto", "parallel_tool_calls": true, "...": "..."}
+```
+
+- The response echoes the request settings: `tools`, `tool_choice`,
+  `parallel_tool_calls`, `temperature`, `top_p`, `max_output_tokens`,
+  `previous_response_id`, `reasoning`, `text`, `metadata`, `store` and
+  the rest of the Open Responses fields, with `null` or the default
+  when not set. There is no `output_text` field; the SDKs make it.
+- Ids: `resp_`, `msg_`, `rs_`, `fc_` and `call_`, each with 24 base62
+  characters.
+- The reasoning item has the raw reasoning of the model both as the
+  `summary` text (the clm client reads it) and as `content`
+  (`reasoning_text`). `encrypted_content` is
+  `lgml1.<base64url text>.<mac>`, signed as the thinking blocks of
+  [Messages thinking](#messages-thinking); send it back to keep the
+  reasoning in a stateless conversation.
+- `status` is `completed`, also for a reply with tool calls; the
+  clients find the calls in the `function_call` items. At
+  `max_output_tokens`, or when the context fills, it is `incomplete`
+  with `incomplete_details: {"reason": "max_output_tokens"}`, and the
+  last message item is `incomplete`.
+- `usage.input_tokens` counts the whole prompt;
+  `input_tokens_details.cached_tokens` the part reused from the cache.
+  `output_tokens` counts the reasoning tokens too.
+
+### Responses examples
+
+```sh
+curl -s localhost:8080/v1/responses -d '{
+  "model": "qwen3-14b", "instructions": "Be brief.", "input": "Say hi."}'
+```
 
 ## Images
 
