@@ -1,6 +1,6 @@
--- lgml.finetune and bin/lgml-finetune on a tiny qwen3 model: chat
--- sample masks, packing, and a short training run whose adapter
--- changes the answer. Output is TAP.
+-- lgml.finetune and bin/lgml-finetune on a tiny qwen3 model: chat and text
+-- sample masks, packing, and short training runs whose adapters change
+-- the output. Output is TAP.
 local lgml = require("lgml")
 local chat = require("lgml.chat")
 local tokenizer = require("lgml.tokenizer")
@@ -175,6 +175,70 @@ do
 	local tuned = answer()
 	ok(tuned:sub(1, 10) == "I am lgml." and base:sub(1, 10) ~= "I am lgml.",
 	    ("the adapter changes the answer: %q -> %q"):format(base, tuned))
+	m:close()
+end
+
+-- Plain text: chunks of the context size, every token trains.
+do
+	local text = "/* file: add.c */\nint add(int a, int b) { return a + b; }\n"
+	local ids = tk:encode(text, { add_bos = false })
+	local ss = finetune.encode_text(tk, text, 16)
+	local count, all = 0, true
+	for _, s in ipairs(ss) do
+		count = count + #s.ids
+		for _, t in ipairs(s.train) do
+			all = all and t
+		end
+	end
+	ok(#ss == (#ids + 15) // 16 and count == #ids and all and #ss[1].ids == 16,
+	    ("text splits into %d chunks of 16 tokens"):format(#ss))
+
+	local mixed = tmp(".jsonl")
+	local f = assert(io.open(mixed, "w"))
+	f:write(json.encode({ text = text }), "\n\n")
+	f:write(json.encode({ messages = { { role = "user", content = "a" },
+	    { role = "assistant", content = "b" } } }), "\n")
+	f:close()
+	local recs = finetune.read_jsonl(mixed)
+	ok(#recs == 2 and recs[1].text == text and recs[2].messages, "chat format takes mixed lines")
+	local good, err = pcall(finetune.read_jsonl, mixed, "text")
+	ok(not good and tostring(err):find(":3:", 1, true), "text format needs text on every line")
+
+	-- The tool learns to complete a source file from its header.
+	local data = tmp(".jsonl")
+	f = assert(io.open(data, "w"))
+	for _ = 1, 3 do
+		f:write(json.encode({ text = text }), "\n")
+	end
+	f:close()
+	local out = tmp(".gguf")
+	local cmd = ("%s %s/../bin/lgml-finetune -m %s -d %s -o %s -b CPU --format text -c 32 " ..
+	    "--lr 1e-2 -e 30 --targets attn_q,attn_k,attn_v,attn_output,ffn_gate,ffn_up,ffn_down,output " ..
+	    "2>&1"):format(arg[-1] or "lua5.4", here, path, data, out)
+	local p = assert(io.popen(cmd))
+	local log = p:read("a")
+	local closed = p:close()
+	local losses = {}
+	for l in log:gmatch("step %d+ epoch %d+ loss ([%d.]+)") do
+		losses[#losses + 1] = tonumber(l)
+	end
+	ok(closed and #losses > 0 and losses[#losses] < losses[1] / 10,
+	    ("text train loss %.3f -> %.4f"):format(losses[1] or 0, losses[#losses] or 0))
+	if not closed then
+		io.stderr:write(log)
+	end
+	local be <close> = assert(lgml.backend("CPU"))
+	local m = transformer.load(be, path)
+	m:set_adapters({ lora.load(m, out) })
+	local head = tk:encode("/* file: add.c */\n", { add_bos = false })
+	local cache = m:cache(128)
+	local got = { m:step(cache, head) }
+	for _ = 1, 7 do
+		got[#got + 1] = m:step(cache, { got[#got] })
+	end
+	local s = tk:decode(got)
+	ok(s == ("int add(int a, int b) { return a + b; }\n"):sub(1, #s) and #s >= 8,
+	    ("the adapter completes the file: %q"):format(s))
 	m:close()
 end
 

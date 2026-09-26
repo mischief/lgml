@@ -1,5 +1,5 @@
 #!/usr/bin/env lua5.4
--- lgml-finetune: train a LoRA adapter on a JSONL chat dataset.
+-- lgml-finetune: train a LoRA adapter on a JSONL chat or text dataset.
 
 local root = ((arg and arg[0] or ""):match("^(.*)/[^/]*$") or ".") .. "/.."
 package.path = root .. "/lua/?.lua;" .. root .. "/lua/?/init.lua;" ..
@@ -21,12 +21,17 @@ usage: lgml-finetune [-h] -m model -d data [-o out] [-b backend] [-r rank]
                      [--wd x] [--optimizer name] [-e epochs] [-c ctx]
                      [--batch n] [--grad-accum n] [--eval file]
                      [--eval-split f] [--eval-every n] [--save-every n]
-                     [--init adapter] [--seed n] [--think]
+                     [--init adapter] [--seed n] [--think] [--format name]
   -m, --model file     base gguf model: a dense llama or qwen3; its
                        weights may be quantized
-  -d, --data file      JSONL training data, one {"messages": [...]} per
-                       line in OpenAI chat form; the loss is on the
-                       assistant turns only
+  -d, --data file      JSONL training data, one object per line:
+                       {"messages": [...]} in OpenAI chat form, with the
+                       loss on the assistant turns only, or {"text": "..."}
+                       with the loss on every token
+      --format name    chat: lines hold messages or text (default);
+                       text: every line holds text, such as a source
+                       file with a "/* file: path */" first line; text
+                       longer than the context splits into chunks
   -o, --out file       adapter gguf to write (default adapter.gguf); it
                        loads in llama.cpp with --lora
   -b, --backend name   ggml backend, for example Vulkan0 or CPU (default
@@ -84,7 +89,7 @@ local function main(args)
 		["warmup="] = false, ["wd="] = false, ["optimizer="] = false, ["batch="] = false,
 		["grad-accum="] = false, ["eval="] = false, ["eval-split="] = false,
 		["eval-every="] = false, ["save-every="] = false, ["init="] = false,
-		["seed="] = false, think = false,
+		["seed="] = false, think = false, ["format="] = false,
 	})
 	if not opts then
 		io.stderr:write("lgml-finetune: ", rest, "\n", USAGE)
@@ -104,6 +109,10 @@ local function main(args)
 	local split = num(opts, "eval-split", 0)
 	local seed = num(opts, "seed", 1, true)
 	local optimizer = opts.optimizer or "adamw"
+	local format = opts.format or "chat"
+	if format ~= "chat" and format ~= "text" then
+		die("format must be chat or text")
+	end
 	if optimizer ~= "adamw" and optimizer ~= "sgd" then
 		die("optimizer must be adamw or sgd")
 	end
@@ -113,7 +122,18 @@ local function main(args)
 
 	local be = assert(lgml.backend(opts.b))
 	local info = assert(lgml.gguf(opts.m))
-	local family = chat.load(info.meta)
+	-- Text data needs no chat template.
+	local family
+	local function chat_family()
+		if not family then
+			local good, f = pcall(chat.load, info.meta)
+			if not good then
+				die(tostring(f))
+			end
+			family = f
+		end
+		return family
+	end
 	local tk = assert(tokenizer.open(opts.m))
 	local model = transformer.load(be, opts.m)
 	local ok, err = pcall(finetune.check, model)
@@ -123,8 +143,14 @@ local function main(args)
 
 	local function samples(path)
 		local list = {}
-		for _, msgs in ipairs(finetune.read_jsonl(path)) do
-			for _, s in ipairs(finetune.encode(tk, family, msgs, { enable_thinking = opts.think })) do
+		local good, recs = pcall(finetune.read_jsonl, path, format)
+		if not good then
+			die(tostring(recs))
+		end
+		for _, r in ipairs(recs) do
+			local ss = r.text and finetune.encode_text(tk, r.text, ctx) or
+			    finetune.encode(tk, chat_family(), r.messages, { enable_thinking = opts.think })
+			for _, s in ipairs(ss) do
 				list[#list + 1] = s
 			end
 		end
@@ -146,7 +172,7 @@ local function main(args)
 		    cut, ctx))
 	end
 	if #tmb == 0 then
-		die(opts.d .. ": no sample has assistant tokens")
+		die(opts.d .. ": no sample has loss tokens")
 	end
 
 	local ad

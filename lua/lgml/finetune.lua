@@ -1,7 +1,9 @@
---- LoRA fine-tuning of `lgml.transformer` models on chat data.
--- Samples are OpenAI chat messages, rendered with the chat template of
--- the model. The loss is the cross-entropy of the next token, on the
--- tokens of assistant turns only. A micro-batch packs whole samples
+--- LoRA fine-tuning of `lgml.transformer` models on chat data or text.
+-- Chat samples are OpenAI chat messages, rendered with the chat
+-- template of the model; the loss is the cross-entropy of the next
+-- token, on the tokens of assistant turns only. Text samples are plain
+-- text in chunks of the context size, with the loss on every token, for
+-- continued pretraining. A micro-batch packs whole samples
 -- into one pass; a block-diagonal causal mask keeps them apart, and
 -- positions start at 0 in each sample. The gradients of a step add up
 -- over its micro-batches, each weighted by its share of the loss
@@ -33,28 +35,63 @@ function M.check(model)
 	end
 end
 
---- Read a JSONL chat dataset.
--- Each line is an object with a messages array in OpenAI form. Blank
--- lines are skipped.
+--- Read a JSONL dataset.
+-- Each line is an object: { messages = OpenAI chat messages } or
+-- { text = a string }. Blank lines are skipped. With format "chat" a
+-- file may mix both kinds; with "text" every line holds text.
 -- @tparam string path the file
--- @treturn {table,...} the message lists
+-- @tparam[opt="chat"] string format "chat" or "text"
+-- @treturn {table,...} the records: { messages } or { text }
 -- @raise on a file error or a bad line
-function M.read_jsonl(path)
+function M.read_jsonl(path, format)
+	local text_only = format == "text"
 	local f = assert(io.open(path))
 	local out, ln = {}, 0
 	for line in f:lines() do
 		ln = ln + 1
 		if line:match("%S") then
 			local v, err = json.decode(line)
-			if type(v) ~= "table" or type(v.messages) ~= "table" or #v.messages == 0 then
+			local chat_ok = type(v) == "table" and type(v.messages) == "table" and #v.messages > 0
+			local text_ok = type(v) == "table" and type(v.text) == "string" and v.text ~= ""
+			if not text_ok and (text_only or not chat_ok) then
 				f:close()
-				error(("%s:%d: need an object with messages (%s)"):format(path, ln,
-				    err or "no messages"))
+				error(("%s:%d: need an object with %s (%s)"):format(path, ln,
+				    text_only and "text" or "messages or text", err or "none found"))
 			end
-			out[#out + 1] = v.messages
+			out[#out + 1] = text_ok and { text = v.text } or { messages = v.messages }
 		end
 	end
 	f:close()
+	return out
+end
+
+--- Tokenize plain text into samples of at most ctx tokens.
+-- Every token trains. Each chunk starts with BOS when the model wants
+-- one; the first token of a chunk is context only.
+-- @param tk the tokenizer, from `lgml.tokenizer.open`
+-- @tparam string text the text
+-- @tparam integer ctx the most tokens in a sample, at least 2
+-- @treturn {table,...} the samples: each has ids and train
+function M.encode_text(tk, text, ctx)
+	local sp = tk:special()
+	local bos = sp.add_bos and sp.bos or nil
+	local ids = tk:encode(text, { add_bos = false })
+	local per = ctx - (bos and 1 or 0)
+	assert(per >= 2, "encode_text: ctx too small")
+	local out = {}
+	for i = 1, #ids, per do
+		local s = { ids = {}, train = {} }
+		if bos then
+			s.ids[1], s.train[1] = bos, false
+		end
+		for j = i, math.min(#ids, i + per - 1) do
+			s.ids[#s.ids + 1] = ids[j]
+			s.train[#s.train + 1] = true
+		end
+		if #s.ids >= 2 then
+			out[#out + 1] = s
+		end
+	end
 	return out
 end
 
