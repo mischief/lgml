@@ -1,7 +1,8 @@
 --- A fake engine for tests.
 -- It streams a canned reply with reasoning, content and, when the
 -- request has tools, one tool call. Each piece waits a few milliseconds
--- on a luv timer.
+-- on a luv timer. It also transcribes, speaks and decides with canned
+-- rules.
 -- @module lgml.server.fake_engine
 
 local sleep = require("lgml.server.stream").sleep
@@ -188,6 +189,80 @@ function F:speak(req, ctl)
 	    string.pack("<I4I2I2I4I4I2I2", 16, 1, 1, 24000, 48000, 2, 16) ..
 	    "data" .. string.pack("<I4", #data) .. data
 	return { wav = wav, sample_rate = 24000 }
+end
+
+-- Lowercase words of 3 or more letters.
+local function words(s)
+	local t = {}
+	for w in s:lower():gmatch("%a%a%a+") do
+		t[w] = true
+	end
+	return t
+end
+
+-- Four times the number of distinct words of text that the state has.
+local function overlap(state, text)
+	local n = 0
+	for w in pairs(words(text)) do
+		if state[w] then
+			n = n + 1
+		end
+	end
+	return 4 * n
+end
+
+local function softmax(s)
+	local z, out = 0, {}
+	for i, v in ipairs(s) do
+		out[i] = math.exp(v)
+		z = z + out[i]
+	end
+	for i = 1, #out do
+		out[i] = out[i] / z
+	end
+	return out
+end
+
+--- Answers typed questions by word overlap with the state.
+-- The log-score of an answer is four times the number of its distinct
+-- words (3 or more letters, any case) that the state has. A choice
+-- option reads its name and text, a score level its text. A noul
+-- scores its instructions and `yes` text against a log-score of 1 for
+-- no. State `"fail"` gives status 500. It waits one delay, so ctl can
+-- cancel; a cancel gives status 499.
+-- @tparam table req the decision request
+-- @tparam[opt] lgml.server.engine.Control ctl the cancel control
+-- @treturn[1] table `{ model, answers, usage }`
+-- @treturn[2] nil
+-- @treturn[2] string an error message
+-- @treturn[2] int an HTTP status
+function F:decide(req, ctl)
+	sleep(self.delay)
+	if ctl and ctl.cancelled and ctl.cancelled() then
+		return nil, "cancelled", 499
+	end
+	if req.state == "fail" then
+		return nil, "fake failure", 500
+	end
+	local state = words(req.state)
+	local answers, nout = {}, 0
+	for _, q in ipairs(req.questions) do
+		local s = {}
+		if q.type == "noul" then
+			s = { overlap(state, q.instructions .. " " .. (q.yes or "")), 1 }
+			answers[q.id] = { yes = softmax(s)[1] }
+		else
+			for i, x in ipairs(q.options or q.levels) do
+				s[i] = overlap(state, type(x) == "table" and (x.key .. " " .. x.text) or x)
+			end
+			answers[q.id] = { probabilities = softmax(s) }
+		end
+		nout = nout + #s
+	end
+	return {
+		model = self.model, answers = answers,
+		usage = { input_tokens = #req.state // 4 + 16 * #req.questions, output_tokens = nout },
+	}
 end
 
 return M

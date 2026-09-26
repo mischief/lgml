@@ -15,12 +15,14 @@ local openai = require("lgml.server.openai")
 local USAGE = [[
 usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b backend]
                    [-c n_ctx] [--no-fa] [--ctk type] [--ctv type] [--alias id]
+                   [--recipe file] [--cache-ram MiB] [--ctx-checkpoints n]
                    [--inproc] [--stt]
   -l, --listen addr   address to listen on (default 127.0.0.1)
   -p, --port port     port to listen on (default 8080)
   -C, --config file   Lua file returning { listen, port, models = { spec, ... } };
                       spec: { model = path, id, backend, ctx, flash_attn, stt,
-                      cache_type_k, cache_type_v,
+                      cache_type_k, cache_type_v, recipe, cache_ram,
+                      ctx_checkpoints,
                       engine = Lua module with new(opts), such as a TTS engine }
   -m, --model file    gguf model file, or a Whisper model directory
   -b, --backend name  ggml backend, for example Vulkan0 or CPU (default best)
@@ -31,6 +33,14 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       attention
       --ctv type      V cache type, as --ctk
       --alias id      model id for /v1/models
+      --recipe file   decision recipe for /v1/systemone: a Jevify
+                      recipe.json (default: temperature 1, two option
+                      orders for choice)
+      --cache-ram MiB host RAM for stored prompt prefixes (default 8192;
+                      0 turns the store off, -1 means no limit)
+      --ctx-checkpoints n
+                      state checkpoints per slot for hybrid and sliding
+                      window models (default 8; 0 turns them off)
       --inproc        run the model in this process, not in a worker
       --stt           the model is speech-to-text (found from config.json
                       when not given)
@@ -50,6 +60,14 @@ local function model_engine(spec)
 	if spec.ctx and not n_ctx then
 		die("bad context size " .. tostring(spec.ctx))
 	end
+	local ram, ckpt = spec.cache_ram and tonumber(spec.cache_ram),
+	    spec.ctx_checkpoints and math.tointeger(tonumber(spec.ctx_checkpoints))
+	if spec.cache_ram and not ram then
+		die("bad cache RAM size " .. tostring(spec.cache_ram))
+	end
+	if spec.ctx_checkpoints and not (ckpt and ckpt >= 0) then
+		die("bad checkpoint count " .. tostring(spec.ctx_checkpoints))
+	end
 	local stt = not spec.engine and (spec.stt or require("lgml.detect").is_whisper(spec.model))
 	if spec.inproc and spec.engine then
 		return require(spec.engine).new({
@@ -64,12 +82,15 @@ local function model_engine(spec)
 			model = spec.model, backend = spec.backend, n_ctx = n_ctx,
 			flash_attn = spec.flash_attn ~= false, id = spec.id,
 			cache_type_k = spec.cache_type_k, cache_type_v = spec.cache_type_v,
+			recipe = spec.recipe, cache_ram = ram, ctx_checkpoints = ckpt,
 		})
 	end
 	local wargs = { "-m", spec.model }
 	for flag, v in pairs({
 		["-b"] = spec.backend, ["-c"] = spec.ctx, ["--alias"] = spec.id,
 		["--ctk"] = spec.cache_type_k, ["--ctv"] = spec.cache_type_v,
+		["--recipe"] = spec.recipe, ["--cache-ram"] = spec.cache_ram,
+		["--ctx-checkpoints"] = spec.ctx_checkpoints,
 	}) do
 		table.move({ flag, tostring(v) }, 1, 2, #wargs + 1, wargs)
 	end
@@ -119,7 +140,8 @@ local function make_engine(opts)
 		return model_engine({
 			model = opts.m, id = opts.alias, backend = opts.b, ctx = opts.c,
 			flash_attn = not opts["no-fa"], stt = opts.stt, inproc = opts.inproc,
-			cache_type_k = opts.ctk, cache_type_v = opts.ctv,
+			cache_type_k = opts.ctk, cache_type_v = opts.ctv, recipe = opts.recipe,
+			cache_ram = opts["cache-ram"], ctx_checkpoints = opts["ctx-checkpoints"],
 		})
 	end
 	die("no engine: give -m model, -C config or --fake")
@@ -130,6 +152,7 @@ local function main(args)
 		config = "C", help = "h", listen = "l", port = "p", model = "m", backend = "b",
 		ctx = "c", fake = false, ["no-fa"] = false, ["alias="] = false,
 		inproc = false, stt = false, ["ctk="] = false, ["ctv="] = false,
+		["recipe="] = false, ["cache-ram="] = false, ["ctx-checkpoints="] = false,
 	})
 	if not opts then
 		io.stderr:write("lgml-server: ", rest, "\n", USAGE)

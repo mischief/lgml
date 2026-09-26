@@ -42,7 +42,7 @@ end
 
 --- Picks the engine for a model id and a method.
 -- @tparam ?string id the model id
--- @tparam string what `"chat"`, `"transcribe"` or `"speak"`
+-- @tparam string what `"chat"`, `"transcribe"`, `"speak"` or `"decide"`
 -- @treturn ?lgml.server.engine.Engine the engine that serves id with
 -- what, else the first engine with what, else nil
 function R:pick(id, what)
@@ -106,6 +106,21 @@ function R:speak(req, ctl)
 		return nil, "no model serves speech", 400
 	end
 	return e:speak(req, ctl)
+end
+
+--- Answers typed questions on the engine for `req.model`.
+-- A request for `"jevify-latest"`, no model or an unknown one goes to
+-- the first engine that can decide.
+-- @tparam table req the decision request
+-- @tparam lgml.server.engine.Control ctl the cancel control
+-- @return the results of `Engine:decide`, or nil, a message and 400
+-- when no engine can decide
+function R:decide(req, ctl)
+	local e = self:pick(req.model, "decide")
+	if not e then
+		return nil, "no model serves decisions", 400
+	end
+	return e:decide(req, ctl)
 end
 
 --- Stops each engine that has a `stop` method.

@@ -60,7 +60,7 @@ end
 local function caps(engine)
 	return {
 		chat = engine.chat ~= nil, transcribe = engine.transcribe ~= nil,
-		speak = engine.speak ~= nil,
+		speak = engine.speak ~= nil, decide = engine.decide ~= nil,
 	}
 end
 
@@ -139,6 +139,23 @@ function M.serve(fd, engine)
 			ch:send(ipc.DONE, id, { ok = r ~= nil, msg = msg, status = status, result = result })
 		end)()
 	end
+	local function decide(id, req)
+		local ctl = { stopped = false }
+		function ctl.cancelled()
+			return ctl.stopped
+		end
+		jobs[id] = ctl
+		coroutine.wrap(function()
+			local r, msg, status
+			if engine.decide then
+				r, msg, status = engine:decide(req, ctl)
+			else
+				msg, status = "model does not support decisions", 400
+			end
+			jobs[id] = nil
+			ch:send(ipc.DONE, id, { ok = r ~= nil, msg = msg, status = status, result = r })
+		end)()
+	end
 	ch = ipc.channel(fd, function(t, id, v)
 		if t == ipc.JOB then
 			chat(id, v)
@@ -148,6 +165,8 @@ function M.serve(fd, engine)
 			transcribe(id, v)
 		elseif t == ipc.SPEAK then
 			speak(id, v)
+		elseif t == ipc.DECIDE then
+			decide(id, v)
 		elseif t == ipc.CANCEL and jobs[id] then
 			jobs[id].stopped = true
 		end

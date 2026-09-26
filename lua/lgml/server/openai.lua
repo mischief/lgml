@@ -5,11 +5,13 @@
 -- `stream = true`, and sends one reply at the end otherwise.
 -- @module lgml.server.openai
 
+local uv = require("luv")
 local json = require("lgml.json")
 local http = require("lgml.server.http")
 local sse = require("lgml.server.sse")
 local engine_api = require("lgml.server.engine")
 local multipart = require("lgml.server.multipart")
+local systemone = require("lgml.systemone")
 
 local M = {}
 
@@ -580,11 +582,47 @@ local function speech(eng, req, res)
 	return res:send(200, wav, { ["Content-Type"] = "audio/wav" })
 end
 
+-- System One decisions
+
+local function systemone_route(eng, req, res)
+	if type(eng.decide) ~= "function" then
+		return res:json(404, { detail = "this server does not serve decisions" })
+	end
+	local dreq, body = systemone.check(req.body)
+	if not dreq then
+		return res:json(422, body)
+	end
+	local t0 = uv.hrtime()
+	local r, msg, status = eng:decide(dreq, {
+		cancelled = function()
+			return res.s:gone()
+		end,
+	})
+	if res.s:gone() then
+		res.close = true
+		return
+	end
+	if not r then
+		return res:json(status or 500, { detail = msg or "decision failed" })
+	end
+	local ok, text = pcall(systemone.reply, dreq, body, r)
+	if not ok then
+		return res:json(500, { detail = tostring(text) })
+	end
+	return res:send(200, text, {
+		["Content-Type"] = "application/json",
+		["x-jevify-latency-ms"] = ("%.1f"):format((uv.hrtime() - t0) / 1e6),
+	})
+end
+
 --- Adds the OpenAI routes for eng to srv.
 -- The routes are `/health`, `/v1/health`, `/models`, `/v1/models`,
--- `/props`, `/chat/completions`, `/audio/speech` and
--- `/audio/transcriptions`, the last three also under `/v1`. A route for
--- a method that eng does not have gives 404.
+-- `/props`, `/chat/completions`, `/audio/speech`,
+-- `/audio/transcriptions` and `/systemone`, the last four also under
+-- `/v1`. A route for a method that eng does not have gives 404.
+-- `/v1/systemone` is Jev's System One API (see `lgml.systemone`): a
+-- bad request gives 422 with a FastAPI `detail` list, and other errors
+-- give `{ detail = message }`.
 -- @tparam lgml.server.httpd.Server srv the server
 -- @tparam lgml.server.engine.Engine eng the engine
 -- @raise when eng does not implement the interface
@@ -618,6 +656,11 @@ function M.install(srv, eng)
 	srv:route("POST", "/audio/speech", speak)
 	srv:route("POST", "/v1/audio/transcriptions", transcribe)
 	srv:route("POST", "/audio/transcriptions", transcribe)
+	local function decide(req, res)
+		return systemone_route(eng, req, res)
+	end
+	srv:route("POST", "/v1/systemone", decide)
+	srv:route("POST", "/systemone", decide)
 end
 
 return M

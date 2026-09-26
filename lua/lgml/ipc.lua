@@ -5,10 +5,10 @@
 --
 -- Each message has a type, a job id and a payload. The worker sends
 -- `HELLO` once, with id 0. Then the front starts jobs with `JOB`,
--- `TRANSCRIBE` or `SPEAK`, each with a new id. The worker answers each
--- job with zero or more `DELTA` or `AUDIO` messages and one `DONE`.
--- The front sends `CANCEL` to stop a job; the job still ends with
--- `DONE`.
+-- `TRANSCRIBE`, `SPEAK` or `DECIDE`, each with a new id. The worker
+-- answers each job with zero or more `DELTA` or `AUDIO` messages and
+-- one `DONE`. The front sends `CANCEL` to stop a job; the job still
+-- ends with `DONE`.
 -- @module lgml.ipc
 local uv = require("luv")
 local imsg = require("imsg")
@@ -19,7 +19,7 @@ local M = {}
 --- Worker to front: the worker is ready.
 -- Payload: `{ models, props, caps }`. models and props are the results
 -- of `Engine:models` and `Engine:props`. caps is `{ chat, transcribe,
--- speak }`, with true for each method the engine has.
+-- speak, decide }`, with true for each method the engine has.
 M.HELLO = 1
 --- Front to worker: start a chat job.
 -- Payload: the chat request for `Engine:chat`.
@@ -37,8 +37,8 @@ M.DELTA = 4
 -- Payload: `{ ok, msg, status, finish, result }`. ok is true on
 -- success. msg and status give the error otherwise. finish is the
 -- `{ reason, usage, timings }` of `Sink:finish` for a chat job. result
--- is the transcription for a transcribe job, or `{ sample_rate }` for
--- a speech job.
+-- is the transcription for a transcribe job, `{ sample_rate }` for a
+-- speech job, or the result of `Engine:decide` for a decide job.
 M.DONE = 5
 --- Front to worker: start a transcription job.
 -- Payload: the request for `Engine:transcribe`. An `AUDIO` message with
@@ -52,6 +52,9 @@ M.AUDIO = 7
 -- Payload: the request for `Engine:speak`. The worker sends `AUDIO`,
 -- then `DONE`.
 M.SPEAK = 8
+--- Front to worker: start a decide job.
+-- Payload: the request for `Engine:decide`. The worker sends `DONE`.
+M.DECIDE = 9
 
 -- These types carry raw bytes, not JSON.
 local RAW = { [M.AUDIO] = true }

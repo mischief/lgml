@@ -1,6 +1,6 @@
 --- The engine interface that `lgml.server.openai` calls.
 -- An engine is a table with methods. It has `models` and `props`. It
--- also has `chat`, `transcribe`, `speak`, or several of them.
+-- also has `chat`, `transcribe`, `speak`, `decide`, or several of them.
 -- `lgml.engine`, `lgml.stt_engine`, `lgml.diffusion_engine`,
 -- `lgml.server.router`, `lgml.server.remote_engine` and
 -- `lgml.server.fake_engine` are engines.
@@ -20,7 +20,7 @@ M.reasons = { stop = true, length = true, tool_calls = true }
 -- @tparam Engine e the engine to check
 -- @treturn Engine e
 -- @raise when e has no `models` or `props` method, or when e has none
--- of `chat`, `transcribe` and `speak`.
+-- of `chat`, `transcribe`, `speak` and `decide`.
 function M.check(e)
 	for _, name in ipairs({ "models", "props" }) do
 		if type(e[name]) ~= "function" then
@@ -28,13 +28,14 @@ function M.check(e)
 		end
 	end
 	if type(e.chat) ~= "function" and type(e.transcribe) ~= "function" and
-	    type(e.speak) ~= "function" then
-		error("engine has no method chat, transcribe or speak", 2)
+	    type(e.speak) ~= "function" and type(e.decide) ~= "function" then
+		error("engine has no method chat, transcribe, speak or decide", 2)
 	end
 	return e
 end
 
---- The cancel control for `Engine:transcribe` and `Engine:speak`.
+--- The cancel control for `Engine:transcribe`, `Engine:speak` and
+-- `Engine:decide`.
 -- The server makes a new control for each request.
 -- @table Control
 -- @field cancelled a function with no arguments. It returns true when
@@ -96,6 +97,22 @@ end
 -- @treturn[2] string an error message
 -- @treturn[2] int an HTTP status
 -- @function speak
+
+--- Answers typed questions about a state, as Jev's System One API.
+-- This method is optional. `lgml.systemone.check` makes req from the
+-- request body; its fields are `model`, `state` (text), `questions`,
+-- `raw` and `recipe`. Each answer is `{ yes = P(yes) }` for a noul and
+-- `{ probabilities }` in option or level order for a choice or a
+-- score, unrounded. An answer can also have `lgml`, the raw log-scores,
+-- when `req.raw` is true.
+-- @tparam table req the request
+-- @tparam Control ctl the cancel control
+-- @treturn[1] table `{ model, answers = { [id] = answer }, usage =
+-- { input_tokens, output_tokens } }`
+-- @treturn[2] nil
+-- @treturn[2] string an error message
+-- @treturn[2] int an HTTP status
+-- @function decide
 
 --- Stops the engine and its worker processes. This method is optional.
 -- `lgml-server` calls it at exit.

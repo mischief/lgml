@@ -119,6 +119,20 @@ in_co(function()
 	    #r.wav == 44 + 5 * 240 * 2, "speech returns wav bytes")
 end)
 
+in_co(function()
+	local req = { state = "Paris is the capital of France.", questions = { {
+		id = "q", type = "choice", instructions = "",
+		options = { { key = "Berlin", text = "" }, { key = "Paris", text = "" } },
+	} } }
+	local r = eng:decide(req)
+	local p = r and r.answers.q.probabilities
+	ok(p and p[2] > 0.9 and r.model == "fake" and r.usage.output_tokens == 2,
+	    "decide runs on the worker")
+	req.state = "fail"
+	local res, msg, status = eng:decide(req)
+	ok(res == nil and msg == "fake failure" and status == 500, "decide error forwarded")
+end)
+
 eng:stop()
 print("1.." .. n)
 os.exit(failed == 0 and 0 or 1)

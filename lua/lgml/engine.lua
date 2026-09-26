@@ -11,6 +11,7 @@ local tokenizer = require("lgml.tokenizer")
 local stream = require("lgml.server.stream")
 local replay = require("lgml.replay")
 local transformer = require("lgml.transformer")
+local decide = require("lgml.decide")
 local prompt_cache = require("lgml.prompt_cache")
 
 local M = {}
@@ -57,6 +58,8 @@ end
 -- - `cache_type_k`, `cache_type_v`: KV cache types from `lgml.kv`
 --   (default q8_0 with flash attention when the head size fits, else f16)
 -- - `id`: model id (default: the gguf `general.name`, or `"lgml"`)
+-- - `recipe`: a decision recipe for `decide`, from `lgml.decide.recipe`
+--   or a recipe file path (default `lgml.decide.default_recipe`)
 -- - `cache_ram`: MiB of host RAM for the prompt store (default 8192; 0
 --   turns it off, -1 means no limit); see `lgml.prompt_cache`
 -- - `ctx_checkpoints`: the most state checkpoints per slot, for models
@@ -94,6 +97,11 @@ function M.new(opts)
 		cache = cache, tokens = {},
 		busy = false, waiting = {},
 	}, E)
+	if type(opts.recipe) == "string" then
+		e.recipe = assert(decide.load_recipe(opts.recipe))
+	else
+		e.recipe = opts.recipe or decide.default_recipe()
+	end
 	e.eog = {}
 	for _, id in ipairs(e.tk:special().eog or {}) do
 		e.eog[id] = true
@@ -162,10 +170,11 @@ local function sampler_opts(req, think)
 end
 
 -- Run ids at cache.n_past. Returns the logits node, which stays valid
--- until the next pass: the cache keeps the graph for replay.
-function E:eval(ids)
+-- until the next pass: the cache keeps the graph for replay. rows is
+-- "last" (the default) or "all".
+function E:eval(ids, rows)
 	return replay.run(self.model, self.cache, ids,
-	    { logits = "last", flash_attn = self.flash_attn })
+	    { logits = rows or "last", flash_attn = self.flash_attn })
 end
 
 -- Keep the longest shared prefix of the cached tokens. At least one
@@ -276,6 +285,29 @@ function E:chat(req, sink)
 	local ok, a, b, c = pcall(self.run, self, req, sink)
 	if not ok then
 		-- The cache may not match the token list now.
+		self.tokens, self.cache.n_past = {}, 0
+	end
+	self:release()
+	if not ok then
+		return nil, tostring(a), 500
+	end
+	return a, b, c
+end
+
+--- Answers typed questions by logit readout (see
+-- `lgml.server.engine.Engine.decide` and `lgml.decide`).
+-- The request waits for the slot, as chat does. A Lua error resets the
+-- cache and returns status 500.
+-- @tparam table req the decision request
+-- @tparam[opt] lgml.server.engine.Control ctl the cancel control
+-- @treturn[1] table the result: `{ model, answers, usage }`
+-- @treturn[2] nil
+-- @treturn[2] string an error message
+-- @treturn[2] int an HTTP status
+function E:decide(req, ctl)
+	self:acquire()
+	local ok, a, b, c = pcall(decide.run, self, req, ctl)
+	if not ok then
 		self.tokens, self.cache.n_past = {}, 0
 	end
 	self:release()
