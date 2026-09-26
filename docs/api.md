@@ -179,7 +179,7 @@ openai-python SDK. Status values:
   stores or routes the request, or it changes speed or cost only.
 - **rejected**: a value other than the default gives 400.
 - **planned**: a value other than the default gives 400 until lgml
-  supports it.
+  supports it. No field has this status now.
 
 `test/test_compat_openai.lua` reads this table and checks it against
 the request checks (`lgml.server.chat_request.FIELDS`). It also sends
