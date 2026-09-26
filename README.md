@@ -14,7 +14,9 @@ a memory budget.
 ## Build
 
 You need Lua 5.4, ggml (from the system, or `-Dggml=subproject`),
-libpng, libjpeg and zlib. The Lua rocks install into `lua_modules`:
+libpng, libjpeg, zlib and utf8proc. Meson builds the last four from
+the wraps in `subprojects` when the system lacks them. The Lua rocks
+install into `lua_modules`:
 
 ```sh
 luarocks --lua-version 5.4 --tree lua_modules install --only-deps lgml-scm-1.rockspec

@@ -56,6 +56,8 @@ wrap_opts = ['c_std=gnu17', 'werror=false', 'warning_level=0', 'default_library=
 zlib = dependency('zlib', default_options : wrap_opts)
 png = dependency('libpng', default_options : wrap_opts)
 jpeg = dependency('libjpeg', default_options : wrap_opts)
+# utf8proc: Unicode NFC for tokenizer.json normalizers. Its tests fetch data at build time.
+utf8proc = dependency('libutf8proc', default_options : wrap_opts + ['tests=disabled'])
 
 lgml = shared_module('lgml',
   'src/lgml.c',
@@ -75,7 +77,7 @@ lgml = shared_module('lgml',
   'src/limage.c',
   'src/sha256.c',
   'src/vocab.c',
-  dependencies : [ggml, lua, m, png, jpeg],
+  dependencies : [ggml, lua, m, png, jpeg, utf8proc],
   name_prefix : '',
   install : true,
   install_dir : get_option('prefix') / 'lib' / 'lua' / '5.4',
@@ -213,7 +215,7 @@ endif
 # fuzz/README.
 lfuzz = executable('lfuzz', 'fuzz/lfuzz.c',
   objects : lgml.extract_all_objects(recursive : true),
-  dependencies : [ggml, lua, m, png, jpeg, cc.find_library('dl', required : false)],
+  dependencies : [ggml, lua, m, png, jpeg, utf8proc, cc.find_library('dl', required : false)],
   export_dynamic : true,
 )
 foreach t : ['json', 'chat', 'http', 'safetensors', 'vocab', 'wav', 'tokenize', 'image', 'grammar']

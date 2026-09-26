@@ -202,9 +202,72 @@ local function synth_gemma4()
 	ok(rt, name .. ": random bytes round-trip")
 end
 
+
+-- A tiny tokenizer.json: ByteLevel with the GPT-2 regex, NFC, and
+-- added tokens that split first.
+local function synth_json()
+	local json = require("lgml.json")
+	local t, id = bpe_vocab.hf_json()
+	local path = os.tmpname()
+	local f = assert(io.open(path, "wb"))
+	f:write(assert(json.encode(t)))
+	f:close()
+	local tk <close> = assert(lgml.tokenizer(path))
+	local name = "tiny tokenizer.json"
+	ok(tk:n_vocab() == id["[MASK]"] + 1, name .. ": loaded")
+	ok(same(tk:encode("hello world"), { id.hello, id["Ġworld"] }), name .. ": merges")
+	ok(same(tk:encode("123 12"), { id["123"], id["Ġ"], id["12"] }), name .. ": digit runs")
+	ok(same(tk:encode("x's"), { id.x, id["'"], id.s }), name .. ": contraction")
+	ok(same(tk:encode("[CLS]hello[SEP]"), { id["[CLS]"], id.hello, id["[SEP]"] }),
+	    name .. ": special tokens")
+	ok(same(tk:encode("x  y"), { id.x, id["  "], id.y }), name .. ": added space run")
+	ok(same(tk:encode("x [MASK] y"), { id.x, id["[MASK]"], id["Ġ"], id.y }),
+	    name .. ": lstrip")
+	local e = "\u{e9}"
+	ok(same(tk:encode("e\u{301}"), { id[utf8.char(0xc3)], id[utf8.char(0xa9)] }) and
+	    tk:decode(tk:encode("e\u{301}")) == e, name .. ": NFC")
+	local sp = tk:special()
+	ok(sp.bos == id["[CLS]"] and sp.eos == id["[SEP]"] and sp.tokens["[MASK]"] == id["[MASK]"],
+	    name .. ": template bos and eos")
+	math.randomseed(11)
+	local rt = true
+	for _ = 1, 2000 do
+		local b = {}
+		for i = 1, math.random(0, 40) do
+			b[i] = string.char(math.random(0, 127))
+		end
+		local s = table.concat(b)
+		if tk:decode(tk:encode(s)) ~= s:gsub(" +%[MASK%]", "[MASK]") then
+			rt = false
+			io.stderr:write(string.format("%s: round trip %q\n", name, s))
+		end
+	end
+	ok(rt, name .. ": random ASCII round-trips")
+	t.normalizer = { type = "NFKC" }
+	f = assert(io.open(path, "wb"))
+	f:write(assert(json.encode(t)))
+	f:close()
+	local bad, err = lgml.tokenizer(path)
+	ok(bad == nil and err:find("normalizer"), name .. ": other normalizers fail")
+	os.remove(path)
+end
+
+-- NFC with utf8proc: composition, canonical order, Hangul, exclusions.
+local function nfc_test()
+	ok(lgml.nfc("abc") == "abc", "nfc: ASCII")
+	ok(lgml.nfc("e\u{301}") == "\u{e9}", "nfc: compose")
+	ok(lgml.nfc("a\u{302}\u{323}") == "\u{1ead}", "nfc: canonical order")
+	ok(lgml.nfc("\u{1100}\u{1161}\u{11a8}") == "\u{ac01}", "nfc: Hangul")
+	ok(lgml.nfc("\u{2126}") == "\u{3a9}", "nfc: singleton")
+	ok(lgml.nfc("\u{958}") == "\u{915}\u{93c}", "nfc: composition exclusion")
+	ok(lgml.nfc("\xff\u{301}") == "\xff\u{301}", "nfc: invalid UTF-8 unchanged")
+end
+
 synth_test("qwen2")
 synth_test("llama-bpe")
 synth_gemma4()
+synth_json()
+nfc_test()
 
 vocab_test("qwen2")
 vocab_test("qwen35")

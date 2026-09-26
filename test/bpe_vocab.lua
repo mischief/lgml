@@ -114,4 +114,65 @@ function M.gemma4_kv()
 	return kv, ids
 end
 
+-- Added tokens of the tokenizer.json vocab, as ModernBERT has them.
+M.hf_added = {
+	{ content = "  ", special = false }, { content = "[UNK]", special = true },
+	{ content = "[CLS]", special = true }, { content = "[SEP]", special = true },
+	{ content = "[PAD]", special = true }, { content = "[MASK]", special = true, lstrip = true },
+}
+
+-- Returns a Hugging Face tokenizer.json table for the byte-level vocab
+-- with the ByteLevel pre-tokenizer, NFC and a [CLS] A [SEP] template,
+-- and the piece -> id table. words adds pieces (byte-level text) with
+-- no merge. Odd merges are strings, even ones pairs.
+function M.hf_json(words)
+	local json = require("lgml.json")
+	local vocab, ids, n = {}, {}, 0
+	local function add(piece)
+		if not ids[piece] then
+			vocab[piece], ids[piece], n = n, n, n + 1
+		end
+	end
+	local bp = byte_pieces()
+	for b = 0, 255 do
+		if b ~= 0xc0 and b ~= 0xc1 and b < 0xf5 then
+			add(bp[b])
+		end
+	end
+	local merges = json.array()
+	for i, m in ipairs(M.merges) do
+		add((m:gsub(" ", "")))
+		merges[i] = i % 2 == 1 and m or json.array({ m:match("^(%S+) (%S+)$") })
+	end
+	for _, w in ipairs(M.whole) do
+		add(w)
+	end
+	for _, w in ipairs(words or {}) do
+		add(w)
+	end
+	local added = json.array()
+	for i, a in ipairs(M.hf_added) do
+		add(a.content)
+		added[i] = { id = ids[a.content], content = a.content, special = a.special,
+			lstrip = a.lstrip or false, rstrip = false, normalized = not a.special,
+			single_word = false }
+	end
+	local function special(name)
+		return { SpecialToken = { id = name, type_id = 0 } }
+	end
+	return {
+		version = "1.0", truncation = json.null, padding = json.null,
+		added_tokens = added,
+		normalizer = { type = "NFC" },
+		pre_tokenizer = { type = "ByteLevel", add_prefix_space = false, trim_offsets = true,
+			use_regex = true },
+		post_processor = { type = "TemplateProcessing",
+			single = json.array({ special("[CLS]"), { Sequence = { id = "A", type_id = 0 } },
+				special("[SEP]") }) },
+		decoder = { type = "ByteLevel" },
+		model = { type = "BPE", dropout = json.null, unk_token = json.null,
+			byte_fallback = false, vocab = vocab, merges = merges },
+	}, ids
+end
+
 return M
