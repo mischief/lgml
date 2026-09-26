@@ -11,6 +11,10 @@ return {
 		{ id = "qwen3-14b", model = "/home/you/models/Qwen3-14B-Q4_K_M.gguf", backend = "Vulkan0",
 		    -- lora = { "/home/you/adapters/tuned.gguf:1.0" },
 		},
+		-- mmproj adds image input: image_url parts with data URLs.
+		{ id = "gemma-4-26b", model = "/home/you/models/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
+			mmproj = "/home/you/models/gemma-4-26B-A4B-it-mmproj-F16.gguf", backend = "Vulkan0",
+			ctx = 16384 },
 		{ id = "whisper", model = "/home/you/models/whisper-large-v3-turbo", backend = "Vulkan0" },
 		{ id = "orpheus", model = "/home/you/models/orpheus", engine = "lgml.tts.orpheus" },
 		{ id = "qwen3-tts", model = "/home/you/models/qwen3-tts", engine = "lgml.tts.qwen3tts" },

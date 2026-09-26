@@ -10,8 +10,10 @@ local preprocess = require("lgml.vision.preprocess")
 local M = {}
 M.__index = M
 
---- The default image token range, as llama.cpp for gemma4v.
-M.MIN_TOKENS, M.MAX_TOKENS = 40, 280
+--- The fewest tokens of one image by default, as llama.cpp for gemma4v.
+M.MIN_TOKENS = 40
+--- The most tokens of one image by default.
+M.MAX_TOKENS = 280
 
 --- Read the encoder config from mmproj metadata.
 -- As in llama.cpp, the FFN gate is gelu with `clip.use_gelu`, silu with
