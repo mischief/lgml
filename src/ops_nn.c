@@ -163,6 +163,19 @@ glu_split(lua_State *L, binfn fn, const char *op)
  */
 static int op_geglu_split(lua_State *L) { return glu_split(L, ggml_geglu_split, "geglu_split"); }
 
+/*** GEGLU with the quick gelu on split input: x * sigmoid(1.702 x) * gate.
+ * @tparam tensor x f32 input with contiguous rows
+ * @tparam tensor gate f32 gate with the shape of x
+ * @treturn tensor node with the shape of x
+ * @raise if an input is not f32, the shapes differ, or rows are not contiguous
+ * @function graph:geglu_quick_split
+ */
+static int
+op_geglu_quick_split(lua_State *L)
+{
+	return glu_split(L, ggml_geglu_quick_split, "geglu_quick_split");
+}
+
 /*** SwiGLU on split input: silu(x) * gate.
  * @tparam tensor x f32 input with contiguous rows
  * @tparam tensor gate f32 gate with the shape of x
@@ -512,6 +525,31 @@ op_conv2d(lua_State *L)
 	    (int)p, (int)d, (int)d), 4);
 }
 
+/*** 2-D pooling over the two innermost dimensions, no padding.
+ * @tparam tensor a f32 (N, C, H, W) input
+ * @tparam int k kernel size and stride, 1 to 1024, at most H and W
+ * @tparam[opt="avg"] string mode "avg" or "max"
+ * @treturn tensor (N, C, H // k, W // k) node
+ * @raise if a is not f32 or k is out of range
+ * @function graph:pool2d
+ */
+static int
+op_pool2d(lua_State *L)
+{
+	static const char *const names[] = { "avg", "max", NULL };
+	struct graph *g = lgml_check_graph(L, 1);
+	struct tensor *a = lgml_operand(L, g, 2);
+	lua_Integer k = luaL_checkinteger(L, 3);
+	int mode = luaL_checkoption(L, 4, "avg", names);
+
+	check_f32(L, a->t, "pool2d", "a");
+	luaL_argcheck(L, k >= 1 && k <= 1024 && k <= a->t->ne[0] && k <= a->t->ne[1], 3,
+	    "kernel out of range");
+	lgml_reserve(L, g, 1);
+	return lgml_push_node(L, g, ggml_pool_2d(g->ctx, a->t, mode == 0 ? GGML_OP_POOL_AVG :
+	    GGML_OP_POOL_MAX, (int)k, (int)k, (int)k, (int)k, 0, 0), 4);
+}
+
 /*** Add nodes to the graph without making them outputs.
  * `graph:compute` runs them too. Use it for writes into leaves, such as a
  * `graph:cpy` that saves recurrent state.
@@ -627,6 +665,7 @@ static const luaL_Reg ops[] = {
 	{ "swiglu", op_swiglu },
 	{ "geglu_split", op_geglu_split },
 	{ "swiglu_split", op_swiglu_split },
+	{ "geglu_quick_split", op_geglu_quick_split },
 	{ "l2_norm", op_l2_norm },
 	{ "group_norm", op_group_norm },
 	{ "argsort", op_argsort },
@@ -638,6 +677,7 @@ static const luaL_Reg ops[] = {
 	{ "pad", op_pad },
 	{ "upscale", op_upscale },
 	{ "conv2d", op_conv2d },
+	{ "pool2d", op_pool2d },
 	{ "hadamard", op_hadamard },
 	{ "expand", op_expand },
 	{ NULL, NULL }

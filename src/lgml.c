@@ -1157,6 +1157,8 @@ can_mul_mat(const struct ggml_tensor *a, const struct ggml_tensor *b)
  * the same size of a, and a broadcasts.
  * @tparam tensor a (M, K), often a weight
  * @tparam tensor b (N, K)
+ * @tparam[opt=false] boolean f32 ask the backend to add up in f32; some
+ * GPU backends add up f16 products in f16 by default
  * @treturn tensor (N, M) node
  * @raise on a shape mismatch
  * @function graph:mul_mat
@@ -1167,11 +1169,16 @@ graph_mul_mat(lua_State *L)
 	struct graph *g = check_graph(L, 1);
 	struct tensor *a = operand(L, g, 2);
 	struct tensor *b = operand(L, g, 3);
+	int f32 = lua_toboolean(L, 4);
+	struct ggml_tensor *r;
 
 	if (!can_mul_mat(a->t, b->t))
 		return luaL_error(L, "mul_mat shape mismatch");
 	reserve(L, g, 1);
-	return push_node(L, g, ggml_mul_mat(g->ctx, a->t, b->t), max_int(a->rank, b->rank));
+	r = ggml_mul_mat(g->ctx, a->t, b->t);
+	if (f32)
+		ggml_prec_set_acc(r, GGML_PREC_F32);
+	return push_node(L, g, r, max_int(a->rank, b->rank));
 }
 
 /*** Matrix product in torch convention.

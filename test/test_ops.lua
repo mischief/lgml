@@ -90,6 +90,11 @@ do
 	local ge = run(function(g) return g:geglu_split(x, gate) end)
 	local gl = run(function(g) return g:mul(g:gelu(x), gate) end)
 	near(ge, gl, "geglu_split matches gelu * gate", 1e-3)
+	local function quick(v)
+		return v / (1 + math.exp(-1.702 * v))
+	end
+	near(run(function(g) return g:geglu_quick_split(x, gate) end), { quick(1) * 3, quick(-2) * 4 },
+	    "geglu_quick_split", 1e-3)
 	ok(not pcall(function() return run(function(g) return g:swiglu(f32({ 3 })) end) end),
 	    "swiglu odd width is an error")
 end
@@ -192,6 +197,24 @@ do
 	    "conv2d direct")
 	near(run(function(g) return g:conv2d(wf, x, 2, 1, 1, true) end), { 1, 5, 11, 28 },
 	    "conv2d direct stride 2 pad 1")
+end
+
+do
+	-- 4x6 input, 2x2 pools: two rows of three.
+	local v = {}
+	for i = 1, 24 do
+		v[i] = i
+	end
+	local x <close> = f32({ 1, 1, 4, 6 }, v)
+	local got, shape = run(function(g) return g:pool2d(x, 2) end)
+	near(shape, { 1, 1, 2, 3 }, "pool2d shape")
+	near(got, { 4.5, 6.5, 8.5, 16.5, 18.5, 20.5 }, "pool2d avg")
+	near(run(function(g) return g:pool2d(x, 2, "max") end), { 8, 10, 12, 20, 22, 24 }, "pool2d max")
+	ok(not pcall(function() return run(function(g) return g:pool2d(x, 5) end) end),
+	    "pool2d kernel larger than the input is an error")
+	local w <close> = be:tensor("f16", { 2, 3 }, { 1, 2, 3, 4, 5, 6 })
+	local b <close> = f32({ 1, 3 }, { 1, 1, 1 })
+	near(run(function(g) return g:mul_mat(w, b, true) end), { 6, 15 }, "mul_mat with f32 sums")
 end
 
 do
