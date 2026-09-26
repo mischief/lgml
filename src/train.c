@@ -20,8 +20,11 @@
 
 #include "lgml.h"
 
-/* New ggml tensors that backward can add for each node on the path. */
-#define BACK_PER_NODE	16
+/*
+ * New ggml tensors that backward can add for each node on the path,
+ * with the out_prod operands of lower_out_prod.
+ */
+#define BACK_PER_NODE	24
 
 /*** A leaf with storage, or a node of a graph.
  * A leaf comes from `backend:tensor` or `weights:get`. A node comes from a
@@ -515,7 +518,7 @@ count_tensors(struct ggml_context *ctx)
  * `soft_max` and frequency factors of `rope` get no gradient.
  * @raise if the tensor is not an f32 scalar node, the graph has a
  * backward pass, no trainable leaf feeds the loss, an op on the path
- * has no gradient, or the graph is too small (see `backend:graph`)
+ * has no gradient, or the graph would pass 1048576 tensors
  * @tparam[opt] table opts options: `lower` true gives every out_prod of
  * the backward pass contiguous f32 operands, as on a backend without
  * the other forms (for tests)
@@ -528,7 +531,7 @@ tensor_backward(lua_State *L)
 	struct graph *g = t->g;
 	struct ggml_cgraph *gb, *gn;
 	struct ggml_tensor *seed, *ids, **accs;
-	int i, n, need, gidx, all = 0;
+	int i, n, need, gidx, before, all = 0;
 
 	if (g == NULL)
 		return luaL_error(L, "backward: need a node of a graph");
@@ -549,10 +552,9 @@ tensor_backward(lua_State *L)
 
 	ggml_set_output(t->t);
 	ggml_build_forward_expand(g->gf, t->t);
+	/* ggml aborts when a context or cgraph is full, so grow both first. */
 	need = check_backward(L, g->gf, t->t) * BACK_PER_NODE + 64;
-	if (g->ntensors + g->nleaves + need > g->size)
-		return luaL_error(L, "backward: graph too small; need about %d tensors, "
-		    "make it with backend:graph(n)", g->ntensors + g->nleaves + need);
+	lgml_graph_room(L, g, need);
 
 	n = ggml_graph_n_nodes(g->gf);
 	accs = lua_newuserdatauv(L, (size_t)n * sizeof(*accs), 0);
@@ -569,17 +571,23 @@ tensor_backward(lua_State *L)
 			accs[i] = seed;
 
 	ggml_set_loss(t->t);
-	gb = ggml_graph_dup(g->ctx, g->gf, true);
+	gb = lgml_new_cgraph(L, g, g->size, 1);
+	ggml_graph_cpy(g->gf, gb);
+	g->gf = gb;
+	g->grads = 1;
+	before = count_tensors(g->ctx);
 	ggml_build_backward_expand(g->ctx, gb, accs);
 	if (lower_out_prod(g, gb, ids, all)) {
 		/* Order the new operands before their users. */
-		gn = ggml_new_graph_custom(g->ctx, (size_t)g->size, false);
+		gn = lgml_new_cgraph(L, g, g->size, 0);
 		for (i = 0; i < ggml_graph_n_nodes(gb); i++)
 			ggml_build_forward_expand(gn, ggml_graph_node(gb, i));
-		gb = gn;
+		g->gf = gn;
+		g->grads = 0;
 	}
-	g->gf = gb;
-	g->ntensors = count_tensors(g->ctx);
+	n = count_tensors(g->ctx) - before;
+	g->ntensors += n;
+	g->ctx_left -= n;
 	g->backward = 1;
 	return 0;
 }

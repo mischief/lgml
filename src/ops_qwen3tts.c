@@ -209,12 +209,13 @@ op_snake(lua_State *L)
 	struct tensor *x = check_act(L, g, 2);
 	struct tensor *a = check_vec(L, g, 3, x->t->ne[0]);
 	struct tensor *b = check_vec(L, g, 4, x->t->ne[0]);
-	struct ggml_context *ctx = g->ctx;
+	struct ggml_context *ctx;
 	struct ggml_tensor *s;
 
 	if (a == NULL || b == NULL)
 		return luaL_error(L, "qwen3tts_snake: need a and b");
 	lgml_reserve(L, g, 8);
+	ctx = g->ctx;
 	s = ggml_sin(ctx, ggml_mul(ctx, x->t, ggml_exp(ctx, a->t)));
 	s = ggml_mul(ctx, ggml_sqr(ctx, s), ggml_exp(ctx, ggml_neg(ctx, b->t)));
 	return lgml_push_node(L, g, ggml_add(ctx, x->t, s), x->rank);

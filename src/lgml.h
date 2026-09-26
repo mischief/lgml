@@ -15,7 +15,8 @@
 #define TENSOR_MT	"lgml_tensor"
 #define HOSTBUF_MT	"lgml_hostbuf"
 
-#define GRAPH_SIZE	16384	/* tensors per graph; a 41-layer MoE needs about 4000 */
+#define GRAPH_SIZE	16384	/* first tensor room of a graph; a 41-layer MoE needs about 4000 */
+#define GRAPH_MAX	(1 << 20)	/* the most tensors a graph grows to */
 #define LOAD_CHUNK	((size_t)64 << 20)
 
 /* Uservalue slots. */
@@ -37,12 +38,22 @@ struct store {
 	int			 closed;
 };
 
+/*
+ * A graph grows: new tensors go into ctx, and a full ctx gets a larger
+ * successor. A full gf moves to a larger cgraph. ctxs holds every
+ * context, for tensors and for cgraphs.
+ */
 struct graph {
 	struct backend		*b;
 	struct ggml_context	*ctx;
+	struct ggml_context	**ctxs;
+	int			 nctx;
+	int			 ctxcap;
+	int			 ctx_left;	/* tensor slots left in ctx */
 	struct ggml_cgraph	*gf;
+	int			 grads;		/* gf has gradient arrays */
 	ggml_gallocr_t		 galloc;
-	int			 size;		/* the most ggml tensors */
+	int			 size;		/* node and leaf slots of gf */
 	int			 ntensors;
 	int			 nleaves;	/* leaf operands from other stores */
 	int			 plan_nodes;	/* nodes at the last plan; -1 before */
@@ -88,12 +99,15 @@ void		 lgml_open_train(lua_State *);
 /*
  * For op files. An op checks its graph with lgml_check_graph, takes
  * operands with lgml_operand, calls lgml_reserve before each new ggml
- * tensor, checks shapes, then returns lgml_push_node.
+ * tensor, checks shapes, then returns lgml_push_node. lgml_reserve can
+ * change g->ctx, so read g->ctx after it.
  */
 struct graph	*lgml_check_graph(lua_State *, int);
 struct tensor	*lgml_operand(lua_State *, struct graph *, int);
 struct tensor	*lgml_opt_operand(lua_State *, struct graph *, int);
 void		 lgml_reserve(lua_State *, struct graph *, int);
+void		 lgml_graph_room(lua_State *, struct graph *, int);
+struct ggml_cgraph *lgml_new_cgraph(lua_State *, struct graph *, int, int);
 int		 lgml_push_node(lua_State *, struct graph *, struct ggml_tensor *, int);
 void		 lgml_graph_ops(lua_State *, const luaL_Reg *);
 

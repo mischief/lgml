@@ -72,15 +72,88 @@ store_release(struct store *s)
 static void
 graph_release(struct graph *g)
 {
-	if (!g->closed || g->refs != 0 || g->ctx == NULL)
+	int i;
+
+	if (!g->closed || g->refs != 0 || g->b == NULL)
 		return;
-	ggml_gallocr_free(g->galloc);
-	ggml_free(g->ctx);
+	if (g->galloc != NULL)
+		ggml_gallocr_free(g->galloc);
+	for (i = 0; i < g->nctx; i++)
+		ggml_free(g->ctxs[i]);
+	free(g->ctxs);
 	g->galloc = NULL;
+	g->ctxs = NULL;
+	g->nctx = 0;
 	g->ctx = NULL;
 	g->gf = NULL;
 	g->b->refs--;
 	backend_release(g->b);
+	g->b = NULL;
+}
+
+/* Extra tensor slots in each context, beyond what reserve counts. */
+#define CTX_SLACK	16
+
+/* Add a context of mem bytes, without data, to the graph. */
+static struct ggml_context *
+graph_ctx(lua_State *L, struct graph *g, size_t mem)
+{
+	struct ggml_init_params ip = { mem, NULL, true };
+	struct ggml_context **v, *c;
+	int cap;
+
+	if (g->nctx == g->ctxcap) {
+		cap = g->ctxcap > 0 ? 2 * g->ctxcap : 8;
+		v = realloc(g->ctxs, (size_t)cap * sizeof(*v));
+		if (v == NULL)
+			luaL_error(L, "out of memory");
+		g->ctxs = v;
+		g->ctxcap = cap;
+	}
+	c = ggml_init(ip);
+	if (c == NULL)
+		luaL_error(L, "ggml_init failed");
+	g->ctxs[g->nctx++] = c;
+	return c;
+}
+
+/* Make an empty cgraph of size slots in its own context. */
+struct ggml_cgraph *
+lgml_new_cgraph(lua_State *L, struct graph *g, int size, int grads)
+{
+	struct ggml_context *c;
+
+	c = graph_ctx(L, g, ggml_graph_overhead_custom((size_t)size, grads != 0));
+	return ggml_new_graph_custom(c, (size_t)size, grads != 0);
+}
+
+/*
+ * Make room for n more tensors: in the tensor context, and as nodes or
+ * leaves of the cgraph. The cgraph grows to at least twice its size.
+ */
+void
+lgml_graph_room(lua_State *L, struct graph *g, int n)
+{
+	struct ggml_cgraph *gf;
+	int need, size, cap;
+
+	if (n < 0 || n > GRAPH_MAX || g->ntensors + g->nleaves > GRAPH_MAX - n)
+		luaL_error(L, "graph full (%d tensors)", GRAPH_MAX);
+	need = g->ntensors + g->nleaves + n;
+	if (n > g->ctx_left) {
+		cap = n > g->ntensors ? n : g->ntensors;
+		cap = cap > 256 ? cap : 256;
+		g->ctx = graph_ctx(L, g, (size_t)(cap + CTX_SLACK) * ggml_tensor_overhead());
+		g->ctx_left = cap;
+	}
+	if (need > g->size) {
+		size = g->size < GRAPH_MAX / 2 ? 2 * g->size : GRAPH_MAX;
+		size = size > need ? size : need;
+		gf = lgml_new_cgraph(L, g, size, g->grads);
+		ggml_graph_cpy(g->gf, gf);
+		g->gf = gf;
+		g->size = size;
+	}
 }
 
 static struct backend *
@@ -446,10 +519,10 @@ short_read:
 }
 
 /*** Make an empty graph on this backend.
- * A graph holds at most size ggml tensors. Some ops add more than one.
- * `tensor:backward` adds about ten for each node on the path from a
- * trainable leaf to the loss.
- * @tparam[opt=16384] int size the most ggml tensors, 64 to 1048576
+ * The graph grows as ops add ggml tensors, up to 1048576 of them. Some
+ * ops add more than one. The size is a hint for the first room; a close
+ * hint saves a few copies of the graph as it grows.
+ * @tparam[opt=16384] int size the first room in ggml tensors, 1 to 1048576
  * @treturn graph the graph
  * @function backend:graph
  */
@@ -458,10 +531,9 @@ backend_graph(lua_State *L)
 {
 	struct backend *b = check_backend(L, 1);
 	lua_Integer size = luaL_optinteger(L, 2, GRAPH_SIZE);
-	struct ggml_init_params ip;
 	struct graph *g;
 
-	luaL_argcheck(L, size >= 64 && size <= 1048576, 2, "size out of range");
+	luaL_argcheck(L, size >= 1 && size <= GRAPH_MAX, 2, "size out of range");
 	g = lua_newuserdatauv(L, sizeof(*g), 2);
 	memset(g, 0, sizeof(*g));
 	g->closed = 1;
@@ -471,27 +543,18 @@ backend_graph(lua_State *L)
 	lua_newtable(L);
 	lua_setiuservalue(L, -2, UV_EXTRA);
 
-	/* Room for the forward graph, and for the graphs that backward makes. */
-	ip.mem_size = ggml_tensor_overhead() * (size_t)size +
-	    2 * ggml_graph_overhead_custom((size_t)size, false) +
-	    ggml_graph_overhead_custom((size_t)size, true);
-	ip.mem_buffer = NULL;
-	ip.no_alloc = true;
-	g->ctx = ggml_init(ip);
-	if (g->ctx == NULL)
-		return luaL_error(L, "ggml_init failed");
-	g->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(b->be));
-	if (g->galloc == NULL) {
-		ggml_free(g->ctx);
-		g->ctx = NULL;
-		return luaL_error(L, "ggml_gallocr_new failed");
-	}
-	g->gf = ggml_new_graph_custom(g->ctx, (size_t)size, false);
-	g->size = (int)size;
-	g->plan_nodes = -1;
+	/* From here graph_release frees what exists, on error too. */
 	g->b = b;
-	g->closed = 0;
 	b->refs++;
+	g->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(b->be));
+	if (g->galloc == NULL)
+		return luaL_error(L, "ggml_gallocr_new failed");
+	g->size = size < 64 ? 64 : (int)size;
+	g->gf = lgml_new_cgraph(L, g, g->size, 0);
+	g->ctx = graph_ctx(L, g, (size_t)(size + CTX_SLACK) * ggml_tensor_overhead());
+	g->ctx_left = (int)size;
+	g->plan_nodes = -1;
+	g->closed = 0;
 	return 1;
 }
 
@@ -629,8 +692,7 @@ operand(lua_State *L, struct graph *g, int idx)
 	lua_pushvalue(L, idx);
 	if (lua_rawget(L, -2) == LUA_TNIL) {
 		/* A leaf takes a graph slot as a leaf, or as a node if trainable. */
-		if (g->ntensors + g->nleaves + 1 > g->size)
-			luaL_error(L, "graph full (%d tensors)", g->size);
+		lgml_graph_room(L, g, 1);
 		g->nleaves++;
 		lua_pushvalue(L, idx);
 		lua_pushboolean(L, 1);
@@ -650,9 +712,9 @@ opt_operand(lua_State *L, struct graph *g, int idx)
 static void
 reserve(lua_State *L, struct graph *g, int n)
 {
-	if (g->ntensors + g->nleaves + n > g->size)
-		luaL_error(L, "graph full (%d tensors)", g->size);
+	lgml_graph_room(L, g, n);
 	g->ntensors += n;
+	g->ctx_left -= n;
 }
 
 static int
@@ -1593,10 +1655,12 @@ graph_compute(lua_State *L)
 	 * gallocr skips tensors that have data. After an earlier compute,
 	 * node data points into a buffer gallocr may free, so plan again.
 	 */
-	for (node = ggml_get_first_tensor(g->ctx); node != NULL;
-	    node = ggml_get_next_tensor(g->ctx, node)) {
-		node->data = NULL;
-		node->buffer = NULL;
+	for (i = 0; i < g->nctx; i++) {
+		for (node = ggml_get_first_tensor(g->ctxs[i]); node != NULL;
+		    node = ggml_get_next_tensor(g->ctxs[i], node)) {
+			node->data = NULL;
+			node->buffer = NULL;
+		}
 	}
 	g->plan_nodes = -1;
 	if (!ggml_gallocr_alloc_graph(g->galloc, g->gf))

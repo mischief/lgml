@@ -15,6 +15,14 @@ end
 
 local be <close> = assert(lgml.backend(os.getenv("LGML_DEVICE") or "CPU"))
 
+local function maxdiff(a, b)
+	local d = #a == #b and 0 or math.huge
+	for i = 1, #a do
+		d = math.max(d, math.abs(a[i] - b[i]))
+	end
+	return d
+end
+
 local function numel(shape)
 	local c = 1
 	for _, d in ipairs(shape) do
@@ -362,6 +370,52 @@ do
 	ok(good, "adamw steps")
 	ok(adam.t == 3, "adamw counts steps")
 	p:requires_grad(false)
+end
+
+-- A graph grows past its size hint: forward, backward and optimizer
+-- steps in graphs made with room for 8 tensors match a large graph.
+do
+	local L, W = 40, 16
+	local ws, x0, r = {}, randn({ 3, W }), randn({ 3, W })
+	for i = 1, L do
+		ws[i] = randn({ W, W }, 0, 0.3)
+	end
+	local function run(size)
+		local ps = {}
+		for i = 1, L do
+			ps[i] = be:tensor("f32", { W, W }, ws[i]:get())
+			ps[i]:requires_grad()
+		end
+		local g = be:graph(size)
+		local x = x0
+		for i = 1, L do
+			x = g:add(g:silu(g:mul_mat(ps[i], x)), x)
+		end
+		local loss = g:sum(g:mul(g:rms_norm(x, 1e-6), r))
+		loss:backward()
+		g:compute(loss)
+		g:compute(loss)
+		local step = be:graph(size)
+		local hp = be:tensor("f32", { 2 }, { 1, 0 })
+		local nodes = {}
+		for i = 1, L do
+			nodes[i] = step:opt_step_sgd(ps[i], ps[i]:grad(), hp)
+		end
+		step:compute(table.unpack(nodes))
+		local out = { loss = loss:get()[1], p = ps[1]:get(), q = ps[L]:get(), g = g }
+		step:close()
+		for i = 1, L do
+			ps[i]:requires_grad(false)
+		end
+		return out
+	end
+	local small, big = run(8), run(1 << 16)
+	ok(small.loss == big.loss, ("grown graph loss %g"):format(small.loss))
+	ok(maxdiff(small.p, big.p) == 0 and maxdiff(small.q, big.q) == 0 and
+	    maxdiff(small.p, ws[1]:get()) > 1e-4, "grown graph gradients and steps match")
+	small.g:close()
+	big.g:close()
+	ok(not pcall(be.graph, be, (1 << 20) + 1), "size hint above the limit raises")
 end
 
 io.stderr:write("finite differences, max scaled error:\n")
