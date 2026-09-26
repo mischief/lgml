@@ -323,6 +323,8 @@ function F:generate(req, ctl)
 		return nil, "image: not a PNG file", 400
 	end
 	local n, seed, steps = req.n or 1, req.seed or 42, req.steps or 8
+	L:debug("image request", "size", ("%dx%d"):format(req.width or 1024, req.height or 1024), "steps", steps,
+	    "seed", seed, "n", n, "edit", req.image ~= nil, "prompt", req.prompt)
 	local r = { images = {}, seeds = {}, width = req.width or 1024, height = req.height or 1024,
 	    steps = n * steps, sample_ms = n * steps }
 	for i = 1, n do

@@ -552,6 +552,20 @@ end
 
 -- Run one chat request on engine e; returns { res, err, status,
 -- reason, usage, text }.
+-- Runs fn with log lines at level into a list. Returns the lines as
+-- one text.
+local function logged(level, fn)
+	local log = require("lgml.log")
+	local lines = {}
+	log.set_output(function(l) lines[#lines + 1] = l end)
+	log.set_level(level)
+	local ok_, err = pcall(fn)
+	log.set_level("info")
+	log.set_output(nil)
+	assert(ok_, err)
+	return table.concat(lines, "\n")
+end
+
 local function chat_on(e, messages, extra)
 	local uv = require("luv")
 	local r = { text = {} }
@@ -653,6 +667,15 @@ local function vision_check()
 	bad = chat_on(text_only, msg(a, "hi"))
 	ok(bad.res == nil and bad.status == 400 and bad.err:find("--mmproj", 1, true),
 	    "vision: no mmproj gives 400")
+	local all = logged("trace", function()
+		chat_on(e, msg(a, "hello world"), greedy)
+	end)
+	ok(all:find('msg="chat prompt" model=', 1, true) and all:find("<image 1 img:%x+ %d+B 6 tokens>") and
+	    not all:find("iVBOR", 1, true), "log: the chat prompt shows the image as a marker")
+	ok(all:find('msg=sampling preset=qwen3', 1, true) and all:find(' settings="{', 1, true) and all:find("msg=prefill tokens=%d+ cached=%d+"),
+	    "log: debug gives the sampling settings and the prefill")
+	ok(all:find("msg=token n=1 id=%d+") and all:find("msg=\"graph %a+\" n=%d+"),
+	    "log: trace gives each token and graph pass")
 	os.remove(path)
 	os.remove(mpath)
 end
@@ -677,6 +700,7 @@ end
 -- change the readout, text-only requests do not change, and questions
 -- on one image share its cache rows.
 local function decide_vision_check()
+	local all
 	local tiny = require("mmproj_tiny")
 	local base64 = require("lgml.base64")
 	local so = require("lgml.systemone")
@@ -812,6 +836,15 @@ local function decide_vision_check()
 	ok(r12 and r21 and scores(r12, "c") ~= scores(r21, "c") and r12.timings.images == 2,
 	    "decide vision: two images, in order")
 
+	all = logged("debug", function()
+		local t, _, e2, s2 = ask(e, { "c" }, { a })
+		assert(t, tostring(e2) .. " " .. tostring(s2))
+	end)
+	ok(all:find('msg="decide prompt" model=', 1, true) and all:find("question=c type=choice order=2 seed=1001", 1, true)
+	    and all:find("<image 1 img:%x+ %d+B 6 tokens><image|>a picture"), "log: each option order logs its prompt")
+	ok(all:find("msg=candidates question=c", 1, true) and all:find("msg=logscores question=c", 1, true) and
+	    all:find("msg=recipe recipe=", 1, true) and all:find("msg=answer question=c", 1, true),
+	    "log: candidates, log-scores, recipe and answer")
 	local _, _, perr, pstatus = ask(plain, { "c" }, { a })
 	ok(pstatus == 400 and perr:find("image input is not supported", 1, true),
 	    "decide vision: no mmproj gives 400")

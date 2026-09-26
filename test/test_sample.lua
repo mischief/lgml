@@ -250,4 +250,8 @@ if ok_vk and vk then
 	vk:close()
 end
 
+local set = presets.settings("qwen3", { seed = 3, top_k = 5, max_tokens = 9 })
+ok(set.temperature == 0.7 and set.top_k == 5 and set.seed == 3 and set.repeat_last_n == 64 and
+    set.max_tokens == nil, "settings fill the defaults, then the preset, then the options")
+
 print("1.." .. n)

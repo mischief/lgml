@@ -7,6 +7,9 @@
 -- image takes one prompt position for each of its embeddings. In the
 -- token list such a position is the string `"img:<sha256>:<i>"`, so
 -- the cached prefix and the prompt store match only the same image.
+-- At debug level a chat logs the rendered prompt, with a marker for each
+-- image, the sampling settings and the prefill; at trace level, each
+-- token (see `lgml.log`).
 -- @module lgml.engine
 local lgml = require("lgml")
 local chat = require("lgml.chat")
@@ -596,6 +599,39 @@ function E:drop_images()
 	self.images = nil
 end
 
+-- The prompt text for logs: each image token becomes a marker with the
+-- image number, key, size and token count.
+function E:shown_prompt(text, images)
+	if #images == 0 then
+		return text
+	end
+	local tok = self.family.image.token
+	local k = 0
+	return (text:gsub(tok:gsub("%p", "%%%0"), function()
+		k = k + 1
+		local img = images[k]
+		if not img then
+			return tok
+		end
+		local key = "img:" .. lgml.sha256(img.bytes)
+		local have = self.images and self.images[key]
+		return ("<image %d %s %dB %d tokens>"):format(k, key:sub(1, 12), #img.bytes,
+		    have and have.n or 0)
+	end))
+end
+
+-- The first lines of a grammar, for logs.
+local function first_lines(text, n)
+	local out = {}
+	for l in text:gmatch("[^\n]+") do
+		out[#out + 1] = l
+		if #out == n then
+			break
+		end
+	end
+	return table.concat(out, "\n")
+end
+
 function E:run(req, sink)
 	self.image_ms = 0
 	local ok, a, b, c = pcall(self.run_prompt, self, req, sink)
@@ -633,6 +669,10 @@ function E:run_prompt(req, sink)
 			return nil, err, 400
 		end
 	end
+	if log.want_prompt() then
+		log.prompt(L, "chat", self:shown_prompt(text, images), "model", self.id, "tokens", #prompt,
+		    "images", #images > 0 and #images or nil, "thinking", think)
+	end
 	if #prompt >= self.n_ctx then
 		return nil, ("prompt has %d tokens; context is %d"):format(#prompt, self.n_ctx), 400
 	end
@@ -647,27 +687,43 @@ function E:run_prompt(req, sink)
 		return nil, tostring(smp):gsub("^.-grammar: ", "grammar: "), 400
 	end
 	local _ <close> = smp
+	if L:on(log.DEBUG) then
+		local preset = think and "qwen3_think" or "qwen3"
+		L:debug("sampling", "preset", preset, "settings", sampler.settings(preset, req),
+		    "seed", req.seed or "random", "max_tokens", max, "thinking", think,
+		    "grammar", gopts.grammar and first_lines(gopts.grammar, 6), "root", gopts.grammar_root)
+	end
 	local parser = self.family.new_parser({ tools = req.tools, enable_thinking = think })
 	local dec = tokenizer.decoder(self.tk, { special = false })
 	local state = {}
 
 	local t0 = lgml.clock()
 	local cached = self:reuse(prompt)
+	L:debug("prefill", "tokens", #prompt, "cached", cached, "restored", self.pc and self.pc.restored or 0,
+	    "compute", #prompt - cached)
 	local logits = self:prefill(prompt, cached + 1, sink)
 	if not logits then
 		return true
 	end
 	local t1 = lgml.clock()
 	local n, reason = 0, "length"
+	local tracing = log.level >= log.TRACE
 	while n < max do
 		local id = smp:sample(logits)
 		smp:accept(id)
 		n = n + 1
 		if self.eog[id] then
+			if tracing then
+				L:trace("token", "n", n, "id", id, "eog", true)
+			end
 			reason = "stop"
 			break
 		end
-		if not deliver_all(sink, parser:feed(dec:push(id)), state) then
+		local piece = dec:push(id)
+		if tracing then
+			L:trace("token", "n", n, "id", id, "text", piece)
+		end
+		if not deliver_all(sink, parser:feed(piece), state) then
 			return true
 		end
 		if n >= max then

@@ -7,9 +7,15 @@
 -- state first so that questions on one state share a prefix. The
 -- recipe is that of `jevify/engine/predict.py`. The request and result
 -- are those of `lgml.server.engine.Engine.decide`.
+-- At debug level a request logs the recipe, and for each question and
+-- option order the rendered prompt, the candidate tokens and the raw
+-- log-scores; then the prior run and the answer (see `lgml.log`).
 -- @module lgml.decide
 local json = require("lgml.json")
 local mt19937 = require("lgml.mt19937")
+local log = require("lgml.log")
+
+local L = log.new("decide")
 
 local M = {}
 
@@ -659,10 +665,22 @@ local function score(e, p, cands, sink)
 end
 
 -- Scores one rendering. Returns the log-scores and the token counts.
--- keys are the prepared images of the prompt, in order.
-local function run_rendering(e, rd, sink, keys)
+-- keys are the prepared images of the prompt, in order, and images the
+-- request images. label holds key, value pairs for the log lines.
+local function run_rendering(e, rd, sink, keys, images, label)
 	local text = M.chat_prompt(e.family, rd.prefix)
 	local p, cands = M.tokenize(e.tk, text, rd.candidates)
+	label = label or {}
+	if log.want_prompt() then
+		local shown = e.shown_prompt and e:shown_prompt(text, images or {}) or text
+		log.prompt(L, "decide", shown, "model", e.id, table.unpack(label))
+	end
+	if L:on(log.DEBUG) then
+		local f = table.move(label, 1, #label, 1, {})
+		table.move({ "mode", rd.mode, "keys", rd.keys, "candidates", rd.candidates, "tokens", cands,
+		    "prompt_tokens", #p }, 1, 10, #f + 1, f)
+		L:debug("candidates", table.unpack(f))
+	end
 	if e.vision then
 		local err
 		p, err = e:expand_images(p, keys or {})
@@ -676,6 +694,11 @@ local function run_rendering(e, rd, sink, keys)
 	local ls = score(e, p, cands, sink)
 	if not ls then
 		return nil
+	end
+	if L:on(log.DEBUG) then
+		local f = table.move(label, 1, #label, 1, {})
+		table.move({ "keys", rd.keys, "logscores", ls }, 1, 4, #f + 1, f)
+		L:debug("logscores", table.unpack(f))
 	end
 	local nout = 0
 	for _, c in ipairs(cands) do
@@ -693,9 +716,10 @@ local function prior_run(e, q, ids, sink)
 	local c = e.decide_priors
 	local run = c.runs[rd.prefix]
 	if run then
+		L:debug("prior", "question", q.id, "cached", true, "keys", run.keys, "logscores", run.logscores)
 		return run
 	end
-	run = run_rendering(e, rd, sink)
+	run = run_rendering(e, rd, sink, nil, nil, { "question", q.id, "type", q.type, "prior", true })
 	if run then
 		if c.n >= PRIOR_CACHE then
 			c.n, c.runs = 0, {}
@@ -748,6 +772,7 @@ function M.run(e, req, ctl)
 		end
 		markers = string.rep(e.image_marker, #images)
 	end
+	L:debug("recipe", "recipe", recipe, "questions", #req.questions, "images", #images)
 	e.decide_ids = e.decide_ids or M.identifiers(e.tk)
 	local ids = e.decide_ids
 	local sink = sink_of(ctl)
@@ -761,7 +786,11 @@ function M.run(e, req, ctl)
 					identifiers = ids, seed = i > 1 and M.SEED + i - 1 or nil,
 					images = markers,
 				})
-				local run, a, b = run_rendering(e, rd, sink, keys)
+				local label = { "question", q.id, "type", q.type, "order", i }
+				if i > 1 then
+					label[7], label[8] = "seed", M.SEED + i - 1
+				end
+				local run, a, b = run_rendering(e, rd, sink, keys, images, label)
 				if not run then
 					return "cancelled"
 				end
@@ -775,6 +804,7 @@ function M.run(e, req, ctl)
 				end
 			end
 			local a = M.finalize(q, runs, prior, recipe)
+			L:debug("answer", "question", q.id, "runs", #runs, "prior", prior ~= nil, "result", a)
 			if req.raw then
 				a.lgml = { runs = runs, prior = prior }
 			end

@@ -411,7 +411,7 @@ function M.format(level, comp, msg, ...)
 		if k == "rid" then
 			rid = v
 		elseif v ~= nil then
-			rest[#rest + 1] = k .. "=" .. M.value(v)
+			rest[#rest + 1] = tostring(k) .. "=" .. M.value(v)
 		end
 	end
 	if rid then

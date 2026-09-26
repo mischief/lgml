@@ -3,11 +3,16 @@
 -- `lgml.server.engine`. One slot: requests run one at a time. The
 -- engine yields after each sampling step, so a worker reads cancel
 -- messages while it runs.
+-- At debug level each request logs its resolved size, steps and seed,
+-- and each image its timings (see `lgml.log`).
 -- @module lgml.image.engine
 local lgml = require("lgml")
 local detect = require("lgml.detect")
 local pipeline = require("lgml.image.pipeline")
 local stream = require("lgml.server.stream")
+local log = require("lgml.log")
+
+local L = log.new("image")
 
 local M = {}
 local E = {}
@@ -99,6 +104,9 @@ function E:run(req, ctl)
 	end
 	local steps = req.steps or pipeline.STEPS
 	local seed = req.seed or math.random(0, (1 << 31) - 1)
+	L:debug("image request", "size", ("%dx%d"):format(w, h), "steps", steps, "seed", seed, "n", req.n or 1,
+	    "cfg", req.cfg_scale, "strength", req.strength, "edit", image ~= nil, "prompt", req.prompt,
+	    "negative_prompt", req.negative_prompt)
 	local out = { images = {}, seeds = {}, width = w, height = h, steps = 0, sample_ms = 0,
 	    decode_ms = 0, encode_ms = 0 }
 	for i = 1, req.n or 1 do
@@ -116,6 +124,8 @@ function E:run(req, ctl)
 		if not img then
 			return nil, tm, 499
 		end
+		L:debug("image", "index", i, "seed", seed + i - 1, "steps", tm.steps, "encode_ms", tm.encode_ms,
+		    "sample_ms", tm.sample_ms, "decode_ms", tm.decode_ms)
 		out.images[i] = img:png()
 		out.seeds[i] = seed + i - 1
 		img:close()

@@ -5,7 +5,13 @@
 -- key while the attention span stays inside one padding block.
 -- The cache holds the last graph; its output nodes stay valid until
 -- the next pass on that cache.
+-- At trace level each pass logs its key and whether it built a graph or
+-- replayed one (see `lgml.log`).
 -- @module lgml.replay
+local log = require("lgml.log")
+
+local L = log.new("replay")
+
 local M = {}
 
 --- Drop the graph that a cache holds.
@@ -46,7 +52,12 @@ function M.run(model, cache, ids, opts, finish)
 	end
 	local key = model.replay_key and model:replay_key(cache, #ids, opts)
 	local r = cache.replay
-	if key and r and r.key == key then
+	local hit = key and r and r.key == key
+	if log.level >= log.TRACE then
+		L:trace(hit and "graph replay" or "graph build", "n", #ids, "n_past", cache.n_past,
+		    "key", key or "none")
+	end
+	if hit then
 		model:refill(r.inp, ids, cache, opts)
 	else
 		M.drop(cache)
