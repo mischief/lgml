@@ -28,6 +28,7 @@ Labels in this file:
 - [Health](#health)
 - [Metrics](#metrics)
 - [CORS](#cors)
+- [OpenAPI document](#openapi-document)
 
 ## Routes
 
@@ -49,6 +50,7 @@ one row are aliases for one handler.
 | GET | `/lora-adapters` | llama.cpp | [Server properties and adapters](#server-properties-and-adapters) |
 | GET | `/health`, `/v1/health` | llama.cpp | [Health](#health) |
 | GET | `/metrics` | lgml | [Metrics](#metrics) |
+| GET | `/openapi.json`, `/v1/openapi.json` | lgml | [OpenAPI document](#openapi-document) |
 
 ## Common behavior
 
@@ -661,3 +663,16 @@ origin is a value such as `http://localhost:8000` or `*`.
   request `Access-Control-Request-Headers`, else `*`) and
   `Access-Control-Max-Age: 600`.
 - `OPTIONS` on an unknown path gives 404.
+
+## OpenAPI document
+
+`GET /openapi.json` (alias `/v1/openapi.json`). lgml. It gives an
+OpenAPI 3.1 document of the routes of this server. The server builds
+it from the tables that its request checks use, so the request fields
+match the checks. Fields and schemas with `x-lgml-extension: true` are
+lgml or llama.cpp extensions. The descriptions are short; this file
+is the full reference.
+
+```sh
+curl -s localhost:8080/openapi.json | jq '.paths | keys'
+```

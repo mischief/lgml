@@ -57,5 +57,6 @@ A test without its model skips.
 
 ## Docs
 
-- `docs/api.md`: the HTTP API reference.
+- `docs/api.md`: the HTTP API reference. A running server also gives
+  its OpenAPI document at `GET /openapi.json`.
 - `ldoc .`: the Lua reference, in `build/doc`.

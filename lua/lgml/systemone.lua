@@ -422,11 +422,13 @@ local function check_question(id, q)
 	return out
 end
 
+local LGML_FIELDS = { raw = true, recipe = true }
+
 local function check_lgml(x, out)
 	if not is_object(x) then
 		bad({ "body", "lgml" }, "must be an object")
 	end
-	only(x, { raw = true, recipe = true }, { "body", "lgml" })
+	only(x, LGML_FIELDS, { "body", "lgml" })
 	if x.raw ~= nil and type(x.raw) ~= "boolean" then
 		bad({ "body", "lgml", "raw" }, "must be a boolean")
 	elseif x.recipe ~= nil and not is_object(x.recipe) then
@@ -599,6 +601,18 @@ function M.error_body(loc, msg, etype)
 	return { detail = json.array({ {
 		loc = json.array(loc), msg = msg, type = etype or "value_error",
 	} }) }
+end
+
+--- The field sets that `check` accepts, for `lgml.server.openapi`.
+-- Each set maps a field name to true. Read only.
+-- @table fields
+-- @field request the top-level fields of a request
+-- @field question the fields of a question
+-- @field lgml the fields of the lgml extension object
+-- @field types the question types
+M.fields = { request = TOP, question = QFIELDS, lgml = LGML_FIELDS, types = {} }
+for k in pairs(CHECK) do
+	M.fields.types[k] = true
 end
 
 -- statistics

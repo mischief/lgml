@@ -1,0 +1,568 @@
+--- The OpenAPI 3.1 document of the HTTP API.
+-- `document` builds it at run time. The paths come from the routes of
+-- a server. The request fields come from the tables that the request
+-- checks use: `lgml.server.openai.CHAT_FIELDS`, `IMAGE_FIELDS`,
+-- `SPEECH_FORMATS`, `TRANSCRIPTION_FORMATS`, `MESSAGE_ROLES` and
+-- `lgml.systemone.fields`. Where a check is a function, its text goes
+-- into `description`. The descriptions are short; `docs/api.md` has
+-- the full reference.
+-- @module lgml.server.openapi
+local json = require("lgml.json")
+local openai = require("lgml.server.openai")
+local systemone = require("lgml.systemone")
+local detect = require("lgml.detect")
+
+local M = {}
+
+--- The OpenAPI version of the document.
+M.OPENAPI = "3.1.0"
+
+-- schema helpers
+
+local function ref(name)
+	return { ["$ref"] = "#/components/schemas/" .. name }
+end
+
+local function arr(items, desc)
+	return { type = "array", items = items, description = desc }
+end
+
+local function str(desc)
+	return { type = "string", description = desc }
+end
+
+local function num(desc)
+	return { type = "number", description = desc }
+end
+
+local function int(desc)
+	return { type = "integer", description = desc }
+end
+
+-- An object schema. required is a list of names, or nil.
+local function obj(props, required, desc)
+	local o = { type = "object", properties = json.object(props or {}), description = desc }
+	if required and #required > 0 then
+		o.required = json.array(required)
+	end
+	return o
+end
+
+-- The keys of a set, sorted, as a JSON array.
+local function keys(set)
+	local t = json.array()
+	for k in pairs(set) do
+		t[#t + 1] = k
+	end
+	table.sort(t)
+	return t
+end
+
+-- Marks s as an lgml or llama.cpp extension of an OpenAI shape.
+local function ext(s)
+	s["x-lgml-extension"] = true
+	return s
+end
+
+--- Makes the schema of one field table entry.
+-- The entry is `{ name, Lua type, check, text }`. A "table" whose check
+-- accepts an array and not an object is an array; other tables are
+-- objects. text becomes the description.
+-- @tparam table c the entry
+-- @treturn table the schema
+function M.field_schema(c)
+	local s
+	if c[2] == "table" then
+		local pred = c[3]
+		s = { type = (pred and pred(json.array()) and not pred({})) and "array" or "object" }
+	else
+		s = { type = c[2] }
+	end
+	if c[4] then
+		s.description = "Must be " .. c[4] .. "."
+	end
+	return s
+end
+
+-- Adds the entries of a field table to props. note gives a
+-- description for fields whose entry has no text.
+local function add_fields(props, tbl, note, skip)
+	for _, c in ipairs(tbl) do
+		if not (skip and skip[c[1]]) then
+			local s = M.field_schema(c)
+			if not s.description and note[c[1]] then
+				s.description = note[c[1]]
+			end
+			props[c[1]] = s
+		end
+	end
+end
+
+-- chat
+
+local CHAT_NOTES = {
+	model = "Model id. A missing or unknown id goes to the first model that serves chat.",
+	stream = "Stream the reply as server-sent events.",
+	stream_options = "`include_usage`: send a last chunk with usage.",
+	temperature = "Sampler temperature.",
+	top_p = "Nucleus sampling threshold.",
+}
+
+-- Fields that engines read and that check_chat does not check.
+local function chat_extras()
+	return {
+		messages = arr(ref("ChatMessage"), "A non-empty array of messages."),
+		grammar = ext(str("GBNF grammar for the answer (llama.cpp). Not with a JSON schema.")),
+		response_format = obj({
+			type = { type = "string", enum = json.array({ "text", "json_object", "json_schema" }) },
+			json_schema = obj({ schema = { type = "object" } }),
+			schema = { type = "object" },
+		}, { "type" }, "Constrains the answer to JSON; json_object may carry `schema` (llama.cpp)."),
+		json_schema = ext({ type = "object", description = "JSON schema for the answer (llama.cpp)." }),
+		seed = ext(int("Sampler seed.")),
+		top_k = ext(int("Top-k sampling.")),
+		min_p = ext(num("Min-p sampling.")),
+		presence_penalty = num("Presence penalty."),
+		frequency_penalty = num("Frequency penalty."),
+		repeat_penalty = ext(num("Repeat penalty.")),
+		reasoning_effort = str('"none" turns thinking off; other values leave it on.'),
+		chat_template_kwargs = ext(obj({
+			enable_thinking = { type = "boolean" },
+			reasoning_effort = { type = "string" },
+			preserve_thinking = { type = "boolean" },
+		}, nil, "Values for the chat template (llama.cpp).")),
+		lora = ext(arr(obj({ id = int(), scale = num() }, { "id", "scale" }),
+		    "Adapter scales for this request, ids from 0 (llama.cpp).")),
+	}
+end
+
+local function chat_schemas(c)
+	local props = chat_extras()
+	add_fields(props, openai.CHAT_FIELDS, CHAT_NOTES)
+	c.ChatRequest = obj(props, { "messages" })
+	local part = {
+		oneOf = json.array({
+			obj({ type = { const = "text" }, text = str() }, { "type", "text" }),
+			obj({
+				type = { const = "image_url" },
+				image_url = { oneOf = json.array({ str(), obj({ url = str() }, { "url" }) }) },
+			}, { "type", "image_url" }, "A data URL of a PNG or JPEG image. Needs a model with vision."),
+		}),
+	}
+	c.ChatMessage = obj({
+		role = { type = "string", enum = keys(openai.MESSAGE_ROLES) },
+		content = { oneOf = json.array({ str(), { type = "null" }, arr(part) }) },
+		reasoning_content = ext(str("Reasoning text of an earlier assistant turn.")),
+		tool_calls = arr(ref("ToolCall")),
+		tool_call_id = str(),
+	}, { "role" })
+	c.ToolCall = obj({
+		id = str(), type = { const = "function" },
+		["function"] = obj({
+			name = str(),
+			arguments = { oneOf = json.array({ str(), { type = "object" } }) },
+		}, { "name", "arguments" }),
+	}, { "function" })
+	c.Usage = obj({
+		prompt_tokens = int(), completion_tokens = int(), total_tokens = int(),
+		prompt_tokens_details = obj({ cached_tokens = int() }),
+	})
+	c.Timings = ext(obj({
+		cache_n = int(), restored_n = int(), prompt_n = int(), prompt_ms = num(),
+		prompt_per_token_ms = num(), prompt_per_second = num(), predicted_n = int(),
+		predicted_ms = num(), predicted_per_token_ms = num(), predicted_per_second = num(),
+	}, nil, "llama.cpp timings."))
+	local finish = { type = "string", enum = json.array({ "stop", "length", "tool_calls" }) }
+	c.ChatCompletion = obj({
+		id = str(), object = { const = "chat.completion" }, created = int(), model = str(),
+		choices = arr(obj({
+			index = int(), finish_reason = finish, logprobs = { type = "null" },
+			message = obj({
+				role = { const = "assistant" }, content = { type = { "string", "null" } },
+				reasoning_content = ext(str()), tool_calls = arr(ref("ToolCall")),
+			}),
+		})),
+		usage = ref("Usage"), timings = ref("Timings"),
+	})
+	c.ChatCompletionChunk = obj({
+		id = str(), object = { const = "chat.completion.chunk" }, created = int(), model = str(),
+		choices = arr(obj({
+			index = int(), finish_reason = { type = { "string", "null" } },
+			delta = obj({
+				role = str(), content = str(), reasoning_content = ext(str()),
+				tool_calls = arr({ type = "object" }),
+			}),
+		})),
+		usage = ref("Usage"), timings = ref("Timings"),
+	}, nil, "One `data:` event. The stream ends with `data: [DONE]`.")
+end
+
+-- images
+
+local IMAGE_NOTES = {
+	model = "Model id.",
+	negative_prompt = "Text for the unconditional pass.",
+}
+
+local function image_props(edit)
+	local props = {
+		prompt = str("1 to 16384 bytes."),
+		size = str(("`auto` or WxH; sides are multiples of %d from %d to %d."):format(
+		    openai.IMAGE_MULTIPLE, openai.IMAGE_MULTIPLE, openai.IMAGE_MAX_SIDE)),
+		response_format = str("Only `b64_json`."),
+		output_format = str("Only `png`."),
+	}
+	-- check_image takes strength for edits only.
+	add_fields(props, openai.IMAGE_FIELDS, IMAGE_NOTES, not edit and { strength = true } or nil)
+	if edit then
+		props.image = { type = "string", contentMediaType = "application/octet-stream",
+		    description = "The input image, PNG or JPEG. `image[]` also works." }
+	end
+	return props
+end
+
+local function image_schemas(c)
+	c.ImageRequest = obj(image_props(false), { "prompt" })
+	c.ImageEditRequest = obj(image_props(true), { "image", "prompt" })
+	c.ImagesResponse = obj({
+		created = int(), output_format = { const = "png" }, size = str(),
+		data = arr(obj({ b64_json = str(), seed = ext(int()) })),
+	})
+end
+
+-- audio
+
+local function audio_schemas(c)
+	c.SpeechRequest = obj({
+		input = str("1 to 16384 bytes."),
+		model = str("Model id."),
+		voice = str("Voice name of the model."),
+		speed = num("0.25 to 4. Some models take only 1."),
+		response_format = { type = "string", enum = keys(openai.SPEECH_FORMATS) },
+	}, { "input" }, "Models can read more fields, such as seed or language; see docs/api.md.")
+	c.TranscriptionRequest = obj({
+		file = { type = "string", contentMediaType = "audio/wav", description = "WAV audio." },
+		model = str("Model id."),
+		language = str("Code or name; missing: detect."),
+		prompt = str("Accepted; not used."),
+		response_format = { type = "string", enum = keys(openai.TRANSCRIPTION_FORMATS) },
+	}, { "file" })
+	c.Transcription = obj({ text = str() })
+	c.TranscriptionVerbose = obj({
+		task = { const = "transcribe" }, language = str(), duration = num(), text = str(),
+		segments = arr(obj({ id = int(), start = num(), ["end"] = num(), text = str() })),
+	})
+end
+
+-- System One
+
+local content = { type = { "string", "object", "array" } }
+
+local SYSTEMONE_NOTES = {
+	state = { type = { "string", "object", "array" }, description = "The state. JSON becomes indented text." },
+	model = str("Model id. Missing or unknown: the first model that decides."),
+	questions = { type = "object", additionalProperties = ref("SystemOneQuestion"),
+	    description = "Questions by id, answered in this order." },
+	lgml = ext(ref("SystemOneExtension")),
+	attachments = ext(arr({ oneOf = json.array({
+		str("A data URL of a PNG or JPEG image."),
+		obj({ type = { const = "image_url" }, image_url = obj({ url = str() }, { "url" }) },
+		    { "type", "image_url" }),
+	}) }, "Images for the state. Needs a model with capability multimodal.")),
+}
+
+local QUESTION_NOTES = {
+	type = { type = "string", enum = keys(systemone.fields.types) },
+	instructions = { type = { "string", "object", "array", "null" } },
+	criteria = { description = ("noul: `{true, false}` texts or null. choice: object of %d to %d options. " ..
+	    "score: array of %d to %d levels."):format(2, systemone.MAX_CHOICE_OPTIONS,
+	    systemone.MIN_SCORE_LEVELS, systemone.MAX_SCORE_LEVELS) },
+}
+
+local LGML_NOTES = {
+	raw = { type = "boolean", description = "Add the raw log-scores to each answer as `lgml`." },
+	recipe = { type = "object", description = "Recipe fields over the server recipe." },
+}
+
+-- An object schema with exactly the fields of set; notes gives the
+-- schema of each, and a field with no note gets a pointer to the docs.
+local function closed(set, notes, required, desc)
+	local props = {}
+	for k in pairs(set) do
+		props[k] = notes[k] or { description = "See docs/api.md." }
+	end
+	local o = obj(props, required, desc)
+	o.additionalProperties = false
+	return o
+end
+
+local function systemone_schemas(c)
+	c.SystemOneRequest = closed(systemone.fields.request, SYSTEMONE_NOTES, { "state", "questions" })
+	c.SystemOneQuestion = closed(systemone.fields.question, QUESTION_NOTES, { "type" })
+	c.SystemOneExtension = closed(systemone.fields.lgml, LGML_NOTES, nil, "lgml extension.")
+	local probs = { type = "object", additionalProperties = { type = "number" } }
+	c.SystemOneResponse = obj({
+		model = str(),
+		answers = { type = "object", additionalProperties = obj({
+			type = { type = "string", enum = keys(systemone.fields.types) },
+			noul = num("P(yes), to 0.01."), choice = str(), score = num(), confidence = num(),
+			legend = { type = "object", additionalProperties = content },
+			probabilities = probs, lgml = ext({ type = "object" }),
+		}, { "type" }) },
+		usage = obj({ input_tokens = int(), output_tokens = int() }),
+	})
+	c.SystemOneValidationError = obj({
+		detail = arr(obj({
+			loc = arr({ type = { "string", "integer" } }), msg = str(), type = str(),
+		})),
+	}, nil, "FastAPI validation error.")
+	c.SystemOneError = obj({ detail = str() })
+end
+
+-- other schemas
+
+local function misc_schemas(c)
+	c.Error = obj({
+		error = obj({
+			message = str(), type = str(),
+			param = { type = { "string", "null" } }, code = { type = { "string", "null" } },
+		}, { "message", "type" }),
+	}, { "error" })
+	local modes = { type = "string", enum = json.array(table.move(detect.MODES, 1, #detect.MODES, 1, {})) }
+	c.Model = obj({
+		id = str(), object = { const = "model" }, created = int(), owned_by = str(),
+		context_length = ext(int()), meta = ext(obj({ n_ctx_train = int() })),
+		capabilities = ext(arr(modes)),
+		status = ext(obj({ value = str() }, nil, "Load state, as llama-server.")),
+		lgml = ext(obj({ status = str(), bytes = int() })),
+	})
+	c.ModelList = obj({ object = { const = "list" }, data = arr(ref("Model")) })
+	c.Props = ext(obj({
+		default_generation_settings = obj({ n_ctx = int(), params = { type = "object" } }),
+		total_slots = int(), model_path = str(), build_info = str(),
+		modalities = obj({ vision = { type = "boolean" } }),
+	}, nil, "llama-server /props subset."))
+	c.LoraAdapter = ext(obj({ id = int(), path = str(), scale = num() }))
+	c.LoadRequest = obj({ model = str() }, { "model" })
+	c.Success = obj({ success = { const = true } })
+	c.Health = obj({ status = { const = "ok" } })
+end
+
+-- operations
+
+local function json_body(schema)
+	return { required = true, content = { ["application/json"] = { schema = schema } } }
+end
+
+local function form_body(schema)
+	return { required = true, content = { ["multipart/form-data"] = { schema = schema } } }
+end
+
+-- The x-lgml-* headers of a reply, from their names without the prefix.
+local function header_set(names)
+	local t = {}
+	for _, h in ipairs(names) do
+		t["x-lgml-" .. h] = { schema = { type = "string" } }
+	end
+	return t
+end
+
+local function reply(desc, mt, schema, headers)
+	return {
+		description = desc, content = { [mt] = { schema = schema or {} } },
+		headers = headers and header_set(headers),
+	}
+end
+
+local function errors(codes)
+	local t = {}
+	for _, c in ipairs(codes) do
+		t[tostring(c)] = reply("Error.", "application/json", ref("Error"))
+	end
+	return t
+end
+
+-- Merges error replies into responses.
+local function with(responses, codes)
+	for k, v in pairs(errors(codes)) do
+		responses[k] = v
+	end
+	return responses
+end
+
+local AUDIO_HEADERS = { "elapsed-ms", "audio-seconds", "rtf" }
+local CHAT_HEADERS = { "cache-n", "restored-n", "prompt-n", "prompt-ms", "predicted-n",
+	"predicted-ms", "predicted-per-second" }
+local IMAGE_HEADERS = { "elapsed-ms", "images", "steps", "seed", "sample-ms", "ms-per-step" }
+
+-- Operations by path without the /v1 prefix, then by method. tag is
+-- openai, llama.cpp or lgml.
+local function operations()
+	local E = { 400, 404, 500, 503 }
+	return {
+		["/chat/completions"] = { POST = {
+			tag = "openai", summary = "Chat completion",
+			requestBody = json_body(ref("ChatRequest")),
+			responses = with({ ["200"] = {
+				description = "The reply, or with stream an event stream of chunks.",
+				content = {
+					["application/json"] = { schema = ref("ChatCompletion") },
+					["text/event-stream"] = { schema = ref("ChatCompletionChunk") },
+				},
+				headers = header_set(CHAT_HEADERS),
+			} }, E),
+		} },
+		["/images/generations"] = { POST = {
+			tag = "openai", summary = "Make images",
+			requestBody = json_body(ref("ImageRequest")),
+			responses = with({ ["200"] = reply("Images.", "application/json", ref("ImagesResponse"),
+			    IMAGE_HEADERS) }, E),
+		} },
+		["/images/edits"] = { POST = {
+			tag = "openai", summary = "Edit an image",
+			requestBody = form_body(ref("ImageEditRequest")),
+			responses = with({ ["200"] = reply("Images.", "application/json", ref("ImagesResponse"),
+			    IMAGE_HEADERS) }, E),
+		} },
+		["/audio/speech"] = { POST = {
+			tag = "openai", summary = "Text to speech",
+			requestBody = json_body(ref("SpeechRequest")),
+			responses = with({ ["200"] = {
+				description = "16-bit mono audio.",
+				content = {
+					["audio/wav"] = { schema = { type = "string", contentMediaType = "audio/wav" } },
+					["audio/pcm"] = { schema = { type = "string", contentMediaType = "audio/pcm" } },
+				},
+				headers = header_set(AUDIO_HEADERS),
+			} }, E),
+		} },
+		["/audio/transcriptions"] = { POST = {
+			tag = "openai", summary = "Speech to text",
+			requestBody = form_body(ref("TranscriptionRequest")),
+			responses = with({ ["200"] = {
+				description = "The text, as response_format asks.",
+				content = {
+					["application/json"] = { schema = { anyOf = json.array({
+						ref("Transcription"), ref("TranscriptionVerbose") }) } },
+					["text/plain"] = { schema = { type = "string" } },
+				},
+				headers = header_set(AUDIO_HEADERS),
+			} }, E),
+		} },
+		["/systemone"] = { POST = {
+			tag = "lgml", summary = "System One decisions (Jev wire format)",
+			requestBody = json_body(ref("SystemOneRequest")),
+			responses = {
+				["200"] = reply("Answers.", "application/json", ref("SystemOneResponse"), { "elapsed-ms" }),
+				["404"] = reply("No model decides.", "application/json", ref("SystemOneError")),
+				["422"] = reply("Bad request, or a bad recipe.", "application/json", {
+					oneOf = json.array({ ref("SystemOneValidationError"), ref("SystemOneError") }) }),
+				["500"] = reply("Engine error.", "application/json", ref("SystemOneError")),
+				["503"] = reply("Worker or load failure.", "application/json", ref("SystemOneError")),
+			},
+		} },
+		["/models"] = { GET = {
+			tag = "openai", summary = "List models",
+			responses = { ["200"] = reply("Models.", "application/json", ref("ModelList")) },
+		} },
+		["/models/load"] = { POST = {
+			tag = "lgml", summary = "Load a model now",
+			requestBody = json_body(ref("LoadRequest")),
+			responses = with({ ["200"] = reply("Loaded.", "application/json", ref("Success")) },
+			    { 400, 404, 503 }),
+		} },
+		["/models/unload"] = { POST = {
+			tag = "lgml", summary = "Unload a model",
+			requestBody = json_body(ref("LoadRequest")),
+			responses = with({ ["200"] = reply("Unloaded.", "application/json", ref("Success")) },
+			    { 400, 404, 409 }),
+		} },
+		["/props"] = { GET = {
+			tag = "llama.cpp", summary = "Server properties",
+			responses = { ["200"] = reply("Properties.", "application/json", ref("Props")) },
+		} },
+		["/lora-adapters"] = { GET = {
+			tag = "llama.cpp", summary = "List LoRA adapters",
+			responses = { ["200"] = reply("Adapters.", "application/json", arr(ref("LoraAdapter"))) },
+		} },
+		["/health"] = { GET = {
+			tag = "llama.cpp", summary = "Health",
+			responses = { ["200"] = reply("Up.", "application/json", ref("Health")) },
+		} },
+		["/metrics"] = { GET = {
+			tag = "lgml", summary = "Prometheus metrics",
+			responses = { ["200"] = reply("Metrics text.", "text/plain", { type = "string" }) },
+		} },
+		["/openapi.json"] = { GET = {
+			tag = "lgml", summary = "This document",
+			responses = { ["200"] = reply("OpenAPI document.", "application/json", { type = "object" }) },
+		} },
+	}
+end
+
+--- The route key of a path: the path without a `/v1` prefix.
+-- @tparam string path the path
+-- @treturn string the key
+function M.canonical(path)
+	return (path:gsub("^/v1/", "/"))
+end
+
+--- Builds the OpenAPI document.
+-- Each route becomes an operation. A route with no operation in this
+-- module gets a stub marked `x-lgml-undocumented`.
+-- @tparam table routes the routes of a server: `{ [path] = { [method] =
+-- handler } }`, as `lgml.server.httpd.Server` keeps them
+-- @treturn table the document, ready for `lgml.json.encode`
+function M.document(routes)
+	local ops = operations()
+	local schemas = {}
+	chat_schemas(schemas)
+	image_schemas(schemas)
+	audio_schemas(schemas)
+	systemone_schemas(schemas)
+	misc_schemas(schemas)
+	local paths = {}
+	for path, methods in pairs(routes) do
+		local item = {}
+		for method in pairs(methods) do
+			local src = ops[M.canonical(path)] and ops[M.canonical(path)][method]
+			local op
+			if src then
+				op = {}
+				for k, v in pairs(src) do
+					op[k] = v
+				end
+				op.tag = nil
+				op.tags = json.array({ src.tag })
+			else
+				op = {
+					summary = method .. " " .. path, ["x-lgml-undocumented"] = true,
+					responses = { default = { description = "See docs/api.md." } },
+				}
+			end
+			op.operationId = method:lower() .. path:gsub("[^%w]+", "_")
+			item[method:lower()] = op
+		end
+		paths[path] = item
+	end
+	return {
+		openapi = M.OPENAPI,
+		info = {
+			title = "lgml", version = "scm", license = { name = "ISC", identifier = "ISC" },
+			description = "OpenAI-shaped API of lgml-server. docs/api.md has the full reference. " ..
+			    "Fields marked x-lgml-extension are lgml or llama.cpp extensions.",
+		},
+		tags = json.array({
+			{ name = "openai", description = "OpenAI-compatible, with lgml extensions." },
+			{ name = "llama.cpp", description = "llama-server compatible." },
+			{ name = "lgml", description = "lgml only." },
+		}),
+		-- The server has no authentication.
+		security = json.array(),
+		servers = json.array({ { url = "/" } }),
+		paths = paths,
+		components = { schemas = schemas },
+	}
+end
+
+return M

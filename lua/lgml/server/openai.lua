@@ -33,6 +33,8 @@ local ROLES = {
 	system = true, developer = true, user = true, assistant = true,
 	tool = true,
 }
+--- The message roles that a chat request can use, as a set. Read only.
+M.MESSAGE_ROLES = ROLES
 
 -- Removes top-level nulls, so "max_tokens": null reads as absent.
 local function strip_nulls(b)
@@ -129,11 +131,15 @@ end
 local CHECKS = {
 	{ "model", "string" }, { "stream", "boolean" },
 	{ "stream_options", "table" }, { "temperature", "number" },
-	{ "top_p", "number" }, { "max_tokens", "number", positive_int },
-	{ "max_completion_tokens", "number", positive_int },
-	{ "tools", "table", is_list },
-	{ "n", "number", function(v) return v == 1 end },
+	{ "top_p", "number" }, { "max_tokens", "number", positive_int, "a positive integer" },
+	{ "max_completion_tokens", "number", positive_int, "a positive integer" },
+	{ "tools", "table", is_list, "an array" },
+	{ "n", "number", function(v) return v == 1 end, "1" },
 }
+--- The top-level fields of a chat request that `check_chat` checks.
+-- Each entry is `{ name, Lua type, check, text }`; check and text are
+-- optional. text tells what check accepts. Read only.
+M.CHAT_FIELDS = CHECKS
 
 --- Checks a chat request body.
 -- It removes top-level nulls and nulls in each message. It checks the
@@ -498,6 +504,8 @@ end
 -- transcriptions
 
 local FORMATS = { json = true, text = true, verbose_json = true }
+--- The transcription `response_format` values, as a set. Read only.
+M.TRANSCRIPTION_FORMATS = FORMATS
 
 local function verbose(r)
 	local segs = json.array()
@@ -577,6 +585,8 @@ end
 -- speech
 
 local SPEECH_FORMATS = { wav = true, pcm = true }
+--- The speech `response_format` values, as a set. Read only.
+M.SPEECH_FORMATS = SPEECH_FORMATS
 
 --- Checks a speech request body.
 -- input must be a string of 1 to 16384 bytes. voice is a string. speed
@@ -746,6 +756,10 @@ local IMAGE_CHECKS = {
 	{ "cfg_scale", "number", function(v) return v >= 0 and v <= 30 end, "a number from 0 to 30" },
 	{ "strength", "number", function(v) return v > 0 and v <= 1 end, "a number above 0, at most 1" },
 }
+--- The optional fields of an image request that `check_image` checks.
+-- Each entry is `{ name, Lua type, check, text }`, as `CHAT_FIELDS`.
+-- Read only.
+M.IMAGE_FIELDS = IMAGE_CHECKS
 
 --- Checks an image request and makes the request for `Engine:generate`.
 -- b is the decoded JSON body, or the fields of an edit form with
@@ -885,7 +899,8 @@ end
 
 --- Adds the OpenAI routes for eng to srv.
 -- The routes are `/health`, `/v1/health`, `/models`, `/v1/models`,
--- `/props`, `/lora-adapters` (the adapters from the `lora` field of
+-- `/props`, `/openapi.json` (also under `/v1`; see
+-- `lgml.server.openapi`), `/lora-adapters` (the adapters from the `lora` field of
 -- the engine props, as llama-server lists them), `/chat/completions`, `/audio/speech`,
 -- `/audio/transcriptions`, `/systemone`, `/images/generations` and
 -- `/images/edits`, the last six also under `/v1`. A route for a method that eng does not have gives 404.
@@ -934,6 +949,11 @@ function M.install(srv, eng)
 		    { ["Content-Type"] = "text/plain; version=0.0.4; charset=utf-8" })
 	end)
 	srv:route("GET", "/health", health)
+	local function spec(_, res)
+		return res:json(200, require("lgml.server.openapi").document(srv.routes))
+	end
+	srv:route("GET", "/openapi.json", spec)
+	srv:route("GET", "/v1/openapi.json", spec)
 	srv:route("GET", "/v1/health", health)
 	srv:route("GET", "/v1/models", list)
 	srv:route("GET", "/models", list)
