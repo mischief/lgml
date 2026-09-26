@@ -1,9 +1,12 @@
 # lgml HTTP API
 
 `lgml-server` serves an HTTP/1.1 API in the shape of the OpenAI API.
-It also gives some llama-server (llama.cpp) endpoints and fields, and
-lgml extensions. This file is the reference for each route. The Lua
-reference (`ldoc .`) documents the modules behind it.
+It also gives the Anthropic Messages API, some llama-server
+(llama.cpp) endpoints and fields, and lgml extensions. The chat
+completions, Messages and Responses routes share one chat engine: each
+translates its request into the same chat request and the engine
+output into its own reply. This file is the reference for each route.
+The Lua reference (`ldoc .`) documents the modules behind it.
 
 Labels in this file:
 
@@ -131,7 +134,9 @@ The OpenAI routes give the OpenAI error object:
   `invalid_value` for another bad value.
 
 `/v1/systemone` uses the FastAPI error shape instead; see
-[System One errors](#system-one-errors).
+[System One errors](#system-one-errors). `/v1/messages` and
+`/v1/messages/count_tokens` use the Anthropic shape; see
+[Messages errors](#messages-errors).
 
 Status codes:
 
@@ -166,12 +171,18 @@ lgml extensions.
 | speech | `x-lgml-elapsed-ms`, `x-lgml-audio-seconds` (length of the audio), `x-lgml-rtf` (wall time over audio time), `x-lgml-sample-rate` (samples per second), `x-lgml-channels` (1) |
 | transcriptions | `x-lgml-elapsed-ms`, `x-lgml-audio-seconds` (length of the input), `x-lgml-rtf` |
 | systemone | `x-lgml-elapsed-ms`, and `x-jevify-latency-ms` (the same time with 1 decimal, as Jevify sends) |
+| messages, responses | `x-lgml-ignored` (accepted fields with no effect), and for messages `request-id`, `x-lgml-ignored-betas` and `x-lgml-thinking-dropped`; see [Anthropic Messages](#anthropic-messages) and [OpenAI Responses](#openai-responses) |
 
 A streamed chat reply has no `x-lgml-*` headers. Its last chunk holds
 the `timings` object instead. With `--cors`, browsers can read these
 headers (`Access-Control-Expose-Headers: *`).
 
 ## Compatibility
+
+This section covers the chat completions API. The Messages and
+Responses APIs have their own tables: see
+[Messages compatibility](#messages-compatibility) and
+[Responses compatibility](#responses-compatibility).
 
 `POST /v1/chat/completions` is a superset of the OpenAI Chat
 Completions API:
@@ -1377,7 +1388,7 @@ its first event.
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
-| `lgml_<kind>_requests_total` | counter | Requests, by kind: `chat`, `transcription`, `speech`, `decide`, `image`. |
+| `lgml_<kind>_requests_total` | counter | Requests, by kind: `chat`, `transcription`, `speech`, `decide`, `image`. `/v1/messages` and `/v1/responses` count as `chat`; token counts do not count. |
 | `lgml_<kind>_errors_total` | counter | Requests of that kind that failed. |
 | `lgml_prompt_tokens_total` | counter | Prompt tokens computed. |
 | `lgml_prompt_seconds_total` | counter | Time spent on prompts. |

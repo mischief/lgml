@@ -830,7 +830,8 @@ function M.document(routes)
 		openapi = M.OPENAPI,
 		info = {
 			title = "lgml", version = "scm", license = { name = "ISC", identifier = "ISC" },
-			description = "OpenAI-shaped API of lgml-server. docs/api.md has the full reference. " ..
+			description = "OpenAI-shaped API of lgml-server, with the Anthropic Messages and OpenAI " ..
+			    "Responses APIs. docs/api.md has the full reference. " ..
 			    "Fields marked x-lgml-extension are lgml or llama.cpp extensions. " ..
 			    "x-lgml-status gives the compatibility status of a chat request field.",
 		},
