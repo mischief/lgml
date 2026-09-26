@@ -439,18 +439,120 @@ end
 -- caches keep every position.
 -- @tparam table cache a cache from `cache`
 -- @tparam integer n the wanted count of kept positions
+-- @tparam[opt] boolean peek true only checks: cache.hi stays
 -- @treturn integer n, or 0 when the ring lost those positions
-function M:rewind(cache, n)
+function M:rewind(cache, n, peek)
 	if not cache.ring then
 		return n
 	end
 	if n > 0 and n < cache.hi and n + cache.ring - self.hp.n_swa + 1 < cache.hi then
 		n = 0
 	end
-	if n == 0 then
+	if n == 0 and not peek then
 		cache.hi = 0
 	end
 	return n
+end
+
+-- The parts of a snapshot: { tensor, offset, bytes } in layer order.
+-- Full-attention layers give rows [0, rows) when rows is set. Rings give
+-- their rows up to hi; recurrent layers give their whole states.
+local function snap_parts(self, cache, rows, state)
+	local parts = {}
+	local function add(t, n)
+		if n > 0 then
+			parts[#parts + 1] = { t, 0, n }
+		end
+	end
+	for il, L in ipairs(self.layers) do
+		if L.recr and state then
+			add(cache.conv[il], cache.conv[il]:nbytes())
+			add(cache.ssm[il], cache.ssm[il]:nbytes())
+		elseif cache.k[il] and (L.swa and state or not L.swa and rows) then
+			local n = L.swa and math.min(cache.hi, cache.ring) or rows
+			for _, t in ipairs({ cache.k[il], cache.v[il] }) do
+				add(t, n * (t:nbytes() // t:shape()[1]))
+			end
+		end
+	end
+	return parts
+end
+
+--- Bytes that `snapshot` copies now.
+-- @tparam table cache a cache from `cache`
+-- @tparam[opt] boolean full true for a full snapshot
+-- @treturn integer bytes
+function M:snapshot_bytes(cache, full)
+	local bytes = 0
+	for _, p in ipairs(snap_parts(self, cache, full and cache.n_past, true)) do
+		bytes = bytes + p[3]
+	end
+	return bytes
+end
+
+--- Copy the cache state at cache.n_past to host memory.
+-- The state is the recurrent conv and delta net states and the sliding
+-- rings with hi: the parts that cannot go back to an earlier position.
+-- A full snapshot also holds rows [0, n_past) of the full-attention
+-- layers.
+-- @tparam table cache a cache from `cache`
+-- @tparam[opt] boolean full true for a full snapshot
+-- @treturn table the snapshot: n (the position), hi, full, bytes and
+-- buf (an `lgml.hostbuf`; close it to free the memory at once)
+function M:snapshot(cache, full)
+	local n = cache.n_past
+	local parts = snap_parts(self, cache, full and n, true)
+	local bytes = 0
+	for _, p in ipairs(parts) do
+		bytes = bytes + p[3]
+	end
+	local buf = lgml.hostbuf(bytes)
+	local off = 0
+	for _, p in ipairs(parts) do
+		p[1]:to_host(buf, off, p[2], p[3])
+		off = off + p[3]
+	end
+	return { n = n, hi = cache.hi, full = full or false, bytes = bytes, buf = buf }
+end
+
+--- Write a snapshot back into the cache it came from.
+-- Without opts it sets n_past, rs_pos and hi to the snapshot's. The
+-- full-attention rows before n of a snapshot without them must still
+-- hold the same tokens. The cached replay graph stays valid.
+-- @tparam table cache the cache
+-- @tparam table snap a snapshot from `snapshot`
+-- @tparam[opt] table opts options:
+-- opts.rows: restore only the first rows full-attention rows of a full
+-- snapshot and set n_past to rows (default snap.n).
+-- opts.state: false leaves the state, rs_pos and hi as they are (default
+-- true); the caller then restores a snapshot at opts.rows.
+function M:restore(cache, snap, opts)
+	opts = opts or {}
+	local rows = opts.rows or snap.n
+	local state = opts.state ~= false
+	assert(rows <= snap.n and (snap.full or rows == snap.n), "restore: rows not in the snapshot")
+	-- Walk the parts in snapshot order; skip the ones not restored.
+	local hi = cache.hi
+	cache.hi = snap.hi
+	local all = snap_parts(self, cache, snap.full and snap.n, true)
+	local want = snap_parts(self, cache, snap.full and rows, state)
+	cache.hi = hi
+	local off, j = 0, 1
+	for _, p in ipairs(all) do
+		local w = want[j]
+		if w and w[1] == p[1] then
+			p[1]:from_host(snap.buf, off, 0, w[3])
+			j = j + 1
+		end
+		off = off + p[3]
+	end
+	cache.n_past = rows
+	if state then
+		cache.hi = snap.hi
+		if cache.rs_pos then
+			cache.rs_pos = snap.n
+		end
+	end
 end
 
 -- The attention spans of a pass that ends at n_kv: global layers and

@@ -13,6 +13,7 @@
 #define STORE_MT	"lgml_weights"
 #define GRAPH_MT	"lgml_graph"
 #define TENSOR_MT	"lgml_tensor"
+#define HOSTBUF_MT	"lgml_hostbuf"
 
 #define GRAPH_SIZE	16384	/* tensors per graph; a 41-layer MoE needs about 4000 */
 #define LOAD_CHUNK	((size_t)64 << 20)
@@ -45,6 +46,11 @@ struct graph {
 	int			 plan_tensors;	/* ntensors at the last plan */
 	int			 refs;
 	int			 closed;
+};
+
+struct hostbuf {
+	char			*p;
+	size_t			 size;
 };
 
 /* A leaf has s. A node has g. */

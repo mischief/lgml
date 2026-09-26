@@ -11,6 +11,7 @@ local tokenizer = require("lgml.tokenizer")
 local stream = require("lgml.server.stream")
 local replay = require("lgml.replay")
 local transformer = require("lgml.transformer")
+local prompt_cache = require("lgml.prompt_cache")
 
 local M = {}
 local E = {}
@@ -56,6 +57,10 @@ end
 -- - `cache_type_k`, `cache_type_v`: KV cache types from `lgml.kv`
 --   (default q8_0 with flash attention when the head size fits, else f16)
 -- - `id`: model id (default: the gguf `general.name`, or `"lgml"`)
+-- - `cache_ram`: MiB of host RAM for the prompt store (default 8192; 0
+--   turns it off, -1 means no limit); see `lgml.prompt_cache`
+-- - `ctx_checkpoints`: the most state checkpoints per slot, for models
+--   with recurrent layers or a sliding ring (default 8; 0 turns them off)
 -- @treturn Engine the engine
 -- @raise when the backend, the model or its tokenizer does not load,
 -- or when no chat template fits the model
@@ -92,6 +97,14 @@ function M.new(opts)
 	e.eog = {}
 	for _, id in ipairs(e.tk:special().eog or {}) do
 		e.eog[id] = true
+	end
+	if model.snapshot then
+		local ram = opts.cache_ram or 8192
+		e.pc = prompt_cache.new(model, cache, {
+			ram = ram < 0 and math.huge or math.floor(ram * 1048576),
+			checkpoints = opts.ctx_checkpoints or 8,
+			special = e.tk:special().tokens,
+		})
 	end
 	return e
 end
@@ -163,6 +176,12 @@ function E:reuse(prompt)
 	while n < #old and n < #prompt - 1 and old[n + 1] == prompt[n + 1] do
 		n = n + 1
 	end
+	-- The prompt cache can swap in a stored slot that shares more.
+	if self.pc then
+		n = self.pc:reuse(self, prompt, n)
+		old = self.tokens
+	end
+	local want = n
 	-- A sliding-window ring can lose the rows before n.
 	if self.model.rewind and n < #old then
 		n = self.model:rewind(self.cache, n)
@@ -171,9 +190,15 @@ function E:reuse(prompt)
 	if self.model.recurrent and n < #old then
 		n = 0
 	end
+	if self.pc and n < want then
+		n = self.pc:back(self, want)
+	end
 	self.cache.n_past = n
 	for i = #old, n + 1, -1 do
 		old[i] = nil
+	end
+	if self.pc then
+		self.pc:trim(n)
 	end
 	return n
 end
@@ -182,10 +207,19 @@ end
 function E:prefill(prompt, from, sink)
 	local logits
 	local i = from
+	-- Passes end at checkpoint positions.
+	local stops, c = self.pc and self.pc:plan(prompt, from) or {}, 1
 	while i <= #prompt do
 		local j = math.min(#prompt, i + UBATCH - 1)
+		if stops[c] and stops[c] <= j then
+			j = stops[c]
+		end
 		logits = self:eval(table.move(prompt, i, j, 1, {}))
 		table.move(prompt, i, j, #self.tokens + 1, self.tokens)
+		if j == stops[c] then
+			self.pc:checkpoint()
+			c = c + 1
+		end
 		i = j + 1
 		stream.sleep(0)
 		if sink:cancelled() then
@@ -311,7 +345,7 @@ function E:run(req, sink)
 	sink:finish(reason, {
 		prompt_tokens = #prompt, completion_tokens = n, cached_tokens = cached,
 	}, {
-		cache_n = cached,
+		cache_n = cached, restored_n = self.pc and self.pc.restored or 0,
 		prompt_n = #prompt - cached, prompt_ms = (t1 - t0) * 1000,
 		predicted_n = n, predicted_ms = (t2 - t1) * 1000,
 		predicted_per_second = n / math.max(t2 - t1, 1e-9),

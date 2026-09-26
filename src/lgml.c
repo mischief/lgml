@@ -14,6 +14,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -120,6 +121,16 @@ check_tensor(lua_State *L, int idx)
 	if (t->t == NULL)
 		luaL_error(L, "tensor closed");
 	return t;
+}
+
+static struct hostbuf *
+check_hostbuf(lua_State *L, int idx)
+{
+	struct hostbuf *hb = luaL_checkudata(L, idx, HOSTBUF_MT);
+
+	if (hb->p == NULL)
+		luaL_error(L, "hostbuf closed");
+	return hb;
 }
 
 static enum ggml_type
@@ -1998,6 +2009,71 @@ tensor_bytes(lua_State *L)
 	return 1;
 }
 
+/* Checked byte range of a tensor and a host buffer, from args 2 to 5. */
+static void
+host_range(lua_State *L, struct tensor *t, struct hostbuf **hb, size_t *hoff, size_t *off,
+    size_t *n)
+{
+	size_t nbytes = ggml_nbytes(t->t);
+	lua_Integer a, b, c;
+
+	*hb = check_hostbuf(L, 2);
+	a = luaL_optinteger(L, 3, 0);
+	b = luaL_optinteger(L, 4, 0);
+	luaL_argcheck(L, a >= 0 && (lua_Unsigned)a <= (*hb)->size, 3, "offset out of range");
+	luaL_argcheck(L, b >= 0 && (lua_Unsigned)b <= nbytes, 4, "offset out of range");
+	c = luaL_optinteger(L, 5, (lua_Integer)(nbytes - (size_t)b));
+	luaL_argcheck(L, c >= 0 && (lua_Unsigned)c <= nbytes - (size_t)b &&
+	    (lua_Unsigned)c <= (*hb)->size - (size_t)a, 5, "count out of range");
+	*hoff = (size_t)a;
+	*off = (size_t)b;
+	*n = (size_t)c;
+}
+
+/*** Copy bytes of the contents into a host buffer.
+ * @tparam hostbuf buf the host buffer
+ * @tparam[opt=0] int buf_off first byte in buf
+ * @tparam[opt=0] int off first byte of the tensor
+ * @tparam[opt] int n bytes to copy (default: from off to the end)
+ * @raise if the tensor has no storage or is not contiguous, or a range
+ * is out of bounds
+ * @function tensor:to_host
+ */
+static int
+tensor_to_host(lua_State *L)
+{
+	struct tensor *t = check_storage(L, 1);
+	struct hostbuf *hb;
+	size_t hoff, off, n;
+
+	host_range(L, t, &hb, &hoff, &off, &n);
+	if (n > 0)
+		ggml_backend_tensor_get(t->t, hb->p + hoff, off, n);
+	return 0;
+}
+
+/*** Copy bytes from a host buffer into the contents.
+ * @tparam hostbuf buf the host buffer
+ * @tparam[opt=0] int buf_off first byte in buf
+ * @tparam[opt=0] int off first byte of the tensor
+ * @tparam[opt] int n bytes to copy (default: from off to the end)
+ * @raise if the tensor has no storage or is not contiguous, or a range
+ * is out of bounds
+ * @function tensor:from_host
+ */
+static int
+tensor_from_host(lua_State *L)
+{
+	struct tensor *t = check_storage(L, 1);
+	struct hostbuf *hb;
+	size_t hoff, off, n;
+
+	host_range(L, t, &hb, &hoff, &off, &n);
+	if (n > 0)
+		ggml_backend_tensor_set(t->t, hb->p + hoff, off, n);
+	return 0;
+}
+
 /*** Get the shape in torch order.
  * @treturn {int,...} one size for each dimension
  * @function tensor:shape
@@ -2372,6 +2448,89 @@ l_clock(lua_State *L)
 	return 1;
 }
 
+/* host buffers */
+
+/*** Allocate a host buffer.
+ * The memory is not cleared. `tensor:to_host` and `tensor:from_host`
+ * copy byte ranges between it and a tensor. Offsets are from 0, as
+ * in `graph:view`. Lua does not see this memory, so the call first
+ * runs a collector step sized for it.
+ * @tparam int nbytes the size in bytes
+ * @treturn hostbuf the buffer
+ * @raise if nbytes is negative or memory runs out
+ * @function hostbuf
+ */
+static int
+l_hostbuf(lua_State *L)
+{
+	lua_Integer n = luaL_checkinteger(L, 1);
+	struct hostbuf *hb;
+
+	luaL_argcheck(L, n >= 0 && (lua_Unsigned)n <= SIZE_MAX / 2, 1, "size out of range");
+	lua_gc(L, LUA_GCSTEP, n >> 10 < INT_MAX ? (int)(n >> 10) : INT_MAX);
+	hb = lua_newuserdatauv(L, sizeof(*hb), 0);
+	hb->p = NULL;
+	hb->size = 0;
+	luaL_setmetatable(L, HOSTBUF_MT);
+	hb->p = malloc(n > 0 ? (size_t)n : 1);
+	if (hb->p == NULL)
+		return luaL_error(L, "hostbuf: out of memory for %I bytes", n);
+	hb->size = (size_t)n;
+	return 1;
+}
+
+/*** Host memory for copies of tensor contents.
+ * Garbage collection frees it; `hostbuf:close` frees it at once.
+ * @type hostbuf
+ */
+
+/*** Free the memory. Later calls raise an error.
+ * The `__gc` and `__close` metamethods call this function.
+ * @function hostbuf:close
+ */
+static int
+hostbuf_close(lua_State *L)
+{
+	struct hostbuf *hb = luaL_checkudata(L, 1, HOSTBUF_MT);
+
+	free(hb->p);
+	hb->p = NULL;
+	hb->size = 0;
+	return 0;
+}
+
+/*** Get the size. The `#` operator gives the same.
+ * @treturn int bytes
+ * @function hostbuf:len
+ */
+static int
+hostbuf_len(lua_State *L)
+{
+	lua_pushinteger(L, (lua_Integer)check_hostbuf(L, 1)->size);
+	return 1;
+}
+
+/*** Read bytes as a string.
+ * @tparam[opt=0] int off first byte
+ * @tparam[opt] int n bytes to read (default: from off to the end)
+ * @treturn string the bytes
+ * @raise if the range is out of bounds
+ * @function hostbuf:bytes
+ */
+static int
+hostbuf_bytes(lua_State *L)
+{
+	struct hostbuf *hb = check_hostbuf(L, 1);
+	lua_Integer off = luaL_optinteger(L, 2, 0), n;
+
+	luaL_argcheck(L, off >= 0 && (lua_Unsigned)off <= hb->size, 2, "offset out of range");
+	n = luaL_optinteger(L, 3, (lua_Integer)(hb->size - (size_t)off));
+	luaL_argcheck(L, n >= 0 && (lua_Unsigned)n <= hb->size - (size_t)off, 3,
+	    "count out of range");
+	lua_pushlstring(L, hb->p + off, (size_t)n);
+	return 1;
+}
+
 static const luaL_Reg backend_meta[] = {
 	{ "__gc", backend_close },
 	{ "__close", backend_close },
@@ -2468,6 +2627,8 @@ static const luaL_Reg tensor_methods[] = {
 	{ "set", tensor_set },
 	{ "get", tensor_get },
 	{ "bytes", tensor_bytes },
+	{ "to_host", tensor_to_host },
+	{ "from_host", tensor_from_host },
 	{ "fill_causal", tensor_fill_causal },
 	{ "fill_mask", tensor_fill_mask },
 	{ "fill_range", tensor_fill_range },
@@ -2481,11 +2642,26 @@ static const luaL_Reg tensor_methods[] = {
 	{ NULL, NULL }
 };
 
+static const luaL_Reg hostbuf_meta[] = {
+	{ "__gc", hostbuf_close },
+	{ "__close", hostbuf_close },
+	{ "__len", hostbuf_len },
+	{ NULL, NULL }
+};
+
+static const luaL_Reg hostbuf_methods[] = {
+	{ "close", hostbuf_close },
+	{ "len", hostbuf_len },
+	{ "bytes", hostbuf_bytes },
+	{ NULL, NULL }
+};
+
 static const luaL_Reg lib[] = {
 	{ "backend", l_backend },
 	{ "clock", l_clock },
 	{ "devices", l_devices },
 	{ "gguf", l_gguf },
+	{ "hostbuf", l_hostbuf },
 	{ "log", l_log },
 	{ "row_size", l_row_size },
 	{ NULL, NULL }
@@ -2552,6 +2728,7 @@ luaopen_lgml(lua_State *L)
 	newclass(L, STORE_MT, store_meta, store_methods);
 	newclass(L, GRAPH_MT, graph_meta, graph_methods);
 	newclass(L, TENSOR_MT, tensor_meta, tensor_methods);
+	newclass(L, HOSTBUF_MT, hostbuf_meta, hostbuf_methods);
 	luaL_newlib(L, lib);
 	lgml_open_sample(L);
 	lgml_open_tokenize(L);

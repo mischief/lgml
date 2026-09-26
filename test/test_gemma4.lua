@@ -408,6 +408,52 @@ local function more(kind, m, ref)
 	ok(not pcall(m.inputs, m, seq, c), tag .. "a pass over ubatch fails once the ring wraps")
 end
 
+-- Ring checkpoints: go back past what the ring holds by a state
+-- snapshot, and past it by a full snapshot. Passes of 8 tokens repeat,
+-- so the logits must match exactly.
+local function ring_check(kind, m)
+	local replay = require("lgml.replay")
+	local tag = kind .. " ring snapshot: "
+	local c = m:cache(64, { ubatch = 8 })
+	local function run(from, to)
+		local out
+		for s = from, to, 8 do
+			local ids = {}
+			for i = s, math.min(to, s + 7) do
+				ids[#ids + 1] = (i * 37) % 200 + 1
+			end
+			out = replay.run(m, c, ids, { logits = "last" }):get()
+		end
+		return out
+	end
+	local function same(a, b)
+		for i = 1, #a do
+			if a[i] ~= b[i] then
+				return false
+			end
+		end
+		return #a == #b
+	end
+	run(1, 24)
+	local st, full = m:snapshot(c), m:snapshot(c, true)
+	local want = run(25, 32)
+	run(33, 48)
+	ok(m:rewind(c, 24, true) == 0, tag .. "the ring lost position 24")
+	m:restore(c, st)
+	ok(c.n_past == 24 and c.hi == 24, tag .. "a checkpoint sets n_past and hi")
+	ok(same(run(25, 32), want), tag .. "logits after a checkpoint restore match")
+	run(33, 48)
+	c.n_past = 0
+	m:rewind(c, 0)
+	m:restore(c, full)
+	ok(same(run(25, 32), want), tag .. "logits after a full restore match")
+	ok(st.bytes > 0 and st.bytes < full.bytes, ("%scheckpoint %d bytes, full %d"):format(tag,
+	    st.bytes, full.bytes))
+	st.buf:close()
+	full.buf:close()
+	replay.drop(c)
+end
+
 -- The chat engine on the tiny model: a second request with the same
 -- first message reuses the cached prefix.
 local function engine_check(path)
@@ -486,6 +532,7 @@ for _, kind in ipairs({ "dense", "moe" }) do
 		end
 		more(kind, m, ref)
 	end
+	ring_check(kind, m)
 	-- The ring holds 13 rows. A long prompt in passes of 8 and decode
 	-- steps across n_past 256 build four graphs.
 	local long = {}

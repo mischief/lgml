@@ -282,5 +282,35 @@ do
 	near(w:get("b"):get(), { 7, 8, 9 }, "gguf writer second tensor")
 end
 
+-- Host buffers: byte ranges of a leaf to and from host memory.
+do
+	local t <close> = f32({ 2, 4 }, { 1, 2, 3, 4, 5, 6, 7, 8 })
+	local hb <close> = lgml.hostbuf(64)
+	ok(hb:len() == 64 and #hb == 64, "hostbuf length")
+	t:to_host(hb)
+	ok(hb:bytes(0, 32) == t:bytes(), "to_host copies the whole tensor")
+	-- Row 2 of t into bytes 40 to 55 of hb.
+	t:to_host(hb, 40, 16, 16)
+	ok(hb:bytes(40, 16) == t:bytes():sub(17, 32), "to_host copies a byte range")
+	local u <close> = f32({ 2, 4 }, { 0, 0, 0, 0, 0, 0, 0, 0 })
+	u:from_host(hb, 40, 0, 16)
+	near(u:get(), { 5, 6, 7, 8, 0, 0, 0, 0 }, "from_host writes a byte range")
+	u:from_host(hb)
+	near(u:get(), { 1, 2, 3, 4, 5, 6, 7, 8 }, "from_host writes the whole tensor")
+	ok(not pcall(t.to_host, t, hb, 60), "to_host past the buffer end fails")
+	ok(not pcall(t.to_host, t, hb, 0, 16, 32), "to_host past the tensor end fails")
+	ok(not pcall(u.from_host, u, hb, -1), "from_host with a negative offset fails")
+	ok(not pcall(u.from_host, u, hb, 0, 33), "from_host with an offset past the end fails")
+	ok(not pcall(lgml.hostbuf, -1), "hostbuf with a negative size fails")
+	local q <close> = be:tensor("q8_0", { 2, 32 })
+	q:zero()
+	local qb <close> = lgml.hostbuf(q:nbytes())
+	q:to_host(qb)
+	ok(qb:bytes() == q:bytes(), "to_host works on a quantized leaf")
+	hb:close()
+	ok(not pcall(hb.len, hb), "a closed hostbuf fails")
+	ok(not pcall(t.to_host, t, hb), "to_host into a closed hostbuf fails")
+end
+
 print("1.." .. n)
 os.exit(failed and 1 or 0)

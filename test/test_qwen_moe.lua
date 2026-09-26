@@ -448,6 +448,182 @@ local function more(arch, m, ref)
 	end
 end
 
+-- Largest difference of two logit lists.
+local function maxdiff(a, b)
+	local d = #a == #b and 0 or math.huge
+	for i = 1, #a do
+		d = math.max(d, math.abs(a[i] - (b[i] or math.huge)))
+	end
+	return d
+end
+
+-- Snapshots on the model: a full snapshot and a state checkpoint go
+-- back to their position, and the next pass gives the same logits.
+local function snapshot_check(arch, m)
+	local replay = require("lgml.replay")
+	local c = m:cache(64)
+	local o = { logits = "last" }
+	local function run(ids)
+		return replay.run(m, c, ids, o):get()
+	end
+	run({ 5, 6, 7, 8, 9, 10 })
+	local full = m:snapshot(c, true)
+	local st = m:snapshot(c)
+	local want = run({ 11, 12 })
+	run({ 13, 14, 15 })
+	m:restore(c, full)
+	ok(c.n_past == 6 and (not c.rs_pos or c.rs_pos == 6), arch .. ": restore sets n_past")
+	ok(maxdiff(run({ 11, 12 }), want) == 0, arch .. ": full snapshot restores the logits")
+	run({ 20, 21, 22, 23 })
+	m:restore(c, st)
+	ok(maxdiff(run({ 11, 12 }), want) == 0, arch .. ": state checkpoint restores the logits")
+	ok(st.bytes < full.bytes and (m.recurrent and st.bytes > 0 or st.bytes == 0),
+	    ("%s: checkpoint %d bytes, full snapshot %d"):format(arch, st.bytes, full.bytes))
+	full.buf:close()
+	st.buf:close()
+	replay.drop(c)
+end
+
+-- A request through the engine outside the server. Returns the reply.
+local function engine_chat(e, messages)
+	local uv = require("luv")
+	local r = {}
+	local sink = {}
+	function sink.content()
+		return true
+	end
+	sink.reasoning, sink.tool_arguments = sink.content, sink.content
+	function sink.tool_call()
+		return 0
+	end
+	function sink.finish(_, reason, usage, timings)
+		r.reason, r.usage, r.timings = reason, usage, timings
+	end
+	function sink.cancelled()
+		return false
+	end
+	local done
+	coroutine.wrap(function()
+		r.res, r.err = e:chat({ messages = messages, max_tokens = 3, top_k = 1,
+		    chat_template_kwargs = { enable_thinking = false } }, sink)
+		done = true
+	end)()
+	while not done do
+		uv.run("once")
+	end
+	assert(r.res, r.err)
+	return r
+end
+
+-- The logits the engine gives for messages after its cache logic, and
+-- those of a new engine without a cache. Returns both and the cached count.
+local function prompt_logits(e, fresh, messages)
+	local sink = { cancelled = function() return false end }
+	local text = e.family.render(messages, { add_generation_prompt = true, enable_thinking = false })
+	local p = e.tk:encode(text)
+	local got, want, cached, done
+	coroutine.wrap(function()
+		cached = e:reuse(p)
+		got = e:prefill(p, cached + 1, sink):get()
+		fresh.tokens, fresh.cache.n_past = {}, 0
+		want = fresh:prefill(p, fresh:reuse(p) + 1, sink):get()
+		done = true
+	end)()
+	while not done do
+		require("luv").run("once")
+	end
+	return got, want, cached, #p
+end
+
+local function long_text(seed, n)
+	local r = rng(seed)
+	local w = {}
+	for i = 1, n do
+		w[i] = string.char(97 + math.floor(r() * 26), 97 + math.floor(r() * 26))
+	end
+	return table.concat(w, " ")
+end
+
+-- The position before the last turn start of the prompt for messages.
+local function last_start(e, messages)
+	local text = e.family.render(messages, { add_generation_prompt = true, enable_thinking = false })
+	local p = e.tk:encode(text)
+	local id = e.tk:special().tokens["<|im_start|>"]
+	for i = #p, 1, -1 do
+		if p[i] == id then
+			return i - 1
+		end
+	end
+end
+
+-- Checkpoints and the RAM store through the engine. Without flash
+-- attention, passes split at other positions give the same logits, so
+-- a restore must give them exactly.
+local function prompt_cache_check(arch, path)
+	local engine = require("lgml.engine")
+	local tag = arch .. " prompt cache: "
+	local fresh = engine.new({ model = path, backend = "CPU", n_ctx = 256, cache_ram = 0,
+	    ctx_checkpoints = 0, flash_attn = false })
+	local e = engine.new({ model = path, backend = "CPU", n_ctx = 256, flash_attn = false })
+	local sys = { role = "system", content = "You are a test. " .. long_text(1, 10) }
+	local u1 = { role = "user", content = long_text(2, 12) }
+	-- Turn 2 extends turn 1 up to its last turn start, then differs.
+	local a = engine_chat(e, { sys, u1 })
+	local turn2 = { sys, u1, { role = "assistant", content = "not what it said" },
+	    { role = "user", content = long_text(3, 8) } }
+	local got, want, cached, np = prompt_logits(e, fresh, turn2)
+	local d = maxdiff(got, want)
+	io.stderr:write(("%sturn 2: %d of %d tokens cached, %d restored, max error %.3g\n"):format(
+	    tag, cached, np, e.pc.restored, d))
+	if e.model.recurrent then
+		ok(cached == last_start(e, { sys, u1 }) and e.pc.restored == cached,
+		    tag .. "turn 2 restores the checkpoint at the last turn start of turn 1")
+	else
+		ok(cached > a.usage.prompt_tokens / 2 and e.pc.restored == 0,
+		    tag .. "turn 2 keeps the prefix without a restore")
+	end
+	ok(d == 0, ("%sturn 2 logits equal a fresh prefill (max error %.3g)"):format(tag, d))
+
+	-- Two conversations in turns: the second visit restores from the store.
+	local ua = { role = "user", content = long_text(4, 20) }
+	local ub = { role = "user", content = long_text(5, 20) }
+	local ra1 = engine_chat(e, { sys, ua })
+	engine_chat(e, { sys, ub })
+	local ra2 = engine_chat(e, { sys, ua })
+	local rb2 = engine_chat(e, { sys, ub })
+	io.stderr:write(("%sA again: %d of %d cached, %d restored; B again: %d cached, %d restored\n")
+	    :format(tag, ra2.timings.cache_n, ra2.usage.prompt_tokens, ra2.timings.restored_n,
+	    rb2.timings.cache_n, rb2.timings.restored_n))
+	-- A hybrid goes back to the checkpoint at the last turn start.
+	local wa = e.model.recurrent and last_start(e, { sys, ua }) or ra1.usage.prompt_tokens - 1
+	local wb = e.model.recurrent and last_start(e, { sys, ub }) or rb2.usage.prompt_tokens - 1
+	ok(ra2.timings.restored_n == wa and ra2.timings.cache_n == wa,
+	    tag .. "the second visit of A restores it from the store")
+	ok(rb2.timings.restored_n == wb and rb2.timings.cache_n == wb,
+	    tag .. "the second visit of B restores it from the store")
+	ok(e.pc.stats.loaded >= 2 and e.pc.stats.evicted == 0, tag .. "store loads, no evictions")
+	got, want = prompt_logits(e, fresh, { sys, ua })
+	d = maxdiff(got, want)
+	ok(d == 0, ("%slogits after a store restore equal a fresh prefill (max error %.3g)")
+	    :format(tag, d))
+
+	-- A budget for about one entry: older entries go.
+	e.pc:clear()
+	local one = e.pc.bytes
+	engine_chat(e, { sys, ua })
+	engine_chat(e, { sys, ub })
+	one = e.pc.store[1] and e.pc.store[1].bytes or 0
+	e.pc.ram = one * 3 // 2
+	local uc = { role = "user", content = long_text(6, 20) }
+	engine_chat(e, { sys, uc })
+	ok(#e.pc.store == 1 and e.pc.bytes <= e.pc.ram and e.pc.stats.evicted >= 1,
+	    ("%sthe budget evicts the oldest entry (%d bytes each)"):format(tag, one))
+	local r = engine_chat(e, { sys, ua })
+	ok(r.timings.restored_n < r.usage.prompt_tokens // 2, tag .. "an evicted prompt prefills again")
+	e.pc:clear()
+	fresh.pc = nil
+end
+
 local be <close> = assert(lgml.backend(os.getenv("LGML_DEVICE") or "CPU"))
 local bin = os.getenv("LGML_LLAMA_LOGITS")
 
@@ -499,6 +675,10 @@ for _, arch in ipairs({ "llama", "qwen3", "qwen3moe", "qwen3next", "qwen35moe", 
 	end
 	if m.recurrent then
 		rc.restart(ok, arch .. ": ", m)
+	end
+	snapshot_check(arch, m)
+	if arch == "qwen35moe" or arch == "qwen3" then
+		prompt_cache_check(arch, path)
 	end
 	m:close()
 	os.remove(path)
