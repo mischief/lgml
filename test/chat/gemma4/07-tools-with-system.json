@@ -1,0 +1,93 @@
+{
+ "messages": [
+  {
+   "role": "system",
+   "content": "Use tools."
+  },
+  {
+   "role": "user",
+   "content": "Find docs"
+  }
+ ],
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "search",
+    "description": "Search documents.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "query": {
+       "type": "string",
+       "description": "Search text"
+      },
+      "limit": {
+       "type": "integer",
+       "description": "Max results",
+       "nullable": true
+      },
+      "tags": {
+       "type": "array",
+       "items": {
+        "type": "string"
+       },
+       "description": "Tags"
+      },
+      "filter": {
+       "type": "object",
+       "description": "Filter",
+       "properties": {
+        "after": {
+         "type": "string",
+         "description": "Date"
+        },
+        "score": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "after"
+       ]
+      },
+      "points": {
+       "type": "array",
+       "items": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "type": "number"
+         },
+         "y": {
+          "type": "number"
+         }
+        },
+        "required": [
+         "x"
+        ]
+       }
+      },
+      "mode": {
+       "type": "string",
+       "enum": [
+        "fast",
+        "exact"
+       ],
+       "description": "Mode"
+      },
+      "Zeta": {
+       "type": "boolean"
+      },
+      "anything": {
+       "type": "object"
+      }
+     },
+     "required": [
+      "query",
+      "tags"
+     ]
+    }
+   }
+  }
+ ]
+}

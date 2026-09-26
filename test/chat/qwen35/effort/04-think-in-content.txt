@@ -1,0 +1,28 @@
+<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
+<|im_start|>user
+q1<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+<think>
+old plan
+</think>
+
+answer one<|im_end|>
+<|im_start|>user
+q2<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+pre <think>a</think> mid </think>
+
+last<|im_end|>
+<|im_start|>user
+q3<|im_end|>
+<|im_start|>assistant
+<think>

@@ -1,0 +1,1 @@
+{"messages":[{"role":"user","content":"q"},{"role":"assistant","content":[{"type":"text","text":""},{"type":"text","text":"a"},{"type":"text","text":"b"}]}],"chat_template_kwargs":{"enable_thinking":false}}

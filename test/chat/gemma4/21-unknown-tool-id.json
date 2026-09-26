@@ -1,0 +1,40 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": "x"
+  },
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "c1",
+     "type": "function",
+     "function": {
+      "name": "now",
+      "arguments": "{}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "zz",
+   "content": "r"
+  }
+ ],
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "now",
+    "description": "Current time.",
+    "parameters": {
+     "type": "object",
+     "properties": {}
+    }
+   }
+  }
+ ]
+}

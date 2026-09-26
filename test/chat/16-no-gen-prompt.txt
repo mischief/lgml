@@ -1,0 +1,6 @@
+<|im_start|>user
+q<|im_end|>
+<|im_start|>assistant
+a<|im_end|>
+<|im_start|>user
+</think> in user<|im_end|>

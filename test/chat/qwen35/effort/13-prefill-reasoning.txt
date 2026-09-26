@@ -1,0 +1,9 @@
+<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.
+
+s<|im_end|>
+<|im_start|>user
+Think<|im_end|>
+<|im_start|>assistant
+<think>
+Let me 

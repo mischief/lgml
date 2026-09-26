@@ -1,0 +1,2 @@
+<|channel>thought
+plan<channel|>text <|tool_call>call:f{a:<|"|>x<|"|>,b:[1,{c:true}]}<tool_call|>

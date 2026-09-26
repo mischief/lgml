@@ -1,0 +1,16 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": "Hi"
+  },
+  {
+   "role": "assistant",
+   "content": "Hel"
+  }
+ ],
+ "chat_template_kwargs": {
+  "enable_thinking": false
+ },
+ "add_generation_prompt": false
+}

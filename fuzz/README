@@ -1,0 +1,32 @@
+Fuzzing
+
+lfuzz is an AFL++ harness. Each target is a Lua script that returns a
+function of one input string. An error that escapes the function is a
+bug: the harness aborts. Targets catch expected errors themselves.
+
+  json         lgml.json, OpenAI request checks, the chat templates
+  chat         the Hermes and Gemma-4 output parsers on model text
+  http         request heads, query strings, multipart bodies
+  safetensors  lgml.safetensors, then a load to the CPU backend
+  vocab        lgml.vocab on vocab.json and added_tokens.json
+  wav          WAV decode, encode, resample and mel
+  tokenize     all pre-tokenizers (qwen2, llama-bpe, gemma4) on tiny
+               vocabs; round trips
+
+Run all targets for 10 minutes (needs afl-clang-fast and luarocks):
+
+  fuzz/run.sh 600
+
+This builds build-fuzz with afl-clang-fast, ASan and UBSan, and builds
+lua-cjson and picohttpparser the same way. The harness uses only the
+CPU backend; no Vulkan driver loads. Crashes land in
+build-fuzz/out/<target>/default/crashes. Replay one:
+
+  fuzz/run.sh replay json build-fuzz/out/json/default/crashes/id:...
+
+After a fix, copy the crash into corpus/<target>/. The normal build
+replays the corpus in the 'fuzz' test suite:
+
+  meson test -C build --suite fuzz
+
+seeds.lua writes the seed corpus. dict/ holds the AFL dictionaries.

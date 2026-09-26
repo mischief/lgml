@@ -1,0 +1,92 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": "Weather in Paris and Rome, and the time?"
+  },
+  {
+   "role": "assistant",
+   "content": null,
+   "tool_calls": [
+    {
+     "id": "a",
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"Paris\"}"
+     }
+    },
+    {
+     "id": "b",
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"Rome\"}"
+     }
+    },
+    {
+     "id": "c",
+     "type": "function",
+     "function": {
+      "name": "now",
+      "arguments": "{}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "a",
+   "content": "sunny"
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "b",
+   "content": "rain"
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "c",
+   "content": "12:00"
+  }
+ ],
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "get_weather",
+    "description": "Get the weather for a city.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string",
+       "description": "City name, e.g. \"Zürich\""
+      },
+      "unit": {
+       "type": "string",
+       "enum": [
+        "c",
+        "f"
+       ]
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "now",
+    "description": "Current time.",
+    "parameters": {
+     "type": "object",
+     "properties": {}
+    }
+   }
+  }
+ ]
+}

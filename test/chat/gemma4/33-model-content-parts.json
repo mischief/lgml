@@ -1,0 +1,25 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": "a"
+  },
+  {
+   "role": "assistant",
+   "content": [
+    {
+     "type": "text",
+     "text": "<|channel>t<channel|> x "
+    },
+    {
+     "type": "text",
+     "text": " y "
+    }
+   ]
+  },
+  {
+   "role": "user",
+   "content": "b"
+  }
+ ]
+}

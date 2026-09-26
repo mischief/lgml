@@ -1,0 +1,7 @@
+<|turn>system
+<|think|>
+<|tool>declaration:search{description:<|"|>Search documents.<|"|>,parameters:{properties:{Zeta:{type:<|"|>BOOLEAN<|"|>},anything:{properties:{},type:<|"|>OBJECT<|"|>},filter:{description:<|"|>Filter<|"|>,properties:{after:{description:<|"|>Date<|"|>,type:<|"|>STRING<|"|>},score:{type:<|"|>NUMBER<|"|>}},required:[<|"|>after<|"|>],type:<|"|>OBJECT<|"|>},limit:{description:<|"|>Max results<|"|>,nullable:true,type:<|"|>INTEGER<|"|>},mode:{description:<|"|>Mode<|"|>,enum:[<|"|>fast<|"|>,<|"|>exact<|"|>],type:<|"|>STRING<|"|>},points:{items:{properties:{x:{type:<|"|>NUMBER<|"|>},y:{type:<|"|>NUMBER<|"|>}},required:[<|"|>x<|"|>],type:<|"|>OBJECT<|"|>},type:<|"|>ARRAY<|"|>},query:{description:<|"|>Search text<|"|>,type:<|"|>STRING<|"|>},tags:{description:<|"|>Tags<|"|>,items:{type:<|"|>STRING<|"|>},type:<|"|>ARRAY<|"|>}},required:[<|"|>query<|"|>,<|"|>tags<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><turn|>
+<|turn>user
+Search<turn|>
+<|turn>model
+<|tool_call>call:search{Zeta:true,big:12345678901,f:2.0,filter:{after:<|"|>2024<|"|>,score:0.5},limit:5,neg:-3.25,none:,query:<|"|>a "b" é<|"|>,tags:[<|"|>x<|"|>,<|"|>y<|"|>]}<tool_call|><|tool_response>response:search{value:<|"|>[]<|"|>}<tool_response|>

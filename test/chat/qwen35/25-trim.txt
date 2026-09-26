@@ -1,0 +1,12 @@
+<|im_start|>user
+x  <|im_end|>
+<|im_start|>assistant
+<think>
+r
+</think>
+
+y<|im_end|>
+<|im_start|>user
+　z<|im_end|>
+<|im_start|>assistant
+<think>

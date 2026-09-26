@@ -1,0 +1,10 @@
+<|turn>system
+<|think|>
+<turn|>
+<|turn>user
+What is 2+2?<turn|>
+<|turn>model
+4<turn|>
+<|turn>user
+And 3+3?<turn|>
+<|turn>model

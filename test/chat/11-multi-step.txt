@@ -1,0 +1,58 @@
+<|im_start|>system
+s
+
+# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{"type": "function", "function": {"name": "now", "description": "", "parameters": {"required": [], "properties": {}, "type": "object"}}}
+</tools>
+
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call><|im_end|>
+<|im_start|>user
+old q<|im_end|>
+<|im_start|>assistant
+old a<|im_end|>
+<|im_start|>user
+new q<|im_end|>
+<|im_start|>assistant
+<think>
+r1
+</think>
+
+<tool_call>
+{"name": "now", "arguments": {}}
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+12:00
+</tool_response><|im_end|>
+<|im_start|>user
+<tool_response>
+extra
+</tool_response><|im_end|>
+<|im_start|>assistant
+mid
+<tool_call>
+{"name": "now", "arguments": {}}
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+12:01
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>
+r3
+</think>
+
+done<|im_end|>
+<|im_start|>user
+<tool_response>
+late
+</tool_response><|im_end|>
+<|im_start|>assistant

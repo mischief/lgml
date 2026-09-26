@@ -1,0 +1,6 @@
+<|turn>system
+<|think|>
+Dev rules.<turn|>
+<|turn>user
+Hi<turn|>
+<|turn>model

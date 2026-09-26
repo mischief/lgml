@@ -1,0 +1,28 @@
+<|im_start|>system
+# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{"type": "function", "function": {"name": "search", "description": "Search files.\nReturns paths.\t😀", "parameters": {"type": "object", "properties": {"q": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}, "score": {"type": "number", "minimum": 0.5}, "flags": {"type": "array", "items": {"type": "string"}}, "deep": {"type": "boolean", "default": false}, "opt": {"type": ["string", "null"], "default": null}}, "required": ["q"]}}}
+</tools>
+
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call><|im_end|>
+<|im_start|>user
+go<|im_end|>
+<|im_start|>assistant
+Calling now.
+<tool_call>
+{"name": "search", "arguments": {"q": "é \"quoted\" \\ back\ttab\nnl \u0001 😀", "limit": 5, "score": 0.75, "flags": ["a", "b"], "deep": true, "opt": null, "nested": {"z": [], "y": {}, "x": [1.5, -2.25, 1e-07, 3e+20]}}}
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+[]
+</tool_response><|im_end|>
+<|im_start|>user
+thanks<|im_end|>
+<|im_start|>assistant

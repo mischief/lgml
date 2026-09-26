@@ -1,0 +1,18 @@
+option('model', type : 'string', value : '',
+  description : 'gguf model for model tests; empty skips them')
+option('whisper', type : 'string', value : '',
+  description : 'Whisper model directory (safetensors) for whisper tests; empty skips them')
+option('whisper_wav', type : 'string', value : '',
+  description : 'speech WAV (jfk.wav) for whisper transcript tests')
+option('orpheus', type : 'string', value : '',
+  description : 'Orpheus model directory for TTS tests; empty skips them')
+option('qwen3tts', type : 'string', value : '',
+  description : 'Qwen3-TTS model directory for TTS tests; empty skips them')
+option('vibevoice', type : 'string', value : '',
+  description : 'VibeVoice model directory for TTS tests; empty skips them')
+option('vocab_dir', type : 'string', value : '',
+  description : 'llama.cpp vocab test directory (ggml-vocab-*.gguf, .inp, .out); empty skips them')
+option('tok_gemma4', type : 'string', value : '',
+  description : 'Gemma-4 gguf for tokenizer special token tests (reads metadata only); empty skips them')
+option('ggml', type : 'combo', choices : ['system', 'subproject'], value : 'system',
+  description : 'ggml from the system, or built from subprojects/ggml.wrap')

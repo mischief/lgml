@@ -1,0 +1,6 @@
+<|im_start|>system
+s1<|im_end|>
+<|im_start|>user
+part1
+part2<|im_end|>
+<|im_start|>assistant

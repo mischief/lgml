@@ -1,0 +1,14 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": "Hi"
+  },
+  {
+   "role": "assistant",
+   "content": "",
+   "reasoning_content": "Let me"
+  }
+ ],
+ "add_generation_prompt": false
+}

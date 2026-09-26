@@ -1,0 +1,1 @@
+{"messages":[{"role":"system","content":[{"type":"text","text":"sys1"},{"type":"text","text":"sys2"}]},{"role":"user","content":[{"type":"text","text":"part one"},{"type":"text","text":"part two"}]}]}

@@ -1,0 +1,69 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": "Q"
+  },
+  {
+   "role": "assistant",
+   "content": "",
+   "reasoning_content": "old thought",
+   "tool_calls": [
+    {
+     "id": "c1",
+     "type": "function",
+     "function": {
+      "name": "now",
+      "arguments": "{}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "c1",
+   "content": "noon"
+  },
+  {
+   "role": "assistant",
+   "content": "Noon."
+  },
+  {
+   "role": "user",
+   "content": "Again"
+  },
+  {
+   "role": "assistant",
+   "content": "",
+   "reasoning_content": "new thought",
+   "tool_calls": [
+    {
+     "id": "c2",
+     "type": "function",
+     "function": {
+      "name": "now",
+      "arguments": "{}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "c2",
+   "content": "one"
+  }
+ ],
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "now",
+    "description": "Current time.",
+    "parameters": {
+     "type": "object",
+     "properties": {}
+    }
+   }
+  }
+ ]
+}

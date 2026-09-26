@@ -1,0 +1,12 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": "q"
+  }
+ ],
+ "add_generation_prompt": true,
+ "chat_template_kwargs": {
+  "enable_thinking": false
+ }
+}

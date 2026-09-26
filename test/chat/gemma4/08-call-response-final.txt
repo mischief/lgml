@@ -1,0 +1,10 @@
+<|turn>system
+<|think|>
+<|tool>declaration:get_weather{description:<|"|>Get the weather for a city.<|"|>,parameters:{properties:{city:{description:<|"|>City name, e.g. "Zürich"<|"|>,type:<|"|>STRING<|"|>},unit:{enum:[<|"|>c<|"|>,<|"|>f<|"|>],type:<|"|>STRING<|"|>}},required:[<|"|>city<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><turn|>
+<|turn>user
+Weather in Paris?<turn|>
+<|turn>model
+<|tool_call>call:get_weather{city:<|"|>Paris<|"|>,unit:<|"|>c<|"|>}<tool_call|><|tool_response>response:get_weather{value:<|"|>{"temp": 21}<|"|>}<tool_response|>It is 21 C.<turn|>
+<|turn>user
+Thanks<turn|>
+<|turn>model

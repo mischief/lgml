@@ -1,0 +1,14 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": "q"
+  },
+  {
+   "role": "assistant",
+   "content": "The answer"
+  }
+ ],
+ "add_generation_prompt": false,
+ "continue_final_message": true
+}

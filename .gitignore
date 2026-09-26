@@ -1,0 +1,8 @@
+build*/
+TODO.md
+DESIGN.md
+lua_modules/
+etc/lgml.lua
+subprojects/*/
+!subprojects/packagefiles/
+subprojects/packagecache/

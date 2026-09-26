@@ -1,0 +1,8 @@
+<|turn>system
+<|think|>
+<turn|>
+<|turn>user
+Write a haiku<turn|>
+<|turn>model
+<|channel>thought
+<channel|>Autumn

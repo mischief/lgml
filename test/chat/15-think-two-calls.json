@@ -1,0 +1,83 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": "q"
+  },
+  {
+   "role": "assistant",
+   "reasoning_content": "\n\nplan\n",
+   "content": "\n",
+   "tool_calls": [
+    {
+     "id": "call_1",
+     "type": "function",
+     "function": {
+      "name": "now",
+      "arguments": {}
+     }
+    },
+    {
+     "id": "call_1",
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "arguments": {
+       "city": "Rome",
+       "unit": "f"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "content": "a"
+  },
+  {
+   "role": "tool",
+   "content": "b"
+  }
+ ],
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "now",
+    "description": "",
+    "parameters": {
+     "required": [],
+     "properties": {},
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "get_weather",
+    "description": "Get the weather for a city.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string",
+       "description": "City name, e.g. \"Zürich\""
+      },
+      "unit": {
+       "type": "string",
+       "enum": [
+        "c",
+        "f"
+       ]
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   }
+  }
+ ],
+ "add_generation_prompt": true
+}

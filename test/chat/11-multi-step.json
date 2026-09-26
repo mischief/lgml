@@ -1,0 +1,87 @@
+{
+ "messages": [
+  {
+   "role": "system",
+   "content": "s"
+  },
+  {
+   "role": "user",
+   "content": "old q"
+  },
+  {
+   "role": "assistant",
+   "reasoning_content": "old r",
+   "content": "old a"
+  },
+  {
+   "role": "user",
+   "content": "new q"
+  },
+  {
+   "role": "assistant",
+   "reasoning_content": "r1",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "call_1",
+     "type": "function",
+     "function": {
+      "name": "now",
+      "arguments": "{}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "content": "12:00"
+  },
+  {
+   "role": "user",
+   "content": "<tool_response>\nextra\n</tool_response>"
+  },
+  {
+   "role": "assistant",
+   "reasoning_content": "",
+   "content": "mid",
+   "tool_calls": [
+    {
+     "id": "call_1",
+     "type": "function",
+     "function": {
+      "name": "now",
+      "arguments": {}
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "content": "12:01"
+  },
+  {
+   "role": "assistant",
+   "reasoning_content": "r3",
+   "content": "done"
+  },
+  {
+   "role": "tool",
+   "content": "late"
+  }
+ ],
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "now",
+    "description": "",
+    "parameters": {
+     "required": [],
+     "properties": {},
+     "type": "object"
+    }
+   }
+  }
+ ],
+ "add_generation_prompt": true
+}

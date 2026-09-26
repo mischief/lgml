@@ -1,0 +1,15 @@
+{
+ "messages": [
+  {
+   "role": "system",
+   "content": "Sys."
+  },
+  {
+   "role": "user",
+   "content": "Hi"
+  }
+ ],
+ "chat_template_kwargs": {
+  "enable_thinking": false
+ }
+}

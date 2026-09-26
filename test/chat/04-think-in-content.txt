@@ -1,0 +1,17 @@
+<|im_start|>user
+q1<|im_end|>
+<|im_start|>assistant
+a1<|im_end|>
+<|im_start|>user
+q2<|im_end|>
+<|im_start|>assistant
+<think>
+r2
+</think>
+
+a2<|im_end|>
+<|im_start|>user
+<tool_response>
+t
+</tool_response><|im_end|>
+<|im_start|>assistant

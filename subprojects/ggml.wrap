@@ -1,0 +1,6 @@
+[wrap-git]
+url = https://github.com/ggml-org/ggml.git
+revision = 353b63b439f27ab2cc19dac97ab1681ba6d2d084
+depth = 1
+method = cmake
+diff_files = ggml-vulkan-release.patch

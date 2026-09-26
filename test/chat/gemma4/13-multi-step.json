@@ -1,0 +1,93 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": "Plan a trip"
+  },
+  {
+   "role": "assistant",
+   "content": "Checking.",
+   "tool_calls": [
+    {
+     "id": "w1",
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"Oslo\"}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "w1",
+   "content": "cold"
+  },
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "t1",
+     "type": "function",
+     "function": {
+      "name": "now",
+      "arguments": "{}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t1",
+   "content": "09:00"
+  },
+  {
+   "role": "assistant",
+   "content": "Oslo is cold at 09:00."
+  },
+  {
+   "role": "user",
+   "content": "OK"
+  }
+ ],
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "get_weather",
+    "description": "Get the weather for a city.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string",
+       "description": "City name, e.g. \"Zürich\""
+      },
+      "unit": {
+       "type": "string",
+       "enum": [
+        "c",
+        "f"
+       ]
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "now",
+    "description": "Current time.",
+    "parameters": {
+     "type": "object",
+     "properties": {}
+    }
+   }
+  }
+ ]
+}

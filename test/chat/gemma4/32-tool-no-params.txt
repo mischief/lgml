@@ -1,0 +1,6 @@
+<|turn>system
+<|think|>
+<|tool>declaration:ping{description:<|"|><|"|>}<tool|><|tool>declaration:odd{description:<|"|>Odd schema.<|"|>,parameters:{properties:{m:{items:{desc:{<|"|>x<|"|>:1},enum:[<|"|>p<|"|>,<|"|>q<|"|>],minItems:1,properties:{k:{type:<|"|>STRING<|"|>}},required:[<|"|>k<|"|>],type:<|"|>STRING<|"|>},type:<|"|>ARRAY<|"|>},o:{description:<|"|>no props<|"|>,nullable:true,properties:{extra:{type:<|"|><|"|>}},type:<|"|>OBJECT<|"|>},v:{enum:[<|"|>a<|"|>,1,true],type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><turn|>
+<|turn>user
+a<turn|>
+<|turn>model

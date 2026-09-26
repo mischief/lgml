@@ -1,0 +1,20 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": "a"
+  },
+  {
+   "role": "system",
+   "content": " new rules "
+  },
+  {
+   "role": "developer",
+   "content": "dev"
+  },
+  {
+   "role": "user",
+   "content": "b"
+  }
+ ]
+}

@@ -1,0 +1,6 @@
+<|turn>system
+<|think|>
+You are terse.<turn|>
+<|turn>user
+Hi there<turn|>
+<|turn>model

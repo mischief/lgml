@@ -1,0 +1,21 @@
+<|im_start|>system
+Use tools.
+
+# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{"type": "function", "function": {"name": "get_weather", "description": "Get the weather for a city.", "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "City name, e.g. \"Zürich\""}, "unit": {"type": "string", "enum": ["c", "f"]}}, "required": ["city"]}}}
+{"type": "function", "function": {"name": "search", "description": "Search files.\nReturns paths.\t😀", "parameters": {"type": "object", "properties": {"q": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}, "score": {"type": "number", "minimum": 0.5}, "flags": {"type": "array", "items": {"type": "string"}}, "deep": {"type": "boolean", "default": false}, "opt": {"type": ["string", "null"], "default": null}}, "required": ["q"]}}}
+{"type": "function", "function": {"name": "now", "description": "", "parameters": {"required": [], "properties": {}, "type": "object"}}}
+</tools>
+
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call><|im_end|>
+<|im_start|>user
+find foo<|im_end|>
+<|im_start|>assistant

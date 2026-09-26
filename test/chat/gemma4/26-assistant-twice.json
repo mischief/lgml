@@ -1,0 +1,20 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": "a"
+  },
+  {
+   "role": "assistant",
+   "content": "b"
+  },
+  {
+   "role": "assistant",
+   "content": "c"
+  },
+  {
+   "role": "user",
+   "content": "d"
+  }
+ ]
+}

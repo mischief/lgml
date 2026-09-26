@@ -1,0 +1,98 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": "go"
+  },
+  {
+   "role": "assistant",
+   "content": "Calling now.",
+   "tool_calls": [
+    {
+     "id": "call_1",
+     "type": "function",
+     "function": {
+      "name": "search",
+      "arguments": {
+       "q": "é \"quoted\" \\ back\ttab\nnl \u0001 😀",
+       "limit": 5,
+       "score": 0.75,
+       "flags": [
+        "a",
+        "b"
+       ],
+       "deep": true,
+       "opt": null,
+       "nested": {
+        "z": [],
+        "y": {},
+        "x": [
+         1.5,
+         -2.25,
+         1e-07,
+         3e+20
+        ]
+       }
+      }
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "content": "[]"
+  },
+  {
+   "role": "user",
+   "content": "thanks"
+  }
+ ],
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "search",
+    "description": "Search files.\nReturns paths.\t😀",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "q": {
+       "type": "string"
+      },
+      "limit": {
+       "type": "integer",
+       "minimum": 1,
+       "maximum": 100,
+       "default": 10
+      },
+      "score": {
+       "type": "number",
+       "minimum": 0.5
+      },
+      "flags": {
+       "type": "array",
+       "items": {
+        "type": "string"
+       }
+      },
+      "deep": {
+       "type": "boolean",
+       "default": false
+      },
+      "opt": {
+       "type": [
+        "string",
+        "null"
+       ],
+       "default": null
+      }
+     },
+     "required": [
+      "q"
+     ]
+    }
+   }
+  }
+ ],
+ "add_generation_prompt": true
+}

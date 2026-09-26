@@ -1,0 +1,8 @@
+<think>x</think><tool_call>
+<function=get_weather>
+<parameter=days>
+3 
+</parameter>
+</function>
+</tool_call><tool_call>
+<function=nope>

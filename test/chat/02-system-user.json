@@ -1,0 +1,13 @@
+{
+ "messages": [
+  {
+   "role": "system",
+   "content": "You are terse."
+  },
+  {
+   "role": "user",
+   "content": "Hi\nthere"
+  }
+ ],
+ "add_generation_prompt": true
+}

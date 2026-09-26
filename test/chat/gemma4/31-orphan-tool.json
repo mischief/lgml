@@ -1,0 +1,17 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": "a"
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "x",
+   "content": "lost"
+  },
+  {
+   "role": "user",
+   "content": "b"
+  }
+ ]
+}

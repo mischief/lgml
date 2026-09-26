@@ -1,0 +1,37 @@
+<|im_start|>system
+# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{"type": "function", "function": {"name": "now", "description": "", "parameters": {"required": [], "properties": {}, "type": "object"}}}
+{"type": "function", "function": {"name": "get_weather", "description": "Get the weather for a city.", "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "City name, e.g. \"Zürich\""}, "unit": {"type": "string", "enum": ["c", "f"]}}, "required": ["city"]}}}
+</tools>
+
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call><|im_end|>
+<|im_start|>user
+q<|im_end|>
+<|im_start|>assistant
+<think>
+plan
+</think>
+
+
+<tool_call>
+{"name": "now", "arguments": {}}
+</tool_call>
+<tool_call>
+{"name": "get_weather", "arguments": {"city": "Rome", "unit": "f"}}
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+a
+</tool_response>
+<tool_response>
+b
+</tool_response><|im_end|>
+<|im_start|>assistant

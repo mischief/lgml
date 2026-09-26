@@ -1,0 +1,23 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": "What time is it?"
+  }
+ ],
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "now",
+    "description": "",
+    "parameters": {
+     "required": [],
+     "properties": {},
+     "type": "object"
+    }
+   }
+  }
+ ],
+ "add_generation_prompt": true
+}

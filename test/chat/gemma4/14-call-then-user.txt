@@ -1,0 +1,9 @@
+<|turn>system
+<|think|>
+<|tool>declaration:now{description:<|"|>Current time.<|"|>,parameters:{type:<|"|>OBJECT<|"|>}}<tool|><turn|>
+<|turn>user
+Time?<turn|>
+<|turn>model
+<|tool_call>call:now{}<tool_call|><|tool_response><|turn>user
+Never mind<turn|>
+<|turn>model

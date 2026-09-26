@@ -1,0 +1,17 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": "Q"
+  },
+  {
+   "role": "assistant",
+   "content": "A",
+   "reasoning_content": "thinking"
+  },
+  {
+   "role": "user",
+   "content": "Q2"
+  }
+ ]
+}

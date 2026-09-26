@@ -1,0 +1,12 @@
+{
+ "messages": [
+  {
+   "role": "system",
+   "content": "  You are terse.\n"
+  },
+  {
+   "role": "user",
+   "content": "  Hi there \n\n"
+  }
+ ]
+}

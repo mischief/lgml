@@ -1,0 +1,193 @@
+--- A fake engine for tests.
+-- It streams a canned reply with reasoning, content and, when the
+-- request has tools, one tool call. Each piece waits a few milliseconds
+-- on a luv timer.
+-- @module lgml.server.fake_engine
+
+local sleep = require("lgml.server.stream").sleep
+
+local M = {}
+local F = {}
+F.__index = F
+
+--- Makes a fake engine.
+-- @tparam[opt] table opts the options:
+--
+-- - `delay`: milliseconds per piece (default 5)
+-- - `model`: model id (default `"fake"`)
+-- - `n_ctx`: context size (default 4096)
+-- - `total_slots`: slot count (default 2)
+-- - `on_cancel`: a function called with the engine on each cancel
+-- @treturn Fake the engine
+function M.new(opts)
+	opts = opts or {}
+	return setmetatable({
+		delay = opts.delay or 5, model = opts.model or "fake",
+		n_ctx = opts.n_ctx or 4096, total_slots = opts.total_slots or 2,
+		calls = 0, cancels = 0, on_cancel = opts.on_cancel,
+	}, F)
+end
+
+--- A fake engine. It implements `lgml.server.engine.Engine`.
+-- The field `calls` counts chat calls. The field `cancels` counts
+-- cancelled chats.
+-- @type Fake
+
+--- Lists the one model.
+-- @treturn {table,...} `{ { id = model, context_length = n_ctx } }`
+function F:models()
+	return { { id = self.model, context_length = self.n_ctx } }
+end
+
+--- Returns the properties: `{ n_ctx, total_slots }`.
+-- @treturn table the properties
+function F:props()
+	return { n_ctx = self.n_ctx, total_slots = self.total_slots }
+end
+
+local function last_user(req)
+	for i = #req.messages, 1, -1 do
+		local m = req.messages[i]
+		if m.role == "user" and type(m.content) == "string" then
+			return m.content
+		end
+	end
+	return ""
+end
+
+local function plan(req)
+	local p = {
+		{ "reasoning", "The user asks " }, { "reasoning", "about Paris." },
+		{ "content", "Let me " }, { "content", "check the weather." },
+	}
+	local tool = req.tools and req.tools[1]
+	local name = tool and tool["function"] and tool["function"].name
+	if name then
+		p[#p + 1] = { "tool", name }
+		p[#p + 1] = { "args", '{"city":' }
+		p[#p + 1] = { "args", ' "Paris"}' }
+	end
+	return p
+end
+
+local function prompt_tokens(req)
+	local n = 0
+	for _, m in ipairs(req.messages) do
+		n = n + #(type(m.content) == "string" and m.content or "") // 4 + 4
+	end
+	return n
+end
+
+local function emit(sink, piece, index)
+	local kind, text = piece[1], piece[2]
+	if kind == "reasoning" then
+		return sink:reasoning(text)
+	elseif kind == "content" then
+		return sink:content(text)
+	elseif kind == "tool" then
+		return sink:tool_call(text)
+	end
+	return sink:tool_arguments(index, text)
+end
+
+--- Counts a cancel and calls `on_cancel`.
+-- @treturn nil
+-- @treturn string `"cancelled"`
+function F:cancel()
+	self.cancels = self.cancels + 1
+	if self.on_cancel then
+		self.on_cancel(self)
+	end
+	return nil, "cancelled"
+end
+
+--- Streams the canned reply.
+-- The user message `"fail"` makes the call fail before any output. The
+-- reply counts one token per piece and stops at `max_tokens`.
+-- @tparam table req the chat request
+-- @tparam lgml.server.engine.Sink sink the reply
+-- @treturn[1] boolean true
+-- @treturn[2] nil
+-- @treturn[2] string an error message
+-- @treturn[2] int an HTTP status
+function F:chat(req, sink)
+	self.calls = self.calls + 1
+	if last_user(req) == "fail" then
+		return nil, "fake failure", 500
+	end
+	local max = req.max_completion_tokens or req.max_tokens
+	local usage = { prompt_tokens = prompt_tokens(req),
+	    completion_tokens = 0, cached_tokens = 0 }
+	local index
+	for _, piece in ipairs(plan(req)) do
+		sleep(self.delay)
+		if sink:cancelled() then
+			return self:cancel()
+		end
+		if max and usage.completion_tokens >= max then
+			sink:finish("length", usage)
+			return true
+		end
+		local r = emit(sink, piece, index)
+		if not r then
+			return self:cancel()
+		end
+		if piece[1] == "tool" then
+			index = r
+		end
+		usage.completion_tokens = usage.completion_tokens + 1
+	end
+	sink:finish("stop", usage, {
+		prompt_n = usage.prompt_tokens, predicted_n = usage.completion_tokens,
+	})
+	return true
+end
+
+--- Returns the text `"fake transcript of N bytes"`.
+-- Audio `"fail"` gives a 400 error. It waits one delay, so ctl can
+-- cancel; a cancel gives status 499.
+-- @tparam table req the request
+-- @tparam string audio the file bytes
+-- @tparam[opt] lgml.server.engine.Control ctl the cancel control
+-- @treturn[1] table the transcription
+-- @treturn[2] nil
+-- @treturn[2] string an error message
+-- @treturn[2] int an HTTP status
+function F:transcribe(req, audio, ctl)
+	sleep(self.delay)
+	if ctl and ctl.cancelled and ctl.cancelled() then
+		return nil, "cancelled", 499
+	end
+	if audio == "fail" then
+		return nil, "audio: not a RIFF WAVE file", 400
+	end
+	local text = ("fake transcript of %d bytes"):format(#audio)
+	return {
+		text = text, language = req.language or "en",
+		language_name = "english", duration = 1.5,
+		segments = { { id = 0, start = 0, ["end"] = 1.5, text = text } },
+	}
+end
+
+--- Returns a WAV of silence, 10 ms per input byte, at 24 kHz s16 mono.
+-- It waits one delay, so ctl can cancel; a cancel gives status 499.
+-- @tparam table req the request
+-- @tparam[opt] lgml.server.engine.Control ctl the cancel control
+-- @treturn[1] table `{ wav, sample_rate = 24000 }`
+-- @treturn[2] nil
+-- @treturn[2] string an error message
+-- @treturn[2] int an HTTP status
+function F:speak(req, ctl)
+	sleep(self.delay)
+	if ctl and ctl.cancelled and ctl.cancelled() then
+		return nil, "cancelled", 499
+	end
+	local n = #req.input * 240
+	local data = string.rep("\0\0", n)
+	local wav = "RIFF" .. string.pack("<I4", 36 + #data) .. "WAVE" .. "fmt " ..
+	    string.pack("<I4I2I2I4I4I2I2", 16, 1, 1, 24000, 48000, 2, 16) ..
+	    "data" .. string.pack("<I4", #data) .. data
+	return { wav = wav, sample_rate = 24000 }
+end
+
+return M

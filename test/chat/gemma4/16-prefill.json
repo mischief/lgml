@@ -1,0 +1,14 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": "Write a haiku"
+  },
+  {
+   "role": "assistant",
+   "content": "Autumn"
+  }
+ ],
+ "continue_final_message": true,
+ "add_generation_prompt": false
+}

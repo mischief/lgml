@@ -1,0 +1,13 @@
+<|im_start|>system
+sys<|im_end|>
+<|im_start|>user
+q1<|im_end|>
+<|im_start|>assistant
+a1<|im_end|>
+<|im_start|>user
+q2<|im_end|>
+<|im_start|>assistant
+a2<|im_end|>
+<|im_start|>user
+q3<|im_end|>
+<|im_start|>assistant

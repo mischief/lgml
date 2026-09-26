@@ -1,0 +1,12 @@
+{
+ "messages": [
+  {
+   "role": "developer",
+   "content": "Dev rules."
+  },
+  {
+   "role": "user",
+   "content": "Hi"
+  }
+ ]
+}

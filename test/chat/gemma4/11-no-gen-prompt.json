@@ -1,0 +1,13 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": "Hi"
+  },
+  {
+   "role": "assistant",
+   "content": "Hello."
+  }
+ ],
+ "add_generation_prompt": false
+}

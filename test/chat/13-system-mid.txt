@@ -1,0 +1,8 @@
+<|im_start|>system
+first<|im_end|>
+<|im_start|>user
+q<|im_end|>
+<|im_start|>system
+second<|im_end|>
+<|im_start|>user
+q2<|im_end|>

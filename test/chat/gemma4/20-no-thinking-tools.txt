@@ -1,0 +1,5 @@
+<|turn>system
+<|tool>declaration:get_weather{description:<|"|>Get the weather for a city.<|"|>,parameters:{properties:{city:{description:<|"|>City name, e.g. "Zürich"<|"|>,type:<|"|>STRING<|"|>},unit:{enum:[<|"|>c<|"|>,<|"|>f<|"|>],type:<|"|>STRING<|"|>}},required:[<|"|>city<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><turn|>
+<|turn>user
+Weather?<turn|>
+<|turn>model

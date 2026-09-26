@@ -1,0 +1,182 @@
+#!/usr/bin/env lua5.4
+-- lgml-server: OpenAI-shaped HTTP server.
+
+local root = ((arg and arg[0] or ""):match("^(.*)/[^/]*$") or ".") .. "/.."
+package.path = root .. "/lua/?.lua;" .. root .. "/lua/?/init.lua;" ..
+    root .. "/lua_modules/share/lua/5.4/?.lua;" .. package.path
+package.cpath = root .. "/" .. (os.getenv("LGML_BUILD") or "build") .. "/?.so;" .. root .. "/lua_modules/lib/lua/5.4/?.so;" ..
+    package.cpath
+
+local uv = require("luv")
+local getopt = require("lgml.getopt")
+local server = require("lgml.server.httpd")
+local openai = require("lgml.server.openai")
+
+local USAGE = [[
+usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b backend]
+                   [-c n_ctx] [--no-fa] [--ctk type] [--ctv type] [--alias id]
+                   [--inproc] [--stt]
+  -l, --listen addr   address to listen on (default 127.0.0.1)
+  -p, --port port     port to listen on (default 8080)
+  -C, --config file   Lua file returning { listen, port, models = { spec, ... } };
+                      spec: { model = path, id, backend, ctx, flash_attn, stt,
+                      cache_type_k, cache_type_v,
+                      engine = Lua module with new(opts), such as a TTS engine }
+  -m, --model file    gguf model file, or a Whisper model directory
+  -b, --backend name  ggml backend, for example Vulkan0 or CPU (default best)
+  -c, --ctx n         context size in tokens (default: the model's)
+      --no-fa         use soft_max attention, not flash attention
+      --ctk type      K cache type: f16, q8_0, q4_0, ... (default q8_0,
+                      or f16 with --no-fa); quantized types need flash
+                      attention
+      --ctv type      V cache type, as --ctk
+      --alias id      model id for /v1/models
+      --inproc        run the model in this process, not in a worker
+      --stt           the model is speech-to-text (found from config.json
+                      when not given)
+      --fake          serve the fake test engine
+  -h, --help          show this help
+]]
+
+local function die(msg)
+	io.stderr:write("lgml-server: ", msg, "\n")
+	os.exit(1)
+end
+
+-- One engine from a model spec: { model, id, backend, ctx, flash_attn,
+-- stt, inproc }.
+local function model_engine(spec)
+	local n_ctx = spec.ctx and tonumber(spec.ctx)
+	if spec.ctx and not n_ctx then
+		die("bad context size " .. tostring(spec.ctx))
+	end
+	local stt = not spec.engine and (spec.stt or require("lgml.detect").is_whisper(spec.model))
+	if spec.inproc and spec.engine then
+		return require(spec.engine).new({
+			model = spec.model, backend = spec.backend, id = spec.id, n_ctx = n_ctx,
+		})
+	elseif spec.inproc and stt then
+		return require("lgml.stt_engine").new({
+			model = spec.model, backend = spec.backend, id = spec.id,
+		})
+	elseif spec.inproc then
+		return require("lgml.engine").new({
+			model = spec.model, backend = spec.backend, n_ctx = n_ctx,
+			flash_attn = spec.flash_attn ~= false, id = spec.id,
+			cache_type_k = spec.cache_type_k, cache_type_v = spec.cache_type_v,
+		})
+	end
+	local wargs = { "-m", spec.model }
+	for flag, v in pairs({
+		["-b"] = spec.backend, ["-c"] = spec.ctx, ["--alias"] = spec.id,
+		["--ctk"] = spec.cache_type_k, ["--ctv"] = spec.cache_type_v,
+	}) do
+		table.move({ flag, tostring(v) }, 1, 2, #wargs + 1, wargs)
+	end
+	if spec.flash_attn == false then
+		wargs[#wargs + 1] = "--no-fa"
+	end
+	if stt then
+		wargs[#wargs + 1] = "--stt"
+	end
+	if spec.engine then
+		table.move({ "--engine", spec.engine }, 1, 2, #wargs + 1, wargs)
+	end
+	return require("lgml.server.remote_engine").new({
+		lua = arg[-1] or "lua5.4", script = root .. "/bin/lgml-worker", args = wargs,
+	})
+end
+
+-- A config file is Lua that returns { models = { spec, ... } }.
+local function config_engine(path, inproc)
+	local chunk, err = loadfile(path, "t", {})
+	if not chunk then
+		die(err)
+	end
+	local ok, cfg = pcall(chunk)
+	if not ok or type(cfg) ~= "table" or type(cfg.models) ~= "table" or #cfg.models == 0 then
+		die(path .. ": must return { models = { ... } }")
+	end
+	local engines = {}
+	for i, spec in ipairs(cfg.models) do
+		if type(spec.model) ~= "string" then
+			die(("%s: models[%d].model must be a path"):format(path, i))
+		end
+		spec.inproc = spec.inproc or inproc
+		engines[i] = model_engine(spec)
+	end
+	return require("lgml.server.router").new(engines), cfg
+end
+
+local function make_engine(opts)
+	if opts.fake then
+		return require("lgml.server.fake_engine").new({ delay = 30 })
+	end
+	if opts.C then
+		return config_engine(opts.C, opts.inproc)
+	end
+	if opts.m then
+		return model_engine({
+			model = opts.m, id = opts.alias, backend = opts.b, ctx = opts.c,
+			flash_attn = not opts["no-fa"], stt = opts.stt, inproc = opts.inproc,
+			cache_type_k = opts.ctk, cache_type_v = opts.ctv,
+		})
+	end
+	die("no engine: give -m model, -C config or --fake")
+end
+
+local function main(args)
+	local opts, rest = getopt.parse(args, "hl:p:m:b:c:C:", {
+		config = "C", help = "h", listen = "l", port = "p", model = "m", backend = "b",
+		ctx = "c", fake = false, ["no-fa"] = false, ["alias="] = false,
+		inproc = false, stt = false, ["ctk="] = false, ["ctv="] = false,
+	})
+	if not opts then
+		io.stderr:write("lgml-server: ", rest, "\n", USAGE)
+		os.exit(2)
+	end
+	if opts.h then
+		io.stdout:write(USAGE)
+		return
+	end
+	if #rest > 0 then
+		io.stderr:write(USAGE)
+		os.exit(2)
+	end
+	local engine, cfg = make_engine(opts)
+	cfg = cfg or {}
+	local port = math.tointeger(tonumber(opts.p or cfg.port or 8080))
+	if not port or port < 0 or port > 65535 then
+		die("bad port " .. tostring(opts.p or cfg.port))
+	end
+	local srv = server.new()
+	openai.install(srv, engine)
+	local bound, err = srv:listen(opts.l or cfg.listen or "127.0.0.1", port)
+	if not bound then
+		if engine.stop then
+			engine:stop()
+		end
+		die("listen: " .. tostring(err))
+	end
+	io.stderr:write(("lgml-server: listening on %s:%d\n"):format(srv.host,
+	    bound))
+	local sigs
+	local function stop()
+		if engine.stop then
+			engine:stop()
+		end
+		srv:close()
+		for _, s in ipairs(sigs) do
+			s:close()
+		end
+		uv.stop()
+	end
+	sigs = {}
+	for i, name in ipairs({ "sigint", "sigterm" }) do
+		sigs[i] = uv.new_signal()
+		sigs[i]:start(name, stop)
+	end
+	uv.run()
+end
+
+main(arg)

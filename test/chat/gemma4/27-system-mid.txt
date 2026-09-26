@@ -1,0 +1,12 @@
+<|turn>system
+<|think|>
+<turn|>
+<|turn>user
+a<turn|>
+<|turn>system
+new rules<turn|>
+<|turn>system
+dev<turn|>
+<|turn>user
+b<turn|>
+<|turn>model

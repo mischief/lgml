@@ -1,0 +1,20 @@
+<|im_start|>user
+q1<|im_end|>
+<|im_start|>assistant
+<think>
+old plan
+</think>
+
+answer one<|im_end|>
+<|im_start|>user
+q2<|im_end|>
+<|im_start|>assistant
+<think>
+a
+</think>
+
+last<|im_end|>
+<|im_start|>user
+q3<|im_end|>
+<|im_start|>assistant
+<think>

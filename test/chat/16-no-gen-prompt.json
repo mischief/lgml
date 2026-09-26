@@ -1,0 +1,17 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": "q"
+  },
+  {
+   "role": "assistant",
+   "content": "a"
+  },
+  {
+   "role": "user",
+   "content": "</think> in user"
+  }
+ ],
+ "add_generation_prompt": false
+}

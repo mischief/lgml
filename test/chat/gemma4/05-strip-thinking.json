@@ -1,0 +1,16 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": "Q1"
+  },
+  {
+   "role": "assistant",
+   "content": "<|channel>thought\nlet me think<channel|>  The answer.  "
+  },
+  {
+   "role": "user",
+   "content": "Q2"
+  }
+ ]
+}

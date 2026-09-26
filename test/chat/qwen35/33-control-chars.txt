@@ -1,0 +1,52 @@
+<|im_start|>system
+# Tools
+
+You have access to the following functions:
+
+<tools>
+{"type": "function", "function": {"name": "f", "description": "ctl \\u0001 and \\\\u0041 text", "parameters": {"type": "object", "properties": {"s": {"type": "string"}}}}}
+</tools>
+
+If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+</IMPORTANT><|im_end|>
+<|im_start|>user
+a\u0001b \\u0041<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+<tool_call>
+<function=f>
+<parameter=s>
+x\u0002\\u0042
+</parameter>
+<parameter=o>
+{"k": "\\u0003\\\\"}
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+ok<|im_end|>
+<|im_start|>assistant
+<think>

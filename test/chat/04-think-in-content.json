@@ -1,0 +1,25 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": "q1"
+  },
+  {
+   "role": "assistant",
+   "content": "<think>\nold thoughts\n</think>\n\na1"
+  },
+  {
+   "role": "user",
+   "content": "q2"
+  },
+  {
+   "role": "assistant",
+   "content": "pre<think>\n\nr2\n\n</think>\n\n\na2"
+  },
+  {
+   "role": "tool",
+   "content": "t"
+  }
+ ],
+ "add_generation_prompt": true
+}

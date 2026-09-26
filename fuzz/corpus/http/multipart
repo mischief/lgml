@@ -1,0 +1,14 @@
+POST /v1/audio/transcriptions HTTP/1.1
+Content-Type: multipart/form-data; boundary="XX"
+Content-Length: 173
+
+--XX
+Content-Disposition: form-data; name="model"
+
+whisper
+--XX
+Content-Disposition: form-data; name="file"; filename="a.wav"
+Content-Type: audio/wav
+
+RIFF
+--XX--

@@ -1,0 +1,10 @@
+<|im_start|>user
+q<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+a
+
+b

@@ -1,0 +1,10 @@
+<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.
+
+sys1
+sys2<|im_end|>
+<|im_start|>user
+part one
+part two<|im_end|>
+<|im_start|>assistant
+<think>

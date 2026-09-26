@@ -1,0 +1,6 @@
+<think>
+plan</think>
+
+text <tool_call>
+{"name": "f", "arguments": {"a": 1}}
+</tool_call>

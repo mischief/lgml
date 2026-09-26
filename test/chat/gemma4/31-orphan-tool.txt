@@ -1,0 +1,8 @@
+<|turn>system
+<|think|>
+<turn|>
+<|turn>user
+a<turn|>
+<|turn>user
+b<turn|>
+<|turn>model
