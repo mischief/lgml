@@ -738,12 +738,14 @@ local function speech(eng, req, res)
 	end
 	local wav = r.wav or r.audio:wav(1, "s16")
 	local pcm = wav_data(wav)
-	-- 16-bit mono; the rate is in the canonical WAV header.
+	-- 16-bit samples; the rate and channels are in the canonical WAV header.
 	local rate = #wav >= 28 and string.unpack("<I4", wav, 25) or 0
+	local channels = #wav >= 24 and string.unpack("<I2", wav, 23) or 0
 	local ms = (uv.hrtime() - t0) / 1e6
 	local fields = { elapsed_ms = ms }
-	if rate > 0 then
-		fields.audio_seconds = #pcm / 2 / rate
+	if rate > 0 and channels > 0 then
+		fields.sample_rate, fields.channels = rate, channels
+		fields.audio_seconds = #pcm / 2 / channels / rate
 		log.note("audio_s", fields.audio_seconds)
 		fields.rtf = ms / 1000 / math.max(fields.audio_seconds, 1e-9)
 		metrics.add("spoken_seconds_total", "audio seconds of speech made", model, fields.audio_seconds)

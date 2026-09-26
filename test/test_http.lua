@@ -519,6 +519,20 @@ local function test_transcribe(port, bare_port)
 	    "engine without transcribe gives 404")
 end
 
+-- Speech replies give the sample rate and channel count in headers.
+local function test_speech(port)
+	local r = roundtrip(port, request("POST", "/v1/audio/speech", json.encode({ input = "hi" })))
+	ok(r.status == 200 and r.headers["content-type"] == "audio/wav" and r.body:sub(1, 4) == "RIFF" and
+	    r.headers["x-lgml-sample-rate"] == "24000" and r.headers["x-lgml-channels"] == "1",
+	    "wav speech has sample rate and channel headers")
+	r = roundtrip(port, request("POST", "/v1/audio/speech", json.encode({ input = "hi", response_format = "pcm" })))
+	ok(r.status == 200 and r.headers["content-type"] == "audio/pcm" and #r.body == 2 * 480 and
+	    r.headers["x-lgml-sample-rate"] == "24000" and r.headers["x-lgml-channels"] == "1" and
+	    r.headers["x-lgml-audio-seconds"] == "0.020", "pcm speech has sample rate and channel headers")
+	r = roundtrip(port, request("POST", "/v1/audio/speech", json.encode({ input = "hi", response_format = "mp3" })))
+	ok(r.status == 400 and body_json(r).error.param == "response_format", "speech rejects mp3")
+end
+
 local PNG_SIG = "\137PNG\r\n\26\n"
 
 local function gen_json(port, body)
@@ -719,6 +733,7 @@ local function main()
 	local bare_port = assert(srv2:listen("127.0.0.1", 0))
 	test_transcribe(port, bare_port)
 	test_images(port, bare_port)
+	test_speech(port)
 	test_served_model(eng)
 	test_cors(eng, port)
 	test_logging(port)

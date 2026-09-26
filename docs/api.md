@@ -142,7 +142,7 @@ lgml extensions.
 | --- | --- |
 | chat, not streamed | the llama.cpp timings of the reply: `x-lgml-cache-n` (prompt tokens reused from the KV cache), `x-lgml-restored-n` (prompt tokens restored from the host prompt store), `x-lgml-prompt-n` (prompt tokens computed), `x-lgml-prompt-ms`, `x-lgml-prompt-per-token-ms`, `x-lgml-prompt-per-second`, `x-lgml-predicted-n` (tokens made), `x-lgml-predicted-ms`, `x-lgml-predicted-per-token-ms`, `x-lgml-predicted-per-second`. An engine can give fewer. |
 | images | `x-lgml-elapsed-ms` (wall time), `x-lgml-images` (count), `x-lgml-steps` (sampling steps of all images), `x-lgml-seed` (seed of the first image), `x-lgml-sample-ms` (sampling time), `x-lgml-ms-per-step` |
-| speech | `x-lgml-elapsed-ms`, `x-lgml-audio-seconds` (length of the audio), `x-lgml-rtf` (wall time over audio time) |
+| speech | `x-lgml-elapsed-ms`, `x-lgml-audio-seconds` (length of the audio), `x-lgml-rtf` (wall time over audio time), `x-lgml-sample-rate` (samples per second), `x-lgml-channels` (1) |
 | transcriptions | `x-lgml-elapsed-ms`, `x-lgml-audio-seconds` (length of the input), `x-lgml-rtf` |
 | systemone | `x-lgml-elapsed-ms`, and `x-jevify-latency-ms` (the same time with 1 decimal, as Jevify sends) |
 
@@ -381,7 +381,8 @@ capability `speech` serves it, such as `lgml.tts.orpheus`,
 
 The reply is 16-bit mono audio. `wav` is a WAV file (`audio/wav`).
 `pcm` is the raw little-endian samples (`audio/pcm`) at the rate of
-the model; use `wav` to learn the rate.
+the model. Both replies have the headers `x-lgml-sample-rate` (for
+example 24000) and `x-lgml-channels` (1).
 
 ```sh
 curl -s localhost:8080/v1/audio/speech -d '{"input": "Hello there.", "voice": "tara"}' -o hello.wav

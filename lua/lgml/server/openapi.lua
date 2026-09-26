@@ -391,6 +391,7 @@ local function with(responses, codes)
 end
 
 local AUDIO_HEADERS = { "elapsed-ms", "audio-seconds", "rtf" }
+local SPEECH_HEADERS = { "elapsed-ms", "audio-seconds", "rtf", "sample-rate", "channels" }
 local CHAT_HEADERS = { "cache-n", "restored-n", "prompt-n", "prompt-ms", "predicted-n",
 	"predicted-ms", "predicted-per-second" }
 local IMAGE_HEADERS = { "elapsed-ms", "images", "steps", "seed", "sample-ms", "ms-per-step" }
@@ -433,7 +434,7 @@ local function operations()
 					["audio/wav"] = { schema = { type = "string", contentMediaType = "audio/wav" } },
 					["audio/pcm"] = { schema = { type = "string", contentMediaType = "audio/pcm" } },
 				},
-				headers = header_set(AUDIO_HEADERS),
+				headers = header_set(SPEECH_HEADERS),
 			} }, E),
 		} },
 		["/audio/transcriptions"] = { POST = {

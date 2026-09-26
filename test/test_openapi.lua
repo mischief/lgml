@@ -188,9 +188,15 @@ local function test_new_fields()
 	    "new chat field appears with its type")
 end
 
+local function test_headers()
+	local h = doc.paths["/v1/audio/speech"].post.responses["200"].headers
+	ok(h["x-lgml-sample-rate"] and h["x-lgml-channels"], "speech lists the sample rate and channel headers")
+end
+
 test_routes()
 test_structure()
 test_fields()
 test_new_fields()
+test_headers()
 print("1.." .. n)
 os.exit(failed == 0 and 0 or 1)
