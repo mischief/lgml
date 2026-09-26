@@ -637,6 +637,7 @@ local function check_body(b)
 	local req = {
 		model = b.model,
 		state = type(state) == "string" and state or M.dumps(state, 2),
+		state_json = type(state) ~= "string" and M.dumps(state) or nil,
 		questions = json.array(),
 		images = #images > 0 and images or nil,
 	}
@@ -673,6 +674,8 @@ end
 --
 -- - `model`: the model name, or nil
 -- - `state`: the state text; a JSON state is its `json.dumps(indent=2)`
+-- - `state_json`: a JSON state as one line (`json.dumps`); nil for a
+--   string state
 -- - `questions`: an array of `{ id, type, instructions }`, in request
 --   order. A choice has `options`, an array of `{ key, text }`. A score
 --   has `levels`, an array of texts. A noul can have `yes` and `no`,

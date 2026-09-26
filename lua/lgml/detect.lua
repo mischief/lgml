@@ -86,6 +86,7 @@ local ENGINES = {
 	["lgml.stt_engine"] = { transcription = true },
 	["lgml.image.engine"] = { image_generation = true },
 	["lgml.embed_engine"] = { embedding = true },
+	["lgml.laya_engine"] = { decide = true },
 	["lgml.tts.orpheus"] = { speech = true },
 	["lgml.tts.qwen3tts"] = { speech = true },
 	["lgml.tts.vibevoice"] = { speech = true },
