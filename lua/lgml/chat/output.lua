@@ -8,6 +8,10 @@
 -- content that can be the start of a stop string. When the content
 -- holds a stop string, the output sends the text before it and ends
 -- the reply; the stop string does not go out.
+--
+-- A token can carry a logprobs entry (see `lgml.server.engine.Sink`).
+-- The output keeps the entries of content tokens, and sends them with
+-- the next content text that goes out.
 -- @module lgml.chat.output
 local M = {}
 
@@ -35,7 +39,7 @@ function M.new(sink, parser, opts)
 	end
 	return setmetatable({
 		sink = sink, parser = parser, map = {},
-		reasoning_tokens = 0, stops = stops, hold = "",
+		reasoning_tokens = 0, stops = stops, hold = "", lp = {},
 	}, O)
 end
 
@@ -58,10 +62,21 @@ local function partial(s, stops)
 	return k
 end
 
+-- Sends content text with the kept logprobs entries. Empty text
+-- keeps them, unless all is true.
+function O:send(text, all)
+	local lp = self.lp
+	if text == "" and not (all and #lp > 0) then
+		return true
+	end
+	self.lp = {}
+	return self.sink:content(text, #lp > 0 and lp or nil)
+end
+
 -- Sends content through the stop strings. Returns true, "stop" or nil.
 function O:content(text)
 	if #self.stops == 0 then
-		return self.sink:content(text)
+		return self:send(text)
 	end
 	local s = self.hold .. text
 	local cut
@@ -73,18 +88,18 @@ function O:content(text)
 	end
 	if cut then
 		self.hold = ""
-		return self.sink:content(s:sub(1, cut - 1)) and "stop" or nil
+		return self:send(s:sub(1, cut - 1), true) and "stop" or nil
 	end
 	local k = partial(s, self.stops)
 	self.hold = s:sub(#s - k + 1)
-	return self.sink:content(s:sub(1, #s - k))
+	return self:send(s:sub(1, #s - k))
 end
 
 -- Sends the held content. Returns true, or nil when the client is gone.
-function O:flush()
+function O:flush(all)
 	local h = self.hold
 	self.hold = ""
-	return self.sink:content(h)
+	return self:send(h, all)
 end
 
 -- Sends one event. Returns true, "stop", or nil when the client is gone.
@@ -123,16 +138,29 @@ function O:deliver(events)
 end
 
 --- Feeds the text of one token.
+-- A token counts as content when the parser reads content before and
+-- after it; then lp, when given, goes out with the content.
 -- @tparam string text the text
+-- @tparam[opt] table lp the logprobs entry of the token
 -- @treturn ?boolean|string true, `"stop"` or nil, as `deliver`
-function O:token(text)
+function O:token(text, lp)
 	local p = self.parser
 	local before = p.state
 	local events = p:feed(text)
 	if before == "reasoning" or p.state == "reasoning" then
 		self.reasoning_tokens = self.reasoning_tokens + 1
 	end
+	if lp and CONTENT[before] and CONTENT[p.state] then
+		self.lp[#self.lp + 1] = lp
+	end
 	return self:deliver(events)
+end
+
+--- Keeps the logprobs entry of a content token that the caller sends
+-- with `deliver`.
+-- @tparam table lp the entry
+function O:logprob(lp)
+	self.lp[#self.lp + 1] = lp
 end
 
 --- True when the parser reads content, not reasoning or a tool call.
@@ -155,8 +183,8 @@ function O:finish(rest)
 		end
 	end
 	local r = self:deliver(events)
-	if r == true and self.hold ~= "" then
-		return self:flush()
+	if r == true and (self.hold ~= "" or #self.lp > 0) then
+		return self:flush(true)
 	end
 	return r
 end

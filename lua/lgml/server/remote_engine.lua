@@ -325,7 +325,7 @@ local function forward(sink, map, v)
 	if k == "reasoning" then
 		return sink:reasoning(v.text)
 	elseif k == "content" then
-		return sink:content(v.text)
+		return sink:content(v.text, v.lp)
 	elseif k == "tool_call" then
 		local idx = sink:tool_call(v.name, v.id)
 		map[v.index] = idx

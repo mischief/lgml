@@ -444,7 +444,8 @@ end
 -- It renders the chat template, reuses the cached prefix, prefills and
 -- samples. It stops at an end token, at the token limit or on cancel.
 -- The request can set sampler settings, `seed`, `max_tokens`,
--- `max_completion_tokens`, `stop` (see `lgml.chat.output`), `tools`,
+-- `max_completion_tokens`, `stop` (see `lgml.chat.output`), `logprobs`
+-- and `top_logprobs` (from the C `sampler:logprobs`), `logit_bias`, `tools`,
 -- `reasoning_effort = "none"` and
 -- `chat_template_kwargs` `enable_thinking`, `reasoning_effort` and
 -- `preserve_thinking`. `grammar` (GBNF) or `response_format` (see
@@ -616,6 +617,41 @@ function E:shown_prompt(text, images)
 	end))
 end
 
+-- The sampler form of a request logit_bias: token ids as integers.
+-- Returns nil and an error message for an id that is not in the vocab.
+function E:logit_bias(lb)
+	if lb == nil then
+		return nil
+	end
+	local out, nv = {}, self.tk:n_vocab()
+	for k, v in pairs(lb) do
+		local id = math.tointeger(tonumber(k))
+		if not id or id < 0 or id >= nv then
+			return nil, ("logit_bias: %s is not a token id of the model (0 to %d)"):format(tostring(k), nv - 1)
+		end
+		out[id] = v
+	end
+	return out
+end
+
+-- A logprobs entry of token id with log probability v.
+local function lp_entry(tk, id, v)
+	local piece = tk:token(id)
+	return { token = tokenizer.clean(piece), logprob = math.max(v, -9999), bytes = { piece:byte(1, -1) } }
+end
+
+-- The logprobs entry of the token id that smp just sampled, with the k
+-- most likely tokens.
+function E:logprobs(smp, id, k)
+	local v, top = smp:logprobs(id, k)
+	local e = lp_entry(self.tk, id, v)
+	e.top_logprobs = {}
+	for i, t in ipairs(top) do
+		e.top_logprobs[i] = lp_entry(self.tk, t[1], t[2])
+	end
+	return e
+end
+
 -- The first lines of a grammar, for logs.
 local function first_lines(text, n)
 	local out = {}
@@ -678,6 +714,11 @@ function E:run_prompt(req, sink)
 	if not gopts then
 		return nil, gerr, 400
 	end
+	gopts.logit_bias, gerr = self:logit_bias(req.logit_bias)
+	if gerr then
+		return nil, gerr, 400
+	end
+	local want_lp, top_lp = req.logprobs == true, math.tointeger(req.top_logprobs) or 0
 	local good, smp = pcall(sampler_opts, req, think, gopts)
 	if not good then
 		return nil, tostring(smp):gsub("^.-grammar: ", "grammar: "), 400
@@ -719,7 +760,7 @@ function E:run_prompt(req, sink)
 		if tracing then
 			L:trace("token", "n", n, "id", id, "text", piece)
 		end
-		local r = out:token(piece)
+		local r = out:token(piece, want_lp and self:logprobs(smp, id, top_lp) or nil)
 		if r == "stop" then
 			reason, stopped = "stop", true
 			break

@@ -30,7 +30,14 @@ local function recorder(stop_after)
 		return true
 	end
 	function r.reasoning(_, t) r.text[#r.text + 1] = "R:" .. t return count() end
-	function r.content(_, t) r.text[#r.text + 1] = "C:" .. t return count() end
+	function r.content(_, t, lp)
+		r.text[#r.text + 1] = "C:" .. t
+		for _, e in ipairs(lp or {}) do
+			r.lp = r.lp or {}
+			r.lp[#r.lp + 1] = e
+		end
+		return count()
+	end
 	function r.tool_call(_, name)
 		r.calls[#r.calls + 1] = name
 		if not count() then return nil end
@@ -68,6 +75,16 @@ in_co(function()
 	    "deltas arrive in order")
 	ok(r.calls[1] == "get_weather" and r.args[0] == '{"city": "Paris"}', "tool call forwarded")
 	ok(r.reason == "stop" and r.usage.completion_tokens == 7, "finish forwarded")
+end)
+
+in_co(function()
+	local r = recorder()
+	local res = eng:chat({ messages = { { role = "user", content = "hi" } }, logprobs = true,
+		top_logprobs = 1, stop = { "weather" } }, r)
+	ok(res == true and r.lp and #r.lp == 2 and r.lp[2].token == "check the weather." and
+	    r.lp[2].top_logprobs[1].bytes[1] == 99, "logprobs are forwarded")
+	ok(table.concat(r.text, "|"):find("C:check the |", 1, true) == nil and
+	    r.text[#r.text] == "C:check the " and r.reason == "stop", "stop runs in the worker")
 end)
 
 in_co(function()

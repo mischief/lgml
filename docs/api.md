@@ -198,9 +198,9 @@ the request checks (`lgml.server.chat_request.FIELDS`).
 | `seed` | OpenAI | supported | Sampler seed. The same seed and request give the same reply on the same build. |
 | `stop` | OpenAI | supported | A string or up to 4 strings. They apply to the content, not to the reasoning or the tool calls. The reply ends before the first stop string, with `finish_reason` `stop`; the stop string is not in it. An empty string has no effect. |
 | `n` | OpenAI | planned | Only 1. |
-| `logprobs` | OpenAI | planned | Only `false`. |
-| `top_logprobs` | OpenAI | planned | A value gives 400. |
-| `logit_bias` | OpenAI | planned | Only `{}`. |
+| `logprobs` | OpenAI | supported | `choices[].logprobs.content` lists the content tokens, in the stream too; see [Log probabilities](#log-probabilities). |
+| `top_logprobs` | OpenAI | supported | From 0 to 20. It needs `logprobs: true`. |
+| `logit_bias` | OpenAI | supported | Token ids of the model's tokenizer to a bias from -100 to 100. An id that the tokenizer does not have gives 400. |
 | `tools` | OpenAI | limited | Function tools only. A `custom` tool gives 400. `strict` is accepted; the arguments follow the schema only when `tool_choice` forces a call. |
 | `tool_choice` | OpenAI | planned | Only `"auto"`. |
 | `parallel_tool_calls` | OpenAI | planned | Only `true`. |
@@ -380,6 +380,24 @@ it.
   `prompt_ms`, `prompt_per_token_ms`, `prompt_per_second`,
   `predicted_n`, `predicted_ms`, `predicted_per_token_ms`,
   `predicted_per_second`. See [Response headers](#response-headers).
+
+### Log probabilities
+
+With `logprobs: true`, `choices[].logprobs` is `{"content": [...],
+"refusal": null}`. Each entry is a content token: `token` (its text),
+`logprob`, `bytes` (the UTF-8 bytes of the token) and `top_logprobs`,
+the `top_logprobs` most likely tokens at that position with the same
+fields. In a stream, each chunk with content carries the entries of
+its tokens.
+
+- The values are the log-softmax of the logits after `logit_bias` and
+  the penalties, before temperature, `top_k`, `top_p` and `min_p`. With
+  a grammar, the tokens that the grammar blocks can have -9999.
+- As for OpenAI, the list covers the content only: reasoning and tool
+  call tokens are not in it.
+- A token of held-back text (such as the start of a stop string) goes
+  out with the next content. The token that holds a stop string is in
+  the list.
 
 ### Streaming
 

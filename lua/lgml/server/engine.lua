@@ -144,7 +144,9 @@ end
 -- optional.
 -- @tparam table req the request: `messages`, `model`, `tools`,
 -- `max_tokens`, `max_completion_tokens`, `stream`, sampler settings,
--- `seed`, `reasoning_effort` and `chat_template_kwargs`
+-- `seed`, `stop`, `logprobs`, `top_logprobs`, `logit_bias`,
+-- `reasoning_effort` and `chat_template_kwargs`. An engine that
+-- cannot do a field of the request returns status 400.
 -- @tparam Sink sink the reply
 -- @treturn[1] boolean true
 -- @treturn[2] nil
@@ -266,7 +268,14 @@ end
 -- @function reasoning
 
 --- Adds content text.
--- @tparam string text the text; an empty string adds nothing
+-- With logprobs, the text can be empty.
+-- @tparam string text the text; an empty string with no logprobs adds
+-- nothing
+-- @tparam[opt] {table,...} logprobs one entry for each token of the
+-- text, when the request has `logprobs`: `{ token, logprob, bytes,
+-- top_logprobs }`, with bytes a list of byte values and top_logprobs a
+-- list of `{ token, logprob, bytes }`. The sink drops them when the
+-- request does not ask for them.
 -- @treturn[1] boolean true
 -- @treturn[2] nil
 -- @treturn[2] string `"cancelled"`

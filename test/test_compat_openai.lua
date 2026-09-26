@@ -300,9 +300,35 @@ local function test_stop()
 	ok(c.content[0] == "Let me " and c.finish[0] == "stop", "stop in a stream")
 end
 
+local function test_logprobs()
+	local status, b = post_json(body({ logprobs = true, top_logprobs = 2 }))
+	local lp = b.choices[1].logprobs
+	ok(status == 200 and lp.refusal == json.null and #lp.content == 2, "logprobs lists the content tokens")
+	local e = lp.content[1]
+	ok(e.token == "Let me " and e.logprob == -0.5 and #e.bytes == 7 and e.bytes[1] == 76 and
+	    #e.top_logprobs == 2 and e.top_logprobs[2].token == "x", "a logprobs entry has the OpenAI shape")
+	local _, _, text = post(body({ stream = true, logprobs = true }))
+	local n, empty_top = 0, true
+	for _, ev in ipairs(events(text)) do
+		if type(ev) == "table" and ev.choices and ev.choices[1] then
+			local l = ev.choices[1].logprobs
+			if l ~= json.null then
+				n = n + #l.content
+				empty_top = empty_top and #l.content[1].top_logprobs == 0
+			end
+		end
+	end
+	ok(n == 2 and empty_top, "stream chunks carry logprobs; top_logprobs defaults to none")
+	status, b = post_json(body({ top_logprobs = 2 }))
+	ok(status == 400 and b.error.param == "top_logprobs", "top_logprobs needs logprobs")
+	status, b = post_json(body())
+	ok(b.choices[1].logprobs == json.null, "logprobs are null when not asked")
+end
+
 test_field_table()
 test_messages()
 test_reply_table()
 test_stop()
+test_logprobs()
 print("1.." .. n)
 os.exit(failed == 0 and 0 or 1)

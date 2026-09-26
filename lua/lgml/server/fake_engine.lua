@@ -108,6 +108,19 @@ local function event(piece)
 	return { type = kind, text = text }
 end
 
+-- The logprobs entry of a piece, with k alternatives.
+local function fake_logprob(text, k)
+	local function entry(t, v)
+		return { token = t, logprob = v, bytes = { t:byte(1, -1) } }
+	end
+	local e = entry(text, -0.5)
+	e.top_logprobs = {}
+	for i = 1, k do
+		e.top_logprobs[i] = entry(i == 1 and text or string.char(118 + i), -0.5 - (i - 1))
+	end
+	return e
+end
+
 --- Counts a cancel and calls `on_cancel`.
 -- @treturn nil
 -- @treturn string `"cancelled"`
@@ -122,7 +135,10 @@ end
 --- Streams the canned reply.
 -- The user message `"fail"` makes the call fail before any output. The
 -- reply counts one token per piece and stops at `max_tokens`. `stop`
--- strings apply to the content, as `lgml.chat.output` applies them. The
+-- strings apply to the content, as `lgml.chat.output` applies them. With
+-- `logprobs`, each content piece is one token with logprob -0.5; its
+-- `top_logprobs` alternatives are the piece and then "x", "y", ...
+-- with logprobs -0.5, -1.5, -2.5, ... The
 -- prompt log (see `lgml.log.prompt`) shows each message as
 -- `<|role|>\ncontent\n`.
 -- @tparam table req the chat request
@@ -151,6 +167,9 @@ function F:chat(req, sink)
 		if max and usage.completion_tokens >= max then
 			sink:finish("length", usage)
 			return true
+		end
+		if req.logprobs == true and piece[1] == "content" then
+			out:logprob(fake_logprob(piece[2], req.top_logprobs or 0))
 		end
 		local r = out:deliver({ event(piece) })
 		if not r then

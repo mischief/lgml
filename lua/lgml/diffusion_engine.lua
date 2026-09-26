@@ -95,13 +95,24 @@ local function thinking(req)
 	return req.reasoning_effort ~= "none"
 end
 
+-- The first field of req that the engine cannot do, or nil.
+local function unsupported(req)
+	if req.logprobs == true then
+		return "logprobs"
+	elseif type(req.logit_bias) == "table" and next(req.logit_bias) ~= nil then
+		return "logit_bias"
+	end
+	return nil
+end
+
 --- Runs one chat completion (see `lgml.server.engine.Engine.chat`).
 -- The prompt and one canvas must fit in the context. Generation stops
 -- at an end token, at the token limit, at the context end, or after 3
 -- blocks in a row that end in a loop. The request can set `seed`,
 -- `max_tokens`, `max_completion_tokens`, `stop`, `tools`, `reasoning_effort =
--- "none"` and `chat_template_kwargs.enable_thinking`. A Lua error
--- resets the cache and returns status 500.
+-- "none"` and `chat_template_kwargs.enable_thinking`. `logprobs` and
+-- `logit_bias` give status 400. A Lua error resets the cache and returns
+-- status 500.
 -- @tparam table req the chat request
 -- @tparam lgml.server.engine.Sink sink the reply
 -- @treturn[1] boolean true
@@ -111,6 +122,10 @@ end
 function E:chat(req, sink)
 	if type(req.messages) ~= "table" or #req.messages == 0 then
 		return nil, "messages must be a non-empty array", 400
+	end
+	local bad = unsupported(req)
+	if bad then
+		return nil, ("%s: a diffusion model does not take it"):format(bad), 400
 	end
 	self:acquire()
 	local ok, a, b, c = pcall(self.run, self, req, sink)

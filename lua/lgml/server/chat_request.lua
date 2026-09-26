@@ -286,6 +286,19 @@ local function stop(v)
 	return true
 end
 
+-- Token ids as decimal strings, biases from -100 to 100.
+local function logit_bias(v)
+	if not is_object(v) then
+		return false
+	end
+	for k, x in pairs(v) do
+		if type(k) ~= "string" or not k:match("^%d+$") or type(x) ~= "number" or x < -100 or x > 100 then
+			return false
+		end
+	end
+	return true
+end
+
 local function prompt_cache_options(v)
 	if not is_object(v) then
 		return false
@@ -366,11 +379,11 @@ M.FIELDS = {
 	    label = "OpenAI" },
 	{ "n", "number", function(v) return v == 1 end, "1 (planned: more)", status = "planned",
 	    label = "OpenAI" },
-	{ "logprobs", "boolean", function(v) return v == false end, "false (planned)",
-	    status = "planned", label = "OpenAI" },
-	{ "top_logprobs", "number", never, "null (planned)", status = "planned", label = "OpenAI" },
-	{ "logit_bias", "table", function(v) return is_object(v) and next(v) == nil end,
-	    "an empty object (planned)", status = "planned", label = "OpenAI" },
+	{ "logprobs", "boolean", status = "supported", label = "OpenAI" },
+	{ "top_logprobs", "number", int_in(0, 20), "an integer from 0 to 20", status = "supported",
+	    label = "OpenAI" },
+	{ "logit_bias", "table", logit_bias, "an object of token ids to numbers from -100 to 100",
+	    status = "supported", label = "OpenAI" },
 	{ "tools", "table", tools, "an array of function tools", status = "limited", label = "OpenAI" },
 	{ "tool_choice", "string|table", function(v) return v == "auto" end, '"auto" (planned: more)',
 	    status = "planned", label = "OpenAI" },
@@ -478,6 +491,9 @@ function M.check(b, raw)
 		if not ok then
 			return nil, err, c[1]
 		end
+	end
+	if b.top_logprobs ~= nil and b.logprobs ~= true then
+		return nil, "top_logprobs needs logprobs: true", "top_logprobs"
 	end
 	if type(b.stop) == "string" then
 		b.stop = json.array({ b.stop })

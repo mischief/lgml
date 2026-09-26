@@ -34,8 +34,8 @@ local function proxy(ch, id)
 		return delta({ k = "reasoning", text = text })
 	end
 
-	function s.content(_, text)
-		return delta({ k = "content", text = text })
+	function s.content(_, text, lp)
+		return delta({ k = "content", text = text, lp = lp })
 	end
 
 	function s.tool_call(_, name, cid)

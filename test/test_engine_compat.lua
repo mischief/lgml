@@ -1,5 +1,6 @@
 -- OpenAI request features of the gguf chat engine on a tiny qwen3 gguf
--- with random weights: stop strings, and the parser output. TAP output.
+-- with random weights: stop strings, logprobs, logit_bias, and the
+-- parser output. TAP output.
 local uv = require("luv")
 local engine = require("lgml.engine")
 local output = require("lgml.chat.output")
@@ -146,8 +147,43 @@ local function test_stop()
 	ok(text(again.content) == c, "the next request is not cut")
 end
 
+local function test_logprobs()
+	local base = chat()
+	local r = chat({ logprobs = true, top_logprobs = 3 })
+	local c = text(r.content)
+	ok(c == text(base.content) and #r.lp > 0, ("logprobs do not change the reply; %d entries"):format(#r.lp))
+	local bytes, sorted, greedy = {}, true, true
+	for _, e in ipairs(r.lp) do
+		bytes[#bytes + 1] = string.char(table.unpack(e.bytes))
+		local t = e.top_logprobs
+		sorted = sorted and #t == 3 and e.logprob <= 0 and t[1].logprob >= t[2].logprob and
+		    t[2].logprob >= t[3].logprob
+		greedy = greedy and t[1].token == e.token and math.abs(t[1].logprob - e.logprob) < 1e-6
+	end
+	ok(sorted, "each entry has 3 alternatives, most likely first")
+	ok(greedy, "at temperature 0 the token is the most likely one")
+	ok(require("lgml.tokenizer").clean(table.concat(bytes)):find(c, 1, true) ~= nil,
+	    "the token bytes hold the content")
+	local plain = chat({ logprobs = false })
+	ok(#plain.lp == 0, "no entries without logprobs")
+end
+
+local function test_logit_bias()
+	local r = chat({ logit_bias = { ["65"] = 100 } })
+	ok(text(r.content):match("^AAAA") ~= nil, "logit_bias 100 forces a token: " .. text(r.content):sub(1, 10))
+	local base = chat({ logprobs = true })
+	local first = base.lp[1]
+	local id = e.tk:encode(first.token)[1]
+	local b = chat({ logprobs = true, logit_bias = { [tostring(id)] = -100 } })
+	ok(b.lp[1] and b.lp[1].token ~= first.token, "logit_bias -100 bans a token")
+	local bad = chat({ logit_bias = { ["999999"] = 1 } })
+	ok(bad.res == nil and bad.status == 400 and bad.err:find("logit_bias"), "a token id past the vocab gives 400")
+end
+
 test_output()
 test_stop()
+test_logprobs()
+test_logit_bias()
 os.remove(path)
 print("1.." .. n)
 os.exit(failed == 0 and 0 or 1)
