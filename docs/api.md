@@ -399,7 +399,7 @@ OpenAI. The body is `multipart/form-data`. A Whisper model (capability
 | `file` | Required. A WAV file: PCM with 8, 16, 24 or 32 bits, or float with 32 or 64 bits. Channels mix to mono. The server resamples to 16 kHz. |
 | `model` | See [Model selection](#model-selection). |
 | `language` | A language code or name. Default: detect. |
-| `prompt` | Accepted. Not used. |
+| `prompt` | Text that guides the style and spelling, as the OpenAI Whisper initial prompt. The first 30 s window sees it as its previous text: the token `startofprev`, the prompt tokens, then the task tokens. It keeps its last 223 tokens (half the text context, less one). It needs `merges.txt` in the model directory. |
 | `response_format` | `json` (default), `text` or `verbose_json`. Others, such as `srt`, give 400. |
 
 Replies:

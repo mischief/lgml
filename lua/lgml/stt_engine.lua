@@ -105,9 +105,14 @@ function E:run(req, audio, ctl)
 	if not ok then
 		return nil, "unknown language " .. tostring(req.language), 400
 	end
+	local prompt
+	if type(req.prompt) == "string" and req.prompt:find("%S") then
+		-- As OpenAI Whisper: one space, then the trimmed text.
+		prompt = self.model:encode_text(" " .. req.prompt:match("^%s*(.-)%s*$"))
+	end
 	local t0 = lgml.clock()
 	local r = self.model:transcribe(a, {
-		lang = lang, step = stepper(ctl), cancelled = ctl and ctl.cancelled,
+		lang = lang, step = stepper(ctl), cancelled = ctl and ctl.cancelled, prompt = prompt,
 	})
 	a:close()
 	r.seconds = lgml.clock() - t0
@@ -118,7 +123,9 @@ end
 -- The audio is resampled to the Whisper rate when needed. A Lua error
 -- returns status 500.
 -- @tparam table req the request: `language` is a code, a name, or nil
--- to detect
+-- to detect. `prompt` is text that the first 30 s window sees as its
+-- previous text, as the initial prompt of OpenAI Whisper. It keeps at
+-- most its last n_text_ctx / 2 - 1 tokens.
 -- @tparam string audio the file bytes (WAV)
 -- @tparam[opt] lgml.server.engine.Control ctl the cancel control;
 -- `ctl.cancelled` is optional

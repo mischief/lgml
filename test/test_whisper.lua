@@ -171,6 +171,43 @@ local function test_vocab()
 	os.remove(ap)
 end
 
+-- text encoding and the decoder prompt
+
+local function test_encoder()
+	local whisper = require("lgml.whisper")
+	local vp, mp = os.tmpname(), os.tmpname()
+	write(vp, json.encode({ h = 0, e = 1, l = 2, o = 3, ["\u{120}"] = 4, w = 5, r = 6, d = 7, he = 8,
+		ll = 9, hell = 10, hello = 11, ["\u{120}w"] = 12, ["'"] = 13, s = 14, ["\u{10a}"] = 15,
+		["\u{120}hello"] = 16, ["\u{120}\u{120}"] = 17 }))
+	write(mp, "#version: 0.2\nh e\nl l\nhe ll\nhell o\n\u{120} w\n\u{120} hello\n\u{120} \u{120}\n")
+	local v <close> = lgml.vocab(vp)
+	local enc = assert(whisper.encoder(v, mp))
+	ok(table.concat(enc(" hello's\n\nworld"), ",") == "16,13,14,15,15,5,3,6,2,7",
+	    "encoder splits as GPT-2 and merges by rank")
+	ok(table.concat(enc("   hello"), ",") == "17,16", "a space run leaves its last space for the word")
+	ok(v:decode(enc(" hello world")) == " hello world", "encoded text decodes back")
+	ok(whisper.encoder(v, mp .. ".none") == nil, "encoder needs merges.txt")
+	os.remove(vp)
+	os.remove(mp)
+	local m = setmetatable({ tok = { prev = 1, sot = 2, transcribe = 3, notimestamps = 4 },
+	    hp = { n_text_ctx = 8 } }, whisper)
+	ok(table.concat(m:prompt(9, { 10, 11, 12, 13, 14 }), ",") == "1,12,13,14,2,9,3,4",
+	    "prompt: startofprev, the last n_text_ctx / 2 - 1 tokens, then the task tokens")
+	ok(table.concat(m:prompt(9), ",") == "2,9,3,4", "prompt without previous text")
+	local seen = {}
+	m.mel, m.vocab = {}, { decode = function() return "x" end }
+	m.encode = function() end
+	m.decode_window = function(_, o)
+		seen[#seen + 1] = o.prev
+		return { #seen + 100 }, 9
+	end
+	m.tok.lang_code, m.tok.lang_name = {}, {}
+	local audio = { rate = function() return whisper.RATE end, len = function() return whisper.N_SAMPLES + 1 end,
+	    mel = function() end }
+	m:transcribe(audio, { prompt = { 7, 8 } })
+	ok(#seen == 2 and seen[1][2] == 8 and seen[2][1] == 101, "the prompt is the previous text of the first window only")
+end
+
 -- audio
 
 local function tone_wav(rate, count)
@@ -227,7 +264,7 @@ local function test_model(dir, wav)
 	local m = whisper.load(be, dir)
 	ok(m.hp.n_mels >= 80 and m.tok.sot ~= nil, "whisper loads")
 	if not wav then
-		for _, name in ipairs({ "jfk", "language", "44.1 kHz stereo", "long", "engine" }) do
+		for _, name in ipairs({ "jfk", "language", "44.1 kHz stereo", "encode_text", "prompt", "long", "engine" }) do
 			skip(name .. ": LGML_WHISPER_WAV not set")
 		end
 		return
@@ -246,6 +283,11 @@ local function test_model(dir, wav)
 	local st = assert(lgml.audio(a:resample(44100):wav(2)))
 	r = m:transcribe(st:resample(16000))
 	ok(r.text == JFK, "44.1 kHz stereo transcript")
+	local s = " And so, my fellow Americans: ask not what your country can do for you."
+	local ids = m:encode_text(s)
+	ok(m.vocab:decode(ids) == s and #ids < 24, "encode_text round trip (" .. #ids .. " tokens)")
+	r = m:transcribe(a, { lang = m:language_id("en"), prompt = m:encode_text(" JFK, inaugural address.") })
+	ok(count(r.text, "ask not what your country") == 1, "transcript with a prompt: " .. r.text)
 	r = m:transcribe(a:concat(a, a, a))
 	ok(count(r.text, "ask not what your country") == 4 and #r.segments == 2 and
 	    math.abs(r.duration - 4 * a:duration()) < 1e-6, "long audio in 30 s windows")
@@ -253,6 +295,7 @@ local function test_model(dir, wav)
 	local eng = require("lgml.stt_engine").new({ model = dir })
 	local res, msg, status = eng:transcribe({ language = "xx" }, bytes)
 	ok(res == nil and status == 400 and msg:find("language") and
+	    eng:transcribe({ prompt = "  Kennedy.  " }, bytes).text:find("ask not what your country", 1, true) and
 	    eng:transcribe({}, bytes).text == JFK and
 	    select(3, eng:transcribe({}, "junk")) == 400, "engine transcribe")
 end
@@ -268,6 +311,7 @@ for _, d in ipairs(lgml.devices()) do
 end
 test_binop_types(dev)
 test_vocab()
+test_encoder()
 test_audio(dev)
 os.remove(tmp)
 

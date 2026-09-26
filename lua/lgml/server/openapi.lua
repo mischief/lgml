@@ -244,7 +244,7 @@ local function audio_schemas(c)
 		file = { type = "string", contentMediaType = "audio/wav", description = "WAV audio." },
 		model = str("Model id."),
 		language = str("Code or name; missing: detect."),
-		prompt = str("Accepted; not used."),
+		prompt = str("Text that the first 30 s window sees as its previous text."),
 		response_format = { type = "string", enum = keys(openai.TRANSCRIPTION_FORMATS) },
 	}, { "file" })
 	c.Transcription = obj({ text = str() })

@@ -187,7 +187,8 @@ end
 
 --- Load a Whisper model from a Hugging Face directory.
 -- The directory holds config.json, vocab.json, optional
--- added_tokens.json, and model.safetensors or a sharded index. The
+-- added_tokens.json, and model.safetensors or a sharded index.
+-- `encode_text` also needs merges.txt. The
 -- function also allocates the decoder state (see `Whisper:alloc_state`).
 -- @tparam lgml.backend be the backend that holds the weights
 -- @tparam string dir the model directory
@@ -398,6 +399,191 @@ function M:language_id(s)
 	return self.tok.lang[string.lower(s)]
 end
 
+-- text encoding
+
+-- GPT-2 bytes_to_unicode: the piece character of each byte.
+local function byte_chars()
+	local c, n = {}, 0
+	for b = 0, 255 do
+		if (b >= 33 and b <= 126) or (b >= 161 and b <= 172) or b >= 174 then
+			c[b] = utf8.char(b)
+		else
+			c[b] = utf8.char(256 + n)
+			n = n + 1
+		end
+	end
+	return c
+end
+
+local SPACE = { [" "] = true, ["\t"] = true, ["\n"] = true, ["\r"] = true, ["\v"] = true, ["\f"] = true }
+
+-- The class of one UTF-8 character for the GPT-2 pre-tokenizer: "s"
+-- (space), "L" (letter), "N" (digit) or "P" (other). Non-ASCII
+-- characters count as letters, except common spaces and punctuation.
+local function class(ch)
+	if SPACE[ch] then
+		return "s"
+	elseif #ch == 1 then
+		return ch:match("%a") and "L" or ch:match("%d") and "N" or "P"
+	end
+	local cp = utf8.codepoint(ch)
+	if cp == 0xa0 or cp == 0x3000 or (cp >= 0x2000 and cp <= 0x200a) then
+		return "s"
+	elseif (cp >= 0xa1 and cp <= 0xbf) or cp == 0xd7 or cp == 0xf7 or (cp >= 0x2010 and cp <= 0x2bff) or
+	    (cp >= 0x3001 and cp <= 0x303f) or (cp >= 0xff01 and cp <= 0xff0f) then
+		return "P"
+	end
+	return "L"
+end
+
+local CONTRACTIONS = { "'s", "'t", "'re", "'ve", "'m", "'ll", "'d" }
+
+-- Splits text as the GPT-2 regex does: contractions, then an optional
+-- space and a run of one class, then whitespace. A whitespace run
+-- before a word leaves its last character for that word.
+local function pretokens(text)
+	local ch, cl = {}, {}
+	for c in text:gmatch(utf8.charpattern) do
+		ch[#ch + 1], cl[#cl + 1] = c, class(c)
+	end
+	local out, i, n = {}, 1, #ch
+	while i <= n do
+		local j
+		if ch[i] == "'" then
+			for _, c in ipairs(CONTRACTIONS) do
+				local k = i + #c - 1
+				if k <= n and table.concat(ch, "", i, k) == c then
+					j = k
+					break
+				end
+			end
+		end
+		if not j then
+			local k = i
+			if ch[i] == " " and i < n and cl[i + 1] ~= "s" then
+				k = i + 1
+			end
+			j = k
+			while j < n and cl[j + 1] == cl[k] do
+				j = j + 1
+			end
+			if cl[k] == "s" and j < n and j > i then
+				j = j - 1
+			end
+		end
+		out[#out + 1] = table.concat(ch, "", i, j)
+		i = j + 1
+	end
+	return out
+end
+
+local function pair_key(a, b)
+	return #a .. " " .. a .. b
+end
+
+-- Byte-level BPE of one pre-token: merge the pair of lowest rank until
+-- no pair has a rank.
+local function bpe(word, ranks)
+	local syms = {}
+	for c in word:gmatch(".") do
+		syms[#syms + 1] = c
+	end
+	while #syms > 1 do
+		local best, a, b
+		for i = 1, #syms - 1 do
+			local r = ranks[pair_key(syms[i], syms[i + 1])]
+			if r and (not best or r < best) then
+				best, a, b = r, syms[i], syms[i + 1]
+			end
+		end
+		if not best then
+			break
+		end
+		local out, i = {}, 1
+		while i <= #syms do
+			if i < #syms and syms[i] == a and syms[i + 1] == b then
+				out[#out + 1] = a .. b
+				i = i + 2
+			else
+				out[#out + 1] = syms[i]
+				i = i + 1
+			end
+		end
+		syms = out
+	end
+	return syms
+end
+
+--- Makes a GPT-2 byte-level BPE encoder for a Hugging Face vocabulary.
+-- The pre-tokenizer follows the GPT-2 regex. It has no Unicode tables:
+-- non-ASCII characters count as letters, except common spaces and
+-- punctuation. Special tokens in the text are encoded as plain text.
+-- @tparam lgml.vocab vocab the vocabulary
+-- @tparam string merges_path the path of merges.txt
+-- @treturn[1] function a function(text) that returns token ids
+-- @treturn[2] nil
+-- @treturn[2] string an error message
+function M.encoder(vocab, merges_path)
+	local f, err = io.open(merges_path, "rb")
+	if not f then
+		return nil, err
+	end
+	local back = {}
+	for b, c in pairs(byte_chars()) do
+		back[utf8.codepoint(c)] = string.char(b)
+	end
+	local function unpiece(s)
+		local out = {}
+		for _, cp in utf8.codes(s) do
+			out[#out + 1] = back[cp] or ""
+		end
+		return table.concat(out)
+	end
+	local ranks, rank = {}, 0
+	for line in f:lines() do
+		local a, b = line:match("^(%S+) (%S+)$")
+		if a and not line:find("^#version") then
+			rank = rank + 1
+			ranks[pair_key(unpiece(a), unpiece(b))] = rank
+		end
+	end
+	f:close()
+	local ids = {}
+	for i = 0, vocab:n() - 1 do
+		local p = vocab:piece(i)
+		if p and not vocab:special(i) and not ids[p] then
+			ids[p] = i
+		end
+	end
+	local clean = require("lgml.tokenizer").clean
+	return function(text)
+		local out = {}
+		for _, w in ipairs(pretokens(clean(text))) do
+			for _, s in ipairs(bpe(w, ranks)) do
+				if ids[s] then
+					out[#out + 1] = ids[s]
+				else
+					for c in s:gmatch(".") do
+						out[#out + 1] = ids[c]
+					end
+				end
+			end
+		end
+		return out
+	end
+end
+
+--- Encodes text to token ids with the merges.txt of the model.
+-- @tparam string text the text
+-- @treturn {int,...} the token ids
+-- @raise when the model directory has no merges.txt
+function M:encode_text(text)
+	if not self.encode_fn then
+		self.encode_fn = assert(M.encoder(self.vocab, self.dir .. "/merges.txt"))
+	end
+	return self.encode_fn(text)
+end
+
 --- Build a decoder prompt.
 -- The prompt is the optional previous text after <|startofprev|>, then
 -- the task tokens. The previous text keeps at most its last
@@ -451,6 +637,8 @@ end
 -- @tparam[opt] table opts options as for `decode_window` (lang,
 -- max_tokens, step), plus:
 -- opts.cancelled: function; true stops after the current window.
+-- opts.prompt: token ids of an initial prompt (see `encode_text`). The
+-- first window sees them as its previous text.
 -- @treturn table result: `text`, `language` (code), `language_name`,
 -- `duration` (seconds) and `segments` (list of `id`, `start`, `end`,
 -- `text`)
@@ -459,7 +647,7 @@ function M:transcribe(audio, opts)
 	opts = opts or {}
 	assert(audio:rate() == M.RATE, "audio must be 16 kHz")
 	local n = audio:len()
-	local segs, texts, lang, prev = {}, {}, opts.lang, nil
+	local segs, texts, lang, prev = {}, {}, opts.lang, opts.prompt
 	for start = 0, math.max(n - 1, 0), M.N_SAMPLES do
 		audio:mel(self.mel, start)
 		self:encode()
