@@ -662,17 +662,25 @@ end
 
 -- Fill the input leaves for the pass at cache.n_past, or at 0 with
 -- no cache. ids is nil when the leaf already holds them.
-local function fill(hp, inp, cache, ids)
+local function fill(hp, inp, cache, ids, opts)
 	local n = inp.n
 	local n_past = cache and cache.n_past or 0
 	inp.n_past, inp.n_kv = n_past, n_past + n
 	if ids then
 		inp.ids:set(ids)
 	end
+	if inp.embd then
+		inp.embd:from_host(opts.embd, opts.embd_off or 0, 0, inp.embd:nbytes())
+	end
 	inp.pos:fill_range(n_past)
-	inp.mask:fill_causal(n_past)
+	if inp.causal then
+		inp.mask:fill_causal(n_past)
+	else
+		inp.mask:fill_mask({ n_past = n_past, causal = false })
+	end
 	if inp.mask_swa then
-		inp.mask_swa:fill_mask({ n_past = n_past, window = hp.n_swa, ring = cache ~= nil })
+		inp.mask_swa:fill_mask({ n_past = n_past, window = hp.n_swa, ring = cache ~= nil,
+			causal = inp.causal })
 	end
 	if cache then
 		inp.rows:fill_range(n_past)
@@ -701,9 +709,18 @@ end
 -- opts.logits: "all" or "last" (default "all").
 -- opts.hidden: a layer count; `forward` stops after that many layers
 -- and gives the hidden state in place of the logits (default nil).
+-- opts.embd: an `lgml.hostbuf` with n rows of n_embd f32 values, such
+-- as image embeddings; they take the place of the token embeddings,
+-- with no scale. ids still give the per-layer inputs of gemma models;
+-- use 0 for them there, as llama.cpp does.
+-- opts.embd_off: the byte offset of the first row in opts.embd
+-- (default 0).
+-- opts.causal: false lets the tokens of this pass see each other both
+-- ways, as llama.cpp does for gemma image tokens (default true).
 -- @treturn table fields n, n_past, n_kv, n_attn, n_swa_attn, cache,
--- flash_attn, logits, hidden, and the tensors ids, pos, mask, mask_swa (with
--- sliding layers), rows and rows_swa (with a cache)
+-- flash_attn, logits, hidden, causal, and the tensors ids, pos, mask,
+-- mask_swa (with sliding layers), rows and rows_swa (with a cache), and
+-- embd (with opts.embd)
 -- @raise when the pass does not fit the cache, or n_past is not where
 -- the recurrent state is
 function M:inputs(ids, cache, opts)
@@ -722,7 +739,7 @@ function M:inputs(ids, cache, opts)
 	local inp = {
 		n = n, n_attn = n_attn, n_swa_attn = n_swa_attn, cache = cache,
 		flash_attn = opts.flash_attn, logits = opts.logits or "all",
-		hidden = opts.hidden,
+		hidden = opts.hidden, causal = opts.causal ~= false,
 		ids = be:tensor("i32", { n }, ids),
 		pos = be:tensor("i32", { n }),
 		mask = be:tensor(mt, { n, n_attn }),
@@ -730,13 +747,16 @@ function M:inputs(ids, cache, opts)
 	if hp.n_swa then
 		inp.mask_swa = be:tensor(mt, { n, n_swa_attn })
 	end
+	if opts.embd then
+		inp.embd = be:tensor("f32", { n, hp.n_embd })
+	end
 	if cache then
 		inp.rows = be:tensor("i64", { n })
 		if cache.ring then
 			inp.rows_swa = be:tensor("i64", { n })
 		end
 	end
-	fill(hp, inp, cache)
+	fill(hp, inp, cache, nil, opts)
 	return inp
 end
 
@@ -748,18 +768,21 @@ end
 -- @treturn string the key
 function M:replay_key(cache, n, opts)
 	local n_attn, n_swa_attn = spans(cache, cache.n_past + n)
-	return ("%d:%d:%d:%s:%s:%s:%s"):format(n, n_attn, n_swa_attn, tostring(opts.flash_attn),
-	    opts.logits or "all", tostring(opts.hidden), self.lora_key or "")
+	return ("%d:%d:%d:%s:%s:%s:%s:%s:%s"):format(n, n_attn, n_swa_attn, tostring(opts.flash_attn),
+	    opts.logits or "all", tostring(opts.hidden), tostring(opts.embd ~= nil),
+	    tostring(opts.causal ~= false), self.lora_key or "")
 end
 
 --- Load new ids into the inputs of an earlier pass with the same key.
 -- @tparam table inp inputs from `inputs`
 -- @tparam {integer,...} ids the token ids
 -- @tparam table cache the cache
+-- @tparam[opt] table opts the input options; opts.embd and
+-- opts.embd_off give the new embeddings
 -- @raise as `inputs`
-function M:refill(inp, ids, cache)
+function M:refill(inp, ids, cache, opts)
 	check_pass(self.hp, cache, #ids)
-	fill(self.hp, inp, cache, ids)
+	fill(self.hp, inp, cache, ids, opts)
 end
 
 --- Build the normed, projected and roped queries, keys and values.
@@ -1131,9 +1154,14 @@ end
 function M:forward(g, inp)
 	local hp, n = self.hp, inp.n
 	local taps, shared = {}, {}
-	local x = g:get_rows(self.tok_embd, inp.ids)
-	if hp.embd_scale then
-		x = g:scale(x, hp.embd_scale)
+	local x
+	if inp.embd then
+		x = inp.embd
+	else
+		x = g:get_rows(self.tok_embd, inp.ids)
+		if hp.embd_scale then
+			x = g:scale(x, hp.embd_scale)
+		end
 	end
 	taps.embd = x
 	local ple = self.ple_embd and per_layer_inputs(self, g, inp, x)

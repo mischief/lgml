@@ -256,6 +256,8 @@ near(mask(3, 3, {}), { 1, 0, 0, 1, 1, 0, 1, 1, 1 }, "fill_mask causal")
 near(mask(2, 4, { n_past = 2 }), { 1, 1, 1, 0, 1, 1, 1, 1 }, "fill_mask n_past")
 near(mask(3, 3, { window = 2 }), { 1, 0, 0, 1, 1, 0, 0, 1, 1 }, "fill_mask window")
 near(mask(2, 2, { causal = false }), { 1, 1, 1, 1 }, "fill_mask full")
+near(mask(2, 4, { n_past = 1, causal = false }), { 1, 1, 1, 0, 1, 1, 1, 0 },
+    "fill_mask full hides keys past the pass")
 -- Prompt of 3, canvas of 2: prompt rows causal, canvas rows see all.
 near(mask(5, 5, { canvas = 3 }), {
 	1, 0, 0, 0, 0,

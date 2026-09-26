@@ -1909,8 +1909,9 @@ tensor_fill_causal(lua_State *L)
  * `n_past` + i. Allowed entries are 0 and others are -inf. opts fields:
  * `n_past` (0), causal (true), window (0 is none), canvas, ring (false).
  * Queries at or past canvas see all keys (with a window, only keys >=
- * canvas - window + 1). Other queries never see canvas keys. With ring,
- * column j holds the latest key p < `n_past` + rows with p % `n_kv` == j.
+ * canvas - window + 1). Other queries never see canvas keys. No query
+ * sees keys at or past `n_past` + rows. With ring, column j holds the
+ * latest key p < `n_past` + rows with p % `n_kv` == j.
  * @tparam table opts options
  * @raise on a bad tensor or out-of-range options
  * @function tensor:fill_mask
@@ -1950,7 +1951,7 @@ tensor_fill_mask(lua_State *L)
 			kp = j;
 			if (ring && j < n_past + rows)
 				kp = j + (n_past + rows - 1 - j) / nkv * nkv;
-			if (ring && j >= n_past + rows)
+			if (kp >= n_past + rows)
 				allow = 0;
 			else if (canvas >= 0 && qp >= canvas)
 				allow = window == 0 || kp >= canvas || kp >= canvas - window + 1;

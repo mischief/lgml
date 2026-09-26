@@ -454,6 +454,96 @@ local function ring_check(kind, m)
 	replay.drop(c)
 end
 
+-- Embedding passes: token embeddings given as opts.embd give the same
+-- logits as the ids, and a non-causal span sees its later rows.
+local function embd_check(kind, m)
+	local replay = require("lgml.replay")
+	local tag = kind .. " embd: "
+	local be, E = m.be, m.hp.n_embd
+	local ids = batches[1]
+	local n = #ids
+	-- Scaled token embeddings of ids, in a host buffer.
+	local buf = lgml.hostbuf(n * E * 4)
+	do
+		local leaf <close> = be:tensor("i32", { n }, ids)
+		local g <close> = be:graph()
+		local x = g:scale(g:get_rows(m.tok_embd, leaf), m.hp.embd_scale)
+		g:compute(x)
+		x:to_host(buf)
+	end
+	local function logits(c, part, opts)
+		local inp = m:inputs(part, c, opts)
+		local g <close> = be:graph()
+		local out = m:forward(g, inp)
+		g:compute(out)
+		if c then
+			c.n_past = inp.n_kv
+		end
+		local v = out:get()
+		for _, t in pairs(inp) do
+			if type(t) == "userdata" then
+				t:close()
+			end
+		end
+		return v
+	end
+	local function maxdiff(a, b)
+		local d = #a == #b and 0 or math.huge
+		for i = 1, math.min(#a, #b) do
+			d = math.max(d, math.abs(a[i] - b[i]))
+		end
+		return d
+	end
+	local a = logits(m:cache(64, { ubatch = 32 }), ids)
+	local b = logits(m:cache(64, { ubatch = 32 }), ids, { embd = buf })
+	ok(maxdiff(a, b) < 1e-4, ("%sembeddings match ids (max diff %.3g)"):format(tag, maxdiff(a, b)))
+
+	-- Text, a span of 6 embedding rows, then text. The span rows are
+	-- token embeddings 7 to 12 of ids, at byte offset 6 rows.
+	local zeros = { 0, 0, 0, 0, 0, 0 }
+	local head, tail = { 5, 6, 7, 8 }, { 9, 10, 11 }
+	local off = 6 * E * 4
+	local function mixed(copts, fa)
+		local c = m:cache(64, copts)
+		local o = { flash_attn = fa }
+		logits(c, head, o)
+		local img = logits(c, zeros, { embd = buf, embd_off = off, causal = false,
+			flash_attn = fa })
+		return img, logits(c, tail, o)
+	end
+	local img, after = mixed({ ubatch = 64 })
+	local img2, after2 = mixed({ ubatch = 8 })
+	local d = math.max(maxdiff(img, img2), maxdiff(after, after2))
+	ok(d < TOL, ("%sa non-causal span on the ring agrees with a full cache (max diff %.3g)")
+	    :format(tag, d))
+	local img3, after3 = mixed({ ubatch = 8 }, true)
+	ok(maxdiff(img, img3) < 3e-2 and maxdiff(after, after3) < 3e-2,
+	    ("%sflash_attn agrees (max diff %.3g)"):format(tag, math.max(maxdiff(img, img3),
+	    maxdiff(after, after3))))
+	-- The first row of a non-causal span sees the later rows.
+	local c = m:cache(64, { ubatch = 8 })
+	logits(c, head)
+	local causal = logits(c, zeros, { embd = buf, embd_off = off })
+	local nv = m.hp.n_vocab
+	local first = function(v) return table.move(v, 1, nv, 1, {}) end
+	ok(maxdiff(first(causal), first(img2)) > 1e-2, tag .. "a non-causal span sees later rows")
+	-- Replay: one graph for two spans with different embeddings.
+	local function replayed(off)
+		local rc2 = m:cache(64, { ubatch = 8 })
+		replay.run(m, rc2, head, {})
+		local out = replay.run(m, rc2, zeros, { embd = buf, embd_off = off, causal = false })
+		return out:get(), rc2
+	end
+	local r1, rc1 = replayed(off)
+	ok(maxdiff(r1, img2) < 1e-4, tag .. "replay gives the same span logits")
+	rc1.n_past = 4
+	local r2 = replay.run(m, rc1, zeros, { embd = buf, embd_off = 0, causal = false }):get()
+	local fresh = replayed(0)
+	ok(maxdiff(r2, fresh) < 1e-4, tag .. "a replayed span loads new embeddings")
+	replay.drop(rc1)
+	buf:close()
+end
+
 -- The chat engine on the tiny model: a second request with the same
 -- first message reuses the cached prefix.
 local function engine_check(path)
@@ -533,6 +623,7 @@ for _, kind in ipairs({ "dense", "moe" }) do
 		more(kind, m, ref)
 	end
 	ring_check(kind, m)
+	embd_check(kind, m)
 	-- The ring holds 13 rows. A long prompt in passes of 8 and decode
 	-- steps across n_past 256 build four graphs.
 	local long = {}
