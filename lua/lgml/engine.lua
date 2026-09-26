@@ -31,6 +31,9 @@ local log = require("lgml.log")
 local L = log.new("engine")
 
 local M = {}
+
+-- Rows the full-attention KV cache gets at load; it grows on demand.
+local KV_INITIAL = 4096
 local E = {}
 E.__index = E
 
@@ -141,6 +144,9 @@ end
 --   or a recipe file path (default `lgml.decide.default_recipe`)
 -- - `cache_ram`: MiB of host RAM for the prompt store (default 8192; 0
 --   turns it off, -1 means no limit); see `lgml.prompt_cache`
+-- - `kv_initial`: rows the full-attention KV cache gets at load
+--   (default 4096); the cache grows when a prompt needs more, up to
+--   `n_ctx`. 0 gives all `n_ctx` rows at load.
 -- - `ctx_checkpoints`: the most state checkpoints per slot, for models
 --   with recurrent layers or a sliding ring (default 8; 0 turns them off)
 -- - `lora`: LoRA adapters, a list of { path, scale } (scale default 1);
@@ -198,6 +204,10 @@ function M.new(opts)
 	for i, spec in ipairs(opts.lora or {}) do
 		local path, scale = spec.path or spec[1], spec.scale or spec[2] or 1
 		adapters[i] = { ad = lora.load(model, path, { scale = scale }), path = path, scale = scale }
+	end
+	local initial = opts.kv_initial or KV_INITIAL
+	if initial > 0 then
+		copts.initial = initial
 	end
 	local cache = model:cache(n_ctx, copts)
 	local e = setmetatable({

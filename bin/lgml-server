@@ -20,6 +20,7 @@ local USAGE = [=[
 usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b backend]
                    [-t threads] [-c n_ctx] [--no-fa] [--ctk type] [--ctv type] [--alias id]
                    [--recipe file] [--cache-ram MiB] [--ctx-checkpoints n]
+                   [--kv-initial n]
                    [--lora file[:scale]]... [--mmproj file] [--image-min-tokens n]
                    [--image-max-tokens n] [--inproc] [--stt] [--engine module]
                    [--text-backend name] [--cpu-moe] [--n-cpu-moe n|auto]
@@ -45,7 +46,7 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       {"model": id} load and unload a model now;
                       spec: { model = path, id, backend, threads, ctx,
                       flash_attn, stt, cache_type_k, cache_type_v, recipe,
-                      cache_ram, ctx_checkpoints, lora = "file[:scale]" or a
+                      cache_ram, ctx_checkpoints, kv_initial, lora = "file[:scale]" or a
                       list of them or of { path, scale }, mmproj,
                       image_min_tokens, image_max_tokens,
                       text_backend = backend of the text encoder of
@@ -84,6 +85,9 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
       --ctx-checkpoints n
                       state checkpoints per slot for hybrid and sliding
                       window models (default 8; 0 turns them off)
+      --kv-initial n  KV cache rows at load (default 4096); the cache
+                      grows as prompts need, up to -c; 0 allocates all
+                      -c rows at load
       --lora file[:scale]
                       apply a LoRA adapter (llama.cpp gguf or PEFT
                       directory) with this scale (default 1); repeat for
@@ -195,6 +199,10 @@ local function model_engine(spec, managed)
 	if spec.ctx_checkpoints and not (ckpt and ckpt >= 0) then
 		die("bad checkpoint count " .. tostring(spec.ctx_checkpoints))
 	end
+	local kvi = spec.kv_initial and math.tointeger(tonumber(spec.kv_initial))
+	if spec.kv_initial and not (kvi and kvi >= 0) then
+		die("bad KV initial size " .. tostring(spec.kv_initial))
+	end
 	local threads = spec.threads and math.tointeger(tonumber(spec.threads))
 	if spec.threads and not (threads and threads >= 1 and threads <= 1024) then
 		die("bad thread count " .. tostring(spec.threads))
@@ -239,6 +247,7 @@ local function model_engine(spec, managed)
 			flash_attn = spec.flash_attn ~= false, id = spec.id,
 			cache_type_k = spec.cache_type_k, cache_type_v = spec.cache_type_v,
 			recipe = spec.recipe, cache_ram = ram, ctx_checkpoints = ckpt, lora = lora,
+			kv_initial = kvi,
 			mmproj = spec.mmproj, image_min_tokens = imin, image_max_tokens = imax,
 			cpu_moe = spec.cpu_moe, n_cpu_moe = spec.n_cpu_moe, n_gpu_layers = spec.n_gpu_layers,
 			override = spec.override,
@@ -251,6 +260,7 @@ local function model_engine(spec, managed)
 		["--ctk"] = spec.cache_type_k, ["--ctv"] = spec.cache_type_v,
 		["--recipe"] = spec.recipe, ["--cache-ram"] = spec.cache_ram,
 		["--ctx-checkpoints"] = spec.ctx_checkpoints, ["--mmproj"] = spec.mmproj,
+		["--kv-initial"] = kvi,
 		["--image-min-tokens"] = imin, ["--image-max-tokens"] = imax,
 	}) do
 		table.move({ flag, tostring(v) }, 1, 2, #wargs + 1, wargs)
@@ -458,6 +468,7 @@ local function make_engine(opts, cfg)
 			flash_attn = not opts["no-fa"], stt = opts.stt, inproc = opts.inproc,
 			cache_type_k = opts.ctk, cache_type_v = opts.ctv, recipe = opts.recipe,
 			cache_ram = opts["cache-ram"], ctx_checkpoints = opts["ctx-checkpoints"],
+			kv_initial = opts["kv-initial"],
 			engine = opts.engine, lora = opts.lora, mmproj = opts.mmproj,
 			image_min_tokens = opts["image-min-tokens"],
 			image_max_tokens = opts["image-max-tokens"],
@@ -536,6 +547,7 @@ local function main(args)
 		threads = "t", ctx = "c", fake = false, ["no-fa"] = false, ["alias="] = false,
 		inproc = false, stt = false, ["ctk="] = false, ["ctv="] = false, ["engine="] = false,
 		["recipe="] = false, ["cache-ram="] = false, ["ctx-checkpoints="] = false,
+		["kv-initial="] = false,
 		["lora="] = false, ["cors="] = false, ["vram="] = false, ["idle="] = false,
 		["mmproj="] = false, ["image-min-tokens="] = false, ["image-max-tokens="] = false,
 		["text-backend="] = false, ["state-dir="] = false, ["unknown-fields="] = false,

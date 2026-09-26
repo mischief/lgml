@@ -9,6 +9,9 @@ local lgml = require("lgml")
 local kv = require("lgml.kv")
 local placement = require("lgml.placement")
 local replay = require("lgml.replay")
+local log = require("lgml.log")
+
+local LOG = log.new("kv")
 
 local M = {}
 M.__index = M
@@ -442,7 +445,11 @@ end
 -- opts.type, opts.type_k, opts.type_v: cache types from `lgml.kv`
 -- (default f16).
 -- opts.ubatch: the most tokens per pass on a ring (default 512).
--- @treturn table cache with n_ctx, n_past (0), type_k, type_v, k, v;
+-- opts.initial: rows the full-attention layers get at first (default
+-- n_ctx). A pass past them grows the cache to twice the rows, or to the
+-- rows the pass needs, at most n_ctx; see `grow`.
+-- @treturn table cache with n_ctx, cap (the rows the full-attention
+-- layers hold now), n_past (0), type_k, type_v, k, v;
 -- ring, ubatch and hi with sliding layers; rs_pos (the position the
 -- states are at), conv and ssm with recurrent layers
 function M:cache(n_ctx, opts)
@@ -455,7 +462,12 @@ function M:cache(n_ctx, opts)
 		end
 	end
 	local tk, tv = kv.types_of(opts, dims)
-	local c = { n_ctx = n_ctx, n_past = 0, be = be, type_k = tk, type_v = tv, k = {}, v = {} }
+	local cap = n_ctx
+	if opts.initial and opts.initial < n_ctx then
+		cap = math.min(n_ctx, math.max(PAD, (opts.initial + PAD - 1) // PAD * PAD))
+	end
+	local c = { n_ctx = n_ctx, cap = cap, n_past = 0, be = be, type_k = tk, type_v = tv,
+		k = {}, v = {} }
 	if hp.n_swa then
 		c.ubatch = opts.ubatch or UBATCH
 		c.ring = math.min(n_ctx, hp.n_swa - 1 + c.ubatch)
@@ -472,7 +484,7 @@ function M:cache(n_ctx, opts)
 			c.conv[il]:zero()
 			c.ssm[il]:zero()
 		elseif not L.kv_src then
-			local rows = L.swa and c.ring or n_ctx
+			local rows = L.swa and c.ring or cap
 			c.k[il] = lbe:tensor(tk, { rows, L.Hkv * L.D })
 			c.v[il] = lbe:tensor(tv, { rows, L.Hkv * L.D })
 			-- Rows past n_past are read under a -inf mask; zero keeps
@@ -519,6 +531,63 @@ function M:cache_size(opts)
 		end
 	end
 	return s.dev[1], s.dev[2], s.cpu[1], s.cpu[2]
+end
+
+--- Give the full-attention layers room for rows positions.
+-- The new tensors get the old rows [0, n_past); the old tensors are
+-- freed. The cached replay graph refers to the old tensors, so it is
+-- dropped. Rings and recurrent states do not change.
+-- @tparam table cache a cache from `cache`
+-- @tparam integer rows the positions needed, at most cache.n_ctx
+-- @treturn boolean true when the cache grew
+function M:grow(cache, rows)
+	-- A cache made by hand without cap holds all n_ctx rows.
+	if rows <= (cache.cap or cache.n_ctx) then
+		return false
+	end
+	assert(rows <= cache.n_ctx, "grow: past n_ctx")
+	local cap = math.min(cache.n_ctx, math.max(cache.cap * 2, (rows + PAD - 1) // PAD * PAD))
+	replay.drop(cache)
+	local keep = math.min(cache.n_past, cache.cap)
+	local buf
+	for il, L in ipairs(self.layers) do
+		if cache.k[il] and not L.swa then
+			for _, name in ipairs({ "k", "v" }) do
+				local old = cache[name][il]
+				local bytes = keep * (old:nbytes() // old:shape()[1])
+				local new = old:backend():tensor(old:type(), { cap, old:shape()[2] })
+				new:zero()
+				if bytes > 0 then
+					if not buf or #buf < bytes then
+						buf = lgml.hostbuf(bytes)
+					end
+					old:to_host(buf, 0, 0, bytes)
+					new:from_host(buf, 0, 0, bytes)
+				end
+				old:close()
+				cache[name][il] = new
+			end
+		end
+	end
+	if buf then
+		buf:close()
+	end
+	LOG:info("cache grew", "rows", cap, "from", cache.cap, "n_ctx", cache.n_ctx, "n_past", cache.n_past)
+	cache.cap = cap
+	return true
+end
+
+--- Device bytes the cache holds now.
+-- @tparam table cache a cache from `cache`
+-- @treturn integer bytes of the K, V, ring and recurrent tensors
+function M.cache_bytes(cache)
+	local n = 0
+	for _, part in ipairs({ cache.k, cache.v, cache.conv or {}, cache.ssm or {} }) do
+		for _, t in pairs(part) do
+			n = n + t:nbytes()
+		end
+	end
+	return n
 end
 
 --- Find how many cached positions stay valid after a rewind.
@@ -619,6 +688,9 @@ function M:restore(cache, snap, opts)
 	local rows = opts.rows or snap.n
 	local state = opts.state ~= false
 	assert(rows <= snap.n and (snap.full or rows == snap.n), "restore: rows not in the snapshot")
+	if snap.full then
+		self:grow(cache, rows)
+	end
 	-- Walk the parts in snapshot order; skip the ones not restored.
 	local hi = cache.hi
 	cache.hi = snap.hi
@@ -649,17 +721,21 @@ local function spans(cache, n_kv)
 	if not cache then
 		return n_kv, n_kv
 	end
-	local n_attn = math.min(cache.n_ctx, (n_kv + PAD - 1) // PAD * PAD)
-	local ring = cache.ring or cache.n_ctx
+	local cap = cache.cap or cache.n_ctx
+	local n_attn = math.min(cap, (n_kv + PAD - 1) // PAD * PAD)
+	local ring = cache.ring or cap
 	return n_attn, n_kv > ring and ring or math.min(ring, n_attn)
 end
 
--- Raise when a pass of n tokens does not fit the cache.
-local function check_pass(hp, cache, n)
+-- Raise when a pass of n tokens does not fit the cache. A pass past
+-- the rows the cache holds now grows it.
+local function check_pass(self, cache, n)
+	local hp = self.hp
 	local n_kv = cache.n_past + n
 	if n_kv > cache.n_ctx then
 		error("context full: " .. n_kv .. " > " .. cache.n_ctx)
 	end
+	self:grow(cache, n_kv)
 	if cache.ring and cache.ring < cache.n_ctx and n > cache.ring - hp.n_swa + 1 then
 		error(("%s: %d tokens in one pass; the ring takes %d"):format(hp.arch, n,
 		    cache.ring - hp.n_swa + 1))
@@ -746,7 +822,7 @@ function M:inputs(ids, cache, opts)
 		cache = self:cache(n)
 	end
 	if cache then
-		check_pass(hp, cache, n)
+		check_pass(self, cache, n)
 	end
 	kv.check(cache, opts.flash_attn)
 	local n_kv = (cache and cache.n_past or 0) + n
@@ -783,6 +859,11 @@ end
 -- @tparam table opts the input options
 -- @treturn string the key
 function M:replay_key(cache, n, opts)
+	-- Grow first: a grow drops the cached graph, and the key holds the
+	-- span of the grown cache.
+	if cache.n_past + n <= cache.n_ctx then
+		self:grow(cache, cache.n_past + n)
+	end
 	local n_attn, n_swa_attn = spans(cache, cache.n_past + n)
 	return ("%d:%d:%d:%s:%s:%s:%s:%s:%s"):format(n, n_attn, n_swa_attn, tostring(opts.flash_attn),
 	    opts.logits or "all", tostring(opts.hidden), tostring(opts.embd ~= nil),
@@ -797,7 +878,7 @@ end
 -- opts.embd_off give the new embeddings
 -- @raise as `inputs`
 function M:refill(inp, ids, cache, opts)
-	check_pass(self.hp, cache, #ids)
+	check_pass(self, cache, #ids)
 	fill(self.hp, inp, cache, ids, opts)
 end
 
