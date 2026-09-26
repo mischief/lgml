@@ -443,9 +443,29 @@ local function models(eng, res)
 			context_length = m.context_length,
 			meta = { n_ctx_train = m.context_length },
 			capabilities = caps,
+			status = { value = m.status or "loaded" },
+			lgml = { status = m.status or "loaded", bytes = m.bytes },
 		}
 	end
 	return res:json(200, { object = "list", data = data })
+end
+
+-- POST /models/load and /models/unload: { "model": id }.
+local function load_route(eng, req, res, what)
+	if type(eng[what]) ~= "function" then
+		return res:error(404, "this server does not load or unload models")
+	end
+	local body, err = json.decode(req.body)
+	if type(body) ~= "table" then
+		return res:error(400, "bad JSON: " .. tostring(err))
+	elseif type(body.model) ~= "string" then
+		return res:error(400, "model must be a string", nil, "model")
+	end
+	local ok, msg, status = eng[what](eng, body.model)
+	if not ok then
+		return res:error(status or 500, msg or what .. " failed")
+	end
+	return res:json(200, { success = true })
 end
 
 local function props(eng, res)
@@ -879,7 +899,14 @@ end
 -- - `image_generation`: `/v1/images/generations` and `/v1/images/edits`
 --
 -- A model entry gives them in its `capabilities` field; else they come
--- from the methods of eng (see `lgml.detect.modes_of`).
+-- from the methods of eng (see `lgml.detect.modes_of`). Each entry also
+-- has the load state as llama-server gives it, `status = { value }`,
+-- and `lgml = { status, bytes }`; see `lgml.server.engine`.
+--
+-- `POST /models/load` and `POST /models/unload` (also under `/v1`)
+-- take `{ "model": id }` and call `Engine:load` or `Engine:unload`.
+-- They give `{ "success": true }`, or an error; 404 when eng has no
+-- such method.
 -- @tparam lgml.server.httpd.Server srv the server
 -- @tparam lgml.server.engine.Engine eng the engine
 -- @raise when eng does not implement the interface
@@ -936,6 +963,13 @@ function M.install(srv, eng)
 	srv:route("POST", "/images/generations", gen)
 	srv:route("POST", "/v1/images/edits", edit)
 	srv:route("POST", "/images/edits", edit)
+	for _, what in ipairs({ "load", "unload" }) do
+		local function h(req, res)
+			return load_route(eng, req, res, what)
+		end
+		srv:route("POST", "/models/" .. what, h)
+		srv:route("POST", "/v1/models/" .. what, h)
+	end
 end
 
 return M

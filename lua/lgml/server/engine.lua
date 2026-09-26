@@ -51,7 +51,9 @@ end
 -- also have `created` and `owned_by`; `/v1/models` shows them. It can
 -- have `capabilities`, a list of mode names from `lgml.detect.MODES`;
 -- without it, `/v1/models` finds them from the engine methods, and
--- `vision = true` adds "multimodal".
+-- `vision = true` adds "multimodal". An entry can have `status`, the
+-- load state (`"unloaded"`, `"loading"`, `"loaded"` or `"unloading"`;
+-- default `"loaded"`), and `bytes`, the memory it takes.
 -- @treturn {table,...} the model list
 -- @function models
 
@@ -139,6 +141,23 @@ end
 -- @treturn[2] string an error message
 -- @treturn[2] int an HTTP status
 -- @function generate
+
+--- Loads a model now. This method is optional.
+-- `lgml.server.router` takes a model id; `lgml.server.pool` models
+-- take none.
+-- @treturn[1] any a true value when the model is loaded
+-- @treturn[2] nil
+-- @treturn[2] string an error message
+-- @treturn[2] int an HTTP status
+-- @function load
+
+--- Unloads a model and frees its memory. This method is optional.
+-- It takes the same arguments as `load`.
+-- @treturn[1] boolean true
+-- @treturn[2] nil
+-- @treturn[2] string an error message
+-- @treturn[2] int an HTTP status
+-- @function unload
 
 --- Stops the engine and its worker processes. This method is optional.
 -- `lgml-server` calls it at exit.

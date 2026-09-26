@@ -218,6 +218,55 @@ function R:generate(req, ctl)
 	return e:generate(req, ctl)
 end
 
+-- The engine with a model of this id, and that model.
+local function find(self, id)
+	for _, e in ipairs(self.engines) do
+		for _, m in ipairs(e:models()) do
+			if m.id == id then
+				return e, m
+			end
+		end
+	end
+end
+
+--- Loads a model by id, or waits for its load under way.
+-- @tparam string id the model id
+-- @treturn[1] boolean true when the model is loaded
+-- @treturn[2] nil
+-- @treturn[2] string an error message
+-- @treturn[2] int 404 for an unknown id, 400 for a model that does not
+-- load on demand, 503 when the load fails
+function R:load(id)
+	local e = find(self, id)
+	if not e then
+		return nil, "unknown model " .. tostring(id), 404
+	elseif not e.load then
+		return nil, ("model %s does not load on demand"):format(id), 400
+	end
+	local ok, msg, status = e:load()
+	if not ok then
+		return nil, msg, status
+	end
+	return true
+end
+
+--- Unloads a model by id and waits until its worker exits.
+-- @tparam string id the model id
+-- @treturn[1] boolean true, also when the model was not loaded
+-- @treturn[2] nil
+-- @treturn[2] string an error message
+-- @treturn[2] int 404 for an unknown id, 400 for a model that does not
+-- load on demand, 409 while it has requests in flight or loads
+function R:unload(id)
+	local e = find(self, id)
+	if not e then
+		return nil, "unknown model " .. tostring(id), 404
+	elseif not e.unload then
+		return nil, ("model %s does not load on demand"):format(id), 400
+	end
+	return e:unload()
+end
+
 --- Stops each engine that has a `stop` method.
 function R:stop()
 	for _, e in ipairs(self.engines) do
