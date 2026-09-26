@@ -103,7 +103,7 @@ function P:add(o)
 		margin = o.margin or 0, extra = o.extra or {}, fixed = o.fixed,
 		context_length = o.context_length, static_props = o.props, idle = o.idle,
 		start = o.start,
-		state = "unloaded", inflight = 0, last = 0, waiters = {}, counted = false,
+		state = "unloaded", inflight = 0, wanted = 0, last = 0, waiters = {}, counted = false,
 	}, Model)
 	self.models[#self.models + 1] = m
 	metrics.set("model_loaded_bytes", "device or host bytes of the loaded model", m.id, 0)
@@ -183,7 +183,8 @@ end
 function P:idle_models(kind, except)
 	local list = {}
 	for _, m in ipairs(self.models) do
-		if m ~= except and m:need(kind) > 0 and m.state == "loaded" and m.inflight == 0 then
+		if m ~= except and m:need(kind) > 0 and m.state == "loaded" and m.inflight == 0 and
+		    m.wanted == 0 then
 			list[#list + 1] = m
 		end
 	end
@@ -225,7 +226,7 @@ function P:reserve_kind(m, kind, deadline)
 			local busy = {}
 			for _, o in ipairs(self.models) do
 				if o ~= m and o:need(kind) > 0 and o.counted and
-				    (o.inflight > 0 or o.state ~= "loaded") then
+				    (o.inflight > 0 or o.wanted > 0 or o.state ~= "loaded") then
 					busy[#busy + 1] = o.id
 				end
 			end
@@ -430,6 +431,18 @@ end
 -- @treturn[2] string the reason of a failed load
 -- @treturn[2] int 503
 function Model:load(hold)
+	-- A model with a caller in here is not idle: a load wakes other
+	-- waiters first, and they must not unload it before this caller runs.
+	self.wanted = self.wanted + 1
+	local eng, err, code = self:load_loop(hold)
+	self.wanted = self.wanted - 1
+	if self.wanted == 0 then
+		self.pool:notify()
+	end
+	return eng, err, code
+end
+
+function Model:load_loop(hold)
 	while true do
 		if self.pool.stopping then
 			return nil, "server is stopping", 503

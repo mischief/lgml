@@ -190,6 +190,23 @@ local function test_in_flight()
 	cleanup(p)
 end
 
+-- Two requests for two models that do not fit together. A model that
+-- loads serves its request before the other load can unload it.
+local function test_swap()
+	local p = pool_mod.new({ budget = { gpu = 100 * MiB } })
+	local a, b = add(p, "a", { size = 60, load_ms = 30 }), add(p, "b", { size = 60, load_ms = 30 })
+	local ha = spawn(function() return chat(a) end)
+	local hb = spawn(function() return chat(b) end)
+	local t0 = uv.now()
+	while not (ha.done and hb.done) and uv.now() - t0 < 5000 do
+		stream.sleep(10)
+	end
+	ok(ha.done and hb.done and ha.res[1] == true and hb.res[1] == true,
+	    "two requests for models that do not fit together both end")
+	ok(a.starts + b.starts <= 3, ("the models load at most 3 times (%d)"):format(a.starts + b.starts))
+	cleanup(p)
+end
+
 -- A model with parts on two kinds counts each part against its budget.
 local function test_parts()
 	local p = pool_mod.new({ budget = { gpu = 100 * MiB, cpu = 100 * MiB } })
@@ -488,6 +505,7 @@ local function main()
 	test_shared_load()
 	test_lru()
 	test_in_flight()
+	test_swap()
 	test_parts()
 	test_no_room()
 	test_idle()
