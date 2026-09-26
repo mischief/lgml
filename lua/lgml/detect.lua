@@ -61,7 +61,7 @@ end
 -- them as `capabilities`:
 --
 -- - `completion`: chat completions
--- - `multimodal`: chat completions with image input
+-- - `multimodal`: chat completions and decisions with image input
 -- - `decide`: System One decisions (`/v1/systemone`)
 -- - `transcription`: speech to text
 -- - `speech`: text to speech
@@ -69,7 +69,7 @@ end
 M.MODES = { "completion", "multimodal", "decide", "transcription", "speech", "image_generation" }
 
 --- The engine method that serves each mode.
--- `multimodal` is `chat` with images.
+-- `multimodal` is `chat` with images; decisions with images also need it.
 M.METHOD = {
 	completion = "chat", multimodal = "chat", decide = "decide",
 	transcription = "transcribe", speech = "speak", image_generation = "generate",

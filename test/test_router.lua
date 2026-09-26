@@ -66,6 +66,29 @@ ok(code == 400 and msg:find("models with vision: eyes", 1, true), "a named model
 _, msg, code = router.new({ vis("text", false) }):chat({ messages = img_msgs })
 ok(code == 400 and msg:find("no model has an mmproj", 1, true), "no vision model gives 400")
 
+-- Decisions with images go to a model with vision that can decide.
+local function dvis(id, vision)
+	local e = vis(id, vision)
+	function e.decide(_, req) return { model = id, images = req.images and #req.images or 0 } end
+	return e
+end
+local chat_eyes = vis("chateyes", true)
+local r6 = router.new({ chat_eyes, dvis("text", false), dvis("eyes", true) })
+local imgs = { { bytes = "\137PNG", mime = "image/png" } }
+ok(r6:decide({ images = imgs }).model == "eyes", "decide images with no model go to a vision decide model")
+ok(r6:decide({ model = "jevify-latest", images = imgs }).model == "eyes",
+    "decide images for jevify-latest go to a vision decide model")
+ok(r6:decide({ model = "jevify-latest" }).model == "text" and r6:decide({}).model == "text",
+    "text decisions keep the first decide model")
+ok(r6:decide({ model = "eyes", images = imgs }).images == 1, "a named vision model gets the images")
+_, msg, code = r6:decide({ model = "text", images = imgs })
+ok(code == 400 and msg:find("not supported by text; models with vision: eyes$"),
+    "a named decide model without vision names the vision decide models: " .. tostring(msg))
+_, msg, code = router.new({ chat_eyes, dvis("text", false) }):decide({ images = imgs })
+ok(code == 400 and msg:find("no model has an mmproj", 1, true),
+    "a chat-only vision model does not serve decisions with images")
+ok(r6:decide({ images = {} }).model == "text", "an empty image list is text")
+
 -- Modes of config specs, without loading.
 local detect = require("lgml.detect")
 local function modes(spec)

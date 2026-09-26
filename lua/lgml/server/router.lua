@@ -103,11 +103,12 @@ function R:pick(id, what)
 	return first
 end
 
--- The chat engines with a vision model, and the ids of those models.
-local function vision_engines(self)
+-- The engines of method what with a vision model, and the ids of
+-- those models.
+local function vision_engines(self, what)
 	local es, ids = {}, {}
 	for _, e in ipairs(self.engines) do
-		if can(e, "chat") then
+		if can(e, what) then
 			for _, m in ipairs(entries(e)) do
 				if m.vision or has(m.capabilities, "multimodal") then
 					es[#es + 1], ids[#ids + 1] = e, m.id
@@ -126,6 +127,25 @@ local function model_of(e, id)
 		end
 	end
 end
+
+-- The engine for a request with images: e when its model has vision,
+-- else the first vision engine for an unknown model. A named model
+-- without vision is an error that names the models with vision.
+local function to_vision(self, e, id, what)
+	local m = model_of(e, id)
+	if m and (m.vision or has(m.capabilities, "multimodal")) then
+		return e
+	end
+	local es, ids = vision_engines(self, what)
+	if #es == 0 then
+		return nil, "image input is not supported: no model has an mmproj", 400
+	elseif m then
+		return nil, ("image input is not supported by %s; models with vision: %s")
+		    :format(m.id, table.concat(ids, ", ")), 400
+	end
+	return es[1]
+end
+
 --- Returns the properties of the first chat engine.
 -- With no chat engine, it uses the first engine.
 -- @treturn table the properties
@@ -148,16 +168,10 @@ function R:chat(req, sink)
 		return nil, "no model serves chat", 400
 	end
 	if type(req.messages) == "table" and media.has_images(req.messages) then
-		local m = model_of(e, req.model)
-		if not (m and (m.vision or has(m.capabilities, "multimodal"))) then
-			local es, ids = vision_engines(self)
-			if #es == 0 then
-				return nil, "image input is not supported: no model has an mmproj", 400
-			elseif m then
-				return nil, ("image input is not supported by %s; models with vision: %s")
-				    :format(m.id, table.concat(ids, ", ")), 400
-			end
-			e = es[1]
+		local err, status
+		e, err, status = to_vision(self, e, req.model, "chat")
+		if not e then
+			return nil, err, status
 		end
 	end
 	return e:chat(req, sink)
@@ -192,7 +206,9 @@ end
 
 --- Answers typed questions on the engine for `req.model`.
 -- A request for `"jevify-latest"`, no model or an unknown one goes to
--- the first engine that can decide.
+-- the first engine that can decide. With images (`req.images`), such a
+-- request goes to the first model with vision that can decide, and a
+-- named model without vision is an error, as for chat.
 -- @tparam table req the decision request
 -- @tparam lgml.server.engine.Control ctl the cancel control
 -- @return the results of `Engine:decide`, or nil, a message and 400
@@ -201,6 +217,13 @@ function R:decide(req, ctl)
 	local e = self:pick(req.model, "decide")
 	if not e then
 		return nil, "no model serves decisions", 400
+	end
+	if type(req.images) == "table" and #req.images > 0 then
+		local err, status
+		e, err, status = to_vision(self, e, req.model, "decide")
+		if not e then
+			return nil, err, status
+		end
 	end
 	return e:decide(req, ctl)
 end
