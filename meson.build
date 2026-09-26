@@ -201,6 +201,9 @@ if lua_bin.found()
   test('decide_head', lua_bin, args : [files('test/test_decide_head.lua')],
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
     timeout : 300)
+  # LGML_LAYA (a Laya model directory) from the environment adds real-model checks
+  # (backend LGML_LAYA_BACKEND, default CPU).
+  test('laya', lua_bin, args : [files('test/test_laya.lua')], timeout : 300)
   test('worker', lua_bin, args : [files('test/test_worker.lua')], timeout : 60)
   test('stream', lua_bin, args : [files('test/test_stream.lua')], timeout : 30)
   test('status', lua_bin, args : [files('test/test_status.lua')], timeout : 60)
