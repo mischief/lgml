@@ -355,7 +355,9 @@ function E:image_embd(key)
 		end
 	end
 	local img = assert(self.images and self.images[key], "no image for " .. key)
+	local t0 = lgml.clock()
 	local buf = assert(self.vision:encode(img.prep))
+	self.image_ms = (self.image_ms or 0) + (lgml.clock() - t0) * 1000
 	table.insert(self.embd_store, 1, { key = key, buf = buf })
 	while #self.embd_store > EMBD_KEEP do
 		table.remove(self.embd_store).buf:close()
@@ -479,7 +481,8 @@ end
 --- Answers typed questions by logit readout (see
 -- `lgml.server.engine.Engine.decide` and `lgml.decide`).
 -- The request waits for the slot, as chat does. A Lua error resets the
--- cache and returns status 500.
+-- cache and returns status 500. Images in `req.images` need an mmproj;
+-- without one they give status 400.
 -- @tparam table req the decision request
 -- @tparam[opt] lgml.server.engine.Control ctl the cancel control
 -- @treturn[1] table the result: `{ model, answers, usage }`
@@ -493,7 +496,9 @@ function E:decide(req, ctl)
 		self:release()
 		return nil, lerr, 400
 	end
+	self.image_ms = 0
 	local ok, a, b, c = pcall(decide.run, self, req, ctl)
+	self:drop_images()
 	if not ok then
 		self.tokens, self.cache.n_past = {}, 0
 	end
@@ -519,44 +524,66 @@ function E:grammar_opts(req, think, prompt)
 	return { grammar = text, grammar_root = root, tokenizer = self.tk }
 end
 
--- Put the images of a request into prompt: each image token becomes
--- one entry for each image embedding. Returns the new prompt, or nil
--- and an error message.
-function E:add_images(prompt, images)
+-- Prepare the images of a request, each `{ bytes }`, for the encoder.
+-- Returns their keys in order (`"img:<sha256>"`), or nil and an error
+-- message. drop_images frees them.
+function E:prepare_images(images)
+	self.images = self.images or {}
+	local keys = {}
+	for k, img in ipairs(images) do
+		local key = "img:" .. lgml.sha256(img.bytes)
+		local have = self.images[key]
+		if not have then
+			local prep, err = self.vision:prepare(img.bytes)
+			if not prep then
+				return nil, ("image %d: %s"):format(k, err)
+			end
+			have = { prep = prep, n = self.vision:tokens(prep) }
+			self.images[key] = have
+		end
+		if have.n > (self.cache.ubatch or have.n) then
+			return nil, ("image %d has %d tokens; a pass takes %d"):format(k, have.n,
+			    self.cache.ubatch)
+		end
+		keys[k] = key
+	end
+	return keys
+end
+
+-- Replace each image token of prompt with one entry for each embedding
+-- of the next prepared image. Returns the new prompt, or nil and an
+-- error message.
+function E:expand_images(prompt, keys)
 	local out, k = {}, 0
-	self.images = {}
 	for _, id in ipairs(prompt) do
 		if id ~= self.image_id then
 			out[#out + 1] = id
 		else
 			k = k + 1
-			local img = images[k]
-			if not img then
+			local key = keys[k]
+			if not key then
 				return nil, "the prompt holds more image tokens than images"
 			end
-			local key = "img:" .. lgml.sha256(img.bytes)
-			local have = self.images[key]
-			if not have then
-				local prep, err = self.vision:prepare(img.bytes)
-				if not prep then
-					return nil, ("image %d: %s"):format(k, err)
-				end
-				have = { prep = prep, n = self.vision:tokens(prep) }
-				self.images[key] = have
-			end
-			if have.n > (self.cache.ubatch or have.n) then
-				return nil, ("image %d has %d tokens; a pass takes %d"):format(k, have.n,
-				    self.cache.ubatch)
-			end
-			for i = 1, have.n do
+			for i = 1, self.images[key].n do
 				out[#out + 1] = key .. ":" .. i
 			end
 		end
 	end
-	if k ~= #images then
+	if k ~= #keys then
 		return nil, "the prompt holds fewer image tokens than images"
 	end
 	return out
+end
+
+-- Put the images of a request into prompt. Returns the new prompt, or
+-- nil and an error message.
+function E:add_images(prompt, images)
+	self.images = {}
+	local keys, err = self:prepare_images(images)
+	if not keys then
+		return nil, err
+	end
+	return self:expand_images(prompt, keys)
 end
 
 -- Free the prepared images of the last request.
@@ -568,6 +595,7 @@ function E:drop_images()
 end
 
 function E:run(req, sink)
+	self.image_ms = 0
 	local ok, a, b, c = pcall(self.run_prompt, self, req, sink)
 	self:drop_images()
 	if not ok then
@@ -580,7 +608,7 @@ function E:run_prompt(req, sink)
 	local think = thinking(req)
 	local kw = type(req.chat_template_kwargs) == "table" and req.chat_template_kwargs or {}
 	local effort, keep = kw.reasoning_effort, kw.preserve_thinking
-	local messages, images = req.messages, nil
+	local messages, images = req.messages, {}
 	if media.has_images(messages) then
 		if not self.vision then
 			return nil, "image input is not supported: start the server with --mmproj", 400
@@ -598,7 +626,7 @@ function E:run_prompt(req, sink)
 	local prompt = self.tk:encode(text)
 	if self.vision then
 		local err
-		prompt, err = self:add_images(prompt, images or {})
+		prompt, err = self:add_images(prompt, images)
 		if not prompt then
 			return nil, err, 400
 		end
@@ -668,6 +696,7 @@ function E:run_prompt(req, sink)
 		predicted_n = n, predicted_ms = (t2 - t1) * 1000,
 		predicted_per_token_ms = (t2 - t1) * 1000 / math.max(n, 1),
 		predicted_per_second = n / math.max(t2 - t1, 1e-9),
+		images = #images, image_encode_ms = self.image_ms,
 	})
 	return true
 end
