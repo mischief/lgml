@@ -736,15 +736,25 @@ split_ctx(lua_State *L, int hidx, struct ggml_context **ctx, struct ggml_context
 	return nh;
 }
 
-/* Allocate the tensors of ctx on be as weights. NULL for no tensors. */
+/*
+ * Allocate the tensors of ctx in bt as weights. NULL for no tensors.
+ * A failed allocation leaves the tensors without data, for a retry.
+ */
 static int
-alloc_weights(struct ggml_context *ctx, ggml_backend_t be, ggml_backend_buffer_t *buf)
+alloc_weights(struct ggml_context *ctx, ggml_backend_buffer_type_t bt, ggml_backend_buffer_t *buf)
 {
+	struct ggml_tensor *gt;
+
 	*buf = NULL;
 	if (ggml_get_first_tensor(ctx) == NULL)
 		return 0;
-	if ((*buf = ggml_backend_alloc_ctx_tensors(ctx, be)) == NULL)
+	if ((*buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, bt)) == NULL) {
+		for (gt = ggml_get_first_tensor(ctx); gt != NULL; gt = ggml_get_next_tensor(ctx, gt)) {
+			gt->data = NULL;
+			gt->buffer = NULL;
+		}
 		return -1;
+	}
 	ggml_backend_buffer_set_usage(*buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 	return 0;
 }
@@ -752,9 +762,12 @@ alloc_weights(struct ggml_context *ctx, ggml_backend_t be, ggml_backend_buffer_t
 /*** Load every tensor of a gguf file to the device.
  * With `opts.cpu`, the tensors it names go to the CPU backend of this
  * backend (see `backend:cpu`); `weights:get` finds tensors of both parts.
+ * They go to pinned host memory of the device when it has some, so that
+ * the device can read them fast for large batches, else to plain memory.
  * @tparam string path gguf file
  * @tparam[opt] table opts `cpu`: a set of tensor names, `{ [name] =
- * true }`, to put on the CPU backend
+ * true }`, to put on the CPU backend; `pinned`: false to use plain
+ * memory for them (default true)
  * @treturn[1] weights the tensors
  * @return[2] nil if the file is not a gguf file
  * @treturn[2] string error message
@@ -771,12 +784,16 @@ backend_load(lua_State *L)
 	struct gguf_context *gctx;
 	struct ggml_context *ctx = NULL, *hctx = NULL;
 	ggml_backend_buffer_t buf, hbuf = NULL;
+	ggml_backend_buffer_type_t hbt, cbt;
 	char *chunk;
 	FILE *f;
-	int e, hidx = 0, sidx, nh = 0;
+	int e, hidx = 0, sidx, nh = 0, pinned = 1;
 
 	if (!lua_isnoneornil(L, 3)) {
 		luaL_checktype(L, 3, LUA_TTABLE);
+		if (lua_getfield(L, 3, "pinned") != LUA_TNIL)
+			pinned = lua_toboolean(L, -1);
+		lua_pop(L, 1);
 		if (lua_getfield(L, 3, "cpu") != LUA_TNIL) {
 			luaL_checktype(L, -1, LUA_TTABLE);
 			hidx = lua_gettop(L);
@@ -799,9 +816,19 @@ backend_load(lua_State *L)
 			return luaL_error(L, nh < 0 ? "ggml_init failed" :
 			    "%s: tensors for the CPU, but the backend has no CPU backend", path);
 		}
-		if (alloc_weights(ctx, b->be, &buf) != 0 || alloc_weights(hctx, b->cpu->be, &hbuf) != 0) {
-			if (hbuf == NULL && buf != NULL)
-				ggml_backend_buffer_free(buf);
+		/*
+		 * Pinned host memory of the device, when it has some, makes
+		 * the copies of op offload faster. Plain memory if that fails.
+		 */
+		cbt = ggml_backend_get_default_buffer_type(b->cpu->be);
+		hbt = pinned ? ggml_backend_dev_host_buffer_type(ggml_backend_get_device(b->be)) : NULL;
+		if (hbt == NULL || alloc_weights(hctx, hbt, &hbuf) != 0)
+			e = alloc_weights(hctx, cbt, &hbuf);
+		else
+			e = 0;
+		if (e != 0 || alloc_weights(ctx, ggml_backend_get_default_buffer_type(b->be), &buf) != 0) {
+			if (hbuf != NULL)
+				ggml_backend_buffer_free(hbuf);
 			gguf_free(gctx);
 			ggml_free(ctx);
 			ggml_free(hctx);
