@@ -10,6 +10,9 @@ return {
 	-- startup minus 1024). A load that does not fit unloads idle models,
 	-- least recently used first.
 	vram = 20000,
+	-- Host memory for models on the CPU and the host part of GPU models,
+	-- in MiB (default: no limit).
+	-- ram = 32000,
 	-- Unload a model after this many seconds without requests (default
 	-- 0: never).
 	idle = 300,
@@ -39,6 +42,14 @@ return {
 		{ id = "gemma-4-26b", model = "/home/you/models/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
 			mmproj = "/home/you/models/gemma-4-26B-A4B-it-mmproj-F16.gguf", backend = "Vulkan0",
 			ctx = 16384 },
+		-- n_cpu_moe keeps the routed experts of the first N layers in host
+		-- memory, where the CPU runs them; "auto" picks the fewest layers
+		-- that fit vram. That part counts against ram. cpu_moe = true
+		-- takes the experts of every layer, n_gpu_layers keeps only the
+		-- last N layers on the GPU, and override = { "pattern=CPU", ... }
+		-- places tensors by Lua pattern.
+		{ id = "qwen3.5-35b", model = "/home/you/models/Qwen3.5-35B-A3B-Q4_K_M.gguf",
+			backend = "Vulkan0", ctx = 32768, n_cpu_moe = "auto" },
 		-- idle = 0 keeps this model loaded until another load needs room.
 		{ id = "whisper", model = "/home/you/models/whisper-large-v3-turbo", backend = "Vulkan0",
 			idle = 0 },

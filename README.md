@@ -33,6 +33,31 @@ bin/lgml-server -C etc/lgml.lua               # several models from a config
 `bin/lgml-server -h` lists the options. `etc/lgml.lua.example` is a
 sample config with chat, vision, Whisper, image and speech models.
 
+### Weights in host memory
+
+A chat model that does not fit in GPU memory can keep part of its
+weights in host memory, as llama.cpp does. The CPU runs the ops on
+those weights; the GPU runs the rest, and the ggml scheduler copies
+activations between them. For prompts, the GPU copies the CPU weights
+and runs the large batches itself.
+
+```sh
+bin/lgml-server -m moe.gguf --cpu-moe          # routed experts on the CPU
+bin/lgml-server -m moe.gguf --n-cpu-moe 20     # experts of the first 20 layers
+bin/lgml-server -m moe.gguf --n-cpu-moe auto   # as few layers as fit
+bin/lgml-server -m model.gguf -ngl 30          # the last 30 layers on the GPU
+bin/lgml-server -m moe.gguf -ot 'blk%.[0-9]%.ffn_.*exps=CPU'
+```
+
+`-ot` takes a Lua pattern, not a regular expression. Model specs in a
+config take the keys `cpu_moe`, `n_cpu_moe`, `n_gpu_layers` and
+`override`. The host part counts against `ram`, the rest against
+`vram`; with `n_cpu_moe = "auto"` the server picks the count that fits
+`vram`. A mixture-of-experts model with its experts on the CPU keeps
+a large part of its GPU speed: on a Ryzen 9 7950X with a 32 GB GPU,
+gemma-4-26B-A4B Q4_K_M runs 24 tokens/s from 3 GB of GPU memory, and
+34 tokens/s from 10 GB with `--n-cpu-moe 15`.
+
 ## Logs
 
 The server and its workers write one line per event to stderr, in

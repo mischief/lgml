@@ -4,7 +4,8 @@
 -- wait for the same load. Each model has a size in bytes, and each
 -- memory kind (`"gpu"` or `"cpu"`) has a budget. A model with parts on
 -- more than one kind, such as an image model with its text encoder on
--- the CPU, counts each part against the budget of its kind. When a load
+-- the CPU, or a chat model with weights in host memory (see
+-- `lgml.placement`), counts each part against the budget of its kind. When a load
 -- does not fit, the pool unloads idle models of that kind, least
 -- recently used first. A model with requests in flight or a load under
 -- way stays.

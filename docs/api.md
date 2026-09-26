@@ -1283,7 +1283,9 @@ fields. It does not load a model.
 - `status.value` (llama.cpp) and `lgml.status`: `unloaded`, `loading`,
   `loaded` or `unloading`. A server without a config gives `loaded`.
 - `lgml.bytes`: with a config, the memory that the model counts
-  against its budget.
+  against the budget of its backend (`vram` for a GPU model). A part in
+  host memory, such as weights that `n_cpu_moe` keeps on the CPU,
+  counts against `ram` and is not in this number.
 
 A request with an `anthropic-version` header gets the Anthropic list
 shape instead, as the Anthropic SDKs read it:
