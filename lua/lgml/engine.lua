@@ -259,6 +259,8 @@ function M.new(opts)
 		be = be, model = model, family = family, family_name = family_name,
 		tk = assert(tokenizer.open(opts.model)),
 		n_ctx = n_ctx, flash_attn = fa, pool = pool,
+		-- Recurrent states and rings cannot start from shared blocks.
+		fixed = model.recurrent or (cache.ring ~= nil and cache.ring < n_ctx),
 		id = opts.id or info.meta["general.name"] or "lgml",
 		cache = cache, tokens = {},
 		busy = false, waiting = {}, adapters = adapters,
@@ -436,6 +438,9 @@ function E:evict_slot(s)
 		if pc then
 			s.ckpts = pc.ckpts
 		end
+	end
+	if s.key == self.lora_key then
+		self:publish(s.cache, s.tokens)
 	end
 	if pc and #s.tokens > 0 and s.key == self.lora_key then
 		local cache, ckpts = pc.cache, pc.ckpts
@@ -817,6 +822,9 @@ function E:reuse(prompt)
 		n = n + 1
 	end
 	n = span_start(prompt, n)
+	-- Cached pool blocks can give a longer prefix than the slot.
+	n = span_start(prompt, self:attach(prompt, n))
+	old = self.tokens
 	-- The prompt cache can swap in a stored slot that shares more.
 	if self.pc then
 		n = span_start(prompt, self.pc:reuse(self, prompt, n))
@@ -844,7 +852,89 @@ function E:reuse(prompt)
 	if self.pc then
 		self.pc:trim(n)
 	end
+	self:publish(self.cache, self.tokens)
 	return n
+end
+
+-- The key before the first block of a sequence: blocks made under
+-- other adapter scales do not match.
+function E:root_key()
+	return "lgml:" .. (self.lora_key or "")
+end
+
+-- Give keys to the full blocks of a pool sequence that have none, so
+-- other sequences can share them. tokens are the sequence's tokens.
+function E:publish(cache, tokens)
+	if not cache.pool then
+		return
+	end
+	local B, alloc, keys = cache.pool.block, cache.pool.alloc, cache.keys
+	for i = #keys + 1, math.min(cache.n_past, #tokens) // B do
+		local parent = keys[i - 1] or self:root_key()
+		local key = kvpool.key(parent, tokens, (i - 1) * B + 1, B)
+		keys[i] = key
+		alloc:publish(cache.blocks[i], key, parent, i, table.move(tokens, (i - 1) * B + 1, i * B, 1, {}))
+	end
+end
+
+-- Share cached pool blocks that hold a longer prefix of prompt than the
+-- n tokens the active slot keeps. The slot then starts over on them. A
+-- cached block that shares only part of its tokens with the prompt
+-- gives a copy of those cells. Models with recurrent states or rings
+-- do not share: the blocks hold no state. Returns the tokens the slot
+-- holds.
+function E:attach(prompt, n)
+	local cache = self.cache
+	if not cache.pool or self.fixed then
+		return n
+	end
+	local B, alloc = cache.pool.block, cache.pool.alloc
+	-- At least one prompt token must run.
+	local max = #prompt - 1
+	local blocks, keys = {}, {}
+	local parent = self:root_key()
+	while (#blocks + 1) * B <= max do
+		local key = kvpool.key(parent, prompt, #blocks * B + 1, B)
+		local b = alloc:lookup(key)
+		if not b then
+			break
+		end
+		blocks[#blocks + 1], keys[#keys + 1] = b, key
+		parent = key
+	end
+	local m = #blocks * B
+	local kid, part = alloc:longest_kid(parent, prompt, m + 1, math.min(B - 1, max - m))
+	if m + part <= n then
+		return n
+	end
+	-- A slot that keeps less than half its tokens goes to the RAM store
+	-- first, as in `lgml.prompt_cache.reuse`.
+	if self.pc and n * 2 < #self.tokens then
+		self.pc:save(self)
+	end
+	self.model:truncate(cache, 0)
+	self.model:share(cache, blocks, keys)
+	if part > 0 then
+		-- Hold the block while the copy takes a new one.
+		alloc:ref(kid)
+		local ok, err = pcall(self.model.grow, self.model, cache, m + part)
+		if ok then
+			self.model.copy_block(cache.pool, kid, cache.blocks[#blocks + 1], part)
+			cache.n_past = m + part
+		else
+			part = 0
+		end
+		alloc:unref(kid)
+		if not ok then
+			L:debug("no block for a partial copy", "err", err)
+		end
+	end
+	self.tokens = table.move(prompt, 1, m + part, 1, {})
+	self.slot.tokens = self.tokens
+	alloc.stats.hits = alloc.stats.hits + 1
+	alloc.stats.hit_blocks = alloc.stats.hit_blocks + #blocks
+	L:debug("shared blocks", "blocks", #blocks, "copied", part, "slot_kept", n)
+	return m + part
 end
 
 -- The embeddings of the image with key: from the host store, or from
@@ -905,6 +995,7 @@ function E:prefill_batched(slot, prompt, from, stops, sink)
 		local ids = table.move(prompt, i, j, 1, {})
 		logits = self:batch_step(slot, ids)
 		table.move(prompt, i, j, #slot.tokens + 1, slot.tokens)
+		self:publish(slot.cache, slot.tokens)
 		if j == stops[c] then
 			self:acquire()
 			local ok, err = pcall(self.checkpoint_slot, self, slot)
@@ -957,6 +1048,7 @@ function E:prefill(prompt, from, sink)
 		end
 		logits = self:eval(ids, "last", embd)
 		table.move(prompt, i, j, #self.tokens + 1, self.tokens)
+		self:publish(self.cache, self.tokens)
 		if j == stops[c] then
 			self.pc:checkpoint()
 			c = c + 1
@@ -1347,6 +1439,12 @@ function E:run_prompt(req, sink, st)
 	end
 	L:debug("prefill", "tokens", #prompt, "cached", cached, "restored", self.pc and self.pc.restored or 0,
 	    "compute", #prompt - cached)
+	if self.pool and L:on(log.DEBUG) then
+		local a = self.pool.alloc
+		L:debug("kv pool", "cells", self.pool.n_ctx, "used", a.used * a.size, "cached", a.cached * a.size,
+		    "hits", a.stats.hits, "hit_blocks", a.stats.hit_blocks, "evicted", a.stats.evicted,
+		    "slot_evictions", self.evictions or 0)
+	end
 	if sink.prompt and not sink:prompt(#prompt, cached) then
 		return true
 	end
@@ -1422,6 +1520,7 @@ function E:run_prompt(req, sink, st)
 		end
 		logits = lg
 		toks[#toks + 1] = id
+		self:publish(slot and slot.cache or self.cache, toks)
 		stream.sleep(0)
 		if sink:cancelled() then
 			return true

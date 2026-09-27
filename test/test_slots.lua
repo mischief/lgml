@@ -62,7 +62,8 @@ local function run(slots)
 end
 
 local e1, a1, b1 = run(1)
-ok(a1 < 20 and b1 < 20, ("one slot, no RAM store: turns do not reuse (cached %d, %d)"):format(a1, b1))
+ok(a1 > 400 and b1 > 400 and e1.pc.restored == 0,
+    ("one slot, no RAM store: the cached pool blocks keep both clients (cached %d, %d)"):format(a1, b1))
 local e2, a2, b2, ra, rb = run(2)
 ok(a2 > 60 and b2 > 60, ("two slots: each client reuses its own prefix (cached %d, %d)"):format(a2, b2))
 ok(e2:props().total_slots == 2, "props report two slots")
@@ -78,11 +79,13 @@ ok(table.concat(ra.text) == want, "a slot gives the same tokens as a fresh cache
 -- A third client with no shared prefix takes the least recently used slot.
 local rc = chat(e2, ("one two three four five six seven "):rep(12))
 ok(rc.res, "a third client runs")
--- Client a was the least recently used, so c took a's slot; b kept its own.
+-- Client a was the least recently used, so c took a's slot; b kept its
+-- own. The blocks of a stay cached in the pool.
 local rb2 = chat(e2, b .. "more again")
 local ra2 = chat(e2, a .. "more again")
 ok(rb2.usage.cached_tokens > 60, ("b kept its slot (cached %d)"):format(rb2.usage.cached_tokens))
-ok(ra2.usage.cached_tokens < 20, ("a lost its slot to c (cached %d)"):format(ra2.usage.cached_tokens))
+ok(ra2.usage.cached_tokens > 400 and e2.pc.restored == 0,
+    ("a lost its slot to c, and gets its cached blocks back (cached %d)"):format(ra2.usage.cached_tokens))
 
 -- Concurrent requests decode together in batched passes and give the
 -- same tokens as one at a time.
@@ -148,7 +151,8 @@ local en = engine.new({ model = path, backend = "CPU", n_ctx = 768, slots = 3, k
 chat(en, a)
 chat(en, b)
 local na = chat(en, a .. "more")
-ok(na.usage.cached_tokens < 20, ("without a RAM store, an evicted slot starts over (cached %d)")
+ok(na.usage.cached_tokens > 0 and na.usage.cached_tokens < 400 and na.usage.cached_tokens % 64 == 0,
+    ("without a RAM store, an evicted slot keeps the first blocks; the pool took its last ones (cached %d)")
     :format(na.usage.cached_tokens))
 
 -- A prompt that does not fit next to a running request waits for it;
@@ -191,6 +195,82 @@ local n1, n2 = rf[1].usage.completion_tokens, rf[2].usage.completion_tokens
 -- The reply that ended leaves an idle slot, whose blocks the other takes.
 ok(math.min(n1, n2) < 400 and math.max(n1, n2) == 400,
     ("one reply ends early, the other gets all its tokens (%d, %d)"):format(n1, n2))
+
+-- Chats with messages, one at a time.
+local function chat_msgs(e, messages, n_tok)
+	local r = sink()
+	local done
+	coroutine.wrap(function()
+		r.res, r.err = e:chat({ messages = messages, max_tokens = n_tok or 4, temperature = 0,
+			chat_template_kwargs = { enable_thinking = false } }, r.sink)
+		done = true
+	end)()
+	while not done do
+		uv.run("once")
+	end
+	return r
+end
+
+-- Two clients with one long system prompt share its blocks: the pool
+-- holds them once. The second one starts while the first one runs, so
+-- it takes the other slot.
+local sys = { role = "system", content = ("Follow the rules of the house and answer in short words. "):rep(4) }
+local es = engine.new({ model = path, backend = "CPU", n_ctx = 2048, slots = 2, cache_ram = 0 })
+local x1 = chat_msgs(es, { sys, { role = "user", content = "first question about fruit" } })
+local y1 = sink()
+local x1b = sink()
+do
+	local done = 0
+	for _, it in ipairs({ { x1b, "first question about fruit, again" }, { y1, "another question about the sea" } }) do
+		coroutine.wrap(function()
+			it[1].res = es:chat({ messages = { sys, { role = "user", content = it[2] } }, max_tokens = 4,
+				temperature = 0, chat_template_kwargs = { enable_thinking = false } }, it[1].sink)
+			done = done + 1
+		end)()
+	end
+	while done < 2 do
+		uv.run("once")
+	end
+end
+local bx, by = es.slots[1].cache.blocks, es.slots[2].cache.blocks
+local same = 0
+while bx[same + 1] and bx[same + 1] == by[same + 1] do
+	same = same + 1
+end
+ok(same >= 3 and bx[same + 1] ~= by[same + 1] and es.pool.alloc:refs_of(bx[1]) == 2,
+    ("two slots share the blocks of the system prompt (%s / %s)"):format(table.concat(bx, ","), table.concat(by, ",")))
+ok(y1.usage.cached_tokens >= 192, ("the second client reuses them (cached %d)"):format(y1.usage.cached_tokens))
+local fresh_e = engine.new({ model = path, backend = "CPU", n_ctx = 2048, slots = 1, cache_ram = 0 })
+ok(table.concat(y1.text) == table.concat(chat_msgs(fresh_e, { sys,
+    { role = "user", content = "another question about the sea" } }).text), "shared blocks give the same tokens")
+
+-- A prompt that shares part of a block gets a copy of those cells, and
+-- the first client's cells do not change.
+local cut = sys.content:sub(1, 150)
+local z1 = chat_msgs(es, { { role = "system", content = cut .. " but the rest differs" },
+	{ role = "user", content = "first question about fruit" } })
+local bz = es.slot.cache.blocks
+local k = z1.usage.cached_tokens // 64
+ok(k >= 1 and bz[k] == bx[k] and bz[k + 1] ~= bx[k + 1] and z1.usage.cached_tokens % 64 ~= 0,
+    ("a partial block is copied (cached %d, blocks %s / %s)"):format(z1.usage.cached_tokens,
+    table.concat(bz, ","), table.concat(bx, ",")))
+local x2 = chat_msgs(es, { sys, { role = "user", content = "first question about fruit" } })
+ok(table.concat(x2.text) == table.concat(x1.text), "the copy leaves the shared cells as they were")
+
+-- One long chat and many short one-off requests on four slots: the
+-- long prefix stays in the pool, and its next turn finds it there.
+local el = engine.new({ model = path, backend = "CPU", n_ctx = 2048, slots = 4, cache_ram = 0 })
+local long = { { role = "user", content = ("a long story about the river and the hills "):rep(20) } }
+local l1 = chat_msgs(el, long, 8)
+for i = 1, 10 do
+	chat_msgs(el, { { role = "user", content = ("short request number %d, %s"):format(i, ("xyz"):rep(i)) } })
+end
+long[2] = { role = "assistant", content = table.concat(l1.text) }
+long[3] = { role = "user", content = "and then?" }
+local l2 = chat_msgs(el, long, 8)
+ok(l2.usage.cached_tokens >= l1.usage.prompt_tokens - 64,
+    ("after 10 short requests the long chat finds its prefix (cached %d of %d)"):format(
+    l2.usage.cached_tokens, l2.usage.prompt_tokens))
 
 os.remove(path)
 print("1.." .. n)

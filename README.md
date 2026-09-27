@@ -136,10 +136,20 @@ chat keeps its prefix. Slots cost no cells of their own; only the
 recurrent states (qwen35, qwen3next) and the sliding-window rings
 (gemma4) are per slot, and the model pool counts them once per slot.
 
-When the pool has no free block, idle slots give theirs up, the least
-recently used first. An evicted slot goes to the RAM prompt store
-(`--cache-ram`) first, so its next request restores it from host
-memory. A prompt that does not fit next to the running requests waits
+A full block gets a key: a hash of the key of the block before it and
+of its own tokens. When a slot lets a keyed block go, the block stays
+cached with its cells until the pool needs it. A request whose prompt
+starts with known blocks shares them with no copy, even from another
+slot or after its own slot went to another client; a block that it
+shares only in part gives it a copy of those cells. Two clients with
+one system prompt hold it once. Models with recurrent states or rings
+do not start from cached blocks yet, since a block holds no state.
+
+When the pool has no free block, it takes cached blocks, the least
+recently used first and the last blocks of a prefix before the first
+ones. Then idle slots give their blocks up, the least recently used
+first. An evicted slot goes to the RAM prompt store (`--cache-ram`)
+first, so its next request restores it from host memory. A prompt that does not fit next to the running requests waits
 for one of them to end. When running requests fill the pool, the reply
 that cannot grow ends with finish reason `length`.
 
