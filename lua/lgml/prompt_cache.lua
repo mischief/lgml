@@ -13,7 +13,10 @@
 -- budget; the least recently used one goes first.
 -- Each entry has the key of the engine state it came from, such as the
 -- adapter set; a slot only takes entries with its current key.
+-- Pool blocks that the pool evicts can spill here too, by key, and go
+-- back to the pool on a hit.
 -- @module lgml.prompt_cache
+local lgml = require("lgml")
 
 local M = {}
 local P = {}
@@ -48,8 +51,9 @@ function M.new(model, cache, opts)
 		model = model, cache = cache,
 		fixed = (model.recurrent or cache.ring and cache.ring < cache.n_ctx) and true or false,
 		ram = opts.ram or 0, max_ckpt = opts.checkpoints or 0, turn = turn, key = opts.key or "",
-		ckpts = {}, store = {}, states = {}, bytes = 0, tick = 0, restored = 0,
-		stats = { restored = 0, checkpoints = 0, saved = 0, loaded = 0, evicted = 0, states = 0 },
+		ckpts = {}, store = {}, states = {}, blocks = {}, bytes = 0, tick = 0, restored = 0,
+		stats = { restored = 0, checkpoints = 0, saved = 0, loaded = 0, evicted = 0, states = 0,
+			spilled = 0, unspilled = 0 },
 	}, P)
 end
 
@@ -120,18 +124,36 @@ local function remove(list, x)
 	end
 end
 
--- Drop the least recently used store or state index entry.
+-- True when entry a goes before entry b: a lower priority, else less
+-- recently used.
+local function before(a, b)
+	local pa, pb = a.prio or 1, b.prio or 1
+	return pa < pb or (pa == pb and a.used < b.used)
+end
+
+-- Drop the store, state index or block entry of the lowest priority,
+-- the least recently used one first.
 function P:evict()
 	local lru, list
 	for _, l in ipairs({ self.store, self.states }) do
 		for _, e in ipairs(l) do
-			if not lru or e.used < lru.used then
+			if not lru or before(e, lru) then
 				lru, list = e, l
 			end
 		end
 	end
-	remove(list, lru)
+	for _, e in pairs(self.blocks) do
+		if not lru or before(e, lru) then
+			lru, list = e, self.blocks
+		end
+	end
 	self.bytes = self.bytes - lru.bytes
+	if list == self.blocks then
+		self.blocks[lru.key] = nil
+		lru.buf:close()
+		return
+	end
+	remove(list, lru)
 	if list == self.states then
 		release(lru.ck)
 		return
@@ -148,10 +170,43 @@ function P:room(bytes)
 	if bytes > self.ram then
 		return false
 	end
-	while self.bytes + bytes > self.ram and (#self.store > 0 or #self.states > 0) do
+	while self.bytes + bytes > self.ram and (#self.store > 0 or #self.states > 0 or next(self.blocks)) do
 		self:evict()
 	end
 	return true
+end
+
+--- Keep the cells of a pool block that the pool evicts.
+-- @tparam string key the block key
+-- @tparam table info the block's parent, depth and tokens
+-- @tparam integer bytes the size of its cells
+-- @tparam function fill `fill(buf)` copies the cells into buf
+function P:spill(key, info, bytes, fill)
+	if self.ram <= 0 or self.blocks[key] or not self:room(bytes) then
+		return
+	end
+	local buf = lgml.hostbuf(bytes)
+	fill(buf)
+	self.tick = self.tick + 1
+	self.blocks[key] = { key = key, parent = info.parent, depth = info.depth, tokens = info.tokens,
+		buf = buf, bytes = bytes, used = self.tick, prio = info.prio }
+	self.bytes = self.bytes + bytes
+	self.stats.spilled = self.stats.spilled + 1
+end
+
+--- Take a spilled block out of the store.
+-- @tparam string key the block key
+-- @treturn table the entry, with key, parent, depth, tokens and buf
+-- (close it after the copy), or nil
+function P:unspill(key)
+	local e = self.blocks[key]
+	if not e then
+		return nil
+	end
+	self.blocks[key] = nil
+	self.bytes = self.bytes - e.bytes
+	self.stats.unspilled = self.stats.unspilled + 1
+	return e
 end
 
 local function same(a, b)
@@ -172,11 +227,12 @@ end
 -- @tparam {integer|string,...} toks the tokens from that block to the
 -- checkpoint (none when it is on a block edge)
 -- @tparam table ck the checkpoint, from `checkpoint`
-function P:add_state(parent, toks, ck)
+-- @tparam[opt] integer prio the priority of the slot (default 1)
+function P:add_state(parent, toks, ck, prio)
 	self.tick = self.tick + 1
 	for _, s in ipairs(self.states) do
 		if s.parent == parent and same(s.toks, toks) then
-			s.used = self.tick
+			s.used, s.prio = self.tick, math.max(s.prio, prio or 1)
 			return
 		end
 	end
@@ -184,7 +240,7 @@ function P:add_state(parent, toks, ck)
 		return
 	end
 	self.states[#self.states + 1] = { parent = parent, toks = toks, n = ck.n, ck = hold(ck),
-		used = self.tick, bytes = ck.bytes }
+		used = self.tick, bytes = ck.bytes, prio = prio or 1 }
 	self.bytes = self.bytes + ck.bytes
 	self.stats.states = self.stats.states + 1
 end
@@ -230,6 +286,7 @@ function P:adopt(s)
 end
 
 -- Save the slot to the store, unless it is short, too big or already there.
+-- The entry has the priority eng.prio, or that of eng.slot.
 function P:save(eng)
 	local toks = eng.tokens
 	if self.ram <= 0 or #toks < MIN_SAVE then
@@ -256,6 +313,7 @@ function P:save(eng)
 	self.store[#self.store + 1] = {
 		tokens = table.move(toks, 1, #toks, 1, {}), ckpts = ckpts, bytes = bytes,
 		snap = hold(self.model:snapshot(self.cache, true)), used = self.tick, key = self.key,
+		prio = eng.prio or (eng.slot and eng.slot.prio),
 	}
 	self.bytes = self.bytes + bytes
 	self.stats.saved = self.stats.saved + 1
@@ -400,9 +458,10 @@ function P:plan(prompt, from)
 	return stops
 end
 
---- Free the store, the state index and the checkpoints.
+--- Free the store, the state index, the spilled blocks and the
+-- checkpoints.
 function P:clear()
-	while #self.store > 0 or #self.states > 0 do
+	while #self.store > 0 or #self.states > 0 or next(self.blocks) do
 		self:evict()
 	end
 	self:trim(-1)

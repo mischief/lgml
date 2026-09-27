@@ -8,8 +8,10 @@
 -- and of its own tokens. A keyed block with no reference stays cached:
 -- it keeps its cells and its key until the pool needs it. A new
 -- sequence with the same prefix finds the blocks by key and shares
--- them. Eviction takes the least recently used cached block, and the
--- deepest one first on a tie, so a prefix loses its last blocks first.
+-- them. Eviction takes the cached block of the lowest priority, then
+-- the least recently used one, and the deepest one first on a tie, so
+-- a prefix loses its last blocks first. A block has the highest
+-- priority of the sequences that used it.
 -- This module holds no tensors; `lgml.transformer` does.
 -- @module lgml.kvpool
 local lgml = require("lgml")
@@ -17,6 +19,10 @@ local lgml = require("lgml")
 local M = {}
 local P = {}
 P.__index = P
+
+--- Priorities of sequences and their blocks: LOW for one-off checks,
+-- NORMAL for chats, HIGH for chats that ask to keep their prefix.
+M.LOW, M.NORMAL, M.HIGH = 0, 1, 2
 
 --- The most sequences an engine keeps by default (`slots`).
 M.SEQS = 4
@@ -69,7 +75,9 @@ end
 -- Fields: `n` (blocks), `size` (cells per block), `cap` (usable
 -- blocks), `used` (blocks with references), `cached` (keyed blocks
 -- with no reference) and `stats` (`evicted` blocks, `hits` and
--- `hit_blocks` of `lookup`s).
+-- `hit_blocks` of `lookup`s). Set `on_evict(b, key, info)` to see each
+-- keyed block before `evict` takes it; info has parent, depth and
+-- tokens.
 -- @type Pool
 
 -- Take free block b.
@@ -129,15 +137,19 @@ end
 -- @treturn[1] integer the block id, with one reference
 -- @return[2] nil when no block is cached
 function P:evict()
-	local best, bu, bd
+	local best, bp, bu, bd
 	for b, info in pairs(self.info) do
-		if not self.refs[b] and b < self.cap and
-		    (not best or info.used < bu or (info.used == bu and info.depth > bd)) then
-			best, bu, bd = b, info.used, info.depth
+		if not self.refs[b] and b < self.cap and (not best or info.prio < bp or
+		    (info.prio == bp and (info.used < bu or (info.used == bu and info.depth > bd)))) then
+			best, bp, bu, bd = b, info.prio, info.used, info.depth
 		end
 	end
 	if not best then
 		return nil
+	end
+	-- The owner of the tensors can copy the cells of a keyed block out.
+	if self.on_evict and self.keys[best] ~= "part" then
+		self.on_evict(best, self.keys[best], self.info[best])
 	end
 	unkey(self, best)
 	self.cached = self.cached - 1
@@ -149,7 +161,8 @@ end
 
 --- Add a reference to a block. A cached block is in use again.
 -- @tparam integer b the block id
-function P:ref(b)
+-- @tparam[opt] integer prio the priority of the sequence (default NORMAL)
+function P:ref(b, prio)
 	local r = self.refs[b]
 	if not r then
 		assert(self.keys[b], "kvpool: ref of a free block")
@@ -158,6 +171,10 @@ function P:ref(b)
 		r = 0
 	end
 	self.refs[b] = r + 1
+	local info = self.info[b]
+	if info then
+		info.prio = math.max(info.prio, prio or M.NORMAL)
+	end
 end
 
 --- Drop a reference to a block. At 0, a keyed block stays cached; any
@@ -195,13 +212,14 @@ end
 -- block)
 -- @tparam integer depth the block index in its sequence, from 1
 -- @tparam {integer|string,...} tokens the tokens of the block
+-- @tparam[opt] integer prio the priority of the sequence (default NORMAL)
 -- @treturn boolean true when b got the key
-function P:publish(b, key, parent, depth, tokens)
+function P:publish(b, key, parent, depth, tokens, prio)
 	if self.keys[b] or self.bykey[key] then
 		return false
 	end
 	self.keys[b], self.bykey[key] = key, b
-	self.info[b] = { parent = parent, depth = depth, tokens = tokens, used = self.tick }
+	self.info[b] = { parent = parent, depth = depth, tokens = tokens, used = self.tick, prio = prio or M.NORMAL }
 	self.kids[parent] = self.kids[parent] or {}
 	self.kids[parent][b] = true
 	return true
@@ -216,14 +234,15 @@ end
 -- @tparam integer depth the block index in its sequence, from 1
 -- @tparam {integer|string,...} tokens the tokens it holds, fewer than
 -- a block
+-- @tparam[opt] integer prio the priority of the sequence (default NORMAL)
 -- @treturn boolean true when b is now cached on release
-function P:publish_part(b, parent, depth, tokens)
+function P:publish_part(b, parent, depth, tokens, prio)
 	if self.keys[b] or #tokens == 0 then
 		return false
 	end
 	-- A marker, not a hash: no lookup finds the block.
 	self.keys[b] = "part"
-	self.info[b] = { parent = parent, depth = depth, tokens = tokens, used = self.tick }
+	self.info[b] = { parent = parent, depth = depth, tokens = tokens, used = self.tick, prio = prio or M.NORMAL }
 	self.kids[parent] = self.kids[parent] or {}
 	self.kids[parent][b] = true
 	return true
