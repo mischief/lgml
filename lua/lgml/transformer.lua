@@ -582,6 +582,18 @@ function M:seq(pool, opts)
 	return c
 end
 
+-- Drop the last batch graph.
+local function drop_batch(self)
+	local r = self.batch_replay
+	self.batch_replay = nil
+	r.g:close()
+	for _, t in pairs(r.inp) do
+		if type(t) == "userdata" then
+			t:close()
+		end
+	end
+end
+
 -- Drop every graph that reads the tensors of pool p.
 local function drop_pool_graphs(self, p)
 	for c in pairs(p.seqs) do
@@ -589,14 +601,32 @@ local function drop_pool_graphs(self, p)
 	end
 	local r = self.batch_replay
 	if r and r.pools and r.pools[p] then
-		self.batch_replay = nil
-		r.g:close()
-		for _, t in pairs(r.inp) do
-			if type(t) == "userdata" then
-				t:close()
+		drop_batch(self)
+	end
+end
+
+--- Free a pool sequence now: its blocks, graphs and state tensors.
+-- The sequence is not valid after this.
+-- @tparam table c a cache from `seq`
+function M:free_seq(c)
+	self:truncate(c, 0)
+	replay.drop(c)
+	local r = self.batch_replay
+	if r then
+		for _, b in ipairs(r.inp.batch) do
+			if b.cache == c then
+				drop_batch(self)
+				break
 			end
 		end
 	end
+	for _, part in ipairs({ c.k, c.v, c.conv or {}, c.ssm or {} }) do
+		for il, t in pairs(part) do
+			t:close()
+			part[il] = nil
+		end
+	end
+	c.pool.seqs[c] = nil
 end
 
 -- Double the cells of pool p, at most p.n_ctx. The new tensors get all

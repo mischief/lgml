@@ -1349,6 +1349,87 @@ function E:checkpoint_slot(slot)
 	self:share_state(slot.cache, slot.tokens, slot.ckpts)
 end
 
+-- The most temporary sequences that `fork_rows` runs at once.
+local FORKS = 4
+
+--- Run several prompts that start with the first n tokens of the active
+-- slot, in batched passes. Each prompt gets a temporary pool sequence
+-- on the slot's cells of those n tokens. A model with fixed state
+-- also needs ck, a checkpoint of the slot at n. Needs the lock.
+-- @tparam integer n the shared tokens
+-- @tparam {{integer,...},...} prompts the prompts
+-- @param[opt] ck the checkpoint at n
+-- @param sink the sink; a cancelled sink stops the passes
+-- @return the logits of the last token of each prompt, as tables, or
+-- nil when cancelled
+function E:fork_rows(n, prompts, ck, sink)
+	local cache, model = self.cache, self.model
+	assert(cache.pool and n <= cache.n_past, "fork_rows: the slot does not hold the shared tokens")
+	assert(not self.fixed or (ck and ck.n == n), "fork_rows: a checkpoint at n is needed")
+	self:publish(cache, self.tokens)
+	local B = cache.pool.block
+	local j, part = n // B, n % B
+	local rows, seqs = {}, {}
+	local ok, err = pcall(function()
+		for first = 1, #prompts, FORKS do
+			local last = math.min(#prompts, first + FORKS - 1)
+			for i = first, last do
+				local c = model:seq(cache.pool, { n_ctx = cache.n_ctx, ubatch = UBATCH })
+				c.prio = kvpool.LOW
+				seqs[i] = c
+				model:share(c, table.move(cache.blocks, 1, j, 1, {}), table.move(cache.keys, 1, j, 1, {}))
+				if part > 0 then
+					model:grow(c, n)
+					model.copy_block(cache.pool, cache.blocks[j + 1], c.blocks[j + 1], part)
+				end
+				c.n_past = n
+				if ck then
+					model:restore(c, ck)
+				end
+			end
+			local at = {}
+			while true do
+				local cs, ids, who = {}, {}, {}
+				for i = first, last do
+					local p, k = prompts[i], at[i] or n
+					if k < #p then
+						who[#who + 1], cs[#cs + 1] = i, seqs[i]
+						ids[#ids + 1] = table.move(p, k + 1, math.min(#p, k + UBATCH), 1, {})
+					end
+				end
+				if #cs == 0 then
+					break
+				end
+				local out = model:run_batch(cs, ids, { flash_attn = self.flash_attn })
+				for x, i in ipairs(who) do
+					at[i] = (at[i] or n) + #ids[x]
+					if at[i] == #prompts[i] then
+						rows[i] = out[x]:get()
+					end
+				end
+				stream.sleep(0)
+				if sink:cancelled() then
+					return
+				end
+			end
+			for i = first, last do
+				model:free_seq(seqs[i])
+				seqs[i] = nil
+			end
+		end
+	end)
+	for _, c in pairs(seqs) do
+		model:free_seq(c)
+	end
+	if not ok then
+		error(err, 0)
+	end
+	if #rows < #prompts then
+		return nil
+	end
+	return rows
+end
+
 --- Prefill a prompt on a slot that a request owns, in batched passes.
 -- Chunks of at most UBATCH tokens join the decode steps and prompt
 -- chunks of other requests in one pass. Checkpoints come at the prompt

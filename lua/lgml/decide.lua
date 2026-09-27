@@ -632,6 +632,17 @@ local function advance(e, ids, sink)
 	return e:prefill(ids, cached + 1, sink, stops)
 end
 
+-- Log P(first token of candidate | prefix) for each candidate, from
+-- the logits row of the last prompt token.
+local function read_row(row, cands)
+	local lse = logsumexp(row, 1, #row)
+	local out = {}
+	for i, c in ipairs(cands) do
+		out[i] = row[c[1] + 1] - lse
+	end
+	return out
+end
+
 -- Log P(candidate | prefix) for each candidate. Candidates of one token
 -- read the last row. Longer ones run their tokens after the prefix.
 local function score(e, p, cands, sink)
@@ -639,13 +650,7 @@ local function score(e, p, cands, sink)
 	if not logits then
 		return nil
 	end
-	local row = logits:get()
-	local nv = #row
-	local lse = logsumexp(row, 1, nv)
-	local out = {}
-	for i, c in ipairs(cands) do
-		out[i] = row[c[1] + 1] - lse
-	end
+	local out = read_row(logits:get(), cands)
 	for i, c in ipairs(cands) do
 		if #c > 1 then
 			local ids = table.move(p, 1, #p, 1, {})
@@ -670,10 +675,10 @@ local function score(e, p, cands, sink)
 	return out
 end
 
--- Scores one rendering. Returns the log-scores and the token counts.
--- keys are the prepared images of the prompt, in order, and images the
--- request images. label holds key, value pairs for the log lines.
-local function run_rendering(e, rd, sink, keys, images, label)
+-- The prompt ids and candidates of one rendering. keys are the
+-- prepared images of the prompt, in order, and images the request
+-- images. label holds key, value pairs for the log lines.
+local function prepare(e, rd, keys, images, label)
 	local text = M.chat_prompt(e.family, rd.prefix)
 	local p, cands = M.tokenize(e.tk, text, rd.candidates)
 	label = label or {}
@@ -697,10 +702,12 @@ local function run_rendering(e, rd, sink, keys, images, label)
 	if #p + 8 >= e.n_ctx then
 		error({ status = 400, msg = ("prompt has %d tokens; context is %d"):format(#p, e.n_ctx) })
 	end
-	local ls = score(e, p, cands, sink)
-	if not ls then
-		return nil
-	end
+	return p, cands
+end
+
+-- The run of a rendering from its log-scores. Returns the run and the
+-- token counts.
+local function finish_run(rd, p, cands, ls, label)
 	if L:on(log.DEBUG) then
 		local f = table.move(label, 1, #label, 1, {})
 		table.move({ "keys", rd.keys, "logscores", ls }, 1, 4, #f + 1, f)
@@ -711,6 +718,99 @@ local function run_rendering(e, rd, sink, keys, images, label)
 		nout = nout + #c
 	end
 	return { keys = rd.keys, logscores = ls }, #p, nout
+end
+
+-- Scores one rendering, as `prepare` takes it. Returns the run and the
+-- token counts, or nil when cancelled.
+local function run_rendering(e, rd, sink, keys, images, label)
+	label = label or {}
+	local p, cands = prepare(e, rd, keys, images, label)
+	local ls = score(e, p, cands, sink)
+	if not ls then
+		return nil
+	end
+	return finish_run(rd, p, cands, ls, label)
+end
+
+-- Scores the renderings of jobs. The first one runs alone; with the
+-- shared prefix pre, it leaves the cells and a checkpoint at the end
+-- of pre. The others then run together on copies of that state (see
+-- `lgml.engine.Engine.fork_rows`); a rendering that cannot runs alone
+-- after them. Sets job.run, job.nin and job.nout. Returns false when
+-- cancelled.
+local function run_jobs(e, jobs, pre, sink)
+	local forks = {}
+	local function alone(job)
+		local ls = score(e, job.p, job.cands, sink)
+		if not ls then
+			return false
+		end
+		job.run, job.nin, job.nout = finish_run(job.rd, job.p, job.cands, ls, job.label)
+		return true
+	end
+	for k, job in ipairs(jobs) do
+		if k == 1 or not (e.fork_rows and pre) then
+			if not alone(job) then
+				return false
+			end
+		else
+			local single, p = true, job.p
+			for _, c in ipairs(job.cands) do
+				single = single and #c == 1
+			end
+			for i = #pre + 1, #p do
+				single = single and type(p[i]) == "number"
+			end
+			if single and #p > #pre and common(p, pre) >= #pre then
+				forks[#forks + 1] = job
+			elseif not alone(job) then
+				return false
+			end
+		end
+	end
+	if #forks == 0 then
+		return true
+	end
+	local ck
+	if e.fixed then
+		for _, c in ipairs(e.pc and e.pc.ckpts or {}) do
+			if c.n == #pre then
+				ck = c
+			end
+		end
+	end
+	local ok = e.cache.pool and (ck or not e.fixed) and common(e.tokens, pre) >= #pre
+	local rows
+	if ok then
+		local prompts = {}
+		for i, job in ipairs(forks) do
+			prompts[i] = job.p
+		end
+		-- A full pool leaves no room for the copies: run them alone.
+		local good
+		good, rows = pcall(e.fork_rows, e, #pre, prompts, ck, sink)
+		if not good and not tostring(rows):find("kv pool full", 1, true) then
+			error(rows, 0)
+		elseif good and not rows then
+			return false
+		end
+		ok = good
+	end
+	if ok then
+		for i, job in ipairs(forks) do
+			sink.cached, sink.computed = sink.cached + #pre, sink.computed + #job.p - #pre
+			job.run, job.nin, job.nout = finish_run(job.rd, job.p, job.cands, read_row(rows[i], job.cands),
+			    job.label)
+		end
+		L:debug("forked renderings", "count", #forks, "shared", #pre)
+		return true
+	end
+	for _, job in ipairs(forks) do
+		if not alone(job) then
+			return false
+		end
+	end
+	return true
 end
 
 local PRIOR_CACHE = 256
@@ -810,9 +910,9 @@ function M.run(e, req, ctl)
 		if renderings > 1 then
 			sink.prefix = state_prefix(e, req.state, ids, markers, keys)
 		end
+		local jobs = {}
 		for _, q in ipairs(req.questions) do
 			local n = q.type == "choice" and recipe.permutations.choice or 1
-			local runs = {}
 			for i = 1, n do
 				local rd = M.render(req.state, q, {
 					identifiers = ids, seed = i > 1 and M.SEED + i - 1 or nil,
@@ -822,12 +922,21 @@ function M.run(e, req, ctl)
 				if i > 1 then
 					label[7], label[8] = "seed", M.SEED + i - 1
 				end
-				local run, a, b = run_rendering(e, rd, sink, keys, images, label)
-				if not run then
-					return "cancelled"
-				end
-				runs[i], nin, nout = run, nin + a, nout + b
+				local p, cands = prepare(e, rd, keys, images, label)
+				jobs[#jobs + 1] = { q = q, i = i, rd = rd, p = p, cands = cands, label = label }
 			end
+		end
+		if not run_jobs(e, jobs, sink.prefix, sink) then
+			return "cancelled"
+		end
+		local by_q = {}
+		for _, job in ipairs(jobs) do
+			by_q[job.q] = by_q[job.q] or {}
+			by_q[job.q][job.i] = job.run
+			nin, nout = nin + job.nin, nout + job.nout
+		end
+		for _, q in ipairs(req.questions) do
+			local runs = by_q[q]
 			local prior
 			if (recipe.prior_weight[q.type] or 0) > 0 then
 				prior = prior_run(e, q, ids, sink)

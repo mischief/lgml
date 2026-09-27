@@ -848,6 +848,23 @@ local function decide_vision_check()
 	    "decide vision: text only gives the same bytes with an mmproj")
 	ok(r2.timings.images == 0 and encodes == 0, "decide vision: text only encodes no image")
 
+	-- Renderings after the first run together on copies of the state;
+	-- they give the same scores as one at a time.
+	local forks = 0
+	local fork_rows = plain.fork_rows
+	plain.fork_rows = function(...)
+		forks = forks + 1
+		return fork_rows(...)
+	end
+	local alone = engine.new({ model = path, backend = "CPU", n_ctx = 2048 })
+	alone.fork_rows = false
+	local long = ('{"state": "%s", "questions": {"c": %s, "n": %s}, "lgml": {"raw": true}}'):format(
+	    ("a long picture of many things "):rep(20), Q.c, Q.n)
+	local f1 = decide_on(plain, assert(so.check(long)))
+	local s1 = decide_on(alone, assert(so.check(long)))
+	local df = math.max(diff(scores(f1, "c"), scores(s1, "c")), diff(scores(f1, "n"), scores(s1, "n")))
+	ok(forks == 1 and df < 1e-3, ("decide: forked renderings give the same scores (%d forks, %.3g)"):format(forks, df))
+
 	-- One image: the prompt holds it before the state text.
 	e.tokens, e.cache.n_past = {}, 0
 	local ta, ra, err, status = ask(e, { "c" }, { a })
