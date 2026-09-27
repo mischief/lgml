@@ -564,8 +564,9 @@ end
 
 --- Make a cache for one sequence on a pool.
 -- It works as a cache from `cache` does, but the global attention rows
--- live in pool blocks: `blocks` lists the block ids in position order.
--- Rings and recurrent states belong to the sequence.
+-- live in pool blocks: `blocks` lists the block ids in position order,
+-- and `keys` the keys of its full blocks that have one (see
+-- `lgml.kvpool`). Rings and recurrent states belong to the sequence.
 -- @tparam table pool a pool from `pool`
 -- @tparam[opt] table opts options: n_ctx (the most positions, default
 -- the pool size) and ubatch (as for `cache`)
@@ -573,7 +574,7 @@ end
 function M:seq(pool, opts)
 	opts = opts or {}
 	next_cache_id = next_cache_id + 1
-	local c = { pool = pool, blocks = {}, n_ctx = math.min(opts.n_ctx or pool.n_ctx, pool.n_ctx),
+	local c = { pool = pool, blocks = {}, keys = {}, n_ctx = math.min(opts.n_ctx or pool.n_ctx, pool.n_ctx),
 		n_past = 0, be = pool.be, type_k = pool.type_k, type_v = pool.type_v, k = {}, v = {},
 		id = next_cache_id, gen = 0 }
 	add_layers(self, c, opts, false)
@@ -630,43 +631,122 @@ local function pool_grow(self, p)
 	p.alloc:set_cap(cap // p.block)
 end
 
--- Give sequence c the blocks for positions [0, n). A pool with no free
--- block grows; a full pool calls pool.pressure, which may free blocks.
--- Returns true when the pool grew.
+-- A block for pool p after block min - 1 of sequence c: a free one,
+-- else a new one when the pool can grow, else a cached one, else one
+-- that pool.pressure frees for c. The second result is true when the
+-- pool grew.
+local function new_block(self, p, c, min)
+	local b = p.alloc:take(min)
+	if b then
+		return b, false
+	end
+	if p.cap < p.n_ctx then
+		pool_grow(self, p)
+		return p.alloc:take(min), true
+	end
+	b = p.alloc:evict()
+	if not b and p.pressure then
+		p.pressure(p, c)
+		b = p.alloc:take(min) or p.alloc:evict()
+	end
+	return b, false
+end
+
+-- Give sequence c the blocks for positions [0, n). The new blocks go
+-- in cell order, so attention reads the cells of a pass in position
+-- order. Returns true when the pool grew.
 local function reserve(self, c, n)
 	local p = c.pool
-	local B, grew = p.block, false
+	local B, grew, first = p.block, false, #c.blocks + 1
 	while #c.blocks * B < n do
-		local b = p.alloc:take()
-		if not b and p.cap < p.n_ctx then
-			pool_grow(self, p)
-			grew = true
-			b = p.alloc:take()
-		end
-		if not b and p.pressure then
-			p.pressure(p, c)
-			b = p.alloc:take()
-		end
+		local last = c.blocks[#c.blocks]
+		local b, g = new_block(self, p, c, last and last + 1)
+		grew = grew or g
 		if not b then
 			error(("kv pool full: %d of %d cells in use"):format(p.alloc.used * B, p.n_ctx))
 		end
 		c.blocks[#c.blocks + 1] = b
 	end
+	if #c.blocks > first then
+		local new = table.move(c.blocks, first, #c.blocks, 1, {})
+		table.sort(new)
+		table.move(new, 1, #new, first, c.blocks)
+	end
 	return grew
 end
 
+--- Copy the first n cells of block src to block dst of a pool, in
+-- every layer.
+-- @tparam table pool the pool
+-- @tparam integer src the block to read
+-- @tparam integer dst the block to write
+-- @tparam integer n the cell count, at most the block size
+function M.copy_block(pool, src, dst, n)
+	local buf
+	for _, part in ipairs({ pool.k, pool.v }) do
+		for _, t in pairs(part) do
+			local row = t:nbytes() // t:shape()[1]
+			if not buf or #buf < n * row then
+				if buf then
+					buf:close()
+				end
+				buf = lgml.hostbuf(n * row)
+			end
+			t:to_host(buf, 0, src * pool.block * row, n * row)
+			t:from_host(buf, 0, dst * pool.block * row, n * row)
+		end
+	end
+	if buf then
+		buf:close()
+	end
+end
+
 --- Give back the blocks of a pool sequence past its first n positions.
--- It also sets n_past to n when n_past is larger.
+-- It also sets n_past to n when n_past is larger, and drops the block
+-- keys past n. When n ends inside a block that other sequences share
+-- or that has a key, the sequence gets a copy of that block: later
+-- writes must not change the shared cells.
 -- @tparam table cache a cache from `seq`
 -- @tparam integer n the positions to keep
 function M:truncate(cache, n)
 	local p = cache.pool
-	local keep = (n + p.block - 1) // p.block
+	local B = p.block
+	local keep = (n + B - 1) // B
 	for i = #cache.blocks, keep + 1, -1 do
 		p.alloc:unref(cache.blocks[i])
 		cache.blocks[i] = nil
 	end
+	local keys = cache.keys
+	for i = #keys, n // B + 1, -1 do
+		keys[i] = nil
+	end
+	local last = cache.blocks[keep]
+	if n % B ~= 0 and last and (p.alloc:refs_of(last) > 1 or p.alloc:key_of(last)) then
+		local prev = cache.blocks[keep - 1]
+		local b = new_block(self, p, cache, prev and prev + 1)
+		if not b then
+			error(("kv pool full: %d of %d cells in use"):format(p.alloc.used * B, p.n_ctx))
+		end
+		M.copy_block(p, last, b, n % B)
+		cache.blocks[keep] = b
+		p.alloc:unref(last)
+	end
 	cache.n_past = math.min(cache.n_past, n)
+end
+
+--- Start an empty pool sequence on shared blocks.
+-- The sequence takes a reference to each block and holds their
+-- positions. n_past becomes the positions of the blocks.
+-- @tparam table cache a cache from `seq`, with no blocks
+-- @tparam {integer,...} blocks the block ids in position order
+-- @tparam {string,...} keys the key of each block
+function M:share(cache, blocks, keys)
+	assert(#cache.blocks == 0, "share: the sequence has blocks")
+	for i, b in ipairs(blocks) do
+		cache.pool.alloc:ref(b)
+		cache.blocks[i], cache.keys[i] = b, keys[i]
+	end
+	cache.n_past = #blocks * cache.pool.block
 end
 
 -- The pool cells of positions [from, from + n) of a pool sequence.
@@ -954,6 +1034,11 @@ function M:restore(cache, snap, opts)
 	local state = opts.state ~= false
 	assert(rows <= snap.n and (snap.full or rows == snap.n), "restore: rows not in the snapshot")
 	if snap.full then
+		-- Shared blocks must not change: a pool sequence starts over on
+		-- blocks of its own.
+		if cache.pool then
+			self:truncate(cache, 0)
+		end
 		self:grow(cache, rows)
 	end
 	-- Walk the parts in snapshot order; skip the ones not restored.

@@ -51,6 +51,64 @@ do
 	t:close()
 end
 
+-- Block keys, the cache of released blocks and its eviction order.
+do
+	local kvpool = require("lgml.kvpool")
+	local a = kvpool.new({ blocks = 8, size = 4 })
+	local toks = {}
+	for i = 1, 12 do
+		toks[i] = 100 + i
+	end
+	local function chain(root, list, t)
+		local parent = root
+		for i, b in ipairs(list) do
+			local key = kvpool.key(parent, t, (i - 1) * 4 + 1, 4)
+			a:publish(b, key, parent, i, table.move(t, (i - 1) * 4 + 1, i * 4, 1, {}))
+			parent = key
+		end
+		return parent
+	end
+	local A, B = { a:take(), a:take(), a:take() }, { a:take(), a:take() }
+	chain("r", A, toks)
+	local other = { 7, 7, 7, 7, 8, 8, 8, 8 }
+	chain("r", B, other)
+	ok(kvpool.key("r", toks, 1, 4) ~= kvpool.key("s", toks, 1, 4) and
+	    a:lookup(kvpool.key("r", toks, 1, 4)) == A[1], "a block key depends on the root and the tokens")
+	ok(not a:publish(a:take(), kvpool.key("r", toks, 1, 4), "r", 1, {}),
+	    "a key that a block has stays with that block")
+	a:unref(5)
+	for i = 3, 1, -1 do
+		a:unref(A[i])
+	end
+	for i = 2, 1, -1 do
+		a:unref(B[i])
+	end
+	ok(a.used == 0 and a.cached == 5, "released keyed blocks stay cached")
+	local kid, part = a:longest_kid(kvpool.key("r", toks, 1, 4), { 105, 106, 0 }, 1, 3)
+	ok(kid == A[2] and part == 2, "longest_kid finds the block that shares the most tokens")
+	-- A hit on the first block of A makes it recent.
+	local hit = a:lookup(kvpool.key("r", toks, 1, 4))
+	a:ref(hit)
+	ok(a.cached == 4 and a.used == 1, "a cached block is in use again")
+	a:unref(hit)
+	local got = { a:take(), a:take(), a:take() }
+	ok(got[1] == 5 and got[2] == 6 and got[3] == 7, "free blocks go before cached ones")
+	ok(a:take() == nil, "no free block is left")
+	local order = {}
+	for i = 1, 5 do
+		order[i] = a:evict()
+	end
+	ok(table.concat(order, ",") == table.concat({ A[3], A[2], B[2], B[1], A[1] }, ","),
+	    "eviction takes the least recently used block, the last block of a prefix first (" ..
+	    table.concat(order, ",") .. ")")
+	ok(a:evict() == nil and a.cached == 0 and a:lookup(kvpool.key("r", toks, 1, 4)) == nil,
+	    "evicted blocks lose their keys")
+	for _, b in ipairs(order) do
+		a:unref(b)
+	end
+	ok(a:take(3) == 3 and a:take(3) == 4 and a:take(3) == 0, "take prefers blocks from min up")
+end
+
 local path = tiny.tmp(".gguf")
 tiny.write(path, "qwen3", { n_ctx = 2048 })
 local m = transformer.load(be, path)
