@@ -2439,6 +2439,88 @@ tensor_fill_mask(lua_State *L)
 	return 0;
 }
 
+/*** Fill the attention mask of one sequence in a shared KV pool.
+ * The tensor is an f32 or f16 leaf of (rows, `n_kv`). Column j is pool
+ * cell `lo` + j. Position p of the sequence is in cell
+ * `blocks[p // block + 1] * block + p % block`. Row i is the query at
+ * `n_past` + i. It sees the cells of positions 0 to `n_past` + i, or of
+ * all positions before `n_past` + rows when causal is false. All other
+ * entries are -inf. opts fields: `n_past` (0), `block`, `blocks` (block
+ * ids from 0, in position order), `lo` (0), causal (true).
+ * @tparam table opts options
+ * @raise on a bad tensor, too few blocks, or a cell outside the columns
+ * @function tensor:fill_blocks
+ */
+static int
+tensor_fill_blocks(lua_State *L)
+{
+	struct tensor *t = check_leaf2d(L, 1);
+	int64_t nkv = t->t->ne[0], rows = t->t->ne[1], i, p, last, col, nb, need;
+	lua_Integer n_past, block, lo;
+	int64_t *cells;
+	int causal;
+	float *m;
+
+	luaL_checktype(L, 2, LUA_TTABLE);
+	lua_getfield(L, 2, "n_past");
+	n_past = luaL_optinteger(L, -1, 0);
+	lua_getfield(L, 2, "block");
+	block = luaL_checkinteger(L, -1);
+	lua_getfield(L, 2, "lo");
+	lo = luaL_optinteger(L, -1, 0);
+	lua_getfield(L, 2, "causal");
+	causal = lua_isnil(L, -1) || lua_toboolean(L, -1);
+	lua_pop(L, 4);
+	if (t->t->type != GGML_TYPE_F32 && t->t->type != GGML_TYPE_F16)
+		return luaL_error(L, "mask must be f32 or f16");
+	if (n_past < 0 || block < 1 || lo < 0 || n_past > INT32_MAX)
+		return luaL_error(L, "fill_blocks: n_past, block or lo out of range");
+	lua_getfield(L, 2, "blocks");
+	luaL_checktype(L, -1, LUA_TTABLE);
+	nb = (int64_t)luaL_len(L, -1);
+	need = (n_past + rows + block - 1) / block;
+	if (nb < need)
+		return luaL_error(L, "fill_blocks: %I blocks hold fewer than %I positions",
+		    (lua_Integer)nb, (lua_Integer)(n_past + rows));
+	cells = malloc((size_t)(need > 0 ? need : 1) * sizeof(*cells));
+	m = malloc((size_t)(nkv * rows) * sizeof(*m));
+	if (cells == NULL || m == NULL) {
+		free(cells);
+		free(m);
+		return luaL_error(L, "out of memory");
+	}
+	for (i = 0; i < need; i++) {
+		lua_geti(L, -1, i + 1);
+		cells[i] = (int64_t)lua_tointeger(L, -1) * block - lo;
+		lua_pop(L, 1);
+	}
+	lua_pop(L, 1);
+	for (i = 0; i < nkv; i++)
+		m[i] = -INFINITY;
+	/* Each row sees what the row before it sees, and more. */
+	for (i = 0, p = 0; i < rows; i++) {
+		if (i > 0)
+			memcpy(m + i * nkv, m + (i - 1) * nkv, (size_t)nkv * sizeof(*m));
+		last = causal ? n_past + i : n_past + rows - 1;
+		for (; p <= last; p++) {
+			col = cells[p / block] + p % block;
+			if (col < 0 || col >= nkv) {
+				free(cells);
+				free(m);
+				return luaL_error(L, "fill_blocks: position %I is in no column",
+				    (lua_Integer)p);
+			}
+			m[i * nkv + col] = 0.0f;
+		}
+	}
+	free(cells);
+	if (t->t->type == GGML_TYPE_F16)
+		ggml_fp32_to_fp16_row(m, (ggml_fp16_t *)m, nkv * rows);
+	ggml_backend_tensor_set(t->t, m, 0, ggml_nbytes(t->t));
+	free(m);
+	return 0;
+}
+
 /*** Set every byte of a leaf to zero, on the device.
  * Zero is 0.0 in float types and a zero block in quantized types.
  * @raise if the tensor has no storage
@@ -3233,6 +3315,7 @@ static const luaL_Reg tensor_methods[] = {
 	{ "from_host", tensor_from_host },
 	{ "fill_causal", tensor_fill_causal },
 	{ "fill_mask", tensor_fill_mask },
+	{ "fill_blocks", tensor_fill_blocks },
 	{ "fill_range", tensor_fill_range },
 	{ "zero", tensor_zero },
 	{ "fill", tensor_fill },
