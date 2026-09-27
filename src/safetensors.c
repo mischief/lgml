@@ -556,9 +556,13 @@ backend_load_safetensors(lua_State *L)
 	seen = lua_gettop(L);
 	for (i = 0; i < nf; i++)
 		make_tensors(L, ctx, lua_touserdata(L, first + i), seen, f32_1d);
+	lgml_mem_need(L, ggml_backend_get_default_buffer_type(b->be),
+	    ggml_backend_alloc_ctx_tensors_from_buft_size(ctx,
+	    ggml_backend_get_default_buffer_type(b->be)), "safetensors weights");
 	s->buf = ggml_backend_alloc_ctx_tensors(ctx, b->be);
 	if (s->buf == NULL)
 		return luaL_error(L, "out of device memory");
+	lgml_store_account(s, MEM_WEIGHTS);
 	for (i = 0; i < nf; i++) {
 		lua_geti(L, list, i + 1);
 		upload(L, lua_tostring(L, -1), lua_touserdata(L, first + i));

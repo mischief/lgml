@@ -44,6 +44,9 @@ struct store {
 	ggml_backend_buffer_t	 buf;
 	int			 refs;
 	int			 closed;
+	int			 mem_key;	/* see lgml_store_account */
+	int			 mem_part;
+	size_t			 mem_bytes;
 };
 
 /*
@@ -73,6 +76,8 @@ struct graph {
 	struct ggml_tensor	**saved;	/* node and its srcs, before sched */
 	int			 nsaved;	/* nodes in saved */
 	int			 backward;	/* 1 after tensor:backward */
+	int			 mem_key[2];	/* compute buffers: backend, CPU */
+	size_t			 mem_bytes[2];
 	int			 refs;
 	int			 closed;
 };
@@ -126,6 +131,16 @@ void		 lgml_graph_room(lua_State *, struct graph *, int);
 struct ggml_cgraph *lgml_new_cgraph(lua_State *, struct graph *, int, int);
 int		 lgml_push_node(lua_State *, struct graph *, struct ggml_tensor *, int);
 void		 lgml_graph_ops(lua_State *, const luaL_Reg *);
+
+/* Memory accounting, in mem.c. Parts of lgml_mem_add. */
+enum { MEM_WEIGHTS, MEM_TENSORS, MEM_COMPUTE, MEM_NPART };
+int		 lgml_mem_key(ggml_backend_buffer_type_t);
+void		 lgml_mem_add(int, int, size_t, size_t);
+void		 lgml_store_account(struct store *, int);
+void		 lgml_store_unaccount(struct store *);
+const char	*lgml_mem_check(lua_State *, ggml_backend_buffer_type_t, size_t, const char *);
+void		 lgml_mem_need(lua_State *, ggml_backend_buffer_type_t, size_t, const char *);
+void		 lgml_open_mem(lua_State *);
 
 /* Decode JSON text and push the value. Raises an error on bad JSON. */
 void		 lgml_json_decode(lua_State *, const char *, size_t, const char *);

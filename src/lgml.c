@@ -68,6 +68,7 @@ store_release(struct store *s)
 {
 	if (!s->closed || s->refs != 0 || s->ctx == NULL)
 		return;
+	lgml_store_unaccount(s);
 	if (s->buf != NULL)
 		ggml_backend_buffer_free(s->buf);
 	ggml_free(s->ctx);
@@ -84,6 +85,9 @@ graph_release(struct graph *g)
 
 	if (!g->closed || g->refs != 0 || g->b == NULL)
 		return;
+	for (i = 0; i < 2; i++)
+		if (g->mem_bytes[i] > 0)
+			lgml_mem_add(g->mem_key[i], MEM_COMPUTE, 0, g->mem_bytes[i]);
 	if (g->galloc != NULL)
 		ggml_gallocr_free(g->galloc);
 	if (g->sched != NULL)
@@ -578,6 +582,8 @@ push_store(lua_State *L, int bidx, struct ggml_context *ctx, ggml_backend_buffer
 	s->buf = buf;
 	s->refs = 0;
 	s->closed = 0;
+	s->mem_bytes = 0;
+	lgml_store_account(s, MEM_TENSORS);
 	b->refs++;
 	luaL_setmetatable(L, STORE_MT);
 	lua_pushvalue(L, bidx);
@@ -633,6 +639,7 @@ backend_tensor(lua_State *L)
 	struct ggml_init_params ip;
 	struct ggml_context *ctx;
 	struct ggml_tensor *gt;
+	ggml_backend_buffer_type_t bt;
 	ggml_backend_buffer_t buf;
 	struct store *s;
 	int rank, hasdata = !lua_isnoneornil(L, 4);
@@ -649,7 +656,13 @@ backend_tensor(lua_State *L)
 	if (ctx == NULL)
 		return luaL_error(L, "ggml_init failed");
 	gt = ggml_new_tensor(ctx, type, GGML_MAX_DIMS, ne);
-	buf = ggml_backend_alloc_ctx_tensors(ctx, b->be);
+	bt = ggml_backend_get_default_buffer_type(b->be);
+	if (lgml_mem_check(L, bt, ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, bt),
+	    "a tensor") != NULL) {
+		ggml_free(ctx);
+		return lua_error(L);
+	}
+	buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, bt);
 	if (buf == NULL) {
 		ggml_free(ctx);
 		return luaL_error(L, "out of device memory");
@@ -808,6 +821,16 @@ backend_load(lua_State *L)
 		return 2;
 	}
 	if (hidx != 0 && (nh = split_ctx(L, hidx, &ctx, &hctx)) != 0) {
+		if (nh > 0 && b->cpu != NULL) {
+			cbt = ggml_backend_get_default_buffer_type(b->cpu->be);
+			if (lgml_mem_check(L, cbt, ggml_backend_alloc_ctx_tensors_from_buft_size(hctx,
+			    cbt), path) != NULL)
+				goto refuse;
+			cbt = ggml_backend_get_default_buffer_type(b->be);
+			if (lgml_mem_check(L, cbt, ggml_backend_alloc_ctx_tensors_from_buft_size(ctx,
+			    cbt), path) != NULL)
+				goto refuse;
+		}
 		if (nh < 0 || b->cpu == NULL) {
 			gguf_free(gctx);
 			ggml_free(ctx);
@@ -834,16 +857,20 @@ backend_load(lua_State *L)
 			ggml_free(hctx);
 			return luaL_error(L, "out of device memory");
 		}
+	} else if (lgml_mem_check(L, ggml_backend_get_default_buffer_type(b->be),
+	    ggml_backend_alloc_ctx_tensors_from_buft_size(ctx,
+	    ggml_backend_get_default_buffer_type(b->be)), path) != NULL) {
+		goto refuse;
 	} else if ((buf = ggml_backend_alloc_ctx_tensors(ctx, b->be)) == NULL) {
 		gguf_free(gctx);
 		ggml_free(ctx);
 		return luaL_error(L, "out of device memory");
 	}
-	push_store(L, 1, ctx, buf);
+	lgml_store_account(push_store(L, 1, ctx, buf), MEM_WEIGHTS);
 	sidx = lua_gettop(L);
 	if (hctx != NULL) {
 		lua_getiuservalue(L, 1, UV_CPU);
-		push_store(L, lua_gettop(L), hctx, hbuf);
+		lgml_store_account(push_store(L, lua_gettop(L), hctx, hbuf), MEM_WEIGHTS);
 		lua_setiuservalue(L, sidx, UV_HOST);
 		lua_pop(L, 1);
 	}
@@ -868,6 +895,12 @@ backend_load(lua_State *L)
 	if (e != 0)
 		return luaL_error(L, "%s: short read", path);
 	return 1;
+refuse:
+	gguf_free(gctx);
+	ggml_free(ctx);
+	if (hctx != NULL)
+		ggml_free(hctx);
+	return lua_error(L);
 }
 
 /*** Make an empty graph on this backend.
@@ -2024,25 +2057,13 @@ restore_srcs(struct graph *g)
 	g->nsaved = 0;
 }
 
-/*
- * Plan a mixed graph through the scheduler. The scheduler points node
- * srcs at its copies, so keep the srcs for the next plan.
- */
+/* Keep the node srcs, which the scheduler points at its copies. */
 static int
-plan_sched(struct graph *g)
+save_srcs(struct graph *g)
 {
-	ggml_backend_t bes[2] = { g->b->be, g->b->cpu->be };
 	struct ggml_tensor **p, *node;
 	int i, j, n = ggml_graph_n_nodes(g->gf);
 
-	if (g->sched != NULL && g->sched_size < g->size) {
-		ggml_backend_sched_free(g->sched);
-		g->sched = NULL;
-	}
-	if (g->sched == NULL) {
-		g->sched = ggml_backend_sched_new(bes, NULL, 2, (size_t)g->size, false, true);
-		g->sched_size = g->size;
-	}
 	free(g->saved);
 	g->saved = malloc((size_t)n * (GGML_MAX_SRC + 1) * sizeof(*g->saved));
 	if (g->saved == NULL)
@@ -2055,8 +2076,134 @@ plan_sched(struct graph *g)
 			p[j + 1] = node->src[j];
 	}
 	g->nsaved = n;
+	return 0;
+}
+
+/*
+ * Plan a mixed graph through the scheduler. The scheduler points node
+ * srcs at its copies, so keep the srcs for the next plan.
+ */
+static int
+plan_sched(struct graph *g)
+{
+	ggml_backend_t bes[2] = { g->b->be, g->b->cpu->be };
+
+	if (g->sched != NULL && g->sched_size < g->size) {
+		ggml_backend_sched_free(g->sched);
+		g->sched = NULL;
+	}
+	if (g->sched == NULL) {
+		g->sched = ggml_backend_sched_new(bes, NULL, 2, (size_t)g->size, false, true);
+		g->sched_size = g->size;
+	}
+	if (save_srcs(g) != 0)
+		return -1;
 	ggml_backend_sched_reset(g->sched);
 	return ggml_backend_sched_alloc_graph(g->sched, g->gf) ? 0 : -1;
+}
+
+/* Set the outputs from the arguments at 2 and up. */
+static void
+mark_outputs(lua_State *L, struct graph *g)
+{
+	struct tensor *t;
+	int i, n = lua_gettop(L);
+
+	luaL_argcheck(L, n >= 2, 2, "no outputs");
+	for (i = 2; i <= n; i++) {
+		t = check_tensor(L, i);
+		luaL_argcheck(L, t->g == g, i, "not a node of this graph");
+		ggml_set_output(t->t);
+		ggml_build_forward_expand(g->gf, t->t);
+	}
+}
+
+/* Check the ops and clear the node storage, for a new plan. */
+static void
+clear_plan(lua_State *L, struct graph *g)
+{
+	struct ggml_tensor *node;
+	int i;
+
+	restore_srcs(g);
+	for (i = 0; i < ggml_graph_n_nodes(g->gf); i++) {
+		node = ggml_graph_node(g->gf, i);
+		if (!ggml_backend_supports_op(g->b->be, node) &&
+		    !(g->mixed && ggml_backend_supports_op(g->b->cpu->be, node)))
+			luaL_error(L, "%s: op %s not supported",
+			    ggml_backend_name(g->b->be), ggml_op_desc(node));
+	}
+	/*
+	 * gallocr skips tensors that have data. After an earlier compute,
+	 * node data points into a buffer gallocr may free, so plan again.
+	 */
+	for (i = 0; i < g->nctx; i++) {
+		for (node = ggml_get_first_tensor(g->ctxs[i]); node != NULL;
+		    node = ggml_get_next_tensor(g->ctxs[i], node)) {
+			node->data = NULL;
+			node->buffer = NULL;
+		}
+	}
+	g->plan_nodes = -1;
+}
+
+/*
+ * The compute buffer sizes that a plan of the graph needs, on the
+ * backend and on its CPU backend. It uses a new allocator or scheduler,
+ * so the plan of the graph does not change.
+ */
+static void
+measure_plan(struct graph *g, size_t sz[2])
+{
+	ggml_backend_t bes[2];
+	ggml_backend_sched_t sched;
+	ggml_gallocr_t ga;
+
+	sz[0] = sz[1] = 0;
+	if (!g->mixed) {
+		ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g->b->be));
+		if (ga != NULL) {
+			ggml_gallocr_reserve_n_size(ga, g->gf, NULL, NULL, sz);
+			ggml_gallocr_free(ga);
+		}
+		return;
+	}
+	bes[0] = g->b->be;
+	bes[1] = g->b->cpu->be;
+	if (save_srcs(g) != 0)
+		return;
+	sched = ggml_backend_sched_new(bes, NULL, 2, (size_t)g->size, false, true);
+	if (sched != NULL) {
+		ggml_backend_sched_reserve_size(sched, g->gf, sz);
+		ggml_backend_sched_free(sched);
+	}
+	restore_srcs(g);
+}
+
+/* Count the compute buffers of the graph in the memory accounting. */
+static void
+account_graph(struct graph *g)
+{
+	ggml_backend_buffer_type_t bt[2];
+	size_t sz[2] = { 0, 0 };
+	int i;
+
+	bt[0] = ggml_backend_get_default_buffer_type(g->b->be);
+	bt[1] = g->b->cpu != NULL ? ggml_backend_get_default_buffer_type(g->b->cpu->be) : bt[0];
+	if (g->use_sched && g->sched != NULL) {
+		sz[0] = ggml_backend_sched_get_buffer_size(g->sched, g->b->be);
+		sz[1] = ggml_backend_sched_get_buffer_size(g->sched, g->b->cpu->be);
+	} else if (g->galloc != NULL) {
+		sz[0] = ggml_gallocr_get_buffer_size(g->galloc, 0);
+	}
+	for (i = 0; i < 2; i++) {
+		if (g->mem_bytes[i] > 0)
+			lgml_mem_add(g->mem_key[i], MEM_COMPUTE, 0, g->mem_bytes[i]);
+		g->mem_key[i] = lgml_mem_key(bt[i]);
+		g->mem_bytes[i] = sz[i];
+		if (sz[i] > 0)
+			lgml_mem_add(g->mem_key[i], MEM_COMPUTE, sz[i], 0);
+	}
 }
 
 /*** Run the graph.
@@ -2074,43 +2221,25 @@ static int
 graph_compute(lua_State *L)
 {
 	struct graph *g = check_graph(L, 1);
-	struct ggml_tensor *node;
-	struct tensor *t;
 	enum ggml_status st;
-	int i, n = lua_gettop(L);
+	size_t sz[2], cur;
 
-	luaL_argcheck(L, n >= 2, 2, "no outputs");
-	for (i = 2; i <= n; i++) {
-		t = check_tensor(L, i);
-		luaL_argcheck(L, t->g == g, i, "not a node of this graph");
-		ggml_set_output(t->t);
-		ggml_build_forward_expand(g->gf, t->t);
-	}
+	mark_outputs(L, g);
 	if (g->plan_nodes == ggml_graph_n_nodes(g->gf) && g->plan_tensors == g->ntensors)
 		goto run;
-	restore_srcs(g);
-	for (i = 0; i < ggml_graph_n_nodes(g->gf); i++) {
-		node = ggml_graph_node(g->gf, i);
-		if (!ggml_backend_supports_op(g->b->be, node) &&
-		    !(g->mixed && ggml_backend_supports_op(g->b->cpu->be, node)))
-			return luaL_error(L, "%s: op %s not supported",
-			    ggml_backend_name(g->b->be), ggml_op_desc(node));
+	clear_plan(L, g);
+	/* The memory guard sees the growth of the buffer before it happens. */
+	if (!g->mixed) {
+		measure_plan(g, sz);
+		cur = ggml_gallocr_get_buffer_size(g->galloc, 0);
+		if (sz[0] > cur)
+			lgml_mem_need(L, ggml_backend_get_default_buffer_type(g->b->be), sz[0] - cur,
+			    "a graph");
 	}
-	/*
-	 * gallocr skips tensors that have data. After an earlier compute,
-	 * node data points into a buffer gallocr may free, so plan again.
-	 */
-	for (i = 0; i < g->nctx; i++) {
-		for (node = ggml_get_first_tensor(g->ctxs[i]); node != NULL;
-		    node = ggml_get_next_tensor(g->ctxs[i], node)) {
-			node->data = NULL;
-			node->buffer = NULL;
-		}
-	}
-	g->plan_nodes = -1;
 	g->use_sched = g->mixed;
 	if (g->mixed ? plan_sched(g) != 0 : !ggml_gallocr_alloc_graph(g->galloc, g->gf))
 		return luaL_error(L, "graph allocation failed");
+	account_graph(g);
 	g->plan_nodes = ggml_graph_n_nodes(g->gf);
 	g->plan_tensors = g->ntensors;
 run:
@@ -2143,6 +2272,33 @@ graph_buffer_size(lua_State *L)
 	}
 	lua_pushinteger(L, (lua_Integer)ggml_gallocr_get_buffer_size(g->galloc, 0));
 	lua_pushinteger(L, 0);
+	return 2;
+}
+
+/*** Find the compute buffer sizes that the graph needs.
+ * The arguments become outputs, as for `graph:compute`. It plans the
+ * storage with a new allocator and allocates nothing, so a worst-case
+ * graph gives the peak of its passes before they run. The next
+ * `graph:compute` plans again.
+ * @tparam tensor t output node of this graph
+ * @tparam tensor ... more output nodes
+ * @treturn int bytes on the backend
+ * @treturn int bytes on its CPU backend, for a graph with leaves on both
+ * @raise if a tensor is not a node of this graph, or the backend does
+ * not support an op
+ * @function graph:measure
+ */
+static int
+graph_measure(lua_State *L)
+{
+	struct graph *g = check_graph(L, 1);
+	size_t sz[2];
+
+	mark_outputs(L, g);
+	clear_plan(L, g);
+	measure_plan(g, sz);
+	lua_pushinteger(L, (lua_Integer)sz[0]);
+	lua_pushinteger(L, (lua_Integer)sz[1]);
 	return 2;
 }
 
@@ -3046,14 +3202,17 @@ l_gguf(lua_State *L)
 static const char *const dev_types[] = { "cpu", "gpu", "igpu", "accel", "meta" };
 
 /*** List the ggml devices.
- * Each entry is { name, description, type, free, total }. type is "cpu",
- * "gpu", "igpu", "accel", "meta" or "unknown". free and total are bytes.
+ * Each entry is { name, description, type, free, total, id }. type is
+ * "cpu", "gpu", "igpu", "accel", "meta" or "unknown". free and total are
+ * bytes. id is the bus id of the device, such as "0000:03:00.0", when
+ * the backend knows it.
  * @treturn {table,...} devices
  * @function devices
  */
 static int
 l_devices(lua_State *L)
 {
+	struct ggml_backend_dev_props props;
 	ggml_backend_dev_t dev;
 	size_t i, n = ggml_backend_dev_count();
 	size_t mfree, mtotal;
@@ -3076,6 +3235,12 @@ l_devices(lua_State *L)
 		lua_setfield(L, -2, "free");
 		lua_pushinteger(L, (lua_Integer)mtotal);
 		lua_setfield(L, -2, "total");
+		memset(&props, 0, sizeof(props));
+		ggml_backend_dev_get_props(dev, &props);
+		if (props.device_id != NULL && props.device_id[0] != '\0') {
+			lua_pushstring(L, props.device_id);
+			lua_setfield(L, -2, "id");
+		}
 		lua_seti(L, -2, (lua_Integer)i + 1);
 	}
 	return 1;
@@ -3295,6 +3460,7 @@ static const luaL_Reg graph_methods[] = {
 	{ "top_k", graph_top_k },
 	{ "compute", graph_compute },
 	{ "buffer_size", graph_buffer_size },
+	{ "measure", graph_measure },
 	{ "splits", graph_splits },
 	{ NULL, NULL }
 };
@@ -3445,5 +3611,6 @@ luaopen_lgml(lua_State *L)
 	lgml_open_ops_vibevoice(L);
 	lgml_open_ops_nn(L);
 	lgml_open_train(L);
+	lgml_open_mem(L);
 	return 1;
 }
