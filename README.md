@@ -3,8 +3,8 @@
 lgml runs models on ggml from Lua 5.4. A C module (`lgml.so`) gives
 tensors, graphs, backends, samplers, tokenizers and codecs. Lua code
 on top of it loads gguf and safetensors models: chat models (llama,
-Qwen3, Qwen3.5 and Gemma 4 with vision), Whisper, text-to-speech models
-and Z-Image. `lgml-server` serves them over an OpenAI-shaped HTTP API;
+Qwen3, Qwen3.5 and Gemma 4 with vision), embedding models
+(Qwen3-Embedding), Whisper, text-to-speech models and Z-Image. `lgml-server` serves them over an OpenAI-shaped HTTP API;
 chat models also serve the Anthropic Messages and OpenAI Responses
 APIs, so Claude Code, Codex and the Anthropic and OpenAI SDKs work
 with no change.
@@ -78,7 +78,8 @@ bin/lgml-server -C etc/lgml.lua               # several models from a config
 ```
 
 `bin/lgml-server -h` lists the options. `etc/lgml.lua.example` is a
-sample config with chat, vision, Whisper, image and speech models.
+sample config with chat, vision, embedding, Whisper, image and speech
+models.
 
 ### Weights in host memory
 

@@ -55,6 +55,10 @@ return {
 		-- idle = 0 keeps this model loaded until another load needs room.
 		{ id = "whisper", model = "/home/you/models/whisper-large-v3-turbo", backend = "Vulkan0",
 			idle = 0 },
+		-- A gguf with a pooling type, such as Qwen3-Embedding, serves
+		-- /v1/embeddings and not chat. ctx is the longest input.
+		-- { id = "qwen3-embedding-4b", model = "/home/you/models/Qwen3-Embedding-4B-Q8_0.gguf",
+		-- 	backend = "Vulkan0", ctx = 8192 },
 		-- mem sets the MiB a model takes, in place of the estimate.
 		-- text_backend = "CPU" keeps the text encoder (4 GiB) out of GPU
 		-- memory; it counts against ram, and mem counts the GPU part: about
