@@ -238,6 +238,26 @@ local function test_gone()
 	cleanup(p)
 end
 
+-- A worker that crashes makes its model fail until a load on purpose.
+local function test_crash()
+	local p = pool_mod.new({ budget = { gpu = 100 * MiB } })
+	local a = add(p, "a")
+	ok(chat(a) == true and a.starts == 1, "a loads and answers")
+	local r, msg = a:chat({ messages = { { role = "user", content = "crash" } } }, sink())
+	ok(r == nil and msg, "the crashing request fails")
+	local t0 = uv.now()
+	while a.state ~= "unloaded" and uv.now() - t0 < 2000 do
+		stream.sleep(10)
+	end
+	ok(a:models()[1].status == "failed", "the model lists as failed")
+	local r2, msg2, code2 = a:chat({ messages = { { role = "user", content = "hi" } } }, sink())
+	ok(r2 == nil and code2 == 503 and msg2:find("crashed", 1, true) and a.starts == 1,
+	    "a request after the crash gets 503 and starts no worker")
+	ok(a:load() and a.state == "loaded" and a.starts == 2, "a load on purpose starts it again")
+	ok(chat(a) == true and a:models()[1].status == "loaded", "then requests work")
+	cleanup(p)
+end
+
 -- A model with parts on two kinds counts each part against its budget.
 local function test_parts()
 	local p = pool_mod.new({ budget = { gpu = 100 * MiB, cpu = 100 * MiB } })
@@ -324,7 +344,7 @@ local function test_failure()
 	    "metrics count the failure")
 	cleanup(p)
 
-	-- A worker that dies after its load: the model is unloaded, then loads again.
+	-- A worker that dies after its load: the model is unloaded and failed.
 	p = pool_mod.new()
 	local a = add(p, "a", { size = 40, measured = 30 })
 	chat(a)
@@ -334,7 +354,9 @@ local function test_failure()
 		stream.sleep(5)
 	end
 	ok(a.state == "unloaded" and not a.counted, "a worker crash unloads the model")
-	ok(chat(a) == true and a.starts == 2, "the next request loads it again")
+	local _, _, code = chat(a)
+	ok(code == 503 and a.starts == 1, "the next request fails without a new worker")
+	ok(a:load() and chat(a) == true and a.starts == 2, "a load on purpose loads it again")
 	cleanup(p)
 end
 
@@ -538,6 +560,7 @@ local function main()
 	test_in_flight()
 	test_swap()
 	test_gone()
+	test_crash()
 	test_parts()
 	test_no_room()
 	test_idle()

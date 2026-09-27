@@ -1,8 +1,10 @@
 --- An engine that runs in a worker process (`lgml-worker`).
 -- It speaks imsg over a socketpair; the messages are in `lgml.ipc`.
 -- When the worker dies, open jobs fail with 503 and a new worker starts
--- after one second, unless `opts.restart` is false. The front polls for
--- client cancel every 250 ms.
+-- after one second, unless `opts.restart` is false. A worker that
+-- crashes again within 5 minutes of a crash does not start again: a GPU
+-- that ran out of memory would crash it on the next request too. The
+-- front polls for client cancel every 250 ms.
 -- @module lgml.server.remote_engine
 local uv = require("luv")
 local ipc = require("lgml.ipc")
@@ -19,6 +21,8 @@ R.__index = R
 
 local CANCEL_POLL_MS = 250
 local RESTART_MS = 1000
+-- A second crash within this time stops the restarts.
+local CRASH_WINDOW_MS = 5 * 60 * 1000
 
 --- Starts a worker and makes an engine for it.
 -- The worker gets `--fd 3`, the log settings of this process (see
@@ -128,6 +132,16 @@ function R:exited(code, sig)
 		self.ch:close("exit")
 	end
 	local restart = self.opts.restart ~= false and not self.stopping
+	if (code ~= 0 or sig ~= 0) and not self.stopping then
+		local t = uv.now()
+		if restart and self.crashed_at and t - self.crashed_at < CRASH_WINDOW_MS then
+			restart = false
+			self.down = ("the worker crashed twice in %d s (code %s, signal %s); see the log, then restart the server")
+			    :format((t - self.crashed_at) // 1000, code, sig)
+			log.write(log.ERROR, "remote", "worker crashed again; no restart", "model", self.opts.id)
+		end
+		self.crashed_at = t
+	end
 	if self.opts.on_exit then
 		self.opts.on_exit(code, sig)
 	end
@@ -353,7 +367,7 @@ function R:chat(req, sink)
 		return nil, rerr, 503
 	end
 	if not self.ch then
-		return nil, "worker not running", 503
+		return nil, self.down or "worker not running", 503
 	end
 	local id = self.next_id
 	self.next_id = id + 1
@@ -423,7 +437,7 @@ function R:transcribe(req, audio, ctl)
 		return nil, "model does not support transcription", 400
 	end
 	if not self.ch then
-		return nil, "worker not running", 503
+		return nil, self.down or "worker not running", 503
 	end
 	local id = self.next_id
 	self.next_id = id + 1
@@ -470,7 +484,7 @@ function R:speak(req, ctl)
 		return nil, "model does not support speech", 400
 	end
 	if not self.ch then
-		return nil, "worker not running", 503
+		return nil, self.down or "worker not running", 503
 	end
 	local id = self.next_id
 	self.next_id = id + 1
@@ -523,7 +537,7 @@ function R:decide(req, ctl)
 		return nil, "model does not support decisions", 400
 	end
 	if not self.ch then
-		return nil, "worker not running", 503
+		return nil, self.down or "worker not running", 503
 	end
 	local id = self.next_id
 	self.next_id = id + 1
@@ -590,7 +604,7 @@ function R:generate(req, ctl)
 		return nil, "model does not support images", 400
 	end
 	if not self.ch then
-		return nil, "worker not running", 503
+		return nil, self.down or "worker not running", 503
 	end
 	local id = self.next_id
 	self.next_id = id + 1
@@ -650,7 +664,7 @@ function R:embed(req, ctl)
 		return nil, "model does not support embeddings", 400
 	end
 	if not self.ch then
-		return nil, "worker not running", 503
+		return nil, self.down or "worker not running", 503
 	end
 	local id = self.next_id
 	self.next_id = id + 1

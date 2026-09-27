@@ -323,7 +323,9 @@ end
 --- A model of the pool. It implements `lgml.server.engine.Engine`.
 -- Each request method loads the model when it is not loaded, and
 -- counts the request as in flight while it runs. The field `state` is
--- `"unloaded"`, `"loading"`, `"loaded"` or `"unloading"`.
+-- `"unloaded"`, `"loading"`, `"loaded"` or `"unloading"`. A model whose
+-- worker crashed lists as `"failed"`, and requests fail until a load
+-- that `load` without hold starts, such as `POST /models/load`.
 -- @type Model
 
 --- Lists the one model with its load state.
@@ -342,7 +344,8 @@ function Model:models()
 		ctx = h.models[1].context_length or ctx
 	end
 	return { {
-		id = self.id, context_length = ctx, capabilities = self.mode_list, status = self.state,
+		id = self.id, context_length = ctx, capabilities = self.mode_list,
+		status = self.failed and self.state == "unloaded" and "failed" or self.state,
 		bytes = self.size, vision = vision,
 	} }
 end
@@ -451,11 +454,19 @@ function Model:arm_idle()
 end
 
 -- The worker exited. A loaded model goes back to unloaded.
-function Model:exited(eng)
+function Model:exited(eng, code, sig)
 	if self.engine ~= eng or self.state ~= "loaded" then
 		return
 	end
-	L:warn("worker exited; unloaded", "model", self.id)
+	if (code or 0) ~= 0 or (sig or 0) ~= 0 then
+		-- A crash, such as a GPU out of memory, would repeat on the next
+		-- request: requests fail until a load on purpose.
+		self.failed = ("the worker of model %s crashed (code %s, signal %s); see the log, then POST /models/load to load it again")
+		    :format(self.id, code, sig)
+		L:error("worker crashed; model failed", "model", self.id, "code", code, "signal", sig)
+	else
+		L:warn("worker exited; unloaded", "model", self.id)
+	end
 	self.engine, self.counted = nil, false
 	metrics.add("model_unloads_total", "model unloads", self.id, 1)
 	metrics.set("model_loaded_bytes", "device or host bytes of the loaded model", self.id, 0)
@@ -490,6 +501,8 @@ function Model:load_loop(hold, gone)
 			return nil, "server is stopping", 503
 		elseif gone and gone() then
 			return nil, CANCELLED, 499
+		elseif hold and self.failed and self.state == "unloaded" then
+			return nil, self.failed, 503
 		elseif self.state == "loaded" then
 			if hold then
 				self.inflight = self.inflight + 1
@@ -507,6 +520,10 @@ function Model:load_loop(hold, gone)
 				return nil, err, 503
 			end
 		else
+			-- A load on purpose (no hold) clears a crash.
+			if not hold then
+				self.failed = nil
+			end
 			local ok, err = self:do_load(gone)
 			if not ok then
 				return nil, err, err == CANCELLED and 499 or 503
@@ -542,8 +559,8 @@ function Model:do_load(gone)
 	if ok then
 		L:info("loading", "model", self.id, "size", self:describe(),
 		    "from", self.measured and "measure" or (self.fixed and "mem" or "estimate"))
-		ok, eng = pcall(self.start, function()
-			self:exited(eng)
+		ok, eng = pcall(self.start, function(code, sig)
+			self:exited(eng, code, sig)
 		end)
 		if not ok then
 			err = tostring(eng)

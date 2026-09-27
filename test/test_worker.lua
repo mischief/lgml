@@ -1,6 +1,7 @@
 -- Tests for the worker process and remote engine, with the fake engine
 -- in the worker. TAP output.
 local uv = require("luv")
+local stream = require("lgml.server.stream")
 local remote = require("lgml.server.remote_engine")
 
 local n, failed = 0, 0
@@ -223,6 +224,25 @@ in_co(function()
 	    "a worker debug line has the model id and the request id")
 	ok(text:find("comp=worker:logged rid=feedc0de msg=\"job done\" kind=chat", 1, true),
 	    "the worker logs the job with the request id")
+end)
+
+-- A worker that crashes twice within the window does not start again.
+in_co(function()
+	local w = remote.new({
+		lua = "lua5.4", script = src .. "/bin/lgml-worker", args = { "--fake", "--alias", "twice" },
+	})
+	local crash = { messages = { { role = "user", content = "crash" } } }
+	local res, _, status = w:chat(crash, recorder())
+	ok(res == nil and status == 503, "the first crash fails its request")
+	w.hello = nil
+	ok(w:ready() and w:chat({ messages = { { role = "user", content = "hi" } } }, recorder()) == true,
+	    "a new worker starts after the first crash")
+	w:chat(crash, recorder())
+	stream.sleep(1500)
+	local r2, msg2, status2 = w:chat({ messages = { { role = "user", content = "hi" } } }, recorder())
+	ok(r2 == nil and status2 == 503 and msg2:find("crashed twice", 1, true) and w.proc == nil,
+	    "after a second crash no worker starts and requests say why")
+	w:shutdown()
 end)
 
 print("1.." .. n)

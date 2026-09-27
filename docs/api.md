@@ -1345,7 +1345,13 @@ fields. It does not load a model.
   - `image_generation`: `/v1/images/generations` and `/v1/images/edits`
   - `embedding`: `/v1/embeddings`
 - `status.value` (llama.cpp) and `lgml.status`: `unloaded`, `loading`,
-  `loaded` or `unloading`. A server without a config gives `loaded`.
+  `loaded`, `unloading` or `failed`. A server without a config gives
+  `loaded`. `failed` means the worker of the model crashed (a GPU out
+  of memory, for example). Requests for it then give 503 with the
+  reason and start no worker, since the crash would repeat. `POST
+  /models/load` loads it again. A server with one model (`-m`) starts a
+  crashed worker once; after a second crash within 5 minutes it starts
+  none, and requests give 503 with the reason.
 - `lgml.bytes`: with a config, the memory that the model counts
   against the budget of its backend (`vram` for a GPU model). A part in
   host memory, such as weights that `n_cpu_moe` keeps on the CPU,
