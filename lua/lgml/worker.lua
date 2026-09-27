@@ -132,13 +132,44 @@ function M.device_used(backend)
 	return pick.total - pick.free
 end
 
+--- Measures the memory of a loaded engine, for `HELLO`.
+-- The parts come from `lgml.budget.report`, with `exact` true. With
+-- before, the field delta is the device bytes in use now less before.
+-- @param engine the engine
+-- @tparam[opt] string backend the backend name
+-- @tparam[opt] integer before `device_used` before the load
+-- @treturn table the `mem` field of `HELLO`
+-- @treturn table the report, for `fits`
+function M.measure(engine, backend, before)
+	local budget = require("lgml.budget")
+	local r = budget.report(engine, backend)
+	local mem = budget.plain(r)
+	mem.exact = true
+	local after = before and M.device_used(backend)
+	if after then
+		mem.delta = after - before
+	end
+	return mem, r
+end
+
+--- Checks that the rest of a model fits the memory guard.
+-- See `lgml.budget.check`.
+-- @tparam table r the report from `measure`
+-- @tparam string name the model name for the message
+-- @treturn[1] boolean true
+-- @treturn[2] nil
+-- @treturn[2] string the error
+function M.fits(r, name)
+	return require("lgml.budget").check(r, "model " .. tostring(name))
+end
+
 --- Serves the engine on fd until the front closes it.
 -- It sends `HELLO`, then runs the luv loop. It returns when the channel
 -- closes. SIGHUP opens the log file again (see `lgml.log.reopen`). A job for a method that the engine does not have ends with
 -- status 400.
 -- @tparam int fd the imsg socket to the front
 -- @tparam lgml.server.engine.Engine engine the engine
--- @tparam[opt] table mem the `mem` field of `HELLO`: `{ used }`
+-- @tparam[opt] table mem the `mem` field of `HELLO` (see `lgml.ipc`)
 function M.serve(fd, engine, mem)
 	local jobs, pending, deciding = {}, {}, {}
 	local ch

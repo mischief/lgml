@@ -22,6 +22,7 @@ local uv = require("luv")
 local stream = require("lgml.server.stream")
 local metrics = require("lgml.server.metrics")
 local engine_api = require("lgml.server.engine")
+local budget_mod = require("lgml.budget")
 local log = require("lgml.log")
 
 local L = log.new("pool")
@@ -53,6 +54,25 @@ local function wake(list, ...)
 	end
 	for _, f in ipairs(fns) do
 		f(...)
+	end
+end
+
+-- The memory parts of a model, as gauges.
+local PARTS = {
+	{ "weights", "weights and other leaves of the loaded model" },
+	{ "cache", "KV cache of the loaded model at its full context" },
+	{ "compute", "largest compute buffers of the loaded model" },
+	{ "overhead", "driver memory of the worker beyond its buffers" },
+}
+
+-- Sets the gauges of model m; all 0 when it is not loaded.
+local function gauges(m)
+	local loaded = m.state == "loaded" and m.engine ~= nil
+	metrics.set("model_loaded_bytes", "device or host bytes of the loaded model", m.id,
+	    loaded and m.size or 0)
+	for _, p in ipairs(PARTS) do
+		local v = loaded and m.parts and m.parts[p[1]] or 0
+		metrics.set("model_" .. p[1] .. "_bytes", p[2], m.id, v)
 	end
 end
 
@@ -109,7 +129,7 @@ function P:add(o)
 		state = "unloaded", inflight = 0, wanted = 0, last = 0, waiters = {}, counted = false,
 	}, Model)
 	self.models[#self.models + 1] = m
-	metrics.set("model_loaded_bytes", "device or host bytes of the loaded model", m.id, 0)
+	gauges(m)
 	return m
 end
 
@@ -227,15 +247,16 @@ end
 
 -- Makes room for the part of m of one kind. Room of other kinds that
 -- earlier calls made stays, since m holds their load locks. Returns
--- true, or nil and the reason. It unloads nothing once gone() is true.
+-- true, or nil, the reason and a status: 507 when m can never fit, 503
+-- after the wait, 499 when gone() turns true. It then unloads nothing.
 function P:reserve_kind(m, kind, deadline, gone)
 	local budget = self.budget[kind] or math.huge
 	local need = m:need(kind)
 	L:debug("reserve", "model", m.id, "kind", kind, "need", mib(need), "budget", mib(budget),
 	    "used", mib(self:used(kind)))
 	if need > budget then
-		return nil, ("model %s needs %s; the %s budget is %s"):format(m.id, mib(need),
-		    kind, mib(budget))
+		return nil, ("model %s needs %s%s; the %s budget is %s"):format(m.id, mib(need),
+		    m:parts_text(), kind, mib(budget)), budget_mod.STATUS
 	end
 	while true do
 		local used = self:used(kind)
@@ -243,7 +264,7 @@ function P:reserve_kind(m, kind, deadline, gone)
 			return true
 		end
 		if gone and gone() then
-			return nil, CANCELLED
+			return nil, CANCELLED, 499
 		end
 		local idle = self:idle_models(kind, m)
 		local room = budget - used
@@ -267,31 +288,32 @@ function P:reserve_kind(m, kind, deadline, gone)
 			local why = ("model %s needs %s; the %s budget is %s, %s in use"):format(m.id,
 			    mib(need), kind, mib(budget), mib(used))
 			if #busy == 0 then
-				return nil, why
+				return nil, why, budget_mod.STATUS
 			end
 			L:debug("waiting for room", "model", m.id, "kind", kind, "busy", table.concat(busy, ","))
 			if gone and gone() then
-				return nil, CANCELLED
+				return nil, CANCELLED, 499
 			end
 			if now() >= deadline or not self:wait_event(deadline, gone) then
 				if gone and gone() then
-					return nil, CANCELLED
+					return nil, CANCELLED, 499
 				end
 				return nil, ("%s; models with requests in flight: %s; waited %g s"):format(why,
-				    table.concat(busy, ", "), self.load_wait)
+				    table.concat(busy, ", "), self.load_wait), 503
 			end
 		end
 	end
 end
 
 -- Makes room for m in the budget of each of its kinds and counts it. It
--- holds the load locks of m. Returns true, or nil and the reason.
+-- holds the load locks of m. Returns true, or nil, the reason and a
+-- status (see reserve_kind).
 function P:reserve(m, gone)
 	local deadline = now() + self.load_wait
 	for _, kind in ipairs(m:kinds()) do
-		local ok, err = self:reserve_kind(m, kind, deadline, gone)
+		local ok, err, status = self:reserve_kind(m, kind, deadline, gone)
 		if not ok then
-			return nil, err
+			return nil, err, status
 		end
 	end
 	m.counted = true
@@ -331,11 +353,13 @@ end
 --- Lists the one model with its load state.
 -- It does not load the model.
 -- @treturn {table,...} `{ { id, context_length, capabilities, status,
--- bytes, vision } }`; status is the state, and bytes the size counted
--- against the budget
+-- bytes, memory, vision } }`; status is the state, bytes the size counted
+-- against the budget, and memory the parts that the worker measured:
+-- `{ weights, cache, compute, overhead }` in bytes, while loaded
 function Model:models()
 	local ctx = self.context_length
 	local h = self.state == "loaded" and self.engine and self.engine.hello
+	local p = self.parts
 	local vision
 	for _, x in ipairs(self.mode_list) do
 		vision = vision or x == "multimodal"
@@ -347,6 +371,8 @@ function Model:models()
 		id = self.id, context_length = ctx, capabilities = self.mode_list,
 		status = self.failed and self.state == "unloaded" and "failed" or self.state,
 		bytes = self.size, vision = vision,
+		memory = self.state == "loaded" and p and { weights = p.weights, cache = p.cache,
+		    compute = p.compute, overhead = p.overhead } or nil,
 	} }
 end
 
@@ -419,6 +445,16 @@ function Model:kinds()
 	return list
 end
 
+-- The measured parts for a message, as " (weights 1 MiB, ...)", or "".
+function Model:parts_text()
+	local p = self.parts
+	if not p then
+		return ""
+	end
+	return (" (weights %s, cache %s, compute %s, overhead %s)"):format(mib(p.weights),
+	    mib(p.cache), mib(p.compute), mib(p.overhead))
+end
+
 -- The size for a log line, with the part of each kind when it has more
 -- than one.
 function Model:describe()
@@ -469,8 +505,8 @@ function Model:exited(eng, code, sig)
 	end
 	self.engine, self.counted = nil, false
 	metrics.add("model_unloads_total", "model unloads", self.id, 1)
-	metrics.set("model_loaded_bytes", "device or host bytes of the loaded model", self.id, 0)
 	self:set_state("unloaded")
+	gauges(self)
 end
 
 --- Loads the model, or waits for a load under way.
@@ -482,7 +518,8 @@ end
 -- @treturn[1] lgml.server.remote_engine.Remote the engine
 -- @treturn[2] nil
 -- @treturn[2] string the reason of a failed load
--- @treturn[2] int 503, or 499 when the client went away
+-- @treturn[2] int 503; 507 when the model does not fit the memory
+-- budget or the device; 499 when the client went away
 function Model:load(hold, gone)
 	-- A model with a caller in here is not idle: a load wakes other
 	-- waiters first, and they must not unload it before this caller runs.
@@ -513,38 +550,80 @@ function Model:load_loop(hold, gone)
 			end
 			return self.engine
 		elseif self.state == "loading" or self.state == "unloading" then
-			local ok, err = await(function(done)
+			local ok, err, status = await(function(done)
 				self.waiters[#self.waiters + 1] = done
 			end, nil, gone)
 			if not ok and err then
-				return nil, err, 503
+				return nil, err, status or 503
 			end
 		else
 			-- A load on purpose (no hold) clears a crash.
 			if not hold then
 				self.failed = nil
 			end
-			local ok, err = self:do_load(gone)
+			local ok, err, status = self:do_load(gone)
 			if not ok then
-				return nil, err, err == CANCELLED and 499 or 503
+				return nil, err, status
 			end
 		end
 	end
 end
 
--- Runs one load. Wakes the waiters with true, or with false and the
--- reason.
+-- The part of the device delta that a sum may miss before a warning:
+-- 256 MiB, or a tenth of the sum.
+local DELTA_SLACK = 256 * MiB
+
+-- Takes the memory report of a loaded worker. An exact report sets the
+-- size to its sum; a report with only a device delta sets it to the
+-- delta, at least the file size, plus the margin.
+function Model:measure(mem)
+	local used = mem and tonumber(mem.used)
+	if not used then
+		return
+	end
+	self.parts = mem.exact and mem or nil
+	if mem.exact and mem.delta and mem.now and
+	    math.abs(mem.delta - mem.now) > math.max(DELTA_SLACK, mem.now // 10) then
+		L:warn("device delta differs from the buffer sum", "model", self.id,
+		    "delta", mib(mem.delta), "held", mib(mem.now))
+	end
+	if self.fixed then
+		return
+	end
+	if mem.exact then
+		-- Without its worst-case graphs, the compute part is a guess.
+		self.measured = used + (mem.reserved and 0 or self.margin)
+	else
+		self.measured = math.max(used, self.files) + self.margin
+	end
+	self.size = self.measured
+	return used
+end
+
+-- Counts the measured size of a loaded model against the budgets: a
+-- larger size than the one reserved unloads idle models, or fails.
+-- Returns true, or nil, the reason and a status.
+function Model:recount(gone)
+	local pool = self.pool
+	self.counted = false
+	local ok, err, status = pool:reserve(self, gone)
+	self.counted = true
+	return ok, err, status
+end
+
+-- Runs one load. Wakes the waiters with true, or with false, the reason
+-- and the status. Returns the same.
 function Model:do_load(gone)
 	local pool = self.pool
 	self:set_state("loading")
 	local t0 = now()
-	local ok, err = pool:take_lock(self, gone), CANCELLED
+	local ok, err, status = pool:take_lock(self, gone), CANCELLED, 499
 	-- A failed load keeps its measure out: start from the estimate.
 	if ok and not self.fixed then
 		self.size = self.measured or self.estimate
 	end
 	if ok then
-		ok, err = pool:reserve(self, gone)
+		ok, err, status = pool:reserve(self, gone)
 	end
 	if err == CANCELLED and not ok then
 		-- Other waiters retry the load themselves.
@@ -553,7 +632,7 @@ function Model:do_load(gone)
 		self:set_state("unloaded")
 		L:info("load cancelled", "model", self.id)
 		wake(self.waiters, false)
-		return nil, err
+		return nil, err, 499
 	end
 	local eng
 	if ok then
@@ -563,9 +642,17 @@ function Model:do_load(gone)
 			self:exited(eng, code, sig)
 		end)
 		if not ok then
-			err = tostring(eng)
+			err, status = tostring(eng), 503
 		else
 			ok, err = eng:ready()
+			status = budget_mod.status(err, 503)
+			if ok then
+				local before = self.size
+				self:measure(eng.hello.mem)
+				if self.size > before then
+					ok, err, status = self:recount(gone)
+				end
+			end
 			if not ok then
 				eng:shutdown()
 			end
@@ -577,23 +664,22 @@ function Model:do_load(gone)
 		self:set_state("unloaded")
 		metrics.add("model_load_failures_total", "model loads that failed", self.id, 1)
 		err = ("model %s did not load: %s"):format(self.id, tostring(err))
-		L:error("load failed", "model", self.id, "err", err)
-		wake(self.waiters, false, err)
-		return nil, err
-	end
-	local used = eng.hello.mem and tonumber(eng.hello.mem.used)
-	if used and not self.fixed then
-		self.measured = math.max(used, self.files) + self.margin
-		self.size = self.measured
+		L:error("load failed", "model", self.id, "err", err, "status", status)
+		wake(self.waiters, false, err, status)
+		return nil, err, status
 	end
 	local secs = now() - t0
+	local mem = eng.hello.mem or {}
 	L:info("loaded", "model", self.id, "s", secs, "size", self:describe(),
-	    "estimate", mib(self.estimate), "measured", used and mib(used) or nil)
+	    "estimate", mib(self.estimate), "measured", mem.used and mib(mem.used) or nil,
+	    "weights", mem.exact and mib(mem.weights) or nil, "cache", mem.exact and mib(mem.cache) or nil,
+	    "compute", mem.exact and mib(mem.compute) or nil,
+	    "overhead", mem.exact and mib(mem.overhead) or nil)
 	self.engine, self.last = eng, now()
 	self.state = "loaded"
 	metrics.add("model_loads_total", "model loads", self.id, 1)
 	metrics.add("model_load_seconds_total", "time spent loading models", self.id, secs)
-	metrics.set("model_loaded_bytes", "device or host bytes of the loaded model", self.id, self.size)
+	gauges(self)
 	pool:drop_lock(self)
 	wake(self.waiters, true)
 	self:arm_idle()
@@ -635,8 +721,8 @@ function Model:unload()
 	eng:shutdown()
 	self.engine, self.counted = nil, false
 	metrics.add("model_unloads_total", "model unloads", self.id, 1)
-	metrics.set("model_loaded_bytes", "device or host bytes of the loaded model", self.id, 0)
 	self:set_state("unloaded")
+	gauges(self)
 	wake(self.waiters, false)
 	return true
 end

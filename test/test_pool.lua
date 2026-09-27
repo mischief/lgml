@@ -38,11 +38,13 @@ end
 
 -- Adds a fake model to pool. o: size (MiB, the estimate), measured
 -- (MiB, what the worker reports), extra (MiB of each other kind),
--- load_ms, delay, fail, idle.
+-- load_ms, delay, fail, idle, margin and files (MiB), delta (MiB, the
+-- device delta that the worker reports).
 local function add(pool, id, o)
 	o = o or {}
 	local args = { "--fake", "--alias", id, "--fake-size", tostring(o.measured or o.size or 40) }
-	for flag, v in pairs({ ["--fake-load-ms"] = o.load_ms, ["--fake-delay"] = o.delay }) do
+	for flag, v in pairs({ ["--fake-load-ms"] = o.load_ms, ["--fake-delay"] = o.delay,
+		["--fake-delta"] = o.delta }) do
 		table.move({ flag, tostring(v) }, 1, 2, #args + 1, args)
 	end
 	if o.fail then
@@ -55,7 +57,8 @@ local function add(pool, id, o)
 	local m
 	m = pool:add({
 		id = id, modes = o.modes or ALL, kind = o.kind or "gpu", size = (o.size or 40) * MiB,
-		idle = o.idle, extra = extra,
+		idle = o.idle, extra = extra, margin = o.margin and o.margin * MiB,
+		files = o.files and o.files * MiB,
 		start = function(on_exit)
 			m.starts = (m.starts or 0) + 1
 			return remote.new({
@@ -274,8 +277,8 @@ local function test_parts()
 	    "unloading the split model for its cpu part frees its gpu part too")
 	local big = add(p, "big", { size = 10, extra = { cpu = 120 } })
 	local r, msg, status = chat(big)
-	ok(r == nil and status == 503 and msg:find("needs 120 MiB; the cpu budget is 100 MiB", 1, true),
-	    "a part larger than its budget gives 503")
+	ok(r == nil and status == 507 and msg:find("needs 120 MiB; the cpu budget is 100 MiB", 1, true),
+	    "a part larger than its budget gives 507")
 	cleanup(p)
 end
 
@@ -285,8 +288,8 @@ local function test_no_room()
 	local b = add(p, "b", { size = 60 })
 	local big = add(p, "big", { size = 200 })
 	local res, msg, status = chat(big)
-	ok(res == nil and status == 503 and msg:find("needs 200 MiB; the gpu budget is 100 MiB", 1, true),
-	    "a model larger than the budget gives 503")
+	ok(res == nil and status == 507 and msg:find("needs 200 MiB; the gpu budget is 100 MiB", 1, true),
+	    "a model larger than the budget gives 507")
 	local long = spawn(function() return chat(a) end)
 	while a.inflight == 0 do
 		stream.sleep(5)
@@ -551,6 +554,37 @@ local function test_estimate()
 	os.remove(path)
 end
 
+-- An exact report of the worker sets the size; a size past the budget
+-- unloads idle models or refuses the load with 507.
+local function test_exact()
+	local p = pool_mod.new({ budget = { gpu = 100 * MiB } })
+	local a = add(p, "a", { size = 50, measured = 30, margin = 20, files = 40 })
+	chat(a)
+	local mem = a:models()[1].memory
+	ok(a.size == 30 * MiB and mem and mem.weights == 30 * MiB and mem.cache == 0,
+	    "an exact report sets the size, with no margin or file floor")
+	local b = add(p, "b", { size = 40, measured = 80 })
+	ok(chat(b) == true and states(p) == "a=unloaded,b=loaded" and p:used("gpu") == 80 * MiB,
+	    "a report above the estimate unloads an idle model")
+	local c = add(p, "c", { size = 40, measured = 120 })
+	local r, msg, status = chat(c)
+	ok(r == nil and status == 507 and msg:find("needs 120 MiB (weights 120 MiB, cache 0 MiB, " ..
+	    "compute 0 MiB, overhead 0 MiB); the gpu budget is 100 MiB", 1, true) and
+	    c.state == "unloaded" and not c.counted and p:used("gpu") == 0,
+	    "a report above the budget refuses the load with 507 and the parts")
+	r, msg, status = chat(c)
+	ok(r == nil and status == 507 and c.starts == 1, "the next load fails from the report, with no worker")
+	ok(a:models()[1].memory == nil, "an unloaded model lists no memory parts")
+	local d = add(p, "d", { size = 10, measured = 10, delta = 700 })
+	chat(d)
+	ok(logged("device delta differs from the buffer sum") ~= nil,
+	    "a device delta far from the sum logs a warning")
+	local text = metrics.render()
+	ok(text:find('lgml_model_weights_bytes{model="d"} 10485760', 1, true) ~= nil,
+	    "metrics give the parts of a loaded model")
+	cleanup(p)
+end
+
 -- A Lua error after main yields ends the coroutine without a report.
 local finished = false
 
@@ -565,6 +599,7 @@ local function main()
 	test_crash()
 	test_parts()
 	test_no_room()
+	test_exact()
 	test_idle()
 	test_failure()
 	test_http()

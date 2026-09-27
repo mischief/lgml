@@ -22,8 +22,9 @@ local M = {}
 -- Payload: `{ models, props, caps, mem }`. models and props are the
 -- results of `Engine:models` and `Engine:props`. caps is `{ chat,
 -- transcribe, speak, decide, generate, embed }`, with true for each method the
--- engine has. mem is `{ used }`: the device bytes that the load took,
--- when the worker can measure them.
+-- engine has. mem is the report of `lgml.worker.measure`: used (the
+-- sum), weights, cache, compute and overhead in bytes, now (the bytes
+-- held now), reserved, exact and delta (the change of the device use).
 M.HELLO = 1
 --- Front to worker: start a chat job.
 -- Payload: the chat request for `Engine:chat`.

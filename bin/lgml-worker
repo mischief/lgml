@@ -22,7 +22,9 @@ local USAGE = "usage: lgml-worker --fd n (-m model | --fake) [-b backend] [-t th
     "                   [--cpu-moe] [--n-cpu-moe n|auto] [--n-gpu-layers n]\n" ..
     "                   [--override-tensor pattern=backend]...\n" ..
     "                   [--log-level name] [--log-file path] [--dump-prompts dir]\n" ..
-    "                   [--fake-size MiB] [--fake-load-ms n] [--fake-delay ms] [--fake-fail]\n" ..
+    "                   [--mem-margin MiB] [--mem-limit MiB]\n" ..
+    "                   [--fake-size MiB] [--fake-delta MiB] [--fake-load-ms n]\n" ..
+    "                   [--fake-delay ms] [--fake-fail]\n" ..
     "       lgml-worker --devices\n"
 
 local opts, rest = getopt.parse(arg, "m:b:t:c:", {
@@ -33,6 +35,7 @@ local opts, rest = getopt.parse(arg, "m:b:t:c:", {
 	["kv-initial="] = false, ["slots="] = false,
 	["mmproj="] = false, ["image-min-tokens="] = false, ["image-max-tokens="] = false,
 	["fake-size="] = false, ["fake-load-ms="] = false, ["fake-delay="] = false,
+	["fake-delta="] = false, ["mem-margin="] = false, ["mem-limit="] = false,
 	["fake-fail"] = false, devices = false, ["log-level="] = false, ["log-file="] = false,
 	["dump-prompts="] = false, ["cpu-moe"] = false, ["n-cpu-moe="] = false,
 	["n-gpu-layers="] = false, ["override-tensor="] = false,
@@ -131,7 +134,16 @@ local function load()
 	})
 end
 
-local mem
+-- The memory guard: allocations that do not fit raise an error (see
+-- lgml.budget). --mem-margin and --mem-limit are MiB.
+local MiB = 1048576
+if not opts.fake then
+	local margin, limit = tonumber(opts["mem-margin"]), tonumber(opts["mem-limit"])
+	require("lgml").memory_guard({
+		margin = math.floor((margin or require("lgml.budget").MARGIN / MiB) * MiB),
+		limit = limit and math.floor(limit * MiB) or nil,
+	})
+end
 local before = not opts.fake and worker.device_used(opts.b)
 local ok, engine = pcall(opts.fake and fake or load)
 if not ok then
@@ -139,17 +151,32 @@ if not ok then
 	worker.fail(fd, tostring(engine))
 	os.exit(1)
 end
-if opts.fake and opts["fake-size"] then
-	mem = { used = math.floor(tonumber(opts["fake-size"]) * 1048576) }
-elseif before then
-	local after = worker.device_used(opts.b)
-	if after and after > before then
-		mem = { used = after - before }
-	end
-end
 if not opts.alias then
 	local m = engine:models()[1]
 	log.set_prefix("worker:" .. (m and m.id or "lgml"))
 end
-L:info("ready", "file", opts.m, "used_mib", mem and mem.used // 1048576)
+local mem
+if opts.fake and opts["fake-size"] then
+	local n = math.floor(tonumber(opts["fake-size"]) * MiB)
+	mem = { used = n, now = n, exact = true, reserved = true, weights = n, cache = 0, compute = 0, overhead = 0,
+		delta = opts["fake-delta"] and math.floor(tonumber(opts["fake-delta"]) * MiB) }
+elseif not opts.fake then
+	local good, r
+	good, mem, r = pcall(worker.measure, engine, opts.b, before)
+	local fits, err = good, mem
+	if good then
+		fits, err = worker.fits(r, opts.alias or opts.m)
+	end
+	if not fits then
+		L:error("load refused", "model", opts.m, "err", err)
+		worker.fail(fd, err)
+		os.exit(1)
+	end
+end
+L:info("ready", "file", opts.m, "used_mib", mem and mem.used // MiB,
+    "weights_mib", mem and mem.weights and mem.weights // MiB,
+    "cache_mib", mem and mem.cache and mem.cache // MiB,
+    "compute_mib", mem and mem.compute and mem.compute // MiB,
+    "overhead_mib", mem and mem.overhead and mem.overhead // MiB,
+    "delta_mib", mem and mem.delta and mem.delta // MiB)
 worker.serve(fd, engine, mem)

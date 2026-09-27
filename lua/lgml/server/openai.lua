@@ -465,7 +465,7 @@ local function models(eng, req, res)
 			meta = { n_ctx_train = m.context_length },
 			capabilities = caps,
 			status = { value = m.status or "loaded" },
-			lgml = { status = m.status or "loaded", bytes = m.bytes },
+			lgml = { status = m.status or "loaded", bytes = m.bytes, memory = m.memory },
 		}
 	end
 	return res:json(200, { object = "list", data = data })
