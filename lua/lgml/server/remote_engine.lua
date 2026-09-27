@@ -16,6 +16,11 @@ local log = require("lgml.log")
 local L = log.new("remote")
 
 local M = {}
+
+--- Milliseconds a worker has to end a cancelled job before it counts
+-- as hung and is killed.
+M.CANCEL_GRACE_MS = 60000
+
 local R = {}
 R.__index = R
 
@@ -308,9 +313,24 @@ function Job:push(ev)
 end
 
 -- Wait for events or the cancel poll timer.
+-- Notes that the job was cancelled on worker r.
+function Job:cancelled(r)
+	self.cancel_at, self.owner = uv.now(), r
+end
+
 function Job:wait()
 	if #self.q > 0 then
 		return
+	end
+	if self.cancel_at and not self.killed and uv.now() - self.cancel_at > M.CANCEL_GRACE_MS then
+		-- The worker did not end the job: kill it, so that its jobs end
+		-- and the model is released.
+		self.killed = true
+		log.write(log.ERROR, "remote", "worker did not stop a cancelled job; killing it",
+		    "model", self.owner.opts.id)
+		if self.owner.proc then
+			self.owner.proc:kill("sigkill")
+		end
 	end
 	local t = uv.new_timer()
 	stream.await(function(done)
@@ -381,6 +401,7 @@ function R:chat(req, sink)
 			if self.ch then
 				self.ch:send(ipc.CANCEL, id)
 			end
+			job:cancelled(self)
 		end
 	end
 	while true do
@@ -455,6 +476,7 @@ function R:transcribe(req, audio, ctl)
 			if self.ch then
 				self.ch:send(ipc.CANCEL, id)
 			end
+			job:cancelled(self)
 		end
 		while #job.q > 0 do
 			local ev = table.remove(job.q, 1)
@@ -503,6 +525,7 @@ function R:speak(req, ctl)
 			if self.ch then
 				self.ch:send(ipc.CANCEL, id)
 			end
+			job:cancelled(self)
 		end
 		while #job.q > 0 do
 			local ev = table.remove(job.q, 1)
@@ -573,6 +596,7 @@ function R:decide(req, ctl)
 			if self.ch then
 				self.ch:send(ipc.CANCEL, id)
 			end
+			job:cancelled(self)
 		end
 		while #job.q > 0 do
 			local ev = table.remove(job.q, 1)
@@ -631,6 +655,7 @@ function R:generate(req, ctl)
 			if self.ch then
 				self.ch:send(ipc.CANCEL, id)
 			end
+			job:cancelled(self)
 		end
 		while #job.q > 0 do
 			local ev = table.remove(job.q, 1)
@@ -683,6 +708,7 @@ function R:embed(req, ctl)
 			if self.ch then
 				self.ch:send(ipc.CANCEL, id)
 			end
+			job:cancelled(self)
 		end
 		while #job.q > 0 do
 			local ev = table.remove(job.q, 1)

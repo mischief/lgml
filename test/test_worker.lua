@@ -245,5 +245,26 @@ in_co(function()
 	w:shutdown()
 end)
 
+-- A worker that does not end a cancelled job is killed after the grace
+-- time, and the request ends.
+in_co(function()
+	remote.CANCEL_GRACE_MS = 300
+	local w = remote.new({
+		lua = "lua5.4", script = src .. "/bin/lgml-worker", args = { "--fake", "--alias", "hung" },
+		restart = false,
+	})
+	local r = recorder()
+	local asked = uv.now()
+	r.cancelled = function() return uv.now() - asked > 200 end
+	local t0 = uv.now()
+	local res, _, status = w:chat({ messages = { { role = "user", content = "hang" } } }, r)
+	local ms = uv.now() - t0
+	ok((res == true or status == 503) and ms < 5000,
+	    ("a cancelled job on a hung worker ends after the grace time (%d ms)"):format(ms))
+	stream.sleep(200)
+	ok(w.proc == nil, "the hung worker was killed")
+	remote.CANCEL_GRACE_MS = 60000
+end)
+
 print("1.." .. n)
 os.exit(failed == 0 and 0 or 1)

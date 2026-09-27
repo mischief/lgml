@@ -184,7 +184,8 @@ end
 -- It calls `sink:prompt` before the first piece. `count_only` finishes
 -- at once with the prompt size.
 -- The last user message `"fail"` makes the call fail before any output,
--- and `"crash"` ends the process with code 3, as a crashed worker.
+-- `"crash"` ends the process with code 3, as a crashed worker, and
+-- `"hang"` blocks the process for 30 s, as a hung worker.
 -- The prompt counts a quarter token per byte of text, 4 per message and
 -- 16 per image part. The reply counts one token per piece and stops at
 -- `max_tokens`. `stop`
@@ -206,6 +207,8 @@ function F:chat(req, sink)
 		return nil, "fake failure", 500
 	elseif last_user(req) == "crash" then
 		os.exit(3)
+	elseif last_user(req) == "hang" then
+		os.execute("sleep 30")
 	end
 	local max = req.max_completion_tokens or req.max_tokens
 	local usage = { prompt_tokens = prompt_tokens(req),

@@ -159,6 +159,7 @@ if lua_bin.found()
   # LGML_SYSTEMONE_MODEL (a chat gguf) from the environment adds real-model checks.
   test('systemone', lua_bin, args : [files('test/test_systemone.lua')], timeout : 600)
   test('worker', lua_bin, args : [files('test/test_worker.lua')], timeout : 60)
+  test('stream', lua_bin, args : [files('test/test_stream.lua')], timeout : 30)
   test('pool', lua_bin, args : [files('test/test_pool.lua')], timeout : 120)
   test('placement', lua_bin, args : [files('test/test_placement.lua')],
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },

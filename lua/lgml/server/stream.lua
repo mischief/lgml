@@ -49,6 +49,10 @@ local function await(fn)
 end
 M.await = await
 
+--- Milliseconds a write may wait for the peer to read, before the stream
+-- counts as broken.
+M.WRITE_TIMEOUT_MS = 60000
+
 --- Yields the running coroutine for ms milliseconds.
 -- @tparam int ms the time
 -- @raise when not called from a coroutine
@@ -157,12 +161,19 @@ function S:write(data)
 	if self.closed or self.broken then
 		return nil, "closed"
 	end
+	-- A peer that stops reading fills the socket buffer, and the write
+	-- would wait forever.
+	local t = uv.new_timer()
 	local err = await(function(done)
+		t:start(M.WRITE_TIMEOUT_MS, 0, function()
+			done("write timeout")
+		end)
 		local ok, e = self.tcp:write(data, done)
 		if not ok then
 			done(e or "write failed")
 		end
 	end)
+	t:close()
 	if err then
 		self.broken = true
 		return nil, err
