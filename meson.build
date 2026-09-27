@@ -146,6 +146,7 @@ if lua_bin.found()
   test('kv_grow', lua_bin, args : [files('test/test_kv_grow.lua')], timeout : 120)
   test('slots', lua_bin, args : [files('test/test_slots.lua')], timeout : 120)
   test('batch', lua_bin, args : [files('test/test_batch.lua')], timeout : 120)
+  test('kvpool', lua_bin, args : [files('test/test_kvpool.lua')], timeout : 120)
   test('engine_apis', lua_bin, args : [files('test/test_engine_apis.lua')], timeout : 120)
   test('tokenize', lua_bin, args : [files('test/test_tokenize.lua')],
     env : { 'LGML_VOCAB_DIR' : get_option('vocab_dir'),

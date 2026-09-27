@@ -66,12 +66,12 @@ end
 -- @tparam integer n_kv rows to read
 -- @tparam integer Hkv KV heads
 -- @tparam integer D head size
+-- @tparam[opt] integer lo the first row (default 0)
 -- @return k and v, each (n_kv, Hkv, D)
-function M.views(g, cache, kw, vw, n_kv, Hkv, D)
-	local k = g:view(kw, { n_kv, Hkv, D },
-	    { lgml.row_size(cache.type_k, Hkv * D), lgml.row_size(cache.type_k, D) })
-	local v = g:view(vw, { n_kv, Hkv, D },
-	    { lgml.row_size(cache.type_v, Hkv * D), lgml.row_size(cache.type_v, D) })
+function M.views(g, cache, kw, vw, n_kv, Hkv, D, lo)
+	local rk, rv = lgml.row_size(cache.type_k, Hkv * D), lgml.row_size(cache.type_v, Hkv * D)
+	local k = g:view(kw, { n_kv, Hkv, D }, { rk, lgml.row_size(cache.type_k, D) }, (lo or 0) * rk)
+	local v = g:view(vw, { n_kv, Hkv, D }, { rv, lgml.row_size(cache.type_v, D) }, (lo or 0) * rv)
 	return k, v
 end
 

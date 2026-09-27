@@ -460,6 +460,66 @@ local function ring_check(kind, m)
 	replay.drop(c)
 end
 
+-- Two sequences of one KV pool in batched passes of at most 8 tokens:
+-- the global layers share the pool, and each sequence keeps its own
+-- ring. The logits of each sequence equal the sequence alone on its
+-- own cache, prompt and decode.
+local function pool_check(kind, m)
+	local prompts = { {}, {} }
+	for i = 1, 40 do
+		prompts[1][i] = (i * 37) % 250 + 1
+	end
+	for i = 1, 27 do
+		prompts[2][i] = (i * 53) % 250 + 1
+	end
+	local steps = 8
+	local want = {}
+	for s, p in ipairs(prompts) do
+		local c = m:cache(128, { ubatch = 8 })
+		local rows = eval(m, c, p, nil, 8)
+		want[s] = { rows[#rows] }
+		for _ = 2, steps do
+			rows = eval(m, c, { argmax(want[s][#want[s]]) })
+			want[s][#want[s] + 1] = rows[1]
+		end
+	end
+	local pool = m:pool(256, { initial = 256 })
+	local seqs = { m:seq(pool, { n_ctx = 128, ubatch = 8 }), m:seq(pool, { n_ctx = 128, ubatch = 8 }) }
+	local got, at = { {}, {} }, { 1, 1 }
+	while at[1] <= #prompts[1] or at[2] <= #prompts[2] do
+		local cs, ids, who = {}, {}, {}
+		for s, p in ipairs(prompts) do
+			if at[s] <= #p then
+				local j = math.min(#p, at[s] + 7)
+				cs[#cs + 1], ids[#ids + 1], who[#who + 1] = seqs[s], table.move(p, at[s], j, 1, {}), s
+				at[s] = j + 1
+			end
+		end
+		local rows = m:run_batch(cs, ids)
+		for i, s in ipairs(who) do
+			if at[s] > #prompts[s] then
+				got[s][1] = rows[i]:get()
+			end
+		end
+	end
+	for _ = 2, steps do
+		local rows = m:decode_batch(seqs, { argmax(got[1][#got[1]]), argmax(got[2][#got[2]]) })
+		got[1][#got[1] + 1], got[2][#got[2] + 1] = rows[1]:get(), rows[2]:get()
+	end
+	local err = 0
+	for s = 1, 2 do
+		for k = 1, steps do
+			for j = 1, #want[s][k] do
+				err = math.max(err, math.abs(want[s][k][j] - got[s][k][j]))
+			end
+		end
+	end
+	ok(err == 0, ("%s pool: batched sequences with rings match each sequence alone (max error %.3g)")
+	    :format(kind, err))
+	ok(seqs[1].k[1] ~= nil and pool.k[1] == nil and seqs[1].ring == 13,
+	    kind .. " pool: sliding layers keep a ring per sequence")
+end
+
 -- Embedding passes: token embeddings given as opts.embd give the same
 -- logits as the ids, and a non-causal span sees its later rows.
 local function embd_check(kind, m)
@@ -944,6 +1004,7 @@ for _, kind in ipairs({ "dense", "moe" }) do
 		more(kind, m, ref)
 	end
 	ring_check(kind, m)
+	pool_check(kind, m)
 	embd_check(kind, m)
 	-- The ring holds 13 rows. A long prompt in passes of 8 and decode
 	-- steps across n_past 256 build four graphs.

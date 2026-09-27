@@ -7,6 +7,7 @@
 -- @module lgml.transformer
 local lgml = require("lgml")
 local kv = require("lgml.kv")
+local kvpool = require("lgml.kvpool")
 local placement = require("lgml.placement")
 local replay = require("lgml.replay")
 local log = require("lgml.log")
@@ -21,6 +22,9 @@ M.__index = M
 local PAD = 256
 -- The default count of tokens per pass on a sliding-window cache.
 local UBATCH = 512
+-- Cells per block of a KV pool. It divides PAD, so a pool window in
+-- PAD steps holds whole blocks.
+local BLOCK = 64
 
 --- Expert gating functions, as gguf `expert_gating_func` numbers.
 -- SOFTMAX: softmax over all router logits. SIGMOID: sigmoid of each
@@ -435,6 +439,59 @@ local function conv_dim(hp)
 	return 2 * hp.n_k_heads * hp.head_k + hp.n_v_heads * hp.head_v
 end
 
+-- Caches get an id, so a batch graph knows which caches it writes.
+local next_cache_id = 0
+
+-- Head sizes of the attention layers, for the cache type check.
+local function attn_dims(self)
+	local dims = {}
+	for _, L in ipairs(self.layers) do
+		if not L.recr then
+			dims[#dims + 1] = L.D
+		end
+	end
+	return dims
+end
+
+-- Rows for cap cells at first: at least PAD, in PAD steps, at most n.
+local function first_cap(n, initial)
+	if initial and initial < n then
+		return math.min(n, math.max(PAD, (initial + PAD - 1) // PAD * PAD))
+	end
+	return n
+end
+
+-- Add the per-sequence parts to cache c: rings, recurrent states, and
+-- with global true the full-attention rows (cap of them).
+local function add_layers(self, c, opts, global)
+	local hp, be = self.hp, self.be
+	if hp.n_swa then
+		c.ubatch = opts.ubatch or UBATCH
+		c.ring = math.min(c.n_ctx, hp.n_swa - 1 + c.ubatch)
+		c.hi = 0
+	end
+	if self.recurrent then
+		c.rs_pos, c.conv, c.ssm = 0, {}, {}
+	end
+	for il, L in ipairs(self.layers) do
+		local lbe = L.cpu and be:cpu() or be
+		if L.recr then
+			c.conv[il] = lbe:tensor("f32", { 1, conv_dim(hp), hp.d_conv - 1 })
+			c.ssm[il] = lbe:tensor("f32", { 1, hp.n_v_heads, hp.head_v, hp.head_v })
+			c.conv[il]:zero()
+			c.ssm[il]:zero()
+		elseif not L.kv_src and (L.swa or global) then
+			local rows = L.swa and c.ring or c.cap
+			c.k[il] = lbe:tensor(c.type_k, { rows, L.Hkv * L.D })
+			c.v[il] = lbe:tensor(c.type_v, { rows, L.Hkv * L.D })
+			-- Rows past n_past are read under a -inf mask; zero keeps
+			-- them finite.
+			c.k[il]:zero()
+			c.v[il]:zero()
+		end
+	end
+end
+
 --- Make a cache for one sequence.
 -- Attention layers get zeroed K and V leaves (rows, Hkv * D). Global
 -- layers hold n_ctx rows. Sliding layers hold a ring of
@@ -454,52 +511,194 @@ end
 -- layers hold now), n_past (0), type_k, type_v, k, v;
 -- ring, ubatch and hi with sliding layers; rs_pos (the position the
 -- states are at), conv and ssm with recurrent layers
--- Caches get an id, so a batch graph knows which caches it writes.
-local next_cache_id = 0
-
 function M:cache(n_ctx, opts)
 	opts = opts or {}
-	local hp, be = self.hp, self.be
-	local dims = {}
-	for _, L in ipairs(self.layers) do
-		if not L.recr then
-			dims[#dims + 1] = L.D
-		end
-	end
-	local tk, tv = kv.types_of(opts, dims)
-	local cap = n_ctx
-	if opts.initial and opts.initial < n_ctx then
-		cap = math.min(n_ctx, math.max(PAD, (opts.initial + PAD - 1) // PAD * PAD))
-	end
+	local tk, tv = kv.types_of(opts, attn_dims(self))
 	next_cache_id = next_cache_id + 1
-	local c = { n_ctx = n_ctx, cap = cap, n_past = 0, be = be, type_k = tk, type_v = tv,
-		k = {}, v = {}, id = next_cache_id, gen = 0 }
-	if hp.n_swa then
-		c.ubatch = opts.ubatch or UBATCH
-		c.ring = math.min(n_ctx, hp.n_swa - 1 + c.ubatch)
-		c.hi = 0
-	end
-	if self.recurrent then
-		c.rs_pos, c.conv, c.ssm = 0, {}, {}
-	end
+	local c = { n_ctx = n_ctx, cap = first_cap(n_ctx, opts.initial), n_past = 0, be = self.be,
+		type_k = tk, type_v = tv, k = {}, v = {}, id = next_cache_id, gen = 0 }
+	add_layers(self, c, opts, true)
+	return c
+end
+
+--- Make a KV pool: one buffer of full-attention rows that several
+-- sequences share.
+-- The pool holds the K and V rows of the global attention layers in
+-- blocks of `block` cells. A sequence from `seq` takes blocks as it
+-- grows; attention of a sequence reads a window of the pool under a
+-- mask that shows only the cells of that sequence. Rings and recurrent
+-- states stay per sequence.
+-- @tparam integer n_cells the pool size in cells (rounded up to 256)
+-- @tparam[opt] table opts options:
+-- opts.type, opts.type_k, opts.type_v: cache types from `lgml.kv`
+-- (default f16).
+-- opts.initial: cells the tensors hold at first (default all). The
+-- pool doubles them when no free block is left, up to n_cells.
+-- opts.block: cells per block (default 64); it must divide 256.
+-- @treturn table the pool: n_ctx (cells), cap (cells the tensors hold
+-- now), block, type_k, type_v, k, v (by layer) and alloc (the
+-- `lgml.kvpool` bookkeeping)
+function M:pool(n_cells, opts)
+	opts = opts or {}
+	local B = opts.block or BLOCK
+	assert(B >= 1 and PAD % B == 0, "pool: the block size must divide " .. PAD)
+	local tk, tv = kv.types_of(opts, attn_dims(self))
+	local size = (n_cells + PAD - 1) // PAD * PAD
+	local cap = first_cap(size, opts.initial)
+	next_cache_id = next_cache_id + 1
+	local p = { n_ctx = size, cap = cap, block = B, be = self.be, type_k = tk, type_v = tv,
+		k = {}, v = {}, id = next_cache_id, gen = 0,
+		alloc = kvpool.new({ blocks = size // B, size = B, cap = cap // B }),
+		seqs = setmetatable({}, { __mode = "k" }) }
 	for il, L in ipairs(self.layers) do
-		local lbe = L.cpu and be:cpu() or be
-		if L.recr then
-			c.conv[il] = lbe:tensor("f32", { 1, conv_dim(hp), hp.d_conv - 1 })
-			c.ssm[il] = lbe:tensor("f32", { 1, hp.n_v_heads, hp.head_v, hp.head_v })
-			c.conv[il]:zero()
-			c.ssm[il]:zero()
-		elseif not L.kv_src then
-			local rows = L.swa and c.ring or cap
-			c.k[il] = lbe:tensor(tk, { rows, L.Hkv * L.D })
-			c.v[il] = lbe:tensor(tv, { rows, L.Hkv * L.D })
-			-- Rows past n_past are read under a -inf mask; zero keeps
-			-- them finite.
-			c.k[il]:zero()
-			c.v[il]:zero()
+		if not L.recr and not L.kv_src and not L.swa then
+			local lbe = L.cpu and self.be:cpu() or self.be
+			p.k[il] = lbe:tensor(tk, { cap, L.Hkv * L.D })
+			p.v[il] = lbe:tensor(tv, { cap, L.Hkv * L.D })
+			p.k[il]:zero()
+			p.v[il]:zero()
 		end
 	end
+	return p
+end
+
+--- Make a cache for one sequence on a pool.
+-- It works as a cache from `cache` does, but the global attention rows
+-- live in pool blocks: `blocks` lists the block ids in position order.
+-- Rings and recurrent states belong to the sequence.
+-- @tparam table pool a pool from `pool`
+-- @tparam[opt] table opts options: n_ctx (the most positions, default
+-- the pool size) and ubatch (as for `cache`)
+-- @treturn table the cache, with pool and blocks
+function M:seq(pool, opts)
+	opts = opts or {}
+	next_cache_id = next_cache_id + 1
+	local c = { pool = pool, blocks = {}, n_ctx = math.min(opts.n_ctx or pool.n_ctx, pool.n_ctx),
+		n_past = 0, be = pool.be, type_k = pool.type_k, type_v = pool.type_v, k = {}, v = {},
+		id = next_cache_id, gen = 0 }
+	add_layers(self, c, opts, false)
+	pool.seqs[c] = true
 	return c
+end
+
+-- Drop every graph that reads the tensors of pool p.
+local function drop_pool_graphs(self, p)
+	for c in pairs(p.seqs) do
+		replay.drop(c)
+	end
+	local r = self.batch_replay
+	if r and r.pools and r.pools[p] then
+		self.batch_replay = nil
+		r.g:close()
+		for _, t in pairs(r.inp) do
+			if type(t) == "userdata" then
+				t:close()
+			end
+		end
+	end
+end
+
+-- Double the cells of pool p, at most p.n_ctx. The new tensors get all
+-- old cells.
+local function pool_grow(self, p)
+	local cap = math.min(p.n_ctx, p.cap * 2)
+	drop_pool_graphs(self, p)
+	local buf
+	for _, part in ipairs({ p.k, p.v }) do
+		for il, old in pairs(part) do
+			local bytes = old:nbytes()
+			local new = old:backend():tensor(old:type(), { cap, old:shape()[2] })
+			new:zero()
+			if not buf or #buf < bytes then
+				if buf then
+					buf:close()
+				end
+				buf = lgml.hostbuf(bytes)
+			end
+			old:to_host(buf, 0, 0, bytes)
+			new:from_host(buf, 0, 0, bytes)
+			old:close()
+			part[il] = new
+		end
+	end
+	if buf then
+		buf:close()
+	end
+	LOG:info("pool grew", "cells", cap, "from", p.cap, "size", p.n_ctx)
+	p.cap = cap
+	p.gen = p.gen + 1
+	p.alloc:set_cap(cap // p.block)
+end
+
+-- Give sequence c the blocks for positions [0, n). A pool with no free
+-- block grows; a full pool calls pool.pressure, which may free blocks.
+-- Returns true when the pool grew.
+local function reserve(self, c, n)
+	local p = c.pool
+	local B, grew = p.block, false
+	while #c.blocks * B < n do
+		local b = p.alloc:take()
+		if not b and p.cap < p.n_ctx then
+			pool_grow(self, p)
+			grew = true
+			b = p.alloc:take()
+		end
+		if not b and p.pressure then
+			p.pressure(p, c)
+			b = p.alloc:take()
+		end
+		if not b then
+			error(("kv pool full: %d of %d cells in use"):format(p.alloc.used * B, p.n_ctx))
+		end
+		c.blocks[#c.blocks + 1] = b
+	end
+	return grew
+end
+
+--- Give back the blocks of a pool sequence past its first n positions.
+-- It also sets n_past to n when n_past is larger.
+-- @tparam table cache a cache from `seq`
+-- @tparam integer n the positions to keep
+function M:truncate(cache, n)
+	local p = cache.pool
+	local keep = (n + p.block - 1) // p.block
+	for i = #cache.blocks, keep + 1, -1 do
+		p.alloc:unref(cache.blocks[i])
+		cache.blocks[i] = nil
+	end
+	cache.n_past = math.min(cache.n_past, n)
+end
+
+-- The pool cells of positions [from, from + n) of a pool sequence.
+local function seq_cells(c, from, n)
+	local B, bl, r = c.pool.block, c.blocks, {}
+	for i = 1, n do
+		local p = from + i - 1
+		r[i] = bl[p // B + 1] * B + p % B
+	end
+	return r
+end
+
+-- The pool window that holds positions [0, n_kv) of a pool sequence:
+-- the first cell and the width, both in PAD steps.
+local function seq_window(c, n_kv)
+	local p = c.pool
+	local B = p.block
+	local nb = (n_kv + B - 1) // B
+	local lo, hi = math.huge, 0
+	for i = 1, nb do
+		local s = c.blocks[i] * B
+		if s < lo then
+			lo = s
+		end
+		local e = i < nb and s + B or s + (n_kv - 1) % B + 1
+		if e > hi then
+			hi = e
+		end
+	end
+	lo = lo // PAD * PAD
+	hi = math.min(p.cap, (hi + PAD - 1) // PAD * PAD)
+	return lo, hi - lo
 end
 
 --- Bytes a cache from `cache` takes on the device.
@@ -543,10 +742,15 @@ end
 -- The new tensors get the old rows [0, n_past); the old tensors are
 -- freed. The cached replay graph refers to the old tensors, so it is
 -- dropped. Rings and recurrent states do not change.
--- @tparam table cache a cache from `cache`
+-- A pool sequence from `seq` takes pool blocks for rows positions.
+-- @tparam table cache a cache from `cache` or `seq`
 -- @tparam integer rows the positions needed, at most cache.n_ctx
--- @treturn boolean true when the cache grew
+-- @treturn boolean true when the cache or its pool grew
 function M:grow(cache, rows)
+	if cache.pool then
+		assert(rows <= cache.n_ctx, "grow: past n_ctx")
+		return reserve(self, cache, rows)
+	end
 	-- A cache made by hand without cap holds all n_ctx rows.
 	if rows <= (cache.cap or cache.n_ctx) then
 		return false
@@ -618,38 +822,90 @@ function M:rewind(cache, n, peek)
 	return n
 end
 
--- The parts of a snapshot: { tensor, offset, bytes } in layer order.
--- Full-attention layers give rows [0, rows) when rows is set. Rings give
--- their rows up to hi; recurrent layers give their whole states.
-local function snap_parts(self, cache, rows, state)
+-- Positions [a, b) of a cache as runs of rows: { pos, row, count }. A
+-- pool sequence maps positions to the cells of its blocks.
+local function runs(cache, a, b)
+	if not cache.pool then
+		return a < b and { { a, a, b - a } } or {}
+	end
+	local B, out, p = cache.pool.block, {}, a
+	while p < b do
+		local row = cache.blocks[p // B + 1] * B + p % B
+		local n = math.min(b - p, B - p % B)
+		local last = out[#out]
+		if last and last[2] + last[3] == row then
+			last[3] = last[3] + n
+		else
+			out[#out + 1] = { p, row, n }
+		end
+		p = p + n
+	end
+	return out
+end
+
+-- The parts of a snapshot in buffer order: { t, bytes, row }. A part
+-- with row (bytes per row) holds positions [0, rows) of a
+-- full-attention layer, in position order. The others copy the first
+-- bytes of t: rings up to hi, and whole recurrent states.
+local function snap_parts(self, cache, rows, state, hi)
 	local parts = {}
-	local function add(t, n)
+	local function add(t, n, row)
 		if n > 0 then
-			parts[#parts + 1] = { t, 0, n }
+			parts[#parts + 1] = { t, n, row }
 		end
 	end
 	for il, L in ipairs(self.layers) do
-		if L.recr and state then
-			add(cache.conv[il], cache.conv[il]:nbytes())
-			add(cache.ssm[il], cache.ssm[il]:nbytes())
-		elseif cache.k[il] and (L.swa and state or not L.swa and rows) then
-			local n = L.swa and math.min(cache.hi, cache.ring) or rows
-			for _, t in ipairs({ cache.k[il], cache.v[il] }) do
-				add(t, n * (t:nbytes() // t:shape()[1]))
+		if L.recr then
+			if state then
+				add(cache.conv[il], cache.conv[il]:nbytes())
+				add(cache.ssm[il], cache.ssm[il]:nbytes())
+			end
+		elseif L.swa then
+			if state and cache.k[il] then
+				for _, t in ipairs({ cache.k[il], cache.v[il] }) do
+					add(t, math.min(hi, cache.ring) * (t:nbytes() // t:shape()[1]))
+				end
+			end
+		elseif rows and not L.kv_src then
+			local src = cache.pool or cache
+			for _, t in ipairs({ src.k[il], src.v[il] }) do
+				local row = t:nbytes() // t:shape()[1]
+				add(t, rows * row, row)
 			end
 		end
 	end
 	return parts
 end
 
+-- Copy part p between the device and buf at off: to the host with out
+-- true, else back. A row part copies its first n positions.
+local function copy_part(cache, p, buf, off, n, out)
+	local t, row = p[1], p[3]
+	if not row then
+		if out then
+			t:to_host(buf, off, 0, p[2])
+		else
+			t:from_host(buf, off, 0, p[2])
+		end
+		return
+	end
+	for _, r in ipairs(runs(cache, 0, n)) do
+		if out then
+			t:to_host(buf, off + r[1] * row, r[2] * row, r[3] * row)
+		else
+			t:from_host(buf, off + r[1] * row, r[2] * row, r[3] * row)
+		end
+	end
+end
+
 --- Bytes that `snapshot` copies now.
--- @tparam table cache a cache from `cache`
+-- @tparam table cache a cache from `cache` or `seq`
 -- @tparam[opt] boolean full true for a full snapshot
 -- @treturn integer bytes
 function M:snapshot_bytes(cache, full)
 	local bytes = 0
-	for _, p in ipairs(snap_parts(self, cache, full and cache.n_past, true)) do
-		bytes = bytes + p[3]
+	for _, p in ipairs(snap_parts(self, cache, full and cache.n_past, true, cache.hi)) do
+		bytes = bytes + p[2]
 	end
 	return bytes
 end
@@ -658,31 +914,33 @@ end
 -- The state is the recurrent conv and delta net states and the sliding
 -- rings with hi: the parts that cannot go back to an earlier position.
 -- A full snapshot also holds rows [0, n_past) of the full-attention
--- layers.
--- @tparam table cache a cache from `cache`
+-- layers, in position order, so it restores into another cache or pool
+-- sequence of the same model.
+-- @tparam table cache a cache from `cache` or `seq`
 -- @tparam[opt] boolean full true for a full snapshot
 -- @treturn table the snapshot: n (the position), hi, full, bytes and
 -- buf (an `lgml.hostbuf`; close it to free the memory at once)
 function M:snapshot(cache, full)
 	local n = cache.n_past
-	local parts = snap_parts(self, cache, full and n, true)
+	local parts = snap_parts(self, cache, full and n, true, cache.hi)
 	local bytes = 0
 	for _, p in ipairs(parts) do
-		bytes = bytes + p[3]
+		bytes = bytes + p[2]
 	end
 	local buf = lgml.hostbuf(bytes)
 	local off = 0
 	for _, p in ipairs(parts) do
-		p[1]:to_host(buf, off, p[2], p[3])
-		off = off + p[3]
+		copy_part(cache, p, buf, off, n, true)
+		off = off + p[2]
 	end
 	return { n = n, hi = cache.hi, full = full or false, bytes = bytes, buf = buf }
 end
 
---- Write a snapshot back into the cache it came from.
+--- Write a snapshot back into a cache.
 -- Without opts it sets n_past, rs_pos and hi to the snapshot's. The
 -- full-attention rows before n of a snapshot without them must still
--- hold the same tokens. The cached replay graph stays valid.
+-- hold the same tokens. The cached replay graph stays valid. A pool
+-- sequence takes the blocks that the rows need.
 -- @tparam table cache the cache
 -- @tparam table snap a snapshot from `snapshot`
 -- @tparam[opt] table opts options:
@@ -699,19 +957,12 @@ function M:restore(cache, snap, opts)
 		self:grow(cache, rows)
 	end
 	-- Walk the parts in snapshot order; skip the ones not restored.
-	local hi = cache.hi
-	cache.hi = snap.hi
-	local all = snap_parts(self, cache, snap.full and snap.n, true)
-	local want = snap_parts(self, cache, snap.full and rows, state)
-	cache.hi = hi
-	local off, j = 0, 1
-	for _, p in ipairs(all) do
-		local w = want[j]
-		if w and w[1] == p[1] then
-			p[1]:from_host(snap.buf, off, 0, w[3])
-			j = j + 1
+	local off = 0
+	for _, p in ipairs(snap_parts(self, cache, snap.full and snap.n, true, snap.hi)) do
+		if p[3] or state then
+			copy_part(cache, p, snap.buf, off, rows, false)
 		end
-		off = off + p[3]
+		off = off + p[2]
 	end
 	cache.n_past = rows
 	if state then
@@ -723,15 +974,25 @@ function M:restore(cache, snap, opts)
 end
 
 -- The attention spans of a pass that ends at n_kv: global layers and
--- sliding layers. With a cache both are padded to PAD rows.
+-- sliding layers, and the first row of the global span. With a cache
+-- the spans are padded to PAD rows. A pool sequence reads the pool
+-- window that holds its cells.
 local function spans(cache, n_kv)
 	if not cache then
-		return n_kv, n_kv
+		return n_kv, n_kv, 0
+	end
+	if cache.pool then
+		local lo, w = seq_window(cache, n_kv)
+		local ring = cache.ring
+		if not ring then
+			return w, w, lo
+		end
+		return w, n_kv > ring and ring or math.min(ring, (n_kv + PAD - 1) // PAD * PAD), lo
 	end
 	local cap = cache.cap or cache.n_ctx
 	local n_attn = math.min(cap, (n_kv + PAD - 1) // PAD * PAD)
 	local ring = cache.ring or cap
-	return n_attn, n_kv > ring and ring or math.min(ring, n_attn)
+	return n_attn, n_kv > ring and ring or math.min(ring, n_attn), 0
 end
 
 -- Raise when a pass of n tokens does not fit the cache. A pass past
@@ -772,7 +1033,10 @@ local function fill(hp, inp, cache, ids, opts)
 		inp.embd:from_host(opts.embd, opts.embd_off or 0, 0, inp.embd:nbytes())
 	end
 	inp.pos:fill_range(n_past)
-	if inp.causal then
+	if cache and cache.pool then
+		inp.mask:fill_blocks({ n_past = n_past, block = cache.pool.block, blocks = cache.blocks,
+			lo = inp.lo, causal = inp.causal })
+	elseif inp.causal then
 		inp.mask:fill_causal(n_past)
 	else
 		inp.mask:fill_mask({ n_past = n_past, causal = false })
@@ -782,7 +1046,11 @@ local function fill(hp, inp, cache, ids, opts)
 			causal = inp.causal })
 	end
 	if cache then
-		inp.rows:fill_range(n_past)
+		if cache.pool then
+			inp.rows:set(seq_cells(cache, n_past, n))
+		else
+			inp.rows:fill_range(n_past)
+		end
 		if inp.rows_swa then
 			local r = {}
 			for i = 1, n do
@@ -802,7 +1070,7 @@ end
 -- gets a new one for this pass. n_past 0 clears the recurrent state.
 -- Any other n_past must be where the state is.
 -- @tparam {integer,...} ids the token ids
--- @tparam[opt] table cache a cache from `cache`
+-- @tparam[opt] table cache a cache from `cache` or `seq`
 -- @tparam[opt] table opts options:
 -- opts.flash_attn: true for flash attention (f16 masks).
 -- opts.logits: "all" or "last" (default "all").
@@ -819,7 +1087,7 @@ end
 -- (default 0).
 -- opts.causal: false lets the tokens of this pass see each other both
 -- ways, as llama.cpp does for gemma image tokens (default true).
--- @treturn table fields n, n_past, n_kv, n_attn, n_swa_attn, cache,
+-- @treturn table fields n, n_past, n_kv, n_attn, n_swa_attn, lo, cache,
 -- flash_attn, logits, hidden, pool, causal, and the tensors ids, pos, mask,
 -- mask_swa (with sliding layers), rows and rows_swa (with a cache), and
 -- embd (with opts.embd)
@@ -836,10 +1104,10 @@ function M:inputs(ids, cache, opts)
 	end
 	kv.check(cache, opts.flash_attn)
 	local n_kv = (cache and cache.n_past or 0) + n
-	local n_attn, n_swa_attn = spans(cache, n_kv)
+	local n_attn, n_swa_attn, lo = spans(cache, n_kv)
 	local mt = opts.flash_attn and "f16" or "f32"
 	local inp = {
-		n = n, n_attn = n_attn, n_swa_attn = n_swa_attn, cache = cache,
+		n = n, n_attn = n_attn, n_swa_attn = n_swa_attn, lo = lo, cache = cache,
 		flash_attn = opts.flash_attn, logits = opts.logits or "all",
 		hidden = opts.hidden, pool = opts.pool, causal = opts.causal ~= false,
 		ids = be:tensor("i32", { n }, ids),
@@ -874,10 +1142,14 @@ function M:replay_key(cache, n, opts)
 	if cache.n_past + n <= cache.n_ctx then
 		self:grow(cache, cache.n_past + n)
 	end
-	local n_attn, n_swa_attn = spans(cache, cache.n_past + n)
-	return ("%d:%d:%d:%s:%s:%s:%s:%s:%s:%s"):format(n, n_attn, n_swa_attn, tostring(opts.flash_attn),
+	local n_attn, n_swa_attn, lo = spans(cache, cache.n_past + n)
+	local key = ("%d:%d:%d:%s:%s:%s:%s:%s:%s:%s"):format(n, n_attn, n_swa_attn, tostring(opts.flash_attn),
 	    opts.logits or "all", tostring(opts.hidden), tostring(opts.pool), tostring(opts.embd ~= nil),
 	    tostring(opts.causal ~= false), self.lora_key or "")
+	if cache.pool then
+		key = key .. (":%d@%d.%d"):format(lo, cache.pool.id, cache.pool.gen)
+	end
+	return key
 end
 
 --- Load new ids into the inputs of an earlier pass with the same key.
@@ -984,9 +1256,12 @@ local function attention(hp, g, inp, il, L, q, k, v, shared)
 		k, v = kv.rotate(g, k, rk), kv.rotate(g, v, rv)
 		local w = L.Hkv * D
 		local rows = L.swa and inp.rows_swa or inp.rows
-		local kw = g:set_rows(c.k[il], g:reshape(k, { n, w }), rows)
-		local vw = g:set_rows(c.v[il], g:reshape(v, { n, w }), rows)
-		k, v = kv.views(g, c, kw, vw, L.swa and inp.n_swa_attn or inp.n_attn, L.Hkv, D)
+		-- A pool sequence writes its global rows into the pool.
+		local src = (c.pool and not L.swa) and c.pool or c
+		local kw = g:set_rows(src.k[il], g:reshape(k, { n, w }), rows)
+		local vw = g:set_rows(src.v[il], g:reshape(v, { n, w }), rows)
+		k, v = kv.views(g, c, kw, vw, L.swa and inp.n_swa_attn or inp.n_attn, L.Hkv, D,
+		    not L.swa and inp.lo or 0)
 	end
 	shared[il] = { k = k, v = v }
 	local mask = L.swa and inp.mask_swa or inp.mask
@@ -1336,10 +1611,12 @@ local function rows_of(g, t, off, n)
 	return g:view(t, shape, strides, off * st[1])
 end
 
---- Attention of layer il for a batch of slots.
--- Rows off+1 .. off+n of q, k and v belong to one slot: their keys and
--- values go into that slot's cache, and they attend over that cache
--- only, with the slot's causal mask.
+--- Attention of layer il for a batch of pool sequences.
+-- Rows off+1 .. off+n of q, k and v belong to one sequence. Their keys
+-- and values go into the cells of that sequence: global layers in the
+-- pool, sliding layers in the sequence's ring. The queries of a
+-- sequence read the pool window of its cells, under a mask that shows
+-- only its own cells.
 -- @return the output (N, H * D)
 function M.attention_batch(hp, g, inp, il, L, q, k, v, shared)
 	local D, out = L.D, nil
@@ -1356,9 +1633,11 @@ function M.attention_batch(hp, g, inp, il, L, q, k, v, shared)
 			vi = kv.rotate(g, g:cont(rows_of(g, v, b.off, n)), rv)
 			local w = L.Hkv * D
 			local rows = L.swa and b.rows_swa or b.rows
-			local kw = g:set_rows(c.k[il], g:reshape(ki, { n, w }), rows)
-			local vw = g:set_rows(c.v[il], g:reshape(vi, { n, w }), rows)
-			ki, vi = kv.views(g, c, kw, vw, L.swa and b.n_swa_attn or b.n_attn, L.Hkv, D)
+			local src = L.swa and c or c.pool
+			local kw = g:set_rows(src.k[il], g:reshape(ki, { n, w }), rows)
+			local vw = g:set_rows(src.v[il], g:reshape(vi, { n, w }), rows)
+			ki, vi = kv.views(g, c, kw, vw, L.swa and b.n_swa_attn or b.n_attn, L.Hkv, D,
+			    not L.swa and b.lo or 0)
 		end
 		shared[il][i] = { k = ki, v = vi }
 		local mask = L.swa and b.mask_swa or b.mask
@@ -1368,8 +1647,8 @@ function M.attention_batch(hp, g, inp, il, L, q, k, v, shared)
 	return out
 end
 
---- Recurrent layer il for a batch of slots: each slot runs its rows
--- through its own conv and delta net states.
+--- Recurrent layer il for a batch of sequences: each sequence runs its
+-- rows through its own conv and delta net states.
 -- @return the output (N, n_embd)
 function M.linear_attention_batch(hp, g, inp, L, il, x, taps, sfx)
 	local out
@@ -1381,8 +1660,8 @@ function M.linear_attention_batch(hp, g, inp, L, il, x, taps, sfx)
 	return out
 end
 
--- Fill the input leaves of a batch pass: slot i gets ids[i] (a list)
--- at its cache.n_past.
+-- Fill the input leaves of a batch pass: sequence i gets ids[i] (a
+-- list) at its cache.n_past.
 local function fill_batch(hp, inp, ids)
 	if ids then
 		local all = {}
@@ -1405,13 +1684,13 @@ local function fill_batch(hp, inp, ids)
 			end
 		end
 		if b.mask then
-			b.mask:fill_causal(n_past)
+			b.mask:fill_blocks({ n_past = n_past, block = c.pool.block, blocks = c.blocks, lo = b.lo })
 		end
 		if b.mask_swa then
 			b.mask_swa:fill_mask({ n_past = n_past, window = hp.n_swa, ring = true, causal = true })
 		end
 		if b.rows then
-			b.rows:fill_range(n_past)
+			b.rows:set(seq_cells(c, n_past, n))
 		end
 		if b.rows_swa then
 			local r = {}
@@ -1428,23 +1707,24 @@ local function fill_batch(hp, inp, ids)
 	inp.pos:set(pos)
 end
 
---- Tell if the model can run several slots in one pass. Every chat
--- model can: attention runs per slot on its cache, and recurrent layers
--- per slot on their states.
+--- Tell if the model can run several pool sequences in one pass. Every
+-- chat model can: attention reads the pool under a mask per sequence,
+-- and recurrent layers run per sequence on their states.
 -- @treturn boolean
 function M:batchable()
 	return true
 end
 
---- Make the inputs of a pass over several slots.
--- Slot i runs ids[i], a list of token ids, at its cache.n_past: one id
--- for a decode step, or a chunk of a prompt.
--- @tparam {table,...} caches the slot caches
+--- Make the inputs of a pass over several pool sequences.
+-- Sequence i runs ids[i], a list of token ids, at its cache.n_past: one
+-- id for a decode step, or a chunk of a prompt.
+-- @tparam {table,...} caches the sequences, from `seq`
 -- @tparam {table,...} ids a list of token ids per cache
 -- @tparam[opt] table opts options: flash_attn
 -- @treturn table inputs for `forward`, with `batch` (one entry per
--- slot: cache, off, n, rows, masks and spans)
--- @raise when a cache is full
+-- sequence: cache, off, n, rows, masks, spans and lo) and pools (the
+-- set of pools it reads)
+-- @raise when a cache is full or is not a pool sequence
 function M:batch_inputs(caches, ids, opts)
 	opts = opts or {}
 	local be, hp = self.be, self.hp
@@ -1453,13 +1733,15 @@ function M:batch_inputs(caches, ids, opts)
 	for _, L in ipairs(self.layers) do
 		attn = attn or not L.recr
 	end
-	local inp = { flash_attn = opts.flash_attn, logits = "all", causal = true, batch = {} }
+	local inp = { flash_attn = opts.flash_attn, logits = "all", causal = true, batch = {}, pools = {} }
 	for i, c in ipairs(caches) do
+		assert(c.pool, "batch_inputs: a batch runs pool sequences")
 		local n = #ids[i]
 		check_pass(self, c, n)
 		kv.check(c, opts.flash_attn)
-		local n_attn, n_swa_attn = spans(c, c.n_past + n)
-		local b = { cache = c, off = N, n = n, n_attn = n_attn, n_swa_attn = n_swa_attn }
+		local n_attn, n_swa_attn, lo = spans(c, c.n_past + n)
+		local b = { cache = c, off = N, n = n, n_attn = n_attn, n_swa_attn = n_swa_attn, lo = lo }
+		inp.pools[c.pool] = true
 		if attn then
 			b.rows, b.mask = be:tensor("i64", { n }), be:tensor(mt, { n, n_attn })
 			if hp.n_swa then
@@ -1479,9 +1761,10 @@ function M:batch_inputs(caches, ids, opts)
 	return inp
 end
 
---- The replay key of a batch pass: the slot caches, their token counts
--- and spans, and the options.
--- @tparam {table,...} caches the slot caches
+--- The replay key of a batch pass: the token counts and spans of the
+-- sequences, and the options. Sequences with rings or recurrent states
+-- add their ids, since the graph reads their own tensors.
+-- @tparam {table,...} caches the sequences
 -- @tparam {table,...} ids a list of token ids per cache
 -- @tparam table opts the input options
 -- @treturn string the key
@@ -1492,22 +1775,24 @@ function M:batch_key(caches, ids, opts)
 		if c.n_past + n <= c.n_ctx then
 			self:grow(c, c.n_past + n)
 		end
-		local a, w = spans(c, c.n_past + n)
-		parts[#parts + 1] = ("%s.%d/%d/%d/%d"):format(c.id or tostring(c), c.gen or 0, n, a, w)
+		local a, w, lo = spans(c, c.n_past + n)
+		local own = (c.ring or c.rs_pos) and c.id or 0
+		parts[#parts + 1] = ("%d.%d.%d/%d/%d/%d/%d"):format(own, c.pool.id, c.pool.gen, n, a, w, lo)
 	end
 	return table.concat(parts, ":")
 end
 
---- Run several slots in one pass.
--- Slot i runs ids[i] (a list of token ids) at its cache.n_past and
+--- Run several pool sequences in one pass.
+-- Sequence i runs ids[i] (a list of token ids) at its cache.n_past and
 -- advances by #ids[i]. The pass reuses the last batch graph when the key
--- matches. Recurrent states and rings follow each slot, as a pass of
--- one slot does; a ring takes at most cache.ubatch tokens per pass.
--- @tparam {table,...} caches the slot caches
+-- matches. Recurrent states and rings follow each sequence, as a pass
+-- of one sequence does; a ring takes at most cache.ubatch tokens per
+-- pass.
+-- @tparam {table,...} caches the sequences, from `seq`
 -- @tparam {table,...} ids a list of token ids per cache
 -- @tparam[opt] table opts options: flash_attn
--- @treturn {userdata,...} one (1, n_vocab) logits node per slot, for
--- its last token; valid until the next batch pass
+-- @treturn {userdata,...} one (1, n_vocab) logits node per sequence,
+-- for its last token; valid until the next batch pass
 function M:run_batch(caches, ids, opts)
 	opts = opts or {}
 	local key = self:batch_key(caches, ids, opts)
@@ -1524,7 +1809,7 @@ function M:run_batch(caches, ids, opts)
 		local inp = self:batch_inputs(caches, ids, opts)
 		local g = self.be:graph()
 		local out = self:forward(g, inp)
-		r = { key = key, g = g, inp = inp, rows = {} }
+		r = { key = key, g = g, inp = inp, rows = {}, pools = inp.pools }
 		local V = out:shape()[2]
 		local rb = lgml.row_size("f32", V)
 		for i, b in ipairs(inp.batch) do
@@ -1539,11 +1824,11 @@ function M:run_batch(caches, ids, opts)
 	return r.rows
 end
 
---- Decode one token for each of several slots in one pass.
--- @tparam {table,...} caches the slot caches
+--- Decode one token for each of several pool sequences in one pass.
+-- @tparam {table,...} caches the sequences, from `seq`
 -- @tparam {integer,...} ids one token id per cache
 -- @tparam[opt] table opts options: flash_attn
--- @treturn {userdata,...} one (1, n_vocab) logits node per slot
+-- @treturn {userdata,...} one (1, n_vocab) logits node per sequence
 function M:decode_batch(caches, ids, opts)
 	local lists = {}
 	for i, id in ipairs(ids) do

@@ -459,9 +459,10 @@ end
 
 -- Snapshots on the model: a full snapshot and a state checkpoint go
 -- back to their position, and the next pass gives the same logits.
--- Batched passes: three slots prefill their prompts in one pass, then
--- decode in one pass per step; each slot's logits match the slot run
--- alone, and so do its greedy tokens.
+-- Batched passes: three sequences of one KV pool prefill their prompts
+-- in one pass, then decode in one pass per step; each sequence's logits
+-- match the sequence run alone on its own cache, and so do its greedy
+-- tokens.
 local function batch_check(arch, m)
 	local prompts = { { 11, 12, 13, 14, 15 }, { 40, 41, 42, 43, 44, 45, 46, 47, 48 }, { 7 } }
 	local steps = 10
@@ -478,8 +479,9 @@ local function batch_check(arch, m)
 		end
 	end
 	local caches, got = {}, {}
+	local pool = m:pool(3 * 128)
 	for i = 1, #prompts do
-		caches[i] = m:cache(128)
+		caches[i] = m:seq(pool, { n_ctx = 128 })
 	end
 	local rows = m:run_batch(caches, prompts)
 	local err, ids = 0, {}
@@ -502,8 +504,8 @@ local function batch_check(arch, m)
 			same = same and got[i][j] == want[i][j]
 		end
 	end
-	ok(err < 1e-3, ("%s: batched prefill logits match each slot alone (max error %.3g)"):format(arch, err))
-	ok(same, arch .. ": batched decode gives the same tokens as each slot alone")
+	ok(err == 0, ("%s: batched prefill logits match each sequence alone (max error %.3g)"):format(arch, err))
+	ok(same, arch .. ": batched decode gives the same tokens as each sequence alone")
 end
 
 local function snapshot_check(arch, m)
