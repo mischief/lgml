@@ -34,6 +34,9 @@ Model.__index = Model
 
 local MiB = 1048576
 
+-- The reason of a load that stopped because its client went away.
+local CANCELLED = "the client closed the request"
+
 local function now()
 	return uv.hrtime() / 1e9
 end
@@ -136,25 +139,46 @@ function P:used(kind)
 	return n
 end
 
--- Wait for a pool event (a request end, an unload, a load end) or the
--- deadline. Returns false at the deadline.
-function P:wait_event(deadline)
-	local t
-	local ok = stream.await(function(done)
-		self.events[#self.events + 1] = function()
-			done(true)
-		end
+-- How often a wait checks that its client is still there, in ms.
+local GONE_CHECK_MS = 250
+
+-- Waits until wake calls back, the deadline passes, or gone() turns
+-- true. Returns what the callback gave, or false.
+local function await(add, deadline, gone)
+	local timers = {}
+	local r = table.pack(stream.await(function(done)
+		add(done)
 		if deadline then
-			t = uv.new_timer()
+			local t = uv.new_timer()
 			t:start(math.max(0, math.floor((deadline - now()) * 1000)), 0, function()
 				done(false)
 			end)
+			timers[#timers + 1] = t
 		end
-	end)
-	if t then
+		if gone then
+			local t = uv.new_timer()
+			t:start(GONE_CHECK_MS, GONE_CHECK_MS, function()
+				if gone() then
+					done(false)
+				end
+			end)
+			timers[#timers + 1] = t
+		end
+	end))
+	for _, t in ipairs(timers) do
 		t:close()
 	end
-	return ok
+	return table.unpack(r, 1, r.n)
+end
+
+-- Wait for a pool event (a request end, an unload, a load end), the
+-- deadline, or gone() to turn true. Returns false at the deadline.
+function P:wait_event(deadline, gone)
+	return await(function(done)
+		self.events[#self.events + 1] = function()
+			done(true)
+		end
+	end, deadline, gone)
 end
 
 function P:notify()
@@ -162,19 +186,26 @@ function P:notify()
 end
 
 -- Take the load locks of the kinds of m, in name order; loads of one
--- kind run one at a time.
-function P:take_lock(m)
+-- kind run one at a time. Returns false when gone() turns true first.
+function P:take_lock(m, gone)
 	for _, kind in ipairs(m:kinds()) do
 		while self.lock[kind] do
-			self:wait_event()
+			if gone and gone() then
+				return false
+			end
+			self:wait_event(nil, gone)
 		end
-		self.lock[kind] = true
+		self.lock[kind] = m
 	end
+	return true
 end
 
+-- Drops the load locks that m holds.
 function P:drop_lock(m)
 	for _, kind in ipairs(m:kinds()) do
-		self.lock[kind] = nil
+		if self.lock[kind] == m then
+			self.lock[kind] = nil
+		end
 	end
 	self:notify()
 end
@@ -196,8 +227,8 @@ end
 
 -- Makes room for the part of m of one kind. Room of other kinds that
 -- earlier calls made stays, since m holds their load locks. Returns
--- true, or nil and the reason.
-function P:reserve_kind(m, kind, deadline)
+-- true, or nil and the reason. It unloads nothing once gone() is true.
+function P:reserve_kind(m, kind, deadline, gone)
 	local budget = self.budget[kind] or math.huge
 	local need = m:need(kind)
 	L:debug("reserve", "model", m.id, "kind", kind, "need", mib(need), "budget", mib(budget),
@@ -210,6 +241,9 @@ function P:reserve_kind(m, kind, deadline)
 		local used = self:used(kind)
 		if used + need <= budget then
 			return true
+		end
+		if gone and gone() then
+			return nil, CANCELLED
 		end
 		local idle = self:idle_models(kind, m)
 		local room = budget - used
@@ -236,7 +270,13 @@ function P:reserve_kind(m, kind, deadline)
 				return nil, why
 			end
 			L:debug("waiting for room", "model", m.id, "kind", kind, "busy", table.concat(busy, ","))
-			if now() >= deadline or not self:wait_event(deadline) then
+			if gone and gone() then
+				return nil, CANCELLED
+			end
+			if now() >= deadline or not self:wait_event(deadline, gone) then
+				if gone and gone() then
+					return nil, CANCELLED
+				end
 				return nil, ("%s; models with requests in flight: %s; waited %g s"):format(why,
 				    table.concat(busy, ", "), self.load_wait)
 			end
@@ -246,10 +286,10 @@ end
 
 -- Makes room for m in the budget of each of its kinds and counts it. It
 -- holds the load locks of m. Returns true, or nil and the reason.
-function P:reserve(m)
+function P:reserve(m, gone)
 	local deadline = now() + self.load_wait
 	for _, kind in ipairs(m:kinds()) do
-		local ok, err = self:reserve_kind(m, kind, deadline)
+		local ok, err = self:reserve_kind(m, kind, deadline, gone)
 		if not ok then
 			return nil, err
 		end
@@ -426,15 +466,17 @@ end
 -- It yields the calling coroutine. With hold, the model counts one
 -- request in flight on success; call `release` after it.
 -- @tparam[opt] boolean hold true to hold the model for a request
+-- @tparam[opt] function gone returns true when the client went away;
+-- the wait then ends, and a load not started yet does not start
 -- @treturn[1] lgml.server.remote_engine.Remote the engine
 -- @treturn[2] nil
 -- @treturn[2] string the reason of a failed load
--- @treturn[2] int 503
-function Model:load(hold)
+-- @treturn[2] int 503, or 499 when the client went away
+function Model:load(hold, gone)
 	-- A model with a caller in here is not idle: a load wakes other
 	-- waiters first, and they must not unload it before this caller runs.
 	self.wanted = self.wanted + 1
-	local eng, err, code = self:load_loop(hold)
+	local eng, err, code = self:load_loop(hold, gone)
 	self.wanted = self.wanted - 1
 	if self.wanted == 0 then
 		self.pool:notify()
@@ -442,10 +484,12 @@ function Model:load(hold)
 	return eng, err, code
 end
 
-function Model:load_loop(hold)
+function Model:load_loop(hold, gone)
 	while true do
 		if self.pool.stopping then
 			return nil, "server is stopping", 503
+		elseif gone and gone() then
+			return nil, CANCELLED, 499
 		elseif self.state == "loaded" then
 			if hold then
 				self.inflight = self.inflight + 1
@@ -456,16 +500,16 @@ function Model:load_loop(hold)
 			end
 			return self.engine
 		elseif self.state == "loading" or self.state == "unloading" then
-			local ok, err = stream.await(function(done)
+			local ok, err = await(function(done)
 				self.waiters[#self.waiters + 1] = done
-			end)
+			end, nil, gone)
 			if not ok and err then
 				return nil, err, 503
 			end
 		else
-			local ok, err = self:do_load()
+			local ok, err = self:do_load(gone)
 			if not ok then
-				return nil, err, 503
+				return nil, err, err == CANCELLED and 499 or 503
 			end
 		end
 	end
@@ -473,16 +517,27 @@ end
 
 -- Runs one load. Wakes the waiters with true, or with false and the
 -- reason.
-function Model:do_load()
+function Model:do_load(gone)
 	local pool = self.pool
 	self:set_state("loading")
 	local t0 = now()
-	pool:take_lock(self)
+	local ok, err = pool:take_lock(self, gone), CANCELLED
 	-- A failed load keeps its measure out: start from the estimate.
-	if not self.fixed then
+	if ok and not self.fixed then
 		self.size = self.measured or self.estimate
 	end
-	local ok, err = pool:reserve(self)
+	if ok then
+		ok, err = pool:reserve(self, gone)
+	end
+	if err == CANCELLED and not ok then
+		-- Other waiters retry the load themselves.
+		self.counted = false
+		pool:drop_lock(self)
+		self:set_state("unloaded")
+		L:info("load cancelled", "model", self.id)
+		wake(self.waiters, false)
+		return nil, err
+	end
 	local eng
 	if ok then
 		L:info("loading", "model", self.id, "size", self:describe(),
@@ -582,8 +637,9 @@ function Model:stop()
 end
 
 -- Hold the model for a request, run method on its engine, release.
-local function run(self, method, ...)
-	local eng, msg, status = self:load(true)
+-- gone tells if the client went away while the model loads.
+local function run(self, gone, method, ...)
+	local eng, msg, status = self:load(true, gone)
 	if not eng then
 		return nil, msg, status
 	end
@@ -601,7 +657,7 @@ end
 -- @return the results of `Engine:chat`, or nil, a message and 503
 -- when the model does not load
 function Model:chat(req, sink)
-	return run(self, "chat", engine_api.with_lora(req, self.lora), sink)
+	return run(self, sink.cancelled and function() return sink:cancelled() end, "chat", engine_api.with_lora(req, self.lora), sink)
 end
 
 --- Transcribes speech. See `lgml.server.engine`.
@@ -610,7 +666,7 @@ end
 -- @tparam lgml.server.engine.Control ctl the cancel control
 -- @return the results of `Engine:transcribe`, or nil, a message and 503
 function Model:transcribe(req, audio, ctl)
-	return run(self, "transcribe", req, audio, ctl)
+	return run(self, ctl and ctl.cancelled, "transcribe", req, audio, ctl)
 end
 
 --- Makes speech. See `lgml.server.engine`.
@@ -618,7 +674,7 @@ end
 -- @tparam lgml.server.engine.Control ctl the cancel control
 -- @return the results of `Engine:speak`, or nil, a message and 503
 function Model:speak(req, ctl)
-	return run(self, "speak", req, ctl)
+	return run(self, ctl and ctl.cancelled, "speak", req, ctl)
 end
 
 --- Answers typed questions. See `lgml.server.engine`.
@@ -626,7 +682,7 @@ end
 -- @tparam lgml.server.engine.Control ctl the cancel control
 -- @return the results of `Engine:decide`, or nil, a message and 503
 function Model:decide(req, ctl)
-	return run(self, "decide", engine_api.with_lora(req, self.lora), ctl)
+	return run(self, ctl and ctl.cancelled, "decide", engine_api.with_lora(req, self.lora), ctl)
 end
 
 --- Makes images. See `lgml.server.engine`.
@@ -634,7 +690,7 @@ end
 -- @tparam lgml.server.engine.Control ctl the cancel control
 -- @return the results of `Engine:generate`, or nil, a message and 503
 function Model:generate(req, ctl)
-	return run(self, "generate", req, ctl)
+	return run(self, ctl and ctl.cancelled, "generate", req, ctl)
 end
 
 --- Embeds text. See `lgml.server.engine`.
@@ -642,7 +698,7 @@ end
 -- @tparam lgml.server.engine.Control ctl the cancel control
 -- @return the results of `Engine:embed`, or nil, a message and 503
 function Model:embed(req, ctl)
-	return run(self, "embed", req, ctl)
+	return run(self, ctl and ctl.cancelled, "embed", req, ctl)
 end
 
 return M

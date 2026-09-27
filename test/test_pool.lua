@@ -207,6 +207,37 @@ local function test_swap()
 	cleanup(p)
 end
 
+-- A request whose client goes away while it waits for room gives 499,
+-- and the model in use stays loaded.
+local function test_gone()
+	local p = pool_mod.new({ budget = { gpu = 100 * MiB }, load_wait = 30 })
+	local a = add(p, "a", { size = 60, delay = 400 })
+	local b = add(p, "b", { size = 60 })
+	local busy = spawn(function() return chat(a) end)
+	while a.inflight == 0 do
+		stream.sleep(5)
+	end
+	local left = false
+	local s = sink()
+	function s.cancelled() return left end
+	local hb = spawn(function()
+		return b:chat({ messages = { { role = "user", content = "hi" } } }, s)
+	end)
+	stream.sleep(50)
+	ok(not hb.done and b.state ~= "loaded", "b waits for room while a runs")
+	left = true
+	local t0 = uv.now()
+	while not hb.done and uv.now() - t0 < 2000 do
+		stream.sleep(10)
+	end
+	ok(hb.done and hb.res[1] == nil and hb.res[3] == 499,
+	    ("the gone request ends with 499 (%s, %s)"):format(tostring(hb.res and hb.res[2]), tostring(hb.res and hb.res[3])))
+	ok(a.state == "loaded" and b.state == "unloaded" and b.starts == 0, "a stays loaded and b never starts")
+	ok(wait(busy) == true, "the request on a ends well")
+	ok(chat(b) == true and b.state == "loaded", "a later request for b still loads it")
+	cleanup(p)
+end
+
 -- A model with parts on two kinds counts each part against its budget.
 local function test_parts()
 	local p = pool_mod.new({ budget = { gpu = 100 * MiB, cpu = 100 * MiB } })
@@ -506,6 +537,7 @@ local function main()
 	test_lru()
 	test_in_flight()
 	test_swap()
+	test_gone()
 	test_parts()
 	test_no_room()
 	test_idle()
