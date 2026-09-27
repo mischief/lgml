@@ -1141,15 +1141,20 @@ curl -s localhost:8080/v1/audio/transcriptions -F file=@jfk.wav -F response_form
 capability `embedding` serves it. A gguf whose metadata sets a pooling
 type (`<arch>.pooling_type`), such as Qwen3-Embedding, is an embedding
 model: it gets capability `embedding` and not `completion`. Config key
-`engine = "lgml.embed_engine"` makes any text gguf an embedding model.
+`engine = "lgml.embed_engine"` makes any gguf text model an embedding
+model; with no pooling type, it pools the last token.
 
 The embedding of an input is the hidden state of its last token after
 the final norm of the model, scaled to length 1. lgml serves pooling
 type 3 (last token); other pooling types do not load. A text input
 gets the end token of the model when the gguf sets
-`tokenizer.ggml.add_eos_token`, as Qwen3-Embedding needs. The inputs
-of a request run one after the other; each input starts from an empty
-cache.
+`tokenizer.ggml.add_eos_token`, as Qwen3-Embedding needs.
+
+Short inputs of one request share a pass of at most 2048 tokens. Each
+input in the pass sees only its own tokens, so it gets the same vector
+as alone, within float rounding (cosine above 0.999). A longer input
+runs alone in passes of 2048 tokens through the KV cache. Models with
+recurrent or sliding-window layers run each input alone.
 
 | Field | Label | Notes |
 | --- | --- | --- |

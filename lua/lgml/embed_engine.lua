@@ -1,9 +1,11 @@
 --- Embedding engine for gguf text models.
 -- It serves `/v1/embeddings` through `lgml.server.openai`; the
--- interface is in `lgml.server.engine`. One cache: requests run one at
--- a time, and the inputs of a request run one after the other. The
--- embedding of an input is the normed hidden state of its last token,
--- scaled to length 1, as gguf `pooling_type` 3 (last) asks.
+-- interface is in `lgml.server.engine`. Requests run one at a time.
+-- The embedding of an input is the normed hidden state of its last
+-- token, scaled to length 1, as gguf `pooling_type` 3 (last) asks.
+-- Short inputs of a request share passes, each input with its own
+-- attention (see `lgml.transformer.embed_packed`). An input longer than
+-- one pass runs alone through the KV cache, in chunks.
 -- A text input gets the end token when the gguf sets
 -- `tokenizer.ggml.add_eos_token`. Token id inputs run as they are.
 -- @module lgml.embed_engine
@@ -20,6 +22,8 @@ E.__index = E
 
 -- Rows the KV cache gets at load; it grows on demand.
 local KV_INITIAL = 4096
+-- The most tokens per pass.
+local UBATCH = 2048
 
 --- gguf `pooling_type` values, by name.
 -- NONE gives one vector per token; lgml serves only LAST.
@@ -47,7 +51,7 @@ end
 -- - `kv_initial`: rows the KV cache gets at load (default 4096); it
 --   grows when an input needs more, up to `n_ctx`. 0 gives all `n_ctx`
 --   rows at load.
--- - `ubatch`: the most tokens per pass (default 512)
+-- - `ubatch`: the most tokens per pass (default 2048)
 -- - `id`: model id (default: the gguf `general.name`, or `"lgml"`)
 -- @treturn Engine the engine
 -- @raise when the backend, the model or its tokenizer does not load,
@@ -79,7 +83,8 @@ function M.new(opts)
 	local tk = assert(lgml.tokenizer(opts.model))
 	return setmetatable({
 		be = be, model = model, tk = tk, n_ctx = n_ctx, flash_attn = fa,
-		cache = model:cache(n_ctx, copts), ubatch = opts.ubatch,
+		cache = model:cache(n_ctx, copts), ubatch = opts.ubatch or UBATCH,
+		packable = model:packable(),
 		eos = meta["tokenizer.ggml.add_eos_token"] and tk:special().eos or nil,
 		id = opts.id or meta["general.name"] or "lgml",
 		busy = false, waiting = {},
@@ -151,21 +156,55 @@ function E:tokens(inputs)
 	return out
 end
 
+-- v scaled to length 1, in place.
+local function unit(v)
+	local s = 0
+	for _, x in ipairs(v) do
+		s = s + x * x
+	end
+	s = s > 0 and 1 / math.sqrt(s) or 0
+	for j = 1, #v do
+		v[j] = v[j] * s
+	end
+	return v
+end
+
+-- The passes of a request: lists of input indexes. Inputs of at most
+-- ubatch tokens fill packed passes of at most ubatch tokens; a new pass
+-- starts when an input does not fit the last one. A longer input runs
+-- alone through the cache, in chunks.
+function E:passes(lists)
+	local out, cur, n = {}, nil, 0
+	for i, ids in ipairs(lists) do
+		if not self.packable or #ids > self.ubatch then
+			out[#out + 1] = { i, alone = true }
+		else
+			if not cur or n + #ids > self.ubatch then
+				cur, n = {}, 0
+				out[#out + 1] = cur
+			end
+			cur[#cur + 1], n = i, n + #ids
+		end
+	end
+	return out
+end
+
 -- The embedding of each token list, scaled to length 1. Returns nil
 -- when ctl cancels.
 function E:run(lists, ctl)
-	local data = {}
-	for i, ids in ipairs(lists) do
-		local v = self.model:embed(self.cache, ids, { flash_attn = self.flash_attn, ubatch = self.ubatch })
-		local s = 0
-		for _, x in ipairs(v) do
-			s = s + x * x
+	local data, opts = {}, { flash_attn = self.flash_attn, ubatch = self.ubatch }
+	for _, p in ipairs(self:passes(lists)) do
+		if p.alone then
+			data[p[1]] = unit(self.model:embed(self.cache, lists[p[1]], opts))
+		else
+			local group = {}
+			for k, i in ipairs(p) do
+				group[k] = lists[i]
+			end
+			for k, v in ipairs(self.model:embed_packed(group, opts)) do
+				data[p[k]] = unit(v)
+			end
 		end
-		s = s > 0 and 1 / math.sqrt(s) or 0
-		for j = 1, #v do
-			v[j] = v[j] * s
-		end
-		data[i] = v
 		-- Let other messages run, such as a cancel.
 		if coroutine.isyieldable() then
 			stream.sleep(0)

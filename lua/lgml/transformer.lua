@@ -1260,7 +1260,8 @@ end
 -- @return logits (n, n_vocab), or (1, n_vocab) when inp.logits is "last";
 -- with inp.hidden, the hidden state (n, n_embd) after that many layers;
 -- with inp.pool "last", the normed hidden state (1, n_embd) of the last
--- token
+-- token; with inp.pool "rows", the normed hidden states (m, n_embd) of
+-- the rows that inp.pool_rows lists
 -- @treturn table named nodes for comparison, such as "embd",
 -- "ffn_out-0", "l_out-0" and "result_norm"
 function M:forward(g, inp)
@@ -1308,7 +1309,10 @@ function M:forward(g, inp)
 		local row = lgml.row_size("f32", hp.n_embd)
 		x = g:view(x, { 1, hp.n_embd }, nil, (n - 1) * row)
 	end
-	if inp.pool == "last" then
+	if inp.pool == "rows" then
+		x = g:get_rows(x, inp.pool_rows)
+	end
+	if inp.pool then
 		taps.result_norm = g:mul(g:rms_norm(x, hp.eps), self.output_norm)
 		return taps.result_norm, taps
 	end
@@ -1601,6 +1605,75 @@ function M:embed(cache, ids, opts)
 		out = replay.run(self, cache, part, o)
 	end
 	return out:get()
+end
+
+-- A causal mask (n, n) of type mt in which each token list of lists
+-- sees only its own tokens.
+local function packed_mask(lists, n, mt)
+	local neg = mt == "f16" and "\0\252" or string.pack("<f", -math.huge)
+	local zero = mt == "f16" and "\0\0" or string.pack("<f", 0)
+	local rows, a = {}, 0
+	for _, l in ipairs(lists) do
+		for k = 1, #l do
+			rows[#rows + 1] = neg:rep(a) .. zero:rep(k) .. neg:rep(n - a - k)
+		end
+		a = a + #l
+	end
+	return table.concat(rows)
+end
+
+--- Tell if `embed_packed` can run the model: it has no recurrent and
+-- no sliding-window layers.
+-- @treturn boolean
+function M:packable()
+	return not self.recurrent and not self.hp.n_swa
+end
+
+--- Run several token lists in one pass and give the pooled hidden
+-- state of each.
+-- The lists share the pass but not their attention: each token sees
+-- only the earlier tokens of its own list, at positions from 0. The
+-- pass uses no cache and no replay, so the lists together must fit
+-- one pass.
+-- @tparam {{integer,...},...} lists the token lists, each non-empty
+-- @tparam[opt] table opts options: flash_attn
+-- @treturn {{number,...},...} the normed hidden state of the last
+-- token of each list, n_embd values each
+-- @raise when the model is not `packable`
+function M:embed_packed(lists, opts)
+	assert(self:packable(), "embed_packed: the model has recurrent or sliding-window layers")
+	opts = opts or {}
+	local be, E = self.be, self.hp.n_embd
+	local ids, pos, last = {}, {}, {}
+	for i, l in ipairs(lists) do
+		for j, id in ipairs(l) do
+			ids[#ids + 1], pos[#pos + 1] = id, j - 1
+		end
+		last[i] = #ids - 1
+	end
+	local n, mt = #ids, opts.flash_attn and "f16" or "f32"
+	local inp = {
+		n = n, n_past = 0, n_kv = n, n_attn = n, n_swa_attn = n, flash_attn = opts.flash_attn,
+		logits = "all", pool = "rows", causal = true,
+		ids = be:tensor("i32", { n }, ids), pos = be:tensor("i32", { n }, pos),
+		mask = be:tensor(mt, { n, n }), pool_rows = be:tensor("i32", { #lists }, last),
+	}
+	inp.mask:set(packed_mask(lists, n, mt))
+	local g = be:graph()
+	local out = self:forward(g, inp)
+	g:compute(out)
+	local flat = out:get()
+	g:close()
+	for _, t in pairs(inp) do
+		if type(t) == "userdata" then
+			t:close()
+		end
+	end
+	local vs = {}
+	for i = 1, #lists do
+		vs[i] = table.move(flat, (i - 1) * E + 1, i * E, 1, {})
+	end
+	return vs
 end
 
 return M
