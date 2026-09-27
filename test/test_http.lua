@@ -613,8 +613,9 @@ local function test_served_model(eng)
 	local port = assert(srv:listen("127.0.0.1", 0))
 	local b = body_json(roundtrip(port, request("POST", "/v1/chat/completions", chat_body())))
 	ok(b.model == "fake", "chat with no model names the model that served it")
-	b = body_json(roundtrip(port, request("POST", "/v1/chat/completions", chat_body({ model = "nope" }))))
-	ok(b.model == "fake", "chat with an unknown model names the model that served it")
+	local nr = roundtrip(port, request("POST", "/v1/chat/completions", chat_body({ model = "nope" })))
+	ok(nr.status == 404 and body_json(nr).error.message:find("model nope not found", 1, true),
+	    "chat with an unknown model gives 404")
 	local m = roundtrip(port, request("GET", "/metrics")).body
 	ok(not m:find('model="nope"', 1, true) and not m:find('lgml_chat_requests_total{model="whisper"}', 1, true),
 	    "metrics use the serving model, not the request id or the first model")

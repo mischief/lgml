@@ -58,8 +58,8 @@ local function default_model(eng)
 end
 
 --- The id of the model that serves a request.
--- It is the id for the reply and the metrics label. An unknown id gives
--- the serving model, so it makes no new metrics series.
+-- It is the id for the reply and the metrics label. An unknown id (a
+-- 404) gives the default model of that kind, so it makes no new series.
 -- @tparam lgml.server.engine.Engine eng the engine
 -- @tparam ?string id the request model
 -- @tparam string what the kind: `"chat"`, `"transcribe"` and so on
@@ -67,7 +67,8 @@ end
 -- @treturn string the model id
 function M.served_model(eng, id, what, images)
 	if eng.model_for then
-		return eng:model_for(id, what, images) or default_model(eng)
+		return eng:model_for(id, what, images) or eng:model_for(nil, what, images)
+		    or default_model(eng)
 	end
 	for _, m in ipairs(eng:models()) do
 		if m.id == id then

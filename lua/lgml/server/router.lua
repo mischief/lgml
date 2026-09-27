@@ -1,7 +1,8 @@
 --- Routes requests to one of several engines by the request's model id.
--- A request with no model or an unknown one goes to the first engine
--- whose model has the mode of the request, as llama.cpp ignores the
--- model field. A router is an engine (see `lgml.server.engine`). The
+-- A request with no model (or an empty one) goes to the first engine
+-- whose model has the mode of the request. An unknown id gives 404, and
+-- a model without that mode gives 400. A router is an engine (see
+-- `lgml.server.engine`). The
 -- modes of an engine come from `Engine:modes` when it has that method,
 -- else from `ready().caps` (as `lgml.server.remote_engine` gives
 -- them), else from its methods. The mode names are in `lgml.detect`.
@@ -11,6 +12,7 @@ local media = require("lgml.chat.media")
 local detect = require("lgml.detect")
 local log = require("lgml.log")
 local engine_api = require("lgml.server.engine")
+local systemone = require("lgml.systemone")
 
 local L = log.new("router")
 
@@ -103,12 +105,16 @@ end
 -- @tparam string what `"chat"`, `"transcribe"`, `"speak"`, `"decide"`,
 -- `"generate"` or `"embed"`
 -- @treturn ?lgml.server.engine.Engine the engine that serves id with
--- what, else the first engine with what, else nil
+-- what; with no id, the first engine with what; else nil
 -- @treturn ?string the id of the picked model
 -- @treturn ?string why: `"named"` (id matched), `"default"` (no id),
 -- `"unknown"` (no model has id) or `"capability"` (the model of id
--- does not serve what)
+-- does not serve what); the last two come with a nil engine
 function R:pick(id, what)
+	-- Jevify clients name their default model.
+	if id == "" or (what == "decide" and id == systemone.DEFAULT_MODEL) then
+		id = nil
+	end
 	local first, first_id
 	for _, e in ipairs(self.engines) do
 		if can(e, what) then
@@ -123,11 +129,32 @@ function R:pick(id, what)
 			end
 		end
 	end
+	if id ~= nil then
+		return nil, nil, find(self, id) and "capability" or "unknown"
+	end
 	if not first then
 		return nil
 	end
-	local why = id == nil and "default" or (find(self, id) and "capability" or "unknown")
-	return first, first_id, why
+	return first, first_id, "default"
+end
+
+-- Words for a method in error messages.
+local SERVES = {
+	chat = "chat", transcribe = "transcriptions", speak = "speech",
+	decide = "decisions", generate = "images", embed = "embeddings",
+}
+
+-- The ids of the models that serve what.
+local function ids_for(self, what)
+	local ids = {}
+	for _, e in ipairs(self.engines) do
+		if can(e, what) then
+			for _, m in ipairs(e:models()) do
+				ids[#ids + 1] = m.id
+			end
+		end
+	end
+	return table.concat(ids, ", ")
 end
 
 -- The engines of method what with a vision model, and the ids of
@@ -156,8 +183,8 @@ local function model_of(e, id)
 end
 
 -- The engine for a request with images: e when its model has vision,
--- else the first vision engine for an unknown model. A named model
--- without vision is an error that names the models with vision.
+-- else the first vision engine when the request names no model. A named
+-- model without vision is an error that names the models with vision.
 local function to_vision(self, e, id, what)
 	local m = model_of(e, id)
 	if m and (m.vision or has(m.capabilities, "multimodal")) then
@@ -179,6 +206,14 @@ end
 local function resolve(self, id, what, images)
 	local e, mid, why = self:pick(id, what)
 	if not e then
+		local word = SERVES[what] or what
+		if why == "unknown" then
+			return nil, ("model %s not found; models for %s: %s"):format(id, word,
+			    ids_for(self, what)), 404, why
+		elseif why == "capability" then
+			return nil, ("model %s does not serve %s; models for %s: %s"):format(id, word,
+			    word, ids_for(self, what)), 400, why
+		end
 		return nil, nil, 400, "none"
 	end
 	if images then
@@ -246,7 +281,7 @@ function R:lora_adapters(list)
 end
 
 --- Runs a chat completion on the engine for `req.model`.
--- A request with images and no model, or an unknown one, goes to the
+-- A request with images and no model goes to the
 -- first model with vision. A named model without vision is an error
 -- that names the models with vision.
 -- @tparam table req the chat request
@@ -290,7 +325,7 @@ function R:speak(req, ctl)
 end
 
 --- Answers typed questions on the engine for `req.model`.
--- A request for `"jevify-latest"`, no model or an unknown one goes to
+-- A request for `"jevify-latest"` or with no model goes to
 -- the first engine that can decide. With images (`req.images`), such a
 -- request goes to the first model with vision that can decide, and a
 -- named model without vision is an error, as for chat.

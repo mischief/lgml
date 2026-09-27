@@ -103,17 +103,21 @@ for one handler.
 ### Model selection
 
 With `-m`, the server has one model. With `-C config`, it has several.
-The `model` field picks one by id. A request with no `model`, or with
-an unknown id, goes to the first model that serves that kind of
-request (as llama-server ignores `model`). Models of a config load on
-the first request for them; see [Load and unload](#load-and-unload).
+The `model` field picks one by id. A request with no `model`, or an
+empty one, goes to the first model that serves that kind of request.
+An unknown id gives 404, and the message lists the models for that
+kind of request. A model that does not serve that kind of request (a
+chat request for a speech model) gives 400. A single model (`-m`)
+serves every request and ignores `model`, as llama-server does. Models
+of a config load on the first request for them; see [Load and
+unload](#load-and-unload).
 
-A chat request with images and no `model` (or an unknown one) goes to
-the first model with vision. A request with images for a named model
+A chat request with images and no `model` goes to the first model with
+vision. A request with images for a named model
 without vision gives 400, and the message names the models with vision.
 
 The `model` field of a chat reply is the id of the model that served
-the request. With no `model` or an unknown id, it is the id of the
+the request. With no `model`, it is the id of the
 model that the server picked, not the id in the request.
 
 ## Errors
@@ -145,7 +149,7 @@ Status codes:
 | Code | When |
 | --- | --- |
 | 400 | Bad JSON, a field that fails a check, a bad grammar or schema, a prompt longer than the context, image input to a model without vision, an engine that rejects the request, a load or unload request to a server started without `-C config`, or with `--inproc`. |
-| 404 | No route for the path. The engine does not serve this kind of request (for example `/v1/audio/speech` with a chat model only). An unknown model id on load or unload. |
+| 404 | No route for the path. The engine does not serve this kind of request (for example `/v1/audio/speech` with a chat model only). An unknown model id. |
 | 405 | The path exists, the method does not. The `Allow` header lists the methods. |
 | 408, 411, 413, 431, 505 | HTTP errors; see [Common behavior](#common-behavior). |
 | 409 | `/models/unload` while the model loads or has requests in flight. |

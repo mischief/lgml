@@ -28,7 +28,15 @@ for _, m in ipairs(r:models()) do
 end
 ok(table.concat(ids, ",") == "whisper,a,b", "models from every engine")
 ok(r:pick("b", "chat") == b, "chat by model id")
-ok(r:pick("nope", "chat") == a, "unknown model goes to first chat engine")
+local pe, pid, pwhy = r:pick("nope", "chat")
+ok(pe == nil and pid == nil and pwhy == "unknown", "an unknown model picks no engine")
+local _, nmsg, ncode = r:chat({ model = "nope", messages = { { role = "user", content = "hi" } } })
+ok(ncode == 404 and nmsg:find("model nope not found", 1, true) and nmsg:find("a, b", 1, true),
+    "chat with an unknown model gives 404 and names the chat models")
+local _, cmsg, ccode = r:chat({ model = "whisper", messages = { { role = "user", content = "hi" } } })
+ok(ccode == 400 and cmsg:find("whisper does not serve chat", 1, true),
+    "chat with a transcription model gives 400")
+ok(r:pick("", "chat") == a, "an empty model goes to first chat engine")
 ok(r:pick(nil, "chat") == a, "no model goes to first chat engine")
 ok(r:pick("whisper", "transcribe") == stt and r:pick(nil, "chat") ~= stt,
     "chat skips transcribe-only engines")
@@ -38,9 +46,9 @@ local _, lmsg, lcode = r:load("a")
 local _, umsg, ucode = r:unload("nope")
 ok(lcode == 400 and ucode == 400 and lmsg == require("lgml.server.engine").NO_LOAD and umsg == lmsg,
     "load and unload give 400 when no model loads on demand")
-ok(r:model_for(nil, "chat") == "a" and r:model_for("nope", "chat") == "a" and
-    r:model_for("b", "chat") == "b" and r:model_for("whisper", "chat") == "a",
-    "model_for gives the model that serves chat")
+ok(r:model_for(nil, "chat") == "a" and r:model_for("nope", "chat") == nil and
+    r:model_for("b", "chat") == "b" and r:model_for("whisper", "chat") == nil,
+    "model_for gives the model that serves chat, and nil for an unknown or wrong model")
 ok(r:model_for(nil, "transcribe") == "whisper" and router.new({ stt }):model_for(nil, "chat") == nil,
     "model_for gives nil when no model serves the method")
 -- LoRA lists, as llama-server reads them.
@@ -73,7 +81,7 @@ function img.models() return { { id = "zimage", context_length = 0 } } end
 function img.props() return { n_ctx = 0, total_slots = 1 } end
 function img.generate(_, req) return { seeds = { req.seed } } end
 local r2 = router.new({ stt, img })
-ok(r2:pick(nil, "generate") == img and r2:pick("whisper", "generate") == img,
+ok(r2:pick(nil, "generate") == img and r2:pick("whisper", "generate") == nil,
     "generate skips engines without generate")
 ok(r2:generate({ model = "zimage", seed = 9 }).seeds[1] == 9, "generate routes")
 ok(select(3, router.new({ stt }):generate({ prompt = "x" })) == 400,
@@ -92,7 +100,8 @@ local img_msgs = { { role = "user", content = {
 	{ type = "text", text = "what is this?" } } } }
 local r3 = router.new({ vis("text", false), vis("eyes", true) })
 ok(r3:chat({ messages = img_msgs }) == "eyes", "images with no model go to a vision model")
-ok(r3:chat({ model = "nope", messages = img_msgs }) == "eyes", "images with an unknown model go to a vision model")
+local _, _, icode = r3:chat({ model = "nope", messages = img_msgs })
+ok(icode == 404, "images with an unknown model give 404")
 ok(r3:chat({ messages = { { role = "user", content = "hi" } } }) == "text", "text stays on the first chat model")
 ok(r3:model_for(nil, "chat", true) == "eyes" and r3:model_for("text", "chat", true) == nil,
     "model_for follows images to a vision model")
@@ -176,8 +185,8 @@ local function cold(id, modes)
 end
 local tts, cv = cold("tts", { "speech" }), cold("cv", { "completion", "multimodal", "decide" })
 local r5 = router.new({ tts, cv })
-ok(r5:pick(nil, "speak") == tts and r5:pick("cv", "speak") == tts, "speech goes by modes")
-ok(r5:pick(nil, "chat") == cv and r5:pick("tts", "decide") == cv, "chat and decide go by modes")
+ok(r5:pick(nil, "speak") == tts and r5:pick("cv", "speak") == nil, "speech goes by modes")
+ok(r5:pick(nil, "chat") == cv and r5:pick("tts", "decide") == nil, "chat and decide go by modes")
 ok(r5:chat({ messages = img_msgs }) == true and cv.loads == 1, "images go to a multimodal model by modes")
 ok(tts.loads == 0 and select(3, router.new({ tts }):chat({ messages = {} })) == 400,
     "no chat model gives 400")
