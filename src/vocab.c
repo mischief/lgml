@@ -188,7 +188,10 @@ load_map(lua_State *L, struct vocab *v, const char *path, int special)
 			luaL_error(L, "%s: piece over %d bytes", path, VOCAB_MAX_PIECE - 1);
 		if (id < 0 || id >= VOCAB_MAX_ID)
 			luaL_error(L, "%s: id out of range", path);
-		if (grow(v, (int)id + 1) != 0 || (p = malloc(klen + 1)) == NULL)
+		if (grow(v, (int)id + 1) != 0)
+			luaL_error(L, "out of memory");
+		p = malloc(klen + 1);
+		if (p == NULL)
 			luaL_error(L, "out of memory");
 		memcpy(p, key, klen);
 		if (!special)

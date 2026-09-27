@@ -70,8 +70,7 @@ png_format(int c)
 static int
 fail(char *err, const char *msg)
 {
-	strncpy(err, msg != NULL && msg[0] != '\0' ? msg : "bad image", IMAGE_ERRLEN - 1);
-	err[IMAGE_ERRLEN - 1] = '\0';
+	snprintf(err, IMAGE_ERRLEN, "%s", msg != NULL && msg[0] != '\0' ? msg : "bad image");
 	return -1;
 }
 
@@ -330,7 +329,8 @@ jpeg_encode(const struct image *im, int quality, size_t *outlen)
 	unsigned char *out = NULL, *tmp;
 	unsigned long size = 0;
 	size_t c = (size_t)im->c, i, y;
-	int oc = im->c <= 2 ? 1 : 3;
+	/* volatile: read after longjmp. */
+	volatile int oc = im->c <= 2 ? 1 : 3;
 	JSAMPROW row;
 
 	if (im->p == NULL || im->c < 1 || im->c > 4 || quality < 1 || quality > 100)

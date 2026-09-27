@@ -6,6 +6,7 @@ project('lgml',
     'c_std=c17',
     'warning_level=3',
     'werror=true',
+    'buildtype=debugoptimized',
   ],
 )
 
