@@ -443,6 +443,8 @@ function E:reserve()
 		return nil
 	end
 	local cells = pool.cap
+	local name = self.be:name()
+	local before = budget_mod.free(name)
 	local ok, best = pcall(function()
 		model:pool_resize(pool, pool.n_ctx)
 		local ks, top = { 1 }, pool.n_ctx
@@ -459,6 +461,10 @@ function E:reserve()
 		return r
 	end)
 	model:pool_resize(pool, cells)
+	-- Later budget checks must see the cells that the shrink freed.
+	if before then
+		budget_mod.settle(name, before - (64 << 20))
+	end
 	if not ok then
 		error(best, 0)
 	end

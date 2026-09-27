@@ -109,6 +109,28 @@ local function device(name)
 	end
 end
 
+--- The free bytes of a device, as ggml reports them.
+-- @tparam string name the backend name, such as "Vulkan0"
+-- @treturn ?integer the bytes, or nil for an unknown device
+function M.free(name)
+	local d = device(name)
+	return d and d.free
+end
+
+--- Wait until a device reports at least want free bytes, at most ms.
+-- The kernel gives freed device memory back some time after the free,
+-- so a check at once sees too little.
+-- @tparam string name the backend name
+-- @tparam integer want the free bytes to wait for
+-- @tparam[opt=3000] integer ms the most time to wait
+function M.settle(name, want, ms)
+	local uv = require("luv")
+	local t = uv.hrtime()
+	while (M.free(name) or want) < want and uv.hrtime() - t < (ms or 3000) * 1e6 do
+		uv.sleep(20)
+	end
+end
+
 -- The device of the best backend: the first GPU, else the first
 -- integrated GPU, else nil.
 local function best()
