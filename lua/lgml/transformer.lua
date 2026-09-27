@@ -701,6 +701,66 @@ function M.copy_block(pool, src, dst, n)
 	end
 end
 
+-- The K and V tensors of a pool, in a fixed order.
+local function pool_tensors(pool)
+	local list = {}
+	for il in pairs(pool.k) do
+		list[#list + 1] = il
+	end
+	table.sort(list)
+	local out = {}
+	for _, il in ipairs(list) do
+		out[#out + 1] = pool.k[il]
+		out[#out + 1] = pool.v[il]
+	end
+	return out
+end
+
+--- Bytes of the cells of one pool block, in all layers.
+-- @tparam table pool the pool
+-- @treturn integer bytes
+function M.block_bytes(pool)
+	local n = 0
+	for _, t in ipairs(pool_tensors(pool)) do
+		n = n + pool.block * (t:nbytes() // t:shape()[1])
+	end
+	return n
+end
+
+--- Copy the cells of a pool block to host memory, or back.
+-- @tparam table pool the pool
+-- @tparam integer b the block id
+-- @param buf an `lgml.hostbuf` of `block_bytes` bytes
+-- @tparam boolean out true to copy to buf, false to copy from it
+function M.copy_block_host(pool, b, buf, out)
+	local off = 0
+	for _, t in ipairs(pool_tensors(pool)) do
+		local n = pool.block * (t:nbytes() // t:shape()[1])
+		if out then
+			t:to_host(buf, off, b * n, n)
+		else
+			t:from_host(buf, off, b * n, n)
+		end
+		off = off + n
+	end
+end
+
+--- Take a block of a pool for sequence c, as its passes do: a free
+-- block past min when there is one, else a new one when the pool can
+-- grow, else a cached one, else one that pool.pressure frees.
+-- @tparam table pool the pool
+-- @tparam[opt] table c the sequence that asks
+-- @tparam[opt] integer min the lowest block wanted
+-- @treturn integer the block id, with one reference
+-- @raise when the pool is full
+function M:take_block(pool, c, min)
+	local b = new_block(self, pool, c, min)
+	if not b then
+		error(("kv pool full: %d of %d cells in use"):format(pool.alloc.used * pool.block, pool.n_ctx))
+	end
+	return b
+end
+
 --- Give back the blocks of a pool sequence past its first n positions.
 -- It also sets n_past to n when n_past is larger, and drops the block
 -- keys past n. When n ends inside a block that other sequences share
@@ -743,7 +803,7 @@ end
 function M:share(cache, blocks, keys)
 	assert(#cache.blocks == 0, "share: the sequence has blocks")
 	for i, b in ipairs(blocks) do
-		cache.pool.alloc:ref(b)
+		cache.pool.alloc:ref(b, cache.prio)
 		cache.blocks[i], cache.keys[i] = b, keys[i]
 	end
 	cache.n_past = #blocks * cache.pool.block
