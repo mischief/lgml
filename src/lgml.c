@@ -611,6 +611,7 @@ push_leaf(lua_State *L, int sidx, struct ggml_tensor *gt, int rank)
 	t->s = s;
 	t->g = NULL;
 	t->rank = rank;
+	t->out = 0;
 	s->refs++;
 	luaL_setmetatable(L, TENSOR_MT);
 	lua_pushvalue(L, sidx);
@@ -1074,9 +1075,45 @@ store_size(lua_State *L)
  * @type graph
  */
 
+static void restore_srcs(struct graph *);
+
+/*
+ * Free the compute buffers of a graph. Its nodes lose their storage, so
+ * a read of a node then raises an error.
+ */
+static void
+free_compute(struct graph *g)
+{
+	struct ggml_tensor *node;
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		if (g->mem_bytes[i] > 0)
+			lgml_mem_add(g->mem_key[i], MEM_COMPUTE, 0, g->mem_bytes[i]);
+		g->mem_bytes[i] = 0;
+	}
+	restore_srcs(g);
+	if (g->sched != NULL)
+		ggml_backend_sched_free(g->sched);
+	if (g->galloc != NULL)
+		ggml_gallocr_free(g->galloc);
+	g->sched = NULL;
+	g->galloc = NULL;
+	for (i = 0; i < g->nctx; i++) {
+		for (node = ggml_get_first_tensor(g->ctxs[i]); node != NULL;
+		    node = ggml_get_next_tensor(g->ctxs[i], node)) {
+			node->data = NULL;
+			node->buffer = NULL;
+		}
+	}
+	g->plan_nodes = -1;
+}
+
 /*** Close the graph.
- * Memory stays until every node tensor of the graph closes.
- * The `__gc` and `__close` metamethods call this function.
+ * The compute buffers go when no output node stays open: at once, or
+ * when the last output closes. The rest stays until every node tensor
+ * of the graph closes. The `__gc` and `__close` metamethods call this
+ * function.
  * @function graph:close
  */
 static int
@@ -1084,6 +1121,8 @@ graph_close(lua_State *L)
 {
 	struct graph *g = luaL_checkudata(L, 1, GRAPH_MT);
 
+	if (!g->closed && g->b != NULL && g->nouts == 0)
+		free_compute(g);
 	g->closed = 1;
 	graph_release(g);
 	return 0;
@@ -1145,6 +1184,7 @@ push_node(lua_State *L, struct graph *g, struct ggml_tensor *r, int rank)
 	t->t = r;
 	t->s = NULL;
 	t->g = g;
+	t->out = 0;
 	t->rank = max_int(rank, min_rank(r));
 	g->refs++;
 	luaL_setmetatable(L, TENSOR_MT);
@@ -2113,6 +2153,10 @@ mark_outputs(lua_State *L, struct graph *g)
 	for (i = 2; i <= n; i++) {
 		t = check_tensor(L, i);
 		luaL_argcheck(L, t->g == g, i, "not a node of this graph");
+		if (!t->out) {
+			t->out = 1;
+			g->nouts++;
+		}
 		ggml_set_output(t->t);
 		ggml_build_forward_expand(g->gf, t->t);
 	}
@@ -2344,6 +2388,8 @@ tensor_close(lua_State *L)
 	if (t->t == NULL)
 		return 0;
 	if (t->g != NULL) {
+		if (t->out && --t->g->nouts == 0 && t->g->closed && t->g->b != NULL)
+			free_compute(t->g);
 		t->g->refs--;
 		graph_release(t->g);
 	} else {

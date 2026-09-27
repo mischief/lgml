@@ -76,6 +76,7 @@ struct graph {
 	struct ggml_tensor	**saved;	/* node and its srcs, before sched */
 	int			 nsaved;	/* nodes in saved */
 	int			 backward;	/* 1 after tensor:backward */
+	int			 nouts;		/* open output node tensors */
 	int			 mem_key[2];	/* compute buffers: backend, CPU */
 	size_t			 mem_bytes[2];
 	int			 refs;
@@ -93,6 +94,7 @@ struct tensor {
 	struct store		*s;
 	struct graph		*g;
 	int			 rank;
+	int			 out;		/* a node counted in g->nouts */
 };
 
 struct backend	*lgml_check_backend(lua_State *, int);
