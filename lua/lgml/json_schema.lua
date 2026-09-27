@@ -680,8 +680,12 @@ local function convert(schema)
 		local function to_rule(s, lit)
 			return lit and '"' .. s .. '"' or s
 		end
+		-- The pattern matches the JSON string content, so a dot and a
+		-- negated class leave out the quote, the backslash and the
+		-- control characters. Else the grammar allows invalid JSON.
+		local UNSAFE = '\\"\\\\\\x00-\\x1F'
 		local function get_dot()
-			return add_rule("dot", "[^\\x0A\\x0D]")
+			return add_rule("dot", "[^" .. UNSAFE .. "]")
 		end
 
 		local function transform(depth)
@@ -766,6 +770,9 @@ local function convert(schema)
 					if i >= len then
 						errors[#errors + 1] = "Unbalanced square brackets"
 					end
+					if b[2] == "^" then
+						b[#b + 1] = UNSAFE
+					end
 					b[#b + 1] = "]"
 					i = i + 1
 					seq[#seq + 1] = { table.concat(b), false }
@@ -843,7 +850,8 @@ local function convert(schema)
 							end
 							i = i + 2
 						elseif ch == '"' then
-							lit[#lit + 1] = '\\"'
+							-- An escaped quote in the JSON text.
+							lit[#lit + 1] = '\\\\\\"'
 							i = i + 1
 						elseif not NON_LITERAL[ch] and (i == len - 1 or #lit == 0
 							or at(i + 1) == "." or not NON_LITERAL[at(i + 1)]) then

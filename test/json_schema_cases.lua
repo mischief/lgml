@@ -1,5 +1,8 @@
 -- Cases from llama.cpp tests/test-json-schema-to-grammar.cpp.
 -- Each case: name, ok (expected success), schema text, grammar.
+-- lgml differs in patterns: a dot and a negated class leave out the
+-- quote, the backslash and control characters, and a quote in a
+-- pattern is an escaped quote in the JSON text.
 return {
 	{
 		name = "min 0",
@@ -705,9 +708,22 @@ return {
         }]],
 		grammar = [[
 
-            root ::= "\"" ("\"") "\""
+            root ::= "\"" ("\\\"") "\""
             space ::= | " " | "\n"{1,2} [ \t]{0,20}
         ]],
+	},
+	{
+		name = "regexp negated class",
+		ok = true,
+		schema = [=[{
+            "type": "string",
+            "pattern": "^[^\\[\\]<>]+$"
+        }]=],
+		grammar = [=[
+
+            root ::= "\"" ([^\[\]<>\"\\\x00-\x1F]+) "\""
+            space ::= | " " | "\n"{1,2} [ \t]{0,20}
+        ]=],
 	},
 	{
 		name = "regexp with top-level alternation",
@@ -731,7 +747,7 @@ return {
         }]],
 		grammar = [[
 
-            dot ::= [^\x0A\x0D]
+            dot ::= [^\"\\\x00-\x1F]
             root ::= "\"" (("(" root-1{1,3} ")")? root-1{3,3} "-" root-1{4,4} " " "a"{3,5} "nd" dot dot dot) "\""
             root-1 ::= [0-9]
             space ::= | " " | "\n"{1,2} [ \t]{0,20}
