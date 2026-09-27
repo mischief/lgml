@@ -16,6 +16,7 @@ local detect = require("lgml.detect")
 local media = require("lgml.chat.media")
 local systemone = require("lgml.systemone")
 local base64 = require("lgml.base64")
+local embeddings = require("lgml.server.embeddings")
 local log = require("lgml.log")
 
 local L = log.new("openai")
@@ -452,7 +453,9 @@ local function models(eng, req, res)
 	local data = json.array()
 	for i, m in ipairs(eng:models()) do
 		local caps = json.array()
-		for j, c in ipairs(m.capabilities or detect.modes_of(eng, m.vision)) do
+		-- A worker engine knows the modes of its model; its methods do not.
+		local list = m.capabilities or (eng.modes and eng:modes()) or detect.modes_of(eng, m.vision)
+		for j, c in ipairs(list) do
 			caps[j] = c
 		end
 		data[i] = {
@@ -956,6 +959,54 @@ local function image_edits(eng, req, res)
 	return run_image(eng, res, ireq)
 end
 
+-- embeddings
+
+--- The fields of an embedding request. This is
+-- `lgml.server.embeddings.FIELDS`.
+M.EMBEDDING_FIELDS = embeddings.FIELDS
+
+local function embeddings_route(eng, req, res)
+	if type(eng.embed) ~= "function" then
+		return res:error(404, "this server does not serve embeddings")
+	end
+	local body, err = json.decode(req.body)
+	if not body then
+		return res:error(400, "bad JSON: " .. err)
+	end
+	local ereq, msg, param, code = embeddings.check(body)
+	if not ereq then
+		return res:error(400, msg, nil, param, code)
+	end
+	local t0 = uv.hrtime()
+	local model = served_model(eng, ereq.model, "embed")
+	log.note("model", model)
+	log.note("inputs", #ereq.input)
+	local r, emsg, status = eng:embed(ereq, {
+		cancelled = function()
+			return res.s:gone()
+		end,
+	})
+	if res.s:gone() then
+		res.close = true
+		return
+	end
+	metrics.request(model, "embedding", r ~= nil)
+	if not r then
+		return res:error(status or 500, emsg or "embedding failed")
+	end
+	local out, rerr = embeddings.reply(ereq, r, model)
+	if not out then
+		return res:error(400, rerr, nil, "dimensions", "invalid_value")
+	end
+	log.note("prompt_tokens", out.usage.prompt_tokens)
+	metrics.add("embedding_tokens_total", "tokens embedded", model, out.usage.prompt_tokens)
+	local fields = { elapsed_ms = (uv.hrtime() - t0) / 1e6 }
+	for k, v in pairs(r.timings or {}) do
+		fields[k] = v
+	end
+	return res:json(200, out, metrics.headers(fields))
+end
+
 --- Adds the OpenAI routes for eng to srv.
 -- Each route below is also under `/v1`, except `/metrics`:
 --
@@ -967,7 +1018,7 @@ end
 -- - `/metrics`: Prometheus text (see `lgml.server.metrics`), at the path
 --   that Prometheus scrapes by default
 -- - `/chat/completions`, `/audio/speech`, `/audio/transcriptions`,
---   `/systemone`, `/images/generations` and `/images/edits`
+--   `/systemone`, `/images/generations`, `/images/edits` and `/embeddings`
 --
 -- A route for a method that eng does not have gives 404.
 -- `/v1/systemone` is Jev's System One API (see `lgml.systemone`): a
@@ -986,9 +1037,11 @@ end
 -- - `transcription`: `/v1/audio/transcriptions`
 -- - `speech`: `/v1/audio/speech`
 -- - `image_generation`: `/v1/images/generations` and `/v1/images/edits`
+-- - `embedding`: `/v1/embeddings`
 --
--- A model entry gives them in its `capabilities` field; else they come
--- from the methods of eng (see `lgml.detect.modes_of`). Each entry also
+-- A model entry gives them in its `capabilities` field; else
+-- `Engine:modes` gives them, else they come from the methods of eng
+-- (see `lgml.detect.modes_of`). Each entry also
 -- has the load state as llama-server gives it, `status = { value }`,
 -- and `lgml = { status, bytes }`; see `lgml.server.engine`.
 --
@@ -1079,6 +1132,11 @@ function M.install(srv, eng, opts)
 	srv:route("POST", "/images/generations", gen)
 	srv:route("POST", "/v1/images/edits", edit)
 	srv:route("POST", "/images/edits", edit)
+	local function embed(req, res)
+		return embeddings_route(eng, req, res)
+	end
+	srv:route("POST", "/v1/embeddings", embed)
+	srv:route("POST", "/embeddings", embed)
 	for _, what in ipairs({ "load", "unload" }) do
 		local function h(req, res)
 			return load_route(eng, req, res, what)

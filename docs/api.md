@@ -28,6 +28,7 @@ Labels in this file:
 - [Images](#images)
 - [Speech](#speech)
 - [Transcriptions](#transcriptions)
+- [Embeddings](#embeddings)
 - [System One decisions](#system-one-decisions)
 - [Models](#models)
 - [Load and unload](#load-and-unload)
@@ -57,6 +58,7 @@ for one handler.
 | POST | `/v1/images/edits`, `/images/edits` | OpenAI | [Images](#images) |
 | POST | `/v1/audio/speech`, `/audio/speech` | OpenAI | [Speech](#speech) |
 | POST | `/v1/audio/transcriptions`, `/audio/transcriptions` | OpenAI | [Transcriptions](#transcriptions) |
+| POST | `/v1/embeddings`, `/embeddings` | OpenAI | [Embeddings](#embeddings) |
 | POST | `/v1/systemone`, `/systemone` | lgml (Jev) | [System One decisions](#system-one-decisions) |
 | GET | `/v1/models`, `/models` | OpenAI | [Models](#models) |
 | POST | `/models/load`, `/v1/models/load` | lgml | [Load and unload](#load-and-unload) |
@@ -85,14 +87,14 @@ for one handler.
 - There is no authentication. An `Authorization` or `x-api-key` header
   has no effect.
 - A chat request with a field that the server does not know gives
-  400 (see [Compatibility](#compatibility)), and so does
-  `/v1/systemone`. For `/v1/messages` and `/v1/responses`,
+  400 (see [Compatibility](#compatibility)), and so do
+  `/v1/embeddings` and `/v1/systemone`. For `/v1/messages` and `/v1/responses`,
   `--unknown-fields` (config
   `unknown_fields`) sets the rule: `reject` (the default) gives 400;
   `ignore` accepts the field and names it in the `x-lgml-ignored`
   header. The other routes ignore unknown fields.
-- A JSON `null` at the top level of a chat or image request reads as
-  an absent field.
+- A JSON `null` at the top level of a chat, image or embedding request
+  reads as an absent field.
 - When the client closes the connection, the server cancels the work.
 - Each reply has the header `x-lgml-request-id`, an id of 8 hex
   digits. The log lines of the request, in the server and in the
@@ -170,6 +172,7 @@ lgml extensions.
 | images | `x-lgml-elapsed-ms` (wall time), `x-lgml-images` (count), `x-lgml-steps` (sampling steps of all images), `x-lgml-seed` (seed of the first image), `x-lgml-sample-ms` (sampling time), `x-lgml-ms-per-step` |
 | speech | `x-lgml-elapsed-ms`, `x-lgml-audio-seconds` (length of the audio), `x-lgml-rtf` (wall time over audio time), `x-lgml-sample-rate` (samples per second), `x-lgml-channels` (1) |
 | transcriptions | `x-lgml-elapsed-ms`, `x-lgml-audio-seconds` (length of the input), `x-lgml-rtf` |
+| embeddings | `x-lgml-elapsed-ms`, `x-lgml-prompt-n` (tokens of all inputs), `x-lgml-prompt-ms` (model time), `x-lgml-prompt-per-second` |
 | systemone | `x-lgml-elapsed-ms`, and `x-jevify-latency-ms` (the same time with 1 decimal, as Jevify sends) |
 | messages, responses | `x-lgml-ignored` (accepted fields with no effect), and for messages `request-id`, `x-lgml-ignored-betas` and `x-lgml-thinking-dropped`; see [Anthropic Messages](#anthropic-messages) and [OpenAI Responses](#openai-responses) |
 
@@ -1132,6 +1135,57 @@ Replies:
 curl -s localhost:8080/v1/audio/transcriptions -F file=@jfk.wav -F response_format=verbose_json
 ```
 
+## Embeddings
+
+`POST /v1/embeddings` (alias `/embeddings`). OpenAI. A model with
+capability `embedding` serves it. A gguf whose metadata sets a pooling
+type (`<arch>.pooling_type`), such as Qwen3-Embedding, is an embedding
+model: it gets capability `embedding` and not `completion`. Config key
+`engine = "lgml.embed_engine"` makes any text gguf an embedding model.
+
+The embedding of an input is the hidden state of its last token after
+the final norm of the model, scaled to length 1. lgml serves pooling
+type 3 (last token); other pooling types do not load. A text input
+gets the end token of the model when the gguf sets
+`tokenizer.ggml.add_eos_token`, as Qwen3-Embedding needs. The inputs
+of a request run one after the other; each input starts from an empty
+cache.
+
+| Field | Label | Notes |
+| --- | --- | --- |
+| `input` | OpenAI | Required. A string; an array of 1 to 2048 strings; an array of token ids; or an array of 1 to 2048 arrays of token ids. Strings must not be empty. Token ids run as they are, with no end token. An input longer than the context of the model gives 400. |
+| `model` | OpenAI | See [Model selection](#model-selection). |
+| `encoding_format` | OpenAI | `float` (default): an array of numbers. `base64`: the little-endian float32 values of the vector, in base64. |
+| `dimensions` | OpenAI | A positive integer. Each vector keeps its first `dimensions` values and is scaled to length 1 again, as for models trained with Matryoshka loss, such as Qwen3-Embedding. A value above the length of the vectors of the model gives 400. |
+| `user` | OpenAI | Accepted; it has no effect. |
+
+Another field gives 400 with code `unknown_parameter`, as for chat.
+
+```json
+{"object": "list", "model": "Qwen3 Embedding 4B",
+ "data": [{"object": "embedding", "index": 0, "embedding": [0.0123, -0.0456, ...]}],
+ "usage": {"prompt_tokens": 9, "total_tokens": 9}}
+```
+
+`data[].index` is the place of the input in the request.
+`usage.prompt_tokens` counts the tokens of all inputs, with the end
+tokens. See also [Response headers](#response-headers).
+
+Instruction models such as Qwen3-Embedding want an instruction before
+each query, and none before the documents. The server does not add
+it; the client writes it into the input:
+
+```
+Instruct: Given a web search query, retrieve relevant passages that answer the query
+Query:What is the capital of China?
+```
+
+```sh
+curl -s localhost:8080/v1/embeddings -d '{
+  "input": ["The capital of China is Beijing.", "Gravity is a force."],
+  "dimensions": 1024}' | jq '.data[].embedding | length'
+```
+
 ## System One decisions
 
 `POST /v1/systemone` (alias `/systemone`). This is the System One API
@@ -1280,6 +1334,7 @@ fields. It does not load a model.
   - `transcription`: `/v1/audio/transcriptions`
   - `speech`: `/v1/audio/speech`
   - `image_generation`: `/v1/images/generations` and `/v1/images/edits`
+  - `embedding`: `/v1/embeddings`
 - `status.value` (llama.cpp) and `lgml.status`: `unloaded`, `loading`,
   `loaded` or `unloading`. A server without a config gives `loaded`.
 - `lgml.bytes`: with a config, the memory that the model counts
@@ -1391,7 +1446,7 @@ its first event.
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
-| `lgml_<kind>_requests_total` | counter | Requests, by kind: `chat`, `transcription`, `speech`, `decide`, `image`. `/v1/messages` and `/v1/responses` count as `chat`; token counts do not count. |
+| `lgml_<kind>_requests_total` | counter | Requests, by kind: `chat`, `transcription`, `speech`, `decide`, `image`, `embedding`. `/v1/messages` and `/v1/responses` count as `chat`; token counts do not count. |
 | `lgml_<kind>_errors_total` | counter | Requests of that kind that failed. |
 | `lgml_prompt_tokens_total` | counter | Prompt tokens computed. |
 | `lgml_prompt_seconds_total` | counter | Time spent on prompts. |
@@ -1401,6 +1456,7 @@ its first event.
 | `lgml_restored_tokens_total` | counter | Prompt tokens restored from host memory. |
 | `lgml_transcribed_seconds_total` | counter | Audio seconds transcribed. |
 | `lgml_spoken_seconds_total` | counter | Audio seconds of speech made. |
+| `lgml_embedding_tokens_total` | counter | Tokens of embedding inputs. |
 | `lgml_images_total` | counter | Images made. |
 | `lgml_image_steps_total` | counter | Image sampling steps run. |
 | `lgml_image_seconds_total` | counter | Time spent making images. |

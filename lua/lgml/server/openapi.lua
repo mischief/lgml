@@ -2,8 +2,8 @@
 -- `document` builds it at run time. The paths come from the routes of
 -- a server. The request fields come from the tables that the request
 -- checks use: `lgml.server.openai.CHAT_FIELDS`, `IMAGE_FIELDS`,
--- `SPEECH_FORMATS`, `TRANSCRIPTION_FORMATS`, `MESSAGE_ROLES` and
--- `lgml.systemone.fields`. Where a check is a function, its text goes
+-- `EMBEDDING_FIELDS`, `SPEECH_FORMATS`, `TRANSCRIPTION_FORMATS`,
+-- `MESSAGE_ROLES` and `lgml.systemone.fields`. Where a check is a function, its text goes
 -- into `description`. The descriptions are short; `docs/api.md` has
 -- the full reference.
 -- @module lgml.server.openapi
@@ -429,6 +429,38 @@ local function audio_schemas(c)
 	})
 end
 
+-- embeddings
+
+local EMBEDDING_NOTES = {
+	model = "Model id. A missing or unknown id goes to the first model that serves embeddings.",
+	user = "Accepted and ignored.",
+}
+
+local function embedding_schemas(c)
+	local ids = arr({ type = "integer", minimum = 0 })
+	local props = {
+		input = { oneOf = json.array({
+			str("One text."), arr(str(), "Texts."), ids, arr(ids, "Token id lists."),
+		}), description = "Texts or token id lists. A text gets the end token of the model; " ..
+		    "token ids run as they are." },
+		dimensions = int("Keep the first values of each vector and scale it to length 1 again."),
+		encoding_format = { type = "string", enum = json.array({ "base64", "float" }),
+		    description = "base64: little-endian float32 values." },
+	}
+	add_fields(props, openai.EMBEDDING_FIELDS, EMBEDDING_NOTES)
+	c.EmbeddingRequest = obj(props, { "input" })
+	-- A field not in EMBEDDING_FIELDS gives 400.
+	c.EmbeddingRequest.additionalProperties = false
+	c.EmbeddingsResponse = obj({
+		object = { const = "list" }, model = str(),
+		data = arr(obj({
+			object = { const = "embedding" }, index = int(),
+			embedding = { oneOf = json.array({ arr(num()), str("base64 float32 values.") }) },
+		})),
+		usage = obj({ prompt_tokens = int(), total_tokens = int() }),
+	})
+end
+
 -- System One
 
 local content = { type = { "string", "object", "array" } }
@@ -575,6 +607,7 @@ local SPEECH_HEADERS = { "elapsed-ms", "audio-seconds", "rtf", "sample-rate", "c
 local CHAT_HEADERS = { "cache-n", "restored-n", "prompt-n", "prompt-ms", "predicted-n",
 	"predicted-ms", "predicted-per-second" }
 local IMAGE_HEADERS = { "elapsed-ms", "images", "steps", "seed", "sample-ms", "ms-per-step" }
+local EMBEDDING_HEADERS = { "elapsed-ms", "prompt-n", "prompt-ms", "prompt-per-second" }
 
 -- Error replies in the Anthropic shape.
 local function anthropic_errors(responses)
@@ -694,6 +727,12 @@ local function operations()
 			responses = with({ ["200"] = reply("Images.", "application/json", ref("ImagesResponse"),
 			    IMAGE_HEADERS) }, E),
 		} },
+		["/embeddings"] = { POST = {
+			tag = "openai", summary = "Embeddings",
+			requestBody = json_body(ref("EmbeddingRequest")),
+			responses = with({ ["200"] = reply("A vector per input.", "application/json",
+			    ref("EmbeddingsResponse"), EMBEDDING_HEADERS) }, E),
+		} },
 		["/audio/speech"] = { POST = {
 			tag = "openai", summary = "Text to speech",
 			requestBody = json_body(ref("SpeechRequest")),
@@ -800,6 +839,7 @@ function M.document(routes)
 	responses_schemas(schemas)
 	image_schemas(schemas)
 	audio_schemas(schemas)
+	embedding_schemas(schemas)
 	systemone_schemas(schemas)
 	misc_schemas(schemas)
 	local paths = {}
