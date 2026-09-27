@@ -6,6 +6,7 @@
 local uv = require("luv")
 local lgml = require("lgml")
 local detect = require("lgml.detect")
+local kvpool = require("lgml.kvpool")
 
 local M = {}
 
@@ -161,10 +162,11 @@ local function place(r, spec, meta, budget)
 		local n = 0
 		if budget and budget < math.huge then
 			local per, fixed = cache_size(meta, spec)
+			local slots = math.max(1, math.tointeger(tonumber(spec.slots)) or kvpool.SEQS)
 			local ctx = math.tointeger(tonumber(spec.ctx)) or math.min(hp.n_ctx, placement.AUTO_CTX)
 			local mmproj = spec.mmproj and M.files(spec.mmproj) or 0
 			n = placement.auto(rules, tensors, hp.n_layer,
-			    budget - mmproj - M.MARGIN - fixed - per * ctx)
+			    budget - mmproj - M.MARGIN - fixed * slots - per * ctx)
 		end
 		rules.n_cpu_moe, rules.auto = n, nil
 		r.n_cpu_moe = n
@@ -180,7 +182,9 @@ end
 
 --- The memory estimate of a spec.
 -- It is the bytes of the model files and the mmproj, plus the KV cache
--- of a chat model, plus `MARGIN`. An image model (`lgml.image.engine`)
+-- of a chat model, plus `MARGIN`. The KV cache of a chat model is one
+-- pool of `ctx` cells that its slots share, plus the rings and
+-- recurrent states of each slot (`slots`, default `lgml.kvpool.SEQS`). An image model (`lgml.image.engine`)
 -- with a `text_backend` of another kind than its `backend` has two
 -- parts: the text encoder file plus `TEXT_MARGIN` goes in `extra`, under
 -- the kind of `text_backend`, and the other files in `files`. For a
@@ -195,7 +199,7 @@ end
 -- positions (default: at most `lgml.placement.AUTO_CTX`) fit; the
 -- result gives it as n_cpu_moe.
 -- @tparam table spec the model spec: `model`, `engine`, `stt`, `mmproj`,
--- `ctx`, `flash_attn`, `cache_type_k`, `cache_type_v`, `backend`,
+-- `ctx`, `slots`, `flash_attn`, `cache_type_k`, `cache_type_v`, `backend`,
 -- `text_backend`, `cpu_moe`, `n_cpu_moe`, `n_gpu_layers` and `override`
 -- @tparam[opt] number budget the memory budget in bytes of the kind of
 -- `backend`
@@ -223,15 +227,17 @@ function M.model(spec, budget, gpu)
 		if per then
 			local n = math.tointeger(tonumber(spec.ctx)) or n_train
 			if not spec.ctx and budget and budget < math.huge and per > 0 then
-				local fit = (budget - r.files - fixed - M.MARGIN) // per // 256 * 256
+				local slots = math.max(1, math.tointeger(tonumber(spec.slots)) or kvpool.SEQS)
+				local fit = (budget - r.files - fixed * slots - M.MARGIN) // per // 256 * 256
 				n = math.min(n, math.max(math.tointeger(fit) or 256, 256))
 			end
 			r.n_ctx = n
-			-- Each slot holds a cache; count every slot at its largest.
-			local slots = math.max(1, math.tointeger(tonumber(spec.slots)) or 1)
-			r.kv = (per * n + fixed) * slots
+			-- The slots share one pool of n cells; each slot has its own
+			-- rings and recurrent states.
+			local slots = math.max(1, math.tointeger(tonumber(spec.slots)) or kvpool.SEQS)
+			r.kv = per * n + fixed * slots
 			if cpu then
-				r.extra.cpu = r.extra.cpu + (cper * n + cfixed) * slots
+				r.extra.cpu = r.extra.cpu + cper * n + cfixed * slots
 			end
 		end
 	end

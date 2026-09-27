@@ -475,6 +475,8 @@ local function test_estimate()
 	local e = estimate.model({ model = path })
 	ok(e.n_ctx == 256 and e.files == size and e.kv == per * 256 + fixed and
 	    e.bytes == size + e.kv + estimate.MARGIN, "estimate: files, cache and margin")
+	e = estimate.model({ model = path, slots = 8 })
+	ok(e.kv == per * 256 + fixed * 8, "estimate: slots share the pool; each adds its fixed part")
 	per = model:cache_size({ type_k = "f32", type_v = "f16" })
 	e = estimate.model({ model = path, ctx = 128, cache_type_k = "f32" })
 	ok(e.n_ctx == 128 and e.kv == per * 128, "estimate: ctx and cache types")
