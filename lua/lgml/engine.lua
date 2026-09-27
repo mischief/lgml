@@ -59,6 +59,13 @@ local EMBD_KEEP = 8
 -- context to fit.
 local RESERVE = 1536 << 20
 
+-- The cancel test of a reply sink, as a plain function.
+local function cancel_of(sink)
+	return function()
+		return sink:cancelled()
+	end
+end
+
 -- The priority of a request: LOW for decisions, HIGH for a chat that
 -- asks to keep its prefix (prompt_cache_retention "24h"), else NORMAL.
 local function prio_of(req, decision)
@@ -549,17 +556,21 @@ function E:room_for(n)
 end
 
 -- Let the device go until a running request ends, then take it again
--- as `chat` does.
-function E:wait_room(st, req)
+-- as `chat` does. Returns false without the lock when the sink is
+-- cancelled.
+function E:wait_room(st, req, sink)
 	st.lock = false
 	self:release()
 	stream.await(function(done)
 		self.slot_waiting[#self.slot_waiting + 1] = done
 	end)
 	local _, key = self:lora_for(req.lora)
-	self:acquire_slot(key)
+	if not self:acquire_slot(key, cancel_of(sink)) then
+		return false
+	end
 	st.lock = true
 	self:set_lora(req.lora)
+	return true
 end
 
 --- Let a running request go and take it up again later.
@@ -615,7 +626,9 @@ function E:preempt(st, req, slot, rest, sink)
 		self.slot_waiting[#self.slot_waiting + 1] = done
 	end)
 	local _, key = self:lora_for(req.lora)
-	self:acquire_slot(key)
+	if not self:acquire_slot(key, cancel_of(sink)) then
+		return nil, nil
+	end
 	st.lock = true
 	self:set_lora(req.lora)
 	self.req_prio = prio_of(req)
@@ -628,14 +641,23 @@ function E:preempt(st, req, slot, rest, sink)
 	return self:own_slot(st), logits
 end
 
--- Wait for the slot. Requests queue in arrival order.
-function E:acquire()
+-- Wait for the slot. Requests queue in arrival order. With a cancel
+-- function, a cancelled request stops waiting: it passes a wake on to
+-- the next request and returns false.
+function E:acquire(cancelled)
 	while self.busy do
 		stream.await(function(done)
 			self.waiting[#self.waiting + 1] = done
 		end)
+		if cancelled and cancelled() then
+			if not self.busy then
+				self:release()
+			end
+			return false
+		end
 	end
 	self.busy = true
+	return true
 end
 
 function E:release()
@@ -667,18 +689,24 @@ function E:slot_freed()
 end
 
 -- Take the device lock with a free slot, and with no other request
--- decoding when the adapter scales must change. Returns with the lock.
-function E:acquire_slot(lora_key)
+-- decoding when the adapter scales must change. Returns true with the
+-- lock, or false without it when cancelled() turns true.
+function E:acquire_slot(lora_key, cancelled)
 	while true do
-		self:acquire()
+		if not self:acquire(cancelled) then
+			return false
+		end
 		local owned = self:owned()
 		if owned < #self.slots and (owned == 0 or lora_key == self.lora_key) then
-			return
+			return true
 		end
 		self:release()
 		stream.await(function(done)
 			self.slot_waiting[#self.slot_waiting + 1] = done
 		end)
+		if cancelled and cancelled() then
+			return false
+		end
 	end
 end
 
@@ -1336,6 +1364,9 @@ end
 -- @return the logits node of the last token, or nil when cancelled
 -- @treturn table the slot the request owns at the end
 function E:prefill_batched(st, req, slot, prompt, from, stops, sink)
+	if sink:cancelled() then
+		return nil, slot
+	end
 	local logits
 	local i, c = from, 1
 	while i <= #prompt do
@@ -1373,6 +1404,9 @@ function E:prefill_batched(st, req, slot, prompt, from, stops, sink)
 end
 
 function E:prefill(prompt, from, sink, extra)
+	if sink:cancelled() then
+		return nil
+	end
 	local logits
 	local i = from
 	-- Passes end at checkpoint positions.
@@ -1469,14 +1503,18 @@ function E:chat(req, sink)
 		return nil, "messages must be a non-empty array", 400
 	end
 	local st = { lock = true }
+	local got
 	if self.concurrent then
 		local scales, key = self:lora_for(req.lora)
 		if not scales then
 			return nil, key, 400
 		end
-		self:acquire_slot(key)
+		got = self:acquire_slot(key, cancel_of(sink))
 	else
-		self:acquire()
+		got = self:acquire(cancel_of(sink))
+	end
+	if not got then
+		return true
 	end
 	local lerr = self:set_lora(req.lora)
 	if lerr then
@@ -1518,14 +1556,19 @@ end
 -- @treturn[2] string an error message
 -- @treturn[2] int an HTTP status
 function E:decide(req, ctl)
+	local gone = ctl and ctl.cancelled
+	local got
 	if self.concurrent then
 		local scales, key = self:lora_for(req.lora)
 		if not scales then
 			return nil, key, 400
 		end
-		self:acquire_slot(key)
+		got = self:acquire_slot(key, gone)
 	else
-		self:acquire()
+		got = self:acquire(gone)
+	end
+	if not got then
+		return nil, "cancelled", 499
 	end
 	local lerr = self:set_lora(req.lora)
 	if lerr then
@@ -1814,7 +1857,9 @@ function E:run_prompt(req, sink, st)
 	-- waits for one of them to end.
 	while st and self.concurrent and self:owned() > 0 and not self:room_for(#prompt + 1) do
 		L:debug("pool full, prompt waits", "tokens", #prompt, "running", self:owned())
-		self:wait_room(st, req)
+		if not self:wait_room(st, req, sink) then
+			return true
+		end
 		cached = self:reuse(prompt)
 	end
 	L:debug("prefill", "tokens", #prompt, "cached", cached, "restored", self.pc and self.pc.restored or 0,

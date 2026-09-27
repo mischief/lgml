@@ -348,6 +348,31 @@ ok(kept > 400 and plain < kept, ("a high priority chat keeps its prefix (cached 
 ok(ek.slots[1].prio == require("lgml.kvpool").HIGH or ek.slot.prio == require("lgml.kvpool").HIGH,
     "the slot of the chat has high priority")
 
+
+-- A request that is cancelled while it waits for a slot leaves the
+-- queue at its turn. It computes nothing, and the next request runs.
+do
+	local ew = engine.new({ model = path, backend = "CPU", n_ctx = 1024, slots = 1, kv_initial = 256 })
+	local runs, run = 0, ew.run
+	ew.run = function(...)
+		runs = runs + 1
+		return run(...)
+	end
+	local fin = {}
+	local first = chat_async(ew, a, 20, fin)
+	local gone = chat_async(ew, b, 20, fin)
+	local stop = false
+	gone.sink.cancelled = function() return stop end
+	local after = chat_async(ew, "short prompt after", 4, fin)
+	stop = true
+	while #fin < 3 do
+		uv.run("once")
+	end
+	ok(gone.res == true and runs == 2 and #gone.text == 0,
+	    "a cancelled request that waits for a slot computes nothing")
+	ok(first.usage and after.usage and after.reason and ew:owned() == 0 and not ew.busy,
+	    "the requests before and after it run to the end")
+end
 os.remove(path)
 print("1.." .. n)
 os.exit(failed == 0 and 0 or 1)
