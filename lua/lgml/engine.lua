@@ -231,10 +231,16 @@ function M.new(opts)
 	if initial > 0 then
 		copts.initial = initial
 	end
-	local cache = model:cache(n_ctx, copts)
+	-- The slots are sequences of one KV pool when the model has one.
+	local n_slots = math.max(1, opts.slots or 1)
+	local pool = model.pool and model:pool(n_ctx * n_slots, copts)
+	local function new_cache()
+		return pool and model:seq(pool, { n_ctx = n_ctx }) or model:cache(n_ctx, copts)
+	end
+	local cache = new_cache()
 	local slots = { { cache = cache, tokens = {}, ckpts = {}, used = 0 } }
-	for i = 2, math.max(1, opts.slots or 1) do
-		slots[i] = { cache = model:cache(n_ctx, copts), tokens = {}, ckpts = {}, used = 0 }
+	for i = 2, n_slots do
+		slots[i] = { cache = new_cache(), tokens = {}, ckpts = {}, used = 0 }
 	end
 	local e = setmetatable({
 		slots = slots, slot = slots[1], tick = 0, pending = {}, slot_waiting = {},
@@ -242,7 +248,7 @@ function M.new(opts)
 		concurrent = #slots > 1 and model.batchable ~= nil and model:batchable(),
 		be = be, model = model, family = family, family_name = family_name,
 		tk = assert(tokenizer.open(opts.model)),
-		n_ctx = n_ctx, flash_attn = fa,
+		n_ctx = n_ctx, flash_attn = fa, pool = pool,
 		id = opts.id or info.meta["general.name"] or "lgml",
 		cache = cache, tokens = {},
 		busy = false, waiting = {}, adapters = adapters,
