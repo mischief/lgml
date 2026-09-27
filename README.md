@@ -142,8 +142,18 @@ cached with its cells until the pool needs it. A request whose prompt
 starts with known blocks shares them with no copy, even from another
 slot or after its own slot went to another client; a block that it
 shares only in part gives it a copy of those cells. Two clients with
-one system prompt hold it once. Models with recurrent states or rings
-do not start from cached blocks yet, since a block holds no state.
+one system prompt hold it once.
+
+A block holds no recurrent state (qwen35, qwen3next) and no ring
+(gemma4). For these models, the state checkpoints that a slot takes at
+turn starts (`--ctx-checkpoints`) also go to a state index in host RAM,
+keyed by the block that ends at or before the checkpoint and the
+tokens after it. A request can then start from cached blocks and the
+deepest checkpoint that its prompt matches; the cells between the last
+block edge and the checkpoint come from a copy of a cached block. The
+last partial block of such a slot stays cached when the slot lets it
+go, for that copy. The index shares the `--cache-ram` budget with the
+prompt store.
 
 When the pool has no free block, it takes cached blocks, the least
 recently used first and the last blocks of a prefix before the first

@@ -163,8 +163,9 @@ end
 -- - `id`: model id (default: the gguf `general.name`, or `"lgml"`)
 -- - `recipe`: a decision recipe for `decide`, from `lgml.decide.recipe`
 --   or a recipe file path (default `lgml.decide.default_recipe`)
--- - `cache_ram`: MiB of host RAM for the prompt store (default 8192; 0
---   turns it off, -1 means no limit); see `lgml.prompt_cache`
+-- - `cache_ram`: MiB of host RAM for the prompt store and the state
+--   index (default 8192; 0 turns them off, -1 means no limit); see
+--   `lgml.prompt_cache`
 -- - `kv_initial`: cells the KV pool gets at load (default 4096); the
 --   pool doubles when its sequences need more, up to `n_ctx`. 0 gives
 --   all `n_ctx` cells at load.
@@ -259,7 +260,8 @@ function M.new(opts)
 		be = be, model = model, family = family, family_name = family_name,
 		tk = assert(tokenizer.open(opts.model)),
 		n_ctx = n_ctx, flash_attn = fa, pool = pool,
-		-- Recurrent states and rings cannot start from shared blocks.
+		-- Recurrent states and rings need a checkpoint to start from
+		-- shared blocks.
 		fixed = model.recurrent or (cache.ring ~= nil and cache.ring < n_ctx),
 		id = opts.id or info.meta["general.name"] or "lgml",
 		cache = cache, tokens = {},
@@ -440,7 +442,7 @@ function E:evict_slot(s)
 		end
 	end
 	if s.key == self.lora_key then
-		self:publish(s.cache, s.tokens)
+		self:publish_tail(s.cache, s.tokens)
 	end
 	if pc and #s.tokens > 0 and s.key == self.lora_key then
 		local cache, ckpts = pc.cache, pc.ckpts
@@ -829,6 +831,9 @@ function E:reuse(prompt)
 	if self.pc then
 		n = span_start(prompt, self.pc:reuse(self, prompt, n))
 		old = self.tokens
+		if self.state_n and self.pc.restored == 0 then
+			self.pc.restored = self.state_n
+		end
 	end
 	local want = n
 	-- A sliding-window ring can lose the rows before n.
@@ -883,14 +888,10 @@ end
 -- gives a copy of those cells. Models with recurrent states or rings
 -- do not share: the blocks hold no state. Returns the tokens the slot
 -- holds.
-function E:attach(prompt, n)
-	local cache = self.cache
-	if not cache.pool or self.fixed then
-		return n
-	end
-	local B, alloc = cache.pool.block, cache.pool.alloc
-	-- At least one prompt token must run.
-	local max = #prompt - 1
+-- The cached blocks that hold the first full blocks of prompt, at most
+-- max tokens, and their keys.
+function E:cached_blocks(prompt, max)
+	local B, alloc = self.pool.block, self.pool.alloc
 	local blocks, keys = {}, {}
 	local parent = self:root_key()
 	while (#blocks + 1) * B <= max do
@@ -902,8 +903,128 @@ function E:attach(prompt, n)
 		blocks[#blocks + 1], keys[#keys + 1] = b, key
 		parent = key
 	end
+	return blocks, keys
+end
+
+-- Keep the partial last block of a pool sequence cached when the
+-- sequence lets it go, so a prompt that shares its tokens can copy it.
+-- Only models with recurrent states or rings keep it: a checkpoint
+-- there needs its cells. For other models it would crowd the pool with
+-- the ends of one-off requests.
+function E:publish_tail(cache, tokens)
+	if not cache.pool or not self.fixed then
+		return
+	end
+	self:publish(cache, tokens)
+	local B = cache.pool.block
+	local n = math.min(cache.n_past, #tokens)
+	local i = n // B + 1
+	if n % B ~= 0 and cache.blocks[i] and #cache.keys == i - 1 then
+		cache.pool.alloc:publish_part(cache.blocks[i], cache.keys[i - 1] or self:root_key(), i,
+		    table.move(tokens, (i - 1) * B + 1, n, 1, {}))
+	end
+end
+
+-- Put the newest checkpoint of a slot in the state index of the prompt
+-- cache, under the key of the pool block that ends at or before it.
+function E:share_state(cache, tokens, ckpts)
+	local ck = ckpts[#ckpts]
+	if not cache.pool or not ck or ck.n ~= cache.n_past or ck.n > #tokens then
+		return
+	end
+	self:publish(cache, tokens)
+	local B = cache.pool.block
+	local j = ck.n // B
+	local parent = j == 0 and self:root_key() or cache.keys[j]
+	if parent then
+		self.pc:add_state(parent, table.move(tokens, j * B + 1, ck.n, 1, {}), ck)
+	end
+end
+
+-- Start the active slot of a model with recurrent states or rings from
+-- cached blocks and a checkpoint of the state index, when that gives
+-- more than keep tokens. The cells from the last block edge to the
+-- checkpoint come from a cached block that shares them. Returns the
+-- tokens the slot holds, or nil. With save, the slot goes to the RAM
+-- store before it starts over.
+function E:attach_state(prompt, keep, save)
+	local pc, cache = self.pc, self.cache
+	if not pc or #pc.states == 0 then
+		return nil
+	end
+	local B, alloc = self.pool.block, self.pool.alloc
+	local max = #prompt - 1
+	local blocks, keys = self:cached_blocks(prompt, max)
+	for j = #blocks, 0, -1 do
+		local parent = j == 0 and self:root_key() or keys[j]
+		for _, s in ipairs(pc:find_states(parent, prompt, j * B + 1, max)) do
+			if s.n <= keep then
+				return nil
+			end
+			local part, kid, got = s.n - j * B, nil, 0
+			if part > 0 then
+				kid, got = alloc:longest_kid(parent, prompt, j * B + 1, part)
+			end
+			if got >= part then
+				if save then
+					pc:save(self)
+				end
+				self.model:truncate(cache, 0)
+				self.model:share(cache, table.move(blocks, 1, j, 1, {}), table.move(keys, 1, j, 1, {}))
+				if part > 0 then
+					alloc:ref(kid)
+					local ok, err = pcall(self.model.grow, self.model, cache, s.n)
+					if ok then
+						self.model.copy_block(cache.pool, kid, cache.blocks[j + 1], part)
+					end
+					alloc:unref(kid)
+					if not ok then
+						error(err, 0)
+					end
+				end
+				self.model:restore(cache, s.ck)
+				pc:adopt(s)
+				self.tokens = table.move(prompt, 1, s.n, 1, {})
+				self.slot.tokens = self.tokens
+				self.state_n = s.n
+				alloc.stats.hits = alloc.stats.hits + 1
+				alloc.stats.hit_blocks = alloc.stats.hit_blocks + j
+				L:debug("shared blocks and state", "blocks", j, "copied", part, "state", s.n, "slot_kept", keep)
+				return s.n
+			end
+		end
+	end
+	return nil
+end
+
+-- Share cached pool blocks that hold a longer prefix of prompt than the
+-- n tokens the active slot keeps. The slot then starts over on them. A
+-- cached block that shares only part of its tokens with the prompt
+-- gives a copy of those cells. A model with recurrent states or rings
+-- also needs a checkpoint from the state index; see `attach_state`.
+-- Returns the tokens the slot holds.
+function E:attach(prompt, n)
+	local cache = self.cache
+	self.state_n = nil
+	if not cache.pool then
+		return n
+	end
+	-- The slot's last partial block may go now; keep it cached.
+	if n < #self.tokens then
+		self:publish_tail(cache, self.tokens)
+	end
+	if self.fixed then
+		local keep = self.pc and self.pc:slot_keep(self, n) or 0
+		local save = self.pc and keep * 2 < #self.tokens
+		return self:attach_state(prompt, keep, save) or n
+	end
+	local B, alloc = cache.pool.block, cache.pool.alloc
+	-- At least one prompt token must run.
+	local max = #prompt - 1
+	local blocks, keys = self:cached_blocks(prompt, max)
 	local m = #blocks * B
-	local kid, part = alloc:longest_kid(parent, prompt, m + 1, math.min(B - 1, max - m))
+	local kid, part = alloc:longest_kid(keys[#keys] or self:root_key(), prompt, m + 1,
+	    math.min(B - 1, max - m))
 	if m + part <= n then
 		return n
 	end
@@ -965,6 +1086,7 @@ function E:checkpoint_slot(slot)
 	local pc = self.pc
 	if slot == self.slot then
 		pc:checkpoint()
+		self:share_state(slot.cache, slot.tokens, pc.ckpts)
 		return
 	end
 	local cache, ckpts = pc.cache, pc.ckpts
@@ -972,6 +1094,7 @@ function E:checkpoint_slot(slot)
 	pc:checkpoint()
 	slot.ckpts = pc.ckpts
 	pc.cache, pc.ckpts = cache, ckpts
+	self:share_state(slot.cache, slot.tokens, slot.ckpts)
 end
 
 --- Prefill a prompt on a slot that a request owns, in batched passes.
@@ -1018,6 +1141,9 @@ function E:prefill(prompt, from, sink)
 	local i = from
 	-- Passes end at checkpoint positions.
 	local stops, c = self.pc and self.pc:plan(prompt, from) or {}, 1
+	if self.pc then
+		self:share_state(self.cache, self.tokens, self.pc.ckpts)
+	end
 	while i <= #prompt do
 		local j = math.min(#prompt, i + UBATCH - 1)
 		if stops[c] and stops[c] <= j then
@@ -1051,6 +1177,7 @@ function E:prefill(prompt, from, sink)
 		self:publish(self.cache, self.tokens)
 		if j == stops[c] then
 			self.pc:checkpoint()
+			self:share_state(self.cache, self.tokens, self.pc.ckpts)
 			c = c + 1
 		end
 		i = j + 1
@@ -1454,6 +1581,9 @@ function E:run_prompt(req, sink, st)
 	local logits, slot
 	if st and self.concurrent and #images == 0 and cached < #prompt then
 		local stops = self.pc and self.pc:plan(prompt, cached + 1) or {}
+		if self.pc then
+			self:share_state(self.cache, self.tokens, self.pc.ckpts)
+		end
 		slot = self:own_slot(st)
 		logits = self:prefill_batched(slot, prompt, cached + 1, stops, sink)
 	else

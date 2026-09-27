@@ -103,7 +103,7 @@ local function build(arch)
 	kv[#kv + 1] = { "general.architecture", gguf.STRING, arch }
 	kv[#kv + 1] = { "general.name", gguf.STRING, "tiny " .. arch }
 	key(".block_count", gguf.UINT32, nl)
-	key(".context_length", gguf.UINT32, 256)
+	key(".context_length", gguf.UINT32, 4096)
 	key(".embedding_length", gguf.UINT32, E)
 	key(".feed_forward_length", gguf.UINT32, 2 * E)
 	key(".attention.head_count", gguf.UINT32, H)
@@ -675,12 +675,71 @@ local function drop_cached(e)
 	end
 end
 
+-- A hybrid chat whose slot went to other requests starts again from
+-- cached pool blocks and the checkpoint at its last turn start, from the
+-- state index. A checkpoint on a block edge serves as well.
+local function state_index_check(arch, path)
+	local engine = require("lgml.engine")
+	local tag = arch .. " state index: "
+	-- A pool with room above the shared blocks keeps the cells of each
+	-- sequence in position order, so logits compare with no error.
+	local e = engine.new({ model = path, backend = "CPU", n_ctx = 4096, flash_attn = false, slots = 2 })
+	local fresh = engine.new({ model = path, backend = "CPU", n_ctx = 1024, cache_ram = 0,
+	    ctx_checkpoints = 0, flash_attn = false, slots = 1 })
+	local sys = { role = "system", content = "You are a test. " .. long_text(7, 30) }
+	local u1 = { role = "user", content = long_text(8, 30) }
+	engine_chat(e, { sys, u1 })
+	-- Two other chats take both slots.
+	engine_chat(e, { { role = "user", content = long_text(9, 10) } })
+	engine_chat(e, { { role = "user", content = long_text(10, 10) } })
+	local k = last_start(e, { sys, u1 })
+	local held = false
+	for _, s in ipairs(e.slots) do
+		held = held or #s.tokens > k
+	end
+	ok(not held and #e.pc.states >= 1, ("%sno slot holds the chat; the index has %d checkpoints")
+	    :format(tag, #e.pc.states))
+	local loaded, hits = e.pc.stats.loaded, e.pool.alloc.stats.hits
+	local turn2 = { sys, u1, { role = "assistant", content = "not what it said" },
+	    { role = "user", content = long_text(11, 8) } }
+	local got, want, cached = prompt_logits(e, fresh, turn2)
+	ok(cached == k and e.pc.restored == k and e.pc.stats.loaded == loaded and e.pool.alloc.stats.hits > hits,
+	    ("%sturn 2 starts from cached blocks and the checkpoint at %d (cached %d, restored %d)")
+	    :format(tag, k, cached, e.pc.restored))
+	local d = maxdiff(got, want)
+	ok(d == 0, ("%sturn 2 logits equal a fresh prefill (max error %.3g)"):format(tag, d))
+
+	-- A checkpoint on a block edge: the index keys it by that block.
+	local text = e.family.render({ { role = "user", content = long_text(12, 60) } },
+	    { add_generation_prompt = true, enable_thinking = false })
+	local p = e.tk:encode(text)
+	local B = e.pool.block
+	-- A sequence of its own runs two blocks of it, keys them, and puts
+	-- its state there in the index; then it lets the blocks go.
+	local c2 = e.model:seq(e.pool)
+	local first = table.move(p, 1, 2 * B, 1, {})
+	require("lgml.replay").run(e.model, c2, first, { logits = "last" })
+	e:publish(c2, first)
+	e.pc:add_state(c2.keys[2], {}, e.model:snapshot(c2))
+	ok(#c2.keys == 2 and e.pool.alloc:lookup(c2.keys[2]) == c2.blocks[2], tag .. "two keyed blocks")
+	require("lgml.replay").drop(c2)
+	e.model:truncate(c2, 0)
+	-- Two other chats take both slots again.
+	engine_chat(e, { { role = "user", content = long_text(13, 10) } })
+	engine_chat(e, { { role = "user", content = long_text(14, 10) } })
+	got, want, cached = prompt_logits(e, fresh, { { role = "user", content = long_text(12, 60) .. " more" } })
+	ok(cached == 2 * B, ("%sa checkpoint on a block edge restores there (cached %d)"):format(tag, cached))
+	d = maxdiff(got, want)
+	ok(d == 0, ("%sits logits equal a fresh prefill (max error %.3g)"):format(tag, d))
+	e.pc:clear()
+end
+
 local function prompt_cache_check(arch, path)
 	local engine = require("lgml.engine")
 	local tag = arch .. " prompt cache: "
-	local fresh = engine.new({ model = path, backend = "CPU", n_ctx = 256, cache_ram = 0,
+	local fresh = engine.new({ model = path, backend = "CPU", n_ctx = 1024, cache_ram = 0,
 	    ctx_checkpoints = 0, flash_attn = false, slots = 1 })
-	local e = engine.new({ model = path, backend = "CPU", n_ctx = 256, flash_attn = false, slots = 1 })
+	local e = engine.new({ model = path, backend = "CPU", n_ctx = 1024, flash_attn = false, slots = 1 })
 	local sys = { role = "system", content = "You are a test. " .. long_text(1, 10) }
 	local u1 = { role = "user", content = long_text(2, 12) }
 	-- Turn 2 extends turn 1 up to its last turn start, then differs.
@@ -701,14 +760,10 @@ local function prompt_cache_check(arch, path)
 	ok(d == 0, ("%sturn 2 logits equal a fresh prefill (max error %.3g)"):format(tag, d))
 
 	-- Two conversations in turns: once the pool has lost their blocks,
-	-- the second visit restores from the store. Cells taken back from the
-	-- cache can be out of position order, which changes the rounding of
-	-- attention, so the first visits start with no cached blocks.
+	-- the second visit restores from the store.
 	local ua = { role = "user", content = long_text(4, 20) }
 	local ub = { role = "user", content = long_text(5, 20) }
-	drop_cached(e)
 	local ra1 = engine_chat(e, { sys, ua })
-	drop_cached(e)
 	engine_chat(e, { sys, ub })
 	drop_cached(e)
 	local ra2 = engine_chat(e, { sys, ua })
@@ -728,13 +783,10 @@ local function prompt_cache_check(arch, path)
 	drop_cached(e)
 	got, want = prompt_logits(e, fresh, { sys, ua })
 	d = maxdiff(got, want)
-	-- The pool of 4 blocks is full here: the restore takes blocks back
-	-- from the cache, out of position order, so a hybrid rounds
-	-- differently.
-	ok(d == 0 or (e.model.recurrent and d < 1e-5),
-	    ("%slogits after a store restore equal a fresh prefill (max error %.3g)"):format(tag, d))
+	ok(d == 0, ("%slogits after a store restore equal a fresh prefill (max error %.3g)"):format(tag, d))
 
-	-- A budget for about one entry: older entries go.
+	-- A budget for about one entry: older entries go. Store entries and
+	-- the checkpoints of the state index share it.
 	e.pc:clear()
 	local one = e.pc.bytes
 	engine_chat(e, { sys, ua })
@@ -743,8 +795,8 @@ local function prompt_cache_check(arch, path)
 	e.pc.ram = one * 3 // 2
 	local uc = { role = "user", content = long_text(6, 20) }
 	engine_chat(e, { sys, uc })
-	ok(#e.pc.store == 1 and e.pc.bytes <= e.pc.ram and e.pc.stats.evicted >= 1,
-	    ("%sthe budget evicts the oldest entry (%d bytes each)"):format(tag, one))
+	ok(#e.pc.store <= 1 and e.pc.bytes <= e.pc.ram and e.pc.stats.evicted >= 1,
+	    ("%sthe budget evicts the oldest entries (%d bytes each)"):format(tag, one))
 	drop_cached(e)
 	local r = engine_chat(e, { sys, ua })
 	ok(r.timings.restored_n < r.usage.prompt_tokens // 2, tag .. "an evicted prompt prefills again")
@@ -956,6 +1008,9 @@ for _, arch in ipairs({ "llama", "qwen3", "qwen3moe", "qwen3next", "qwen35moe", 
 	if arch == "qwen35moe" or arch == "qwen3" then
 		prompt_cache_check(arch, path)
 		concurrent_check(arch, path)
+	end
+	if arch == "qwen35moe" or arch == "qwen3next" then
+		state_index_check(arch, path)
 	end
 	if arch == "qwen3" then
 		grammar_engine_check(arch, path)

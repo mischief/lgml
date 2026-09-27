@@ -918,6 +918,44 @@ end
 
 -- The chat engine on the tiny model: a second request with the same
 -- first message reuses the cached prefix.
+-- A chat on a model with rings whose slot went to other requests
+-- starts again from cached pool blocks and a checkpoint of the state
+-- index, which holds the rings, and answers as a fresh engine does.
+local function ring_index_check()
+	local path = os.tmpname()
+	local kv, ts = build("dense")
+	for _, x in ipairs(kv) do
+		if x[1] == "gemma4.context_length" then
+			x[3] = 2048
+		end
+	end
+	gguf.write(path, kv, ts)
+	local engine = require("lgml.engine")
+	local e = engine.new({ model = path, backend = "CPU", n_ctx = 2048, slots = 2, flash_attn = false })
+	local fresh = engine.new({ model = path, backend = "CPU", n_ctx = 2048, slots = 1, cache_ram = 0,
+		ctx_checkpoints = 0, flash_attn = false })
+	local g = { temperature = 0 }
+	local words = {}
+	for i = 1, 120 do
+		words[i] = ("w%d"):format(i * 7 % 97)
+	end
+	local first = { role = "user", content = table.concat(words, " ") }
+	chat_on(e, { first }, g)
+	chat_on(e, { { role = "user", content = "one other chat" } }, g)
+	chat_on(e, { { role = "user", content = "and a third one" } }, g)
+	local turn2 = { first, { role = "assistant", content = "not what it said" },
+		{ role = "user", content = "more words here" } }
+	local hits = e.pool.alloc.stats.hits
+	local r = chat_on(e, turn2, g)
+	local want = chat_on(fresh, turn2, g)
+	ok(e.fixed and e.slots[1].cache.ring < 2048, "ring index: the model keeps rings per slot")
+	ok(r.usage.cached_tokens > 100 and e.pool.alloc.stats.hits > hits and #e.pc.states > 0,
+	    ("ring index: turn 2 starts from cached blocks and a checkpoint (cached %d of %d)")
+	    :format(r.usage.cached_tokens, r.usage.prompt_tokens))
+	ok(r.text == want.text, "ring index: turn 2 answers as a fresh engine")
+	os.remove(path)
+end
+
 local function engine_check(path)
 	local e = require("lgml.engine").new({ model = path, backend = "CPU", n_ctx = 96 })
 	require("lgml.server.engine").check(e)
@@ -1025,6 +1063,7 @@ for _, kind in ipairs({ "dense", "moe" }) do
 	end
 	if kind == "dense" then
 		engine_check(path)
+		ring_index_check()
 		vision_check()
 		decide_vision_check()
 	end
