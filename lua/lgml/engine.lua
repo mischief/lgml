@@ -1,8 +1,11 @@
 --- Chat engine for gguf text models.
 -- It serves `lgml.server.openai`; the interface is in
--- `lgml.server.engine`. One slot: requests run one at a time. The slot
--- keeps its KV cache and token list, so a request that shares a prefix
--- computes only the rest.
+-- `lgml.server.engine`. The engine keeps a few slots. A slot is one
+-- sequence of a shared KV pool, with its token list, so a request that
+-- shares a prefix with a slot computes only the rest. The pool holds
+-- n_ctx cells for all slots: a slot takes blocks of cells as its
+-- sequence grows, and an idle slot gives its blocks up when a running
+-- one needs them.
 -- With a vision encoder (`mmproj`), user messages can hold images. An
 -- image takes one prompt position for each of its embeddings. In the
 -- token list such a position is the string `"img:<sha256>:<i>"`, so
@@ -22,6 +25,7 @@ local replay = require("lgml.replay")
 local transformer = require("lgml.transformer")
 local decide = require("lgml.decide")
 local prompt_cache = require("lgml.prompt_cache")
+local kvpool = require("lgml.kvpool")
 local grammar = require("lgml.grammar")
 local lora = require("lgml.lora")
 local media = require("lgml.chat.media")
@@ -67,8 +71,9 @@ local THINK_END = {
 }
 
 -- The largest context, in steps of 256, whose cache fits in the free
--- memory of the model's device. nil when the device does not report it.
-local function fit_ctx(be, model, max, copts)
+-- memory of the model's device, with the per-sequence part for n_slots
+-- sequences. nil when the device does not report it.
+local function fit_ctx(be, model, max, copts, n_slots)
 	if not model.cache_size then
 		return nil
 	end
@@ -85,7 +90,7 @@ local function fit_ctx(be, model, max, copts)
 	if per == 0 then
 		return max
 	end
-	local n = (free - RESERVE - fixed) // per // 256 * 256
+	local n = (free - RESERVE - fixed * n_slots) // per // 256 * 256
 	return math.min(max, math.max(n, 256))
 end
 
@@ -113,7 +118,8 @@ end
 
 -- Set rules.n_cpu_moe to the fewest expert layers on the CPU so the
 -- weights and the cache of the wanted context fit in free device memory.
-local function auto_moe(be, rules, info, opts)
+-- The per-sequence part of the cache counts once per slot.
+local function auto_moe(be, rules, info, opts, n_slots)
 	local hp = transformer.config(info.meta)
 	local free
 	for _, d in ipairs(lgml.devices()) do
@@ -136,7 +142,7 @@ local function auto_moe(be, rules, info, opts)
 			local st = require("luv").fs_stat(opts.mmproj)
 			mmproj = st and st.size or 0
 		end
-		n = placement.auto(rules, info.tensors, hp.n_layer, free - RESERVE - mmproj - fixed - per * ctx)
+		n = placement.auto(rules, info.tensors, hp.n_layer, free - RESERVE - mmproj - fixed * n_slots - per * ctx)
 	end
 	L:info("n_cpu_moe auto", "n_cpu_moe", n, "free_mib", free and free // 1048576)
 	rules.n_cpu_moe, rules.auto = n, nil
@@ -149,7 +155,8 @@ end
 -- - `backend`: backend name (default: the best one)
 -- - `threads`: CPU thread count (default: `lgml.threads()`)
 -- - `n_ctx`: context size (default: the model's, or less so the cache
---   fits in free device memory; at most the model's)
+--   fits in free device memory; at most the model's). It is the size of
+--   the KV pool that all slots share, and the most tokens of one request.
 -- - `flash_attn`: false to use soft_max attention (default true)
 -- - `cache_type_k`, `cache_type_v`: KV cache types from `lgml.kv`
 --   (default q8_0 with flash attention when the head size fits, else f16)
@@ -158,12 +165,15 @@ end
 --   or a recipe file path (default `lgml.decide.default_recipe`)
 -- - `cache_ram`: MiB of host RAM for the prompt store (default 8192; 0
 --   turns it off, -1 means no limit); see `lgml.prompt_cache`
--- - `kv_initial`: rows the full-attention KV cache gets at load
---   (default 4096); the cache grows when a prompt needs more, up to
---   `n_ctx`. 0 gives all `n_ctx` rows at load.
--- - `slots`: KV caches kept on the device (default 1). Each request
---   takes the slot that shares the longest prefix with its prompt, so
---   clients that take turns keep their caches; see `E:pick_slot`.
+-- - `kv_initial`: cells the KV pool gets at load (default 4096); the
+--   pool doubles when its sequences need more, up to `n_ctx`. 0 gives
+--   all `n_ctx` cells at load.
+-- - `slots`: the most sequences the engine keeps (default
+--   `lgml.kvpool.SEQS`, 4). Each request takes the slot that shares the
+--   longest prefix with its prompt, so clients that take turns keep
+--   their caches; see `E:pick_slot`. Slots share the pool, so a slot
+--   costs only its recurrent states and rings, not n_ctx cells. With
+--   two or more, requests run at the same time in batched passes.
 -- - `ctx_checkpoints`: the most state checkpoints per slot, for models
 --   with recurrent layers or a sliding ring (default 8; 0 turns them off)
 -- - `lora`: LoRA adapters, a list of { path, scale } (scale default 1);
@@ -194,8 +204,9 @@ function M.new(opts)
 		rules = nil
 	end
 	local be = assert(lgml.backend(opts.backend, { threads = opts.threads, cpu = rules ~= nil }))
+	local n_slots = math.max(1, opts.slots or kvpool.SEQS)
 	if rules and rules.auto then
-		auto_moe(be, rules, info, opts)
+		auto_moe(be, rules, info, opts, n_slots)
 	end
 	local model = (transformer.supports(arch) and transformer or require("lgml." .. arch))
 	    .load(be, opts.model, rules and {
@@ -217,7 +228,7 @@ function M.new(opts)
 	end
 	local n_ctx = math.min(opts.n_ctx or model.hp.n_ctx, model.hp.n_ctx)
 	if not opts.n_ctx then
-		n_ctx = fit_ctx(be, model, n_ctx, copts) or n_ctx
+		n_ctx = fit_ctx(be, model, n_ctx, copts, n_slots) or n_ctx
 		if n_ctx < model.hp.n_ctx then
 			L:info("context cut to fit free device memory", "n_ctx", n_ctx, "n_ctx_train", model.hp.n_ctx)
 		end
@@ -232,8 +243,7 @@ function M.new(opts)
 		copts.initial = initial
 	end
 	-- The slots are sequences of one KV pool when the model has one.
-	local n_slots = math.max(1, opts.slots or 1)
-	local pool = model.pool and model:pool(n_ctx * n_slots, copts)
+	local pool = model.pool and model:pool(n_ctx, copts)
 	local function new_cache()
 		return pool and model:seq(pool, { n_ctx = n_ctx }) or model:cache(n_ctx, copts)
 	end
@@ -261,6 +271,11 @@ function M.new(opts)
 	e.eog = {}
 	for _, id in ipairs(e.tk:special().eog or {}) do
 		e.eog[id] = true
+	end
+	if pool then
+		pool.pressure = function(_, want)
+			e:pool_pressure(want)
+		end
 	end
 	e:set_lora()
 	if opts.mmproj then
@@ -394,8 +409,103 @@ function E:set_lora(list)
 		error(self.model.hp.arch .. ": this model takes no adapters")
 	end
 	self.lora_key = key
-	self.tokens, self.cache.n_past = {}, 0
+	self.tokens = {}
+	self:clear_cache(self.cache)
 	return nil
+end
+
+-- Empty a slot's cache: no positions, and no pool blocks.
+function E:clear_cache(cache)
+	cache.n_past = 0
+	if cache.pool then
+		self.model:truncate(cache, 0)
+	end
+	if self.model.rewind then
+		self.model:rewind(cache, 0)
+	end
+end
+
+-- Empty an idle slot so the pool gets its blocks back. With a prompt
+-- store, the slot goes there first, so a later request can restore it;
+-- the store keeps only slots of the current adapter scales.
+function E:evict_slot(s)
+	local pc = self.pc
+	local active = s == self.slot
+	if active then
+		s.tokens = self.tokens
+		if pc then
+			s.ckpts = pc.ckpts
+		end
+	end
+	if pc and #s.tokens > 0 and s.key == self.lora_key then
+		local cache, ckpts = pc.cache, pc.ckpts
+		pc.cache, pc.ckpts = s.cache, s.ckpts
+		pc:save({ tokens = s.tokens })
+		pc.cache, pc.ckpts = cache, ckpts
+	end
+	if pc then
+		pc:drop(s.ckpts)
+	end
+	L:debug("slot evicted", "index", self:slot_index(s), "tokens", #s.tokens, "blocks", #s.cache.blocks)
+	s.tokens = {}
+	if active then
+		self.tokens = s.tokens
+	end
+	self:clear_cache(s.cache)
+	self.evictions = (self.evictions or 0) + 1
+end
+
+-- The pool has no free block for want (a sequence that runs now):
+-- empty idle slots, the least recently used first, until a block is
+-- free. Slots that requests use keep their blocks.
+function E:pool_pressure(want)
+	local list = {}
+	for _, s in ipairs(self.slots) do
+		if s.cache ~= want and not s.owner and #s.cache.blocks > 0 then
+			list[#list + 1] = s
+		end
+	end
+	table.sort(list, function(a, b)
+		return a.used < b.used
+	end)
+	local alloc = self.pool.alloc
+	for _, s in ipairs(list) do
+		self:evict_slot(s)
+		if alloc.used < alloc.cap then
+			return
+		end
+	end
+end
+
+-- True when the pool can give the active slot room for n positions:
+-- its free blocks and the blocks of idle slots.
+function E:room_for(n)
+	local cache = self.cache
+	if not cache.pool then
+		return true
+	end
+	local B, a = self.pool.block, self.pool.alloc
+	local room = a.n - a.used
+	for _, s in ipairs(self.slots) do
+		if s ~= self.slot and not s.owner then
+			room = room + #s.cache.blocks
+		end
+	end
+	return (n + B - 1) // B - #cache.blocks <= room
+end
+
+-- Let the device go until a running request ends, then take it again
+-- as `chat` does.
+function E:wait_room(st, req)
+	st.lock = false
+	self:release()
+	stream.await(function(done)
+		self.slot_waiting[#self.slot_waiting + 1] = done
+	end)
+	local _, key = self:lora_for(req.lora)
+	self:acquire_slot(key)
+	st.lock = true
+	self:set_lora(req.lora)
 end
 
 -- Wait for the slot. Requests queue in arrival order.
@@ -537,18 +647,29 @@ function E:flush()
 		self:release()
 		return
 	end
-	local caches, ids = {}, {}
-	for i, e in ipairs(list) do
-		caches[i], ids[i] = e.slot.cache, e.ids
+	-- Take the pool blocks of each step first: a step that gets none
+	-- fails alone.
+	local caches, ids, run = {}, {}, {}
+	for _, e in ipairs(list) do
+		local c = e.slot.cache
+		local good, err = pcall(self.model.grow, self.model, c, math.min(c.n_ctx, c.n_past + #e.ids))
+		if good then
+			run[#run + 1] = e
+			caches[#run], ids[#run] = c, e.ids
+		else
+			e.err = err
+		end
 	end
-	local ok, rows
+	local all = list
+	list = run
+	local ok, rows = true, {}
 	if #list == 1 then
 		-- One request: its slot's own replayed graph is the fast path.
 		ok, rows = pcall(function()
 			return { replay.run(self.model, caches[1], ids[1],
 			    { logits = "last", flash_attn = self.flash_attn }) }
 		end)
-	else
+	elseif #list > 1 then
 		ok, rows = pcall(self.model.run_batch, self.model, caches, ids,
 		    { flash_attn = self.flash_attn })
 	end
@@ -567,6 +688,8 @@ function E:flush()
 		else
 			e.err = rows
 		end
+	end
+	for _, e in ipairs(all) do
 		e.done()
 	end
 end
@@ -667,7 +790,8 @@ function E:pick_slot(prompt)
 		if self.pc then
 			self.pc:trim(-1)
 		end
-		self.tokens, self.cache.n_past, best.key = {}, 0, self.lora_key
+		self.tokens, best.key = {}, self.lora_key
+		self:clear_cache(self.cache)
 	end
 	best.used = self.tick
 	return best
@@ -711,6 +835,9 @@ function E:reuse(prompt)
 		n = self.pc:back(self, want)
 	end
 	self.cache.n_past = n
+	if self.cache.pool then
+		self.model:truncate(self.cache, n)
+	end
 	for i = #old, n + 1, -1 do
 		old[i] = nil
 	end
@@ -891,12 +1018,14 @@ function E:chat(req, sink)
 		-- The cache may not match the token list now.
 		local slot = st.slot
 		if slot then
-			slot.tokens, slot.cache.n_past = {}, 0
+			slot.tokens = {}
+			self:clear_cache(slot.cache)
 			if slot == self.slot then
 				self.tokens = slot.tokens
 			end
 		else
-			self.tokens, self.cache.n_past = {}, 0
+			self.tokens = {}
+			self:clear_cache(self.cache)
 		end
 	end
 	self:end_request(st)
@@ -936,7 +1065,8 @@ function E:decide(req, ctl)
 	local ok, a, b, c = pcall(decide.run, self, req, ctl)
 	self:drop_images()
 	if not ok then
-		self.tokens, self.cache.n_past = {}, 0
+		self.tokens = {}
+		self:clear_cache(self.cache)
 	end
 	self:release()
 	if not ok then
@@ -1208,6 +1338,13 @@ function E:run_prompt(req, sink, st)
 
 	local t0 = lgml.clock()
 	local cached = self:reuse(prompt)
+	-- A prompt that the pool cannot hold next to the running requests
+	-- waits for one of them to end.
+	while st and self.concurrent and self:owned() > 0 and not self:room_for(#prompt + 1) do
+		L:debug("pool full, prompt waits", "tokens", #prompt, "running", self:owned())
+		self:wait_room(st, req)
+		cached = self:reuse(prompt)
+	end
 	L:debug("prefill", "tokens", #prompt, "cached", cached, "restored", self.pc and self.pc.restored or 0,
 	    "compute", #prompt - cached)
 	if sink.prompt and not sink:prompt(#prompt, cached) then
@@ -1269,11 +1406,21 @@ function E:run_prompt(req, sink, st)
 		if n >= max then
 			break
 		end
+		local good, lg
 		if slot then
-			logits = self:decode_step(slot, id)
+			good, lg = pcall(self.decode_step, self, slot, id)
 		else
-			logits = self:eval({ id })
+			good, lg = pcall(self.eval, self, { id })
 		end
+		if not good then
+			-- Other requests hold the rest of the pool: the reply ends.
+			if not tostring(lg):find("kv pool full", 1, true) then
+				error(lg, 0)
+			end
+			L:info("kv pool full; the reply ends", "tokens", n)
+			break
+		end
+		logits = lg
 		toks[#toks + 1] = id
 		stream.sleep(0)
 		if sink:cancelled() then

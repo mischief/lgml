@@ -10,6 +10,9 @@ local M = {}
 local P = {}
 P.__index = P
 
+--- The default count of sequences an engine keeps (`slots`).
+M.SEQS = 4
+
 --- Make the bookkeeping of a pool.
 -- @tparam table opts `blocks` (the count), `size` (cells per block)
 -- and `cap` (usable blocks now, default all)

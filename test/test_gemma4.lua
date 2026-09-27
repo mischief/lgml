@@ -670,7 +670,7 @@ local function vision_check()
 	gguf.write(path, kv, ts)
 	local mkv, mts = tiny.build(E)
 	gguf.write(mpath, mkv, mts)
-	local e = require("lgml.engine").new({ model = path, backend = "CPU", n_ctx = 96,
+	local e = require("lgml.engine").new({ model = path, backend = "CPU", n_ctx = 96, slots = 1,
 		mmproj = mpath, image_min_tokens = 1, image_max_tokens = 6 })
 	local function url(seed)
 		local t <close> = e.be:tensor("f32", { 1, 3, 12, 18 })

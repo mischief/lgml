@@ -254,6 +254,14 @@ function P:trim(n)
 	end
 end
 
+--- Free a list of checkpoints of a slot that is not the active one.
+-- @tparam {table,...} list the checkpoints; the call empties it
+function P:drop(list)
+	while #list > 0 do
+		release(table.remove(list))
+	end
+end
+
 --- Take a checkpoint at cache.n_past, unless one is there.
 -- Past the limit, it drops the oldest but the first: the first one
 -- often ends a system prompt that other conversations share.

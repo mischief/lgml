@@ -612,13 +612,14 @@ end
 -- a restore must give them exactly.
 -- Concurrent chats on a two-slot engine: the prompts prefill and decode
 -- in batched passes and give the same replies as one engine per chat.
+-- The two chats fit the pool of 256 cells together.
 local function concurrent_check(arch, path)
 	local engine = require("lgml.engine")
 	local uv = require("luv")
 	local convs = {
-		{ { role = "system", content = "You are a test. " .. long_text(4, 40) },
-		  { role = "user", content = long_text(5, 20) } },
-		{ { role = "user", content = long_text(6, 30) } },
+		{ { role = "system", content = "You are a test. " .. long_text(4, 12) },
+		  { role = "user", content = long_text(5, 8) } },
+		{ { role = "user", content = long_text(6, 20) } },
 	}
 	local want = {}
 	for i, m in ipairs(convs) do
