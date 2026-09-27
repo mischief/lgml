@@ -153,6 +153,9 @@ if lua_bin.found()
       'LGML_TOK_GEMMA4' : get_option('tok_gemma4') }, timeout : 60)
   test('nd', lua_bin, args : [files('test/test_nd.lua')], timeout : 120)
   test('router', lua_bin, args : [files('test/test_router.lua')], timeout : 30)
+  test('embeddings', lua_bin, args : [files('test/test_embeddings.lua')],
+    env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
+    timeout : 120)
   # LGML_SYSTEMONE_MODEL (a chat gguf) from the environment adds real-model checks.
   test('systemone', lua_bin, args : [files('test/test_systemone.lua')], timeout : 600)
   test('worker', lua_bin, args : [files('test/test_worker.lua')], timeout : 60)
@@ -215,6 +218,10 @@ if lua_bin.found()
   test('diffusion_gemma_model', lua_bin, args : [files('test/test_diffusion_gemma_model.lua')],
     suite : 'model', env : { 'LGML_THREADS' : '' },
     is_parallel : false, timeout : 3600)
+  # LGML_EMBED_MODEL (a Qwen3-Embedding gguf) and LGML_BACKEND come from the environment.
+  test('embeddings_model', lua_bin, args : [files('test/test_embeddings_model.lua')],
+    suite : 'model', env : { 'LGML_THREADS' : '' },
+    is_parallel : false, timeout : 600)
   # LGML_ZIMAGE (a directory with the Z-Image files) comes from the environment.
   test('zimage_model', lua_bin, args : [files('test/test_zimage_model.lua')],
     suite : 'model', env : { 'LGML_THREADS' : '' },

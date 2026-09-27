@@ -53,7 +53,8 @@ end
 -- ("q8_0" or "q4_0") stores the 2-D weights of the layers quantized.
 -- opts.tied leaves out output.weight. opts.n_ctx sets the context length
 -- (default 256). opts.override gives f32 values
--- by tensor name in place of the random ones. Returns the tensors, { name =
+-- by tensor name in place of the random ones. opts.kv adds metadata
+-- entries { name, type, value }. Returns the tensors, { name =
 -- { shape, values } }, for tests that compute by hand.
 function M.write(path, arch, opts)
 	opts = opts or {}
@@ -136,6 +137,9 @@ function M.write(path, arch, opts)
 		w(p .. "ffn_gate.weight", { F, E })
 		w(p .. "ffn_up.weight", { F, E })
 		w(p .. "ffn_down.weight", { E, F })
+	end
+	for _, e in ipairs(opts.kv or {}) do
+		kv[#kv + 1] = e
 	end
 	gguf.write(path, kv, ts)
 	return byname, nv

@@ -163,6 +163,15 @@ local function test_fields()
 	end
 	ok(gen.prompt and gen.size and edit.image, "image prompt, size and input image")
 
+	local names = {}
+	for _, c in ipairs(openai.EMBEDDING_FIELDS) do
+		names[c[1]] = true
+	end
+	ok(sorted(props("EmbeddingRequest")) == sorted(names) and
+	    schemas.EmbeddingRequest.additionalProperties == false and
+	    list(schemas.EmbeddingRequest.required) == "input", "EmbeddingRequest fields")
+	ok(list(props("EmbeddingRequest").encoding_format.enum) == "base64,float", "embedding formats")
+
 	ok(list(props("SpeechRequest").response_format.enum) == sorted(openai.SPEECH_FORMATS), "speech formats")
 	ok(list(props("TranscriptionRequest").response_format.enum) == sorted(openai.TRANSCRIPTION_FORMATS),
 	    "transcription formats")
