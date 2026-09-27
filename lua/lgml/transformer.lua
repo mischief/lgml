@@ -1795,7 +1795,8 @@ end
 -- them.
 -- @param g the graph
 -- @tparam table inp inputs from `inputs`
--- @return logits (n, n_vocab), or (1, n_vocab) when inp.logits is "last";
+-- @return logits (n, n_vocab), or (1, n_vocab) when inp.logits is "last",
+-- or one row per entry of the i32 leaf inp.logit_rows when it is "rows";
 -- with inp.hidden, the hidden state (n, n_embd) after that many layers;
 -- with inp.pool "last", the normed hidden state (1, n_embd) of the last
 -- token; with inp.pool "rows", the normed hidden states (m, n_embd) of
@@ -1843,7 +1844,9 @@ function M:forward(g, inp)
 			return x, taps
 		end
 	end
-	if (inp.logits == "last" or inp.pool == "last") and n > 1 then
+	if inp.logits == "rows" then
+		x = g:get_rows(x, inp.logit_rows)
+	elseif (inp.logits == "last" or inp.pool == "last") and n > 1 then
 		local row = lgml.row_size("f32", hp.n_embd)
 		x = g:view(x, { 1, hp.n_embd }, nil, (n - 1) * row)
 	end
@@ -1996,7 +1999,7 @@ function M:batch_inputs(caches, ids, opts)
 	for _, L in ipairs(self.layers) do
 		attn = attn or not L.recr
 	end
-	local inp = { flash_attn = opts.flash_attn, logits = "all", causal = true, batch = {}, pools = {} }
+	local inp = { flash_attn = opts.flash_attn, logits = "rows", causal = true, batch = {}, pools = {} }
 	for i, c in ipairs(caches) do
 		assert(c.pool, "batch_inputs: a batch runs pool sequences")
 		local n = #ids[i]
@@ -2020,6 +2023,12 @@ function M:batch_inputs(caches, ids, opts)
 	inp.n = N
 	inp.ids = be:tensor("i32", { N })
 	inp.pos = be:tensor("i32", { N })
+	-- Only the last token of each sequence needs logits.
+	local last = {}
+	for i, b in ipairs(inp.batch) do
+		last[i] = b.off + b.n - 1
+	end
+	inp.logit_rows = be:tensor("i32", { #last }, last)
 	fill_batch(hp, inp, ids)
 	return inp
 end
@@ -2075,8 +2084,8 @@ function M:run_batch(caches, ids, opts)
 		r = { key = key, g = g, inp = inp, rows = {}, pools = inp.pools }
 		local V = out:shape()[2]
 		local rb = lgml.row_size("f32", V)
-		for i, b in ipairs(inp.batch) do
-			r.rows[i] = g:cont(g:view(out, { 1, V }, nil, (b.off + b.n - 1) * rb))
+		for i in ipairs(inp.batch) do
+			r.rows[i] = g:cont(g:view(out, { 1, V }, nil, (i - 1) * rb))
 		end
 		self.batch_replay = r
 	end
