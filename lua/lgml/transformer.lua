@@ -324,6 +324,8 @@ end
 -- opts.placement: rules from `lgml.placement.rules`; the weights they
 -- place on the CPU load to `be:cpu()`, and so do the caches of layers
 -- whose attn_norm is there (default: all on be).
+-- opts.pinned: false to put those CPU weights in plain memory, not in
+-- pinned host memory of the device (default true).
 -- @treturn Model the model
 -- @raise when the file does not open, a weight is missing, the
 -- architecture is not supported, or the placement moves weights and be
@@ -336,7 +338,7 @@ function M.load(be, path, opts)
 	if cpu and not be:cpu() then
 		error(path .. ": the placement moves weights to the CPU; open the backend with cpu = true")
 	end
-	local w = assert(be:load(path, cpu and { cpu = cpu }))
+	local w = assert(be:load(path, cpu and { cpu = cpu, pinned = opts.pinned }))
 	local function get(name)
 		return assert(w:get(name), name)
 	end

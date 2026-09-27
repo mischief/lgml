@@ -102,6 +102,15 @@ local function on_cpu(name)
 	return true
 end
 
+-- The device type of a backend: "gpu", "igpu", "cpu" or nil.
+local function dev_type(be)
+	for _, d in ipairs(lgml.devices()) do
+		if d.name == be:name() then
+			return d.type
+		end
+	end
+end
+
 -- Set rules.n_cpu_moe to the fewest expert layers on the CPU so the
 -- weights and the cache of the wanted context fit in free device memory.
 local function auto_moe(be, rules, info, opts)
@@ -189,7 +198,12 @@ function M.new(opts)
 		auto_moe(be, rules, info, opts)
 	end
 	local model = (transformer.supports(arch) and transformer or require("lgml." .. arch))
-	    .load(be, opts.model, rules and { placement = rules } or nil)
+	    .load(be, opts.model, rules and {
+		placement = rules,
+		-- An integrated GPU shares RAM with the CPU, so pinned memory
+		-- gives no speed, and it counts against the GPU memory limit.
+		pinned = dev_type(be) ~= "igpu",
+	    } or nil)
 	if rules then
 		local dev, host = model.w:size()
 		L:info("weights placed", "device_mib", dev // 1048576, "cpu_mib", host // 1048576,
