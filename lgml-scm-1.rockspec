@@ -18,6 +18,8 @@ dependencies = {
 }
 build = {
 	type = "command",
-	build_command = "meson setup build-rock --prefix=$(PREFIX) --buildtype=release && meson compile -C build-rock",
+	-- werror off: other compilers warn on other lines.
+	build_command = "rm -rf build-rock && meson setup build-rock --prefix=$(PREFIX) --bindir=$(BINDIR) " ..
+		"-Dlua_dir=$(LUADIR) -Dlua_cdir=$(LIBDIR) -Dwerror=false && meson compile -C build-rock",
 	install_command = "meson install -C build-rock",
 }

@@ -63,6 +63,15 @@ jpeg = dependency('libjpeg', default_options : wrap_opts)
 # utf8proc: Unicode NFC for tokenizer.json normalizers. Its tests fetch data at build time.
 utf8proc = dependency('libutf8proc', default_options : wrap_opts + ['tests=disabled'])
 
+lua_dir = get_option('lua_dir')
+if lua_dir == ''
+  lua_dir = get_option('prefix') / 'share' / 'lua' / '5.4'
+endif
+lua_cdir = get_option('lua_cdir')
+if lua_cdir == ''
+  lua_cdir = get_option('prefix') / 'lib' / 'lua' / '5.4'
+endif
+
 lgml = shared_module('lgml',
   'src/lgml.c',
   'src/ops_orpheus.c',
@@ -84,8 +93,12 @@ lgml = shared_module('lgml',
   dependencies : [ggml, lua, m, png, jpeg, utf8proc],
   name_prefix : '',
   install : true,
-  install_dir : get_option('prefix') / 'lib' / 'lua' / '5.4',
+  install_dir : lua_cdir,
 )
+
+install_subdir('lua/lgml', install_dir : lua_dir)
+install_data('bin/lgml-server', 'bin/lgml-worker', 'bin/lgml-repl', 'bin/lgml-finetune',
+  install_dir : get_option('bindir'), install_mode : 'rwxr-xr-x')
 
 # Rock dependencies install into lua_modules (see lgml-scm-1.rockspec).
 rocks = meson.current_source_dir() / 'lua_modules'

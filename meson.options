@@ -16,3 +16,7 @@ option('tok_gemma4', type : 'string', value : '',
   description : 'Gemma-4 gguf for tokenizer special token tests (reads metadata only); empty skips them')
 option('ggml', type : 'combo', choices : ['auto', 'system', 'subproject'], value : 'auto',
   description : 'ggml from the system, or built from subprojects/ggml.wrap; auto: the system one when found')
+option('lua_dir', type : 'string', value : '',
+  description : 'install directory of the Lua modules; empty: <prefix>/share/lua/5.4')
+option('lua_cdir', type : 'string', value : '',
+  description : 'install directory of the C module; empty: <prefix>/lib/lua/5.4')
