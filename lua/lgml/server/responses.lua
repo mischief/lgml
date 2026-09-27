@@ -152,8 +152,8 @@ M.FIELDS = {
 	{ "max_tool_calls", "number", int_in(1), "a positive integer", status = "no-op", label = "OpenAI" },
 	{ "prompt_cache_key", "string", status = "no-op", label = "OpenAI" },
 	{ "prompt_cache_options", "table", cache_options, "an object", status = "no-op", label = "OpenAI" },
-	{ "prompt_cache_retention", "string", one_of("in_memory", "24h"), "in_memory or 24h", status = "no-op",
-	    label = "OpenAI" },
+	{ "prompt_cache_retention", "string", one_of("in_memory", "24h"), "in_memory or 24h",
+	    status = "supported", label = "OpenAI" },
 	{ "safety_identifier", "string", status = "no-op", label = "OpenAI" },
 	{ "user", "string", status = "no-op", label = "OpenAI" },
 	{ "service_tier", "string", one_of("auto", "default", "flex", "scale", "priority", "fast", "ultrafast"),
@@ -676,6 +676,7 @@ function M.translate(body, ctx, history)
 		end
 	end
 	chat.parallel_tool_calls = body.parallel_tool_calls
+	chat.prompt_cache_retention = body.prompt_cache_retention
 	chat.temperature, chat.top_p = body.temperature, body.top_p
 	chat.max_completion_tokens = body.max_output_tokens
 	local param, code

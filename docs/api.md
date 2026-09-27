@@ -255,7 +255,7 @@ usage, the event stream framing and the tool call fragments.
 | `store` | OpenAI | no-op | The server stores nothing. |
 | `service_tier` | OpenAI | no-op | `auto`, `default`, `flex`, `scale`, `priority` or `fast`. |
 | `prompt_cache_key` | OpenAI | no-op | The server reuses each shared prompt prefix; see `timings.cache_n`. |
-| `prompt_cache_retention` | OpenAI | no-op | `in_memory` or `24h`. |
+| `prompt_cache_retention` | OpenAI | supported | `in_memory` or `24h`. `24h` gives the request high priority in the KV pool: its cached prefix goes last, and other requests wait for it when the pool is full. |
 | `prompt_cache_options` | OpenAI | no-op | `mode` and `ttl`. |
 | `prediction` | OpenAI | no-op | The reply is the same without it. |
 | `verbosity` | OpenAI | rejected | Only `medium`. |
@@ -853,7 +853,7 @@ the replies.
 | `max_tool_calls` | OpenAI | no-op | It limits built-in tools, which lgml does not have. |
 | `prompt_cache_key` | OpenAI | no-op | The server reuses each shared prompt prefix. |
 | `prompt_cache_options` | OpenAI | no-op | `prewarm: true` gives 400. |
-| `prompt_cache_retention` | OpenAI | no-op | `in_memory` or `24h`. |
+| `prompt_cache_retention` | OpenAI | supported | `in_memory` or `24h`; as for chat completions. |
 | `safety_identifier` | OpenAI | no-op | A string. |
 | `user` | OpenAI | no-op | A string. |
 | `service_tier` | OpenAI | no-op | The response has `service_tier: "default"`. |

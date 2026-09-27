@@ -475,7 +475,7 @@ M.FIELDS = {
 	    "auto, default, flex, scale, priority or fast", status = "no-op", label = "OpenAI" },
 	{ "prompt_cache_key", "string", status = "no-op", label = "OpenAI" },
 	{ "prompt_cache_retention", "string", one_of("in_memory", "24h"), "in_memory or 24h",
-	    status = "no-op", label = "OpenAI" },
+	    status = "supported", label = "OpenAI" },
 	{ "prompt_cache_options", "table", prompt_cache_options,
 	    "an object with mode (implicit or explicit) and ttl (30m)", status = "no-op", label = "OpenAI" },
 	{ "prediction", "table", prediction, "an object with type content and text content",

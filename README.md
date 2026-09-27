@@ -161,11 +161,30 @@ prompt store.
 
 When the pool has no free block, it takes cached blocks, the least
 recently used first and the last blocks of a prefix before the first
-ones. Then idle slots give their blocks up, the least recently used
-first. An evicted slot goes to the RAM prompt store (`--cache-ram`)
-first, so its next request restores it from host memory. A prompt that does not fit next to the running requests waits
-for one of them to end. When running requests fill the pool, the reply
-that cannot grow ends with finish reason `length`.
+ones. A keyed block that the pool takes goes to the RAM prompt store
+(`--cache-ram`) first, and a later prompt that needs it copies it back.
+Then idle slots give their blocks up, the least recently used first. An
+evicted slot goes to the RAM prompt store too, so its next request
+restores it from host memory.
+
+Each request has a priority: low for decisions (`/v1/systemone`),
+normal for chats, and high for a chat with `prompt_cache_retention`
+`24h`. A slot has the priority of its last request, and a block the
+highest priority of the requests that used it. The pool takes cached
+blocks and idle slots of low priority first, then normal, then high;
+within one priority, the least recently used first. A new prompt that
+shares little with every slot takes an empty slot, else the idle slot
+of the lowest priority. So a burst of one-off checks evicts its own
+blocks before the prefix of a long chat.
+
+A prompt that does not fit next to the running requests waits for one
+of them to end. When running requests fill the pool, the request that
+gets no block lets its cells go and waits for another request to end;
+a running request of lower priority does so for it first. Its cells
+stay cached, and a checkpoint of its state goes to the state index, so
+it takes them up again and runs on, and its reply is whole. Only a
+request that runs alone and fills the pool ends with finish reason
+`length`; `-c` bounds that.
 
 With two or more slots, requests run at the same time: prompt chunks
 (up to 512 tokens) and decode steps of all requests go into one batched
