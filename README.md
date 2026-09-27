@@ -206,6 +206,29 @@ queued ones; they only progress together. On a GPU, a batched pass can
 round differently from a single one, so a greedy reply can change at a
 near tie, as in llama.cpp. A prompt with images prefills alone.
 
+### Memory
+
+With a config, each model counts against the budget of its backend.
+Before its first load, the count is an estimate: the files, the KV
+cache at `ctx` and 1 GiB. After a load, the worker reports the exact
+parts, and the count is their sum:
+
+- weights: the buffers of the weights and other leaves
+- cache: the KV pool at `ctx` cells, and the state of each slot
+- compute: the largest compute buffers, which the worker plans at
+  load (a chat model: prompt chunks of 512 tokens over all `ctx`
+  cells, alone and one per batched slot, plus an image of the most
+  tokens; an image model: its largest side)
+- overhead: the driver memory of the worker beyond its buffers, from
+  the DRM fdinfo on Linux, at least 256 MiB on a GPU
+
+A worker refuses a load that does not fit the free device memory less
+`mem_margin` (default 256 MiB), and a KV pool grow or graph that does
+not fit either. Such a load or request gets status 507. `GET
+/v1/models` and `/metrics` give the parts. Speech, transcription and
+embedding engines do not plan their compute buffers; they count the
+estimate margin in place of them.
+
 ## Logs
 
 The server and its workers write one line per event to stderr, in

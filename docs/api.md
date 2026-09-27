@@ -156,6 +156,7 @@ Status codes:
 | 422 | `/v1/systemone`: the body fails a check, or `lgml.recipe` is not valid. |
 | 500 | The engine failed, or a handler raised an error. |
 | 503 | A model worker died or is not running, a load failed, a load waited `load_wait` seconds for memory, or the server is stopping. |
+| 507 | Memory: the model does not fit its budget or the free device memory, or a request needs more KV cache or compute memory than the device has free. The message starts with `memory budget:` or names the parts of the model. See [Models](#models). |
 
 A streamed chat reply that fails after the first event ends with an
 error event and `[DONE]`; see [Streaming](#streaming).
@@ -762,7 +763,7 @@ data: {"type": "error", "error": {"type": "api_error", "message": "..."}, "reque
 ```
 
 `error.type` by status: 400 `invalid_request_error`, 404
-`not_found_error`, 413 `request_too_large`, 500 `api_error`, 503
+`not_found_error`, 413 `request_too_large`, 500 and 507 `api_error`, 503
 `overloaded_error`. The status is the one of
 [Errors](#errors).
 
@@ -1051,7 +1052,7 @@ capability `image_generation` serves them, such as Z-Image with
 | `prompt` | OpenAI | Required. 1 to 16384 bytes. |
 | `model` | OpenAI | See [Model selection](#model-selection). |
 | `n` | OpenAI | An integer from 1 to 10. Default 1. |
-| `size` | OpenAI | `auto` or `WxH`. Each side is a multiple of 16 from 16 to 2048. Default for generations: `1024x1024`. For edits, `auto` is the input size, rounded down to a multiple of 16. |
+| `size` | OpenAI | `auto` or `WxH`. Each side is a multiple of 16 from 16 to the `image_max_side` of the model (default 1024, at most 2048); a larger side gives 400. Default for generations: `1024x1024`. For edits, `auto` is the input size, rounded down to a multiple of 16, at most `image_max_side`. |
 | `response_format` | OpenAI | Only `b64_json` (the default). |
 | `output_format` | OpenAI | Only `png` (the default). |
 | `steps` | lgml | Sampling steps, an integer from 1 to 100. Z-Image default: 8. |
@@ -1307,7 +1308,7 @@ and `x-jevify-latency-ms`.
   `["body", "lgml", "recipe"]`.
 - 404 `{"detail": "this server does not serve decisions"}` when no
   model decides.
-- 400, 500 and 503 give `{"detail": "message"}`. For example, a prompt
+- 400, 500, 503 and 507 give `{"detail": "message"}`. For example, a prompt
   longer than the context gives 400.
 
 ### Example
@@ -1330,7 +1331,9 @@ fields. It does not load a model.
   "context_length": 16384, "meta": {"n_ctx_train": 16384},
   "capabilities": ["completion", "decide"],
   "status": {"value": "loaded"},
-  "lgml": {"status": "loaded", "bytes": 10485760000}}]}
+  "lgml": {"status": "loaded", "bytes": 10485760000,
+    "memory": {"weights": 8589934592, "cache": 1073741824,
+      "compute": 553648128, "overhead": 268435456}}}]}
 ```
 
 - `context_length` (lgml) and `meta.n_ctx_train` (llama.cpp): the
@@ -1356,6 +1359,15 @@ fields. It does not load a model.
   against the budget of its backend (`vram` for a GPU model). A part in
   host memory, such as weights that `n_cpu_moe` keeps on the CPU,
   counts against `ram` and is not in this number.
+- `lgml.memory`: with a config, while the model is loaded, the bytes
+  that its worker reports, on the memory of its backend. `weights`:
+  the weights and other leaves. `cache`: the KV cache at the full
+  context. `compute`: the largest compute buffers, which the worker
+  plans at load. `overhead`: driver memory of the worker beyond its
+  buffers (the DRM fdinfo on Linux; at least 256 MiB on a GPU).
+  `lgml.bytes` is their sum, plus the estimate margin for an engine
+  that does not plan its compute buffers. A `mem` key in the config
+  replaces the sum in `lgml.bytes`.
 
 A request with an `anthropic-version` header gets the Anthropic list
 shape instead, as the Anthropic SDKs read it:
@@ -1383,6 +1395,10 @@ worker. A worker also starts on the first request for its model.
   unloads idle models, least recently used first. When that is not
   enough, the load waits up to `load_wait` seconds (default 60) for
   requests of other models to end, then fails with 503.
+- A model larger than its budget fails with 507. After a load, the
+  worker reports the exact size; when it is larger than the budget, or
+  than the free device memory less `mem_margin` (default 256 MiB), the
+  load fails with 507 and the worker stops.
 - Unload stops the worker. It gives 409 while the model loads or has
   requests in flight. An unloaded model gives success.
 - A missing `model` gives 400. An unknown id gives 404.
@@ -1482,6 +1498,10 @@ its first event.
 | `lgml_model_load_failures_total` | counter | Model loads that failed. |
 | `lgml_model_unloads_total` | counter | Model unloads. |
 | `lgml_model_loaded_bytes` | gauge | Memory of the loaded model, 0 when unloaded. |
+| `lgml_model_weights_bytes` | gauge | Weights part of `lgml.memory`, 0 when unloaded. |
+| `lgml_model_cache_bytes` | gauge | KV cache part of `lgml.memory`, 0 when unloaded. |
+| `lgml_model_compute_bytes` | gauge | Compute part of `lgml.memory`, 0 when unloaded. |
+| `lgml_model_overhead_bytes` | gauge | Overhead part of `lgml.memory`, 0 when unloaded. |
 
 ## CORS
 

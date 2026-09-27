@@ -186,12 +186,11 @@ l_memory_reset(lua_State *L)
 }
 
 /*** Set the memory guard.
- * Loads, tensors and graph plans that need more memory than the guard
- * allows raise an error that starts with "memory budget:". On a device,
- * the new bytes plus margin must fit in the free memory that ggml
- * reports. With a limit, the lgml bytes of each memory stay at most the
- * limit. A graph that runs through the scheduler (weights on a device
- * and its CPU) checks the limit only after its plan.
+ * A load, tensor or graph plan past the guard raises an error that
+ * starts with "memory budget:". On a device, the new bytes plus margin
+ * must fit the free memory that ggml reports. With a limit, the lgml
+ * bytes of each memory stay at most the limit. The guard does not check
+ * a graph that runs through the scheduler (weights on a device and CPU).
  * @tparam[opt] table opts `margin`: bytes that stay free on a device
  * (default 256 MiB); `limit`: the most bytes of each memory, 0 for no
  * limit (default 0)

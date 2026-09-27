@@ -62,12 +62,12 @@ return {
 		-- /v1/embeddings and not chat. ctx is the longest input.
 		-- { id = "qwen3-embedding-4b", model = "/home/you/models/Qwen3-Embedding-4B-Q8_0.gguf",
 		-- 	backend = "Vulkan0", ctx = 8192 },
-		-- mem sets the MiB a model takes, in place of the estimate.
 		-- text_backend = "CPU" keeps the text encoder (4 GiB) out of GPU
-		-- memory; it counts against ram, and mem counts the GPU part: about
-		-- 7.5 GiB at 512x512 and 9.6 GiB at 1024x1024.
+		-- memory; it counts against ram. The worker plans the GPU part
+		-- for image_max_side (default 1024): about 9.6 GiB at 1024x1024.
+		-- mem = MiB would set the count in place of the measure.
 		{ id = "zimage", model = "/home/you/models/zimage", engine = "lgml.image.engine",
-			backend = "Vulkan0", text_backend = "CPU", mem = 10000 },
+			backend = "Vulkan0", text_backend = "CPU" },
 		{ id = "orpheus", model = "/home/you/models/orpheus", engine = "lgml.tts.orpheus" },
 		{ id = "qwen3-tts", model = "/home/you/models/qwen3-tts", engine = "lgml.tts.qwen3tts" },
 		-- Models on the CPU do not count against vram.
