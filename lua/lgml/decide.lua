@@ -623,7 +623,13 @@ end
 local function advance(e, ids, sink)
 	local cached = e:reuse(ids)
 	sink.cached, sink.computed = sink.cached + cached, sink.computed + #ids - cached
-	return e:prefill(ids, cached + 1, sink)
+	-- A checkpoint at the end of the shared state lets the next
+	-- renderings restore it.
+	local pre, stops = sink.prefix, nil
+	if pre and #pre > cached and #pre < #ids and common(ids, pre) >= #pre then
+		stops = { #pre }
+	end
+	return e:prefill(ids, cached + 1, sink, stops)
 end
 
 -- Log P(candidate | prefix) for each candidate. Candidates of one token
@@ -709,6 +715,25 @@ end
 
 local PRIOR_CACHE = 256
 
+-- The ids that all renderings of one state share: the state and the
+-- text up to the question. Two probe questions show where they differ.
+local function state_prefix(e, state, ids, markers, keys)
+	local function probe(text)
+		local rd = M.render(state, { type = "noul", instructions = text },
+		    { identifiers = ids, images = markers })
+		local p = M.tokenize(e.tk, M.chat_prompt(e.family, rd.prefix), rd.candidates)
+		if e.vision and keys then
+			p = e:expand_images(p, keys)
+		end
+		return p
+	end
+	local a, b = probe("a"), probe("b")
+	if not a or not b then
+		return nil
+	end
+	return table.move(a, 1, common(a, b), 1, {})
+end
+
 -- The content-free run of a question, cached by prompt text.
 local function prior_run(e, q, ids, sink)
 	local rd = M.render("", q, { content_free = true, identifiers = ids })
@@ -778,6 +803,13 @@ function M.run(e, req, ctl)
 	local sink = sink_of(ctl)
 	local answers, nin, nout = {}, 0, 0
 	local ok, res = pcall(function()
+		local renderings = 0
+		for _, q in ipairs(req.questions) do
+			renderings = renderings + (q.type == "choice" and recipe.permutations.choice or 1)
+		end
+		if renderings > 1 then
+			sink.prefix = state_prefix(e, req.state, ids, markers, keys)
+		end
 		for _, q in ipairs(req.questions) do
 			local n = q.type == "choice" and recipe.permutations.choice or 1
 			local runs = {}

@@ -1372,11 +1372,26 @@ function E:prefill_batched(st, req, slot, prompt, from, stops, sink)
 	return logits, slot
 end
 
-function E:prefill(prompt, from, sink)
+function E:prefill(prompt, from, sink, extra)
 	local logits
 	local i = from
 	-- Passes end at checkpoint positions.
 	local stops, c = self.pc and self.pc:plan(prompt, from) or {}, 1
+	-- A caller can ask for more, such as the end of a state that several
+	-- prompts share. Only models with fixed state need them.
+	if extra and self.pc and self.pc.fixed then
+		for _, k in ipairs(extra) do
+			if k >= from and k < #prompt then
+				stops[#stops + 1] = k
+			end
+		end
+		table.sort(stops)
+		for k = #stops, 2, -1 do
+			if stops[k] == stops[k - 1] then
+				table.remove(stops, k)
+			end
+		end
+	end
 	if self.pc then
 		self:share_state(self.cache, self.tokens, self.pc.ckpts)
 	end
