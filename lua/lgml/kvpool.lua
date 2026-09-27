@@ -193,6 +193,28 @@ function P:publish(b, key, parent, depth, tokens)
 	return true
 end
 
+--- Keep the partial last block of a sequence cached when the sequence
+-- lets it go, so a prompt that shares its tokens can copy its cells.
+-- The block gets no key: only `longest_kid` finds it.
+-- @tparam integer b the block id, with a reference
+-- @tparam string parent the key of the full block before it (the root
+-- key for the first block)
+-- @tparam integer depth the block index in its sequence, from 1
+-- @tparam {integer|string,...} tokens the tokens it holds, fewer than
+-- a block
+-- @treturn boolean true when b is now cached on release
+function P:publish_part(b, parent, depth, tokens)
+	if self.keys[b] or #tokens == 0 then
+		return false
+	end
+	-- A marker, not a hash: no lookup finds the block.
+	self.keys[b] = "part"
+	self.info[b] = { parent = parent, depth = depth, tokens = tokens, used = self.tick }
+	self.kids[parent] = self.kids[parent] or {}
+	self.kids[parent][b] = true
+	return true
+end
+
 --- The key of a block, or nil.
 -- @tparam integer b the block id
 -- @treturn string the key
