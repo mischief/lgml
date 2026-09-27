@@ -37,6 +37,7 @@ M.reasons = {
 	[499] = "Client Closed Request",
 	[500] = "Internal Server Error", [501] = "Not Implemented",
 	[503] = "Service Unavailable", [505] = "HTTP Version Not Supported",
+	[507] = "Insufficient Storage",
 }
 
 local ERROR_TYPES = {

@@ -4,6 +4,7 @@
 -- bytes go straight to C; Lua sees only token ids and text.
 -- @module lgml.stt_engine
 local lgml = require("lgml")
+local budget = require("lgml.budget")
 local whisper = require("lgml.whisper")
 local stream = require("lgml.server.stream")
 
@@ -141,7 +142,7 @@ function E:transcribe(req, audio, ctl)
 	local ok, r, msg, status = pcall(self.run, self, req, audio, ctl)
 	self:release()
 	if not ok then
-		return nil, tostring(r), 500
+		return nil, tostring(r), budget.status(r, 500)
 	end
 	return r, msg, status
 end

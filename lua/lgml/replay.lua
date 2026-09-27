@@ -19,8 +19,11 @@ local L = log.new("replay")
 local M = {}
 
 --- Drop the graph that a cache holds.
+-- Its compute buffers go when its output nodes close. With done true,
+-- they close now, as the caller reads them no more.
 -- @tparam table cache the model cache
-function M.drop(cache)
+-- @tparam[opt] boolean done true to close the output nodes
+function M.drop(cache, done)
 	local r = cache and cache.replay
 	if not r then
 		return
@@ -29,6 +32,11 @@ function M.drop(cache)
 	r.g:close()
 	for _, t in pairs(r.inp) do
 		if type(t) == "userdata" then
+			t:close()
+		end
+	end
+	if done then
+		for _, t in ipairs(r.outs) do
 			t:close()
 		end
 	end

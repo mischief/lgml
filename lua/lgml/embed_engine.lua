@@ -10,6 +10,7 @@
 -- `tokenizer.ggml.add_eos_token`. Token id inputs run as they are.
 -- @module lgml.embed_engine
 local lgml = require("lgml")
+local budget = require("lgml.budget")
 local transformer = require("lgml.transformer")
 local stream = require("lgml.server.stream")
 local log = require("lgml.log")
@@ -244,7 +245,7 @@ function E:embed(req, ctl)
 	local t1 = lgml.clock()
 	self:release()
 	if not ok then
-		return nil, tostring(data), 500
+		return nil, tostring(data), budget.status(data, 500)
 	elseif not data then
 		return nil, "cancelled", 499
 	end

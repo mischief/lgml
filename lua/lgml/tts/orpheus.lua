@@ -4,6 +4,7 @@
 -- lgml.server.engine.
 -- @module lgml.tts.orpheus
 local lgml = require("lgml")
+local budget = require("lgml.budget")
 local transformer = require("lgml.transformer")
 local replay = require("lgml.replay")
 local snac = require("lgml.snac")
@@ -459,7 +460,7 @@ function E:speak(req, ctl)
 	local ok, audio, err, status = pcall(self.run, self, req, ctl, voice, stats)
 	self:release()
 	if not ok then
-		return nil, tostring(audio), 500
+		return nil, tostring(audio), budget.status(audio, 500)
 	elseif not audio then
 		return nil, err, status
 	end

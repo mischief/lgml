@@ -4,6 +4,7 @@
 -- interface is in lgml.server.engine.
 -- @module lgml.tts.qwen3tts
 local lgml = require("lgml")
+local budget = require("lgml.budget")
 local qwen3tts = require("lgml.qwen3tts")
 local stream = require("lgml.server.stream")
 
@@ -234,7 +235,7 @@ function E:speak(req, ctl)
 	local ok, r, emsg, estatus = pcall(self.run, self, req, spk, ctl)
 	self:release()
 	if not ok then
-		return nil, tostring(r), 500
+		return nil, tostring(r), budget.status(r, 500)
 	end
 	return r, emsg, estatus
 end

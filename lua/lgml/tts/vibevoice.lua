@@ -5,6 +5,7 @@
 -- steps (4 to 25).
 -- @module lgml.tts.vibevoice
 local lgml = require("lgml")
+local budget = require("lgml.budget")
 local uv = require("luv")
 local model = require("lgml.vibevoice.model")
 local stream = require("lgml.server.stream")
@@ -358,7 +359,7 @@ function E:speak(req, ctl)
 	local ok, r, msg, status = pcall(self.run, self, req, ctl, voice)
 	self:release()
 	if not ok then
-		return nil, tostring(r), 500
+		return nil, tostring(r), budget.status(r, 500)
 	end
 	return r, msg, status
 end

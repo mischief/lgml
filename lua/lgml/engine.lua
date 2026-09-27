@@ -19,6 +19,7 @@
 -- token (see `lgml.log`).
 -- @module lgml.engine
 local lgml = require("lgml")
+local budget_mod = require("lgml.budget")
 local chat = require("lgml.chat")
 local sampler = require("lgml.sampler")
 local tokenizer = require("lgml.tokenizer")
@@ -305,7 +306,7 @@ function M.new(opts)
 		concurrent = #slots > 1 and model.batchable ~= nil and model:batchable(),
 		be = be, model = model, family = family, family_name = family_name,
 		tk = assert(tokenizer.open(opts.model)),
-		n_ctx = n_ctx, flash_attn = fa, pool = pool,
+		n_ctx = n_ctx, flash_attn = fa, pool = pool, copts = copts,
 		-- Recurrent states and rings need a checkpoint to start from
 		-- shared blocks.
 		fixed = model.recurrent or (cache.ring ~= nil and cache.ring < n_ctx),
@@ -372,6 +373,123 @@ function E:load_vision(opts)
 	end
 	self.vision, self.image_marker = enc, im.begin .. im.token .. im.finish
 	self.embd_store = {}
+end
+
+-- The device and CPU compute bytes of a pass of k pool sequences of n
+-- tokens each, with its input leaves. The sequences share span cells
+-- block by block, so each one reads a window of all span cells. It
+-- plans the graph and runs nothing; the blocks go back to the pool.
+function E:plan_pass(k, n, span)
+	local model, pool = self.model, self.pool
+	local each = math.max(n, span // k // pool.block * pool.block)
+	local caches, ids = {}, {}
+	local ok, dev, cpu = pcall(function()
+		for i = 1, k do
+			caches[i] = model:seq(pool, { n_ctx = self.n_ctx })
+			ids[i] = {}
+			for j = 1, n do
+				ids[i][j] = 0
+			end
+		end
+		for cells = pool.block, each, pool.block do
+			for _, c in ipairs(caches) do
+				model:grow(c, cells)
+			end
+		end
+		for _, c in ipairs(caches) do
+			c.n_past = each - n
+			if c.rs_pos then
+				c.rs_pos = c.n_past
+			end
+		end
+		local inp
+		if k == 1 then
+			inp = model:inputs(ids[1], caches[1], { logits = "last", flash_attn = self.flash_attn })
+		else
+			inp = model:batch_inputs(caches, ids, { flash_attn = self.flash_attn })
+		end
+		local g <close> = model.be:graph()
+		local d, h = g:measure((model:forward(g, inp)))
+		-- The input leaves, such as the masks, live with the graph.
+		for _, part in ipairs({ inp, table.unpack(inp.batch or {}) }) do
+			for _, t in pairs(part) do
+				if type(t) == "userdata" then
+					d = d + t:nbytes()
+					t:close()
+				end
+			end
+		end
+		return d, h
+	end)
+	for _, c in ipairs(caches) do
+		model:free_seq(c)
+	end
+	if not ok then
+		error(dev, 0)
+	end
+	return dev, cpu
+end
+
+--- The device bytes of the largest compute buffers of the engine.
+-- It plans prompt chunks of `UBATCH` tokens over all n_ctx cells: one
+-- alone plus, with batched slots, one per slot, as a dropped graph lives
+-- until the collector takes its outputs. An image of the most tokens
+-- adds its encoder. The pool grows to n_ctx for the plans and shrinks
+-- back, so a full cache that does not fit raises the budget error.
+-- @treturn ?integer the bytes, or nil for an engine without a pool
+function E:reserve()
+	local pool, model = self.pool, self.model
+	if not pool then
+		return nil
+	end
+	local cells = pool.cap
+	local ok, best = pcall(function()
+		model:pool_resize(pool, pool.n_ctx)
+		local ks, top = { 1 }, pool.n_ctx
+		if self.concurrent then
+			ks[2] = #self.slots
+		end
+		local r = 0
+		for _, k in ipairs(ks) do
+			local n = math.min(UBATCH, top // k // pool.block * pool.block)
+			if n > 0 then
+				r = r + self:plan_pass(k, n, top)
+			end
+		end
+		return r
+	end)
+	model:pool_resize(pool, cells)
+	if not ok then
+		error(best, 0)
+	end
+	if self.vision and self.vision.measure then
+		best = best + self.vision:measure()
+	end
+	return best
+end
+
+--- The memory plan of the engine, for `lgml.budget.report`.
+-- @treturn table `{ backend, cache, cache_now, compute }`: the device
+-- bytes of the KV cache at n_ctx cells and now, and the largest compute
+-- buffers from `reserve`
+function E:memory()
+	local r = { backend = self.be }
+	if self.model.cache_size then
+		local per, fixed = self.model:cache_size(self.copts)
+		local n = #self.slots
+		if self.pool then
+			r.cache = per * self.pool.n_ctx + fixed * n
+			r.cache_now = per * self.pool.cap + fixed * n
+		else
+			r.cache, r.cache_now = 0, 0
+			for _, s in ipairs(self.slots) do
+				r.cache = r.cache + per * s.cache.n_ctx + fixed
+				r.cache_now = r.cache_now + per * (s.cache.cap or s.cache.n_ctx) + fixed
+			end
+		end
+	end
+	r.compute = self:reserve()
+	return r
 end
 
 --- Lists the one model of the engine.
@@ -717,6 +835,9 @@ function E:end_request(st)
 		self:release()
 	end
 	if st.slot then
+		-- The next request of the slot starts with a new graph: this one
+		-- only holds compute memory.
+		replay.drop(st.slot.cache, true)
 		st.slot.owner, st.slot.preempt = nil, nil
 		st.slot = nil
 		self:slot_freed()
@@ -761,6 +882,10 @@ function E:batch_step(slot, ids)
 	-- Alone: run at once, with no trip through the event loop.
 	if #self.pending == 0 and not self.busy and self:owned() == 1 then
 		self:acquire()
+		-- One graph at a time holds compute memory: the batch one goes.
+		if self.model.drop_batch then
+			self.model:drop_batch(false)
+		end
 		local ok, logits = pcall(replay.run, self.model, slot.cache, ids,
 		    { logits = "last", flash_attn = self.flash_attn })
 		self:release()
@@ -852,6 +977,13 @@ function E:flush()
 	local all = list
 	list = run
 	local ok, rows = true, {}
+	if #list == 1 and self.model.drop_batch then
+		self.model:drop_batch(false)
+	elseif #list > 1 then
+		for _, c in ipairs(caches) do
+			replay.drop(c)
+		end
+	end
 	if #list == 1 then
 		-- One request: its slot's own replayed graph is the fast path.
 		ok, rows = pcall(function()
@@ -1620,7 +1752,7 @@ function E:chat(req, sink)
 	end
 	self:end_request(st)
 	if not ok then
-		return nil, tostring(a), 500
+		return nil, tostring(a), budget_mod.status(a, 500)
 	end
 	return a, b, c
 end
@@ -1666,7 +1798,7 @@ function E:decide(req, ctl)
 	end
 	self:release()
 	if not ok then
-		return nil, tostring(a), 500
+		return nil, tostring(a), budget_mod.status(a, 500)
 	end
 	return a, b, c
 end

@@ -266,12 +266,47 @@ function M:encode(img)
 	g:compute(out)
 	local buf = lgml.hostbuf(out:nbytes())
 	out:to_host(buf)
+	local n = out:shape()[1]
+	-- With its output closed, the graph frees its compute buffer at close.
+	out:close()
 	for _, t in pairs(inp) do
 		if type(t) == "userdata" then
 			t:close()
 		end
 	end
-	return buf, out:shape()[1]
+	return buf, n
+end
+
+--- The compute buffer bytes of an image of the most tokens.
+-- The image is a rows x cols grid of tokens, with rows * cols at most
+-- the token limit and rows the square root. It plans the graph and runs
+-- nothing.
+-- @treturn integer the bytes on the backend
+function M:measure()
+	local hp, be = self.hp, self.be
+	local most = hp.max_pixels // (hp.patch * hp.patch * hp.merge * hp.merge)
+	local rows = math.max(1, math.floor(math.sqrt(most)))
+	local cols = math.max(1, most // rows)
+	local nx, ny = cols * hp.merge, rows * hp.merge
+	local px, py = {}, {}
+	for i = 0, nx * ny - 1 do
+		px[i + 1] = i % nx
+		py[i + 1] = i // nx
+	end
+	local inp = {
+		nx = nx, ny = ny, flash_attn = self.flash_attn,
+		pixels = be:tensor("f32", { 1, 3, ny * hp.patch, nx * hp.patch }),
+		px = be:tensor("i32", { nx * ny }, px),
+		py = be:tensor("i32", { nx * ny }, py),
+	}
+	local g <close> = be:graph()
+	local bytes = g:measure((self:forward(g, inp)))
+	for _, t in pairs(inp) do
+		if type(t) == "userdata" then
+			t:close()
+		end
+	end
+	return bytes
 end
 
 return M

@@ -10,6 +10,7 @@ local kv = require("lgml.kv")
 local kvpool = require("lgml.kvpool")
 local placement = require("lgml.placement")
 local replay = require("lgml.replay")
+local budget = require("lgml.budget")
 local log = require("lgml.log")
 
 local LOG = log.new("kv")
@@ -582,15 +583,32 @@ function M:seq(pool, opts)
 	return c
 end
 
--- Drop the last batch graph.
-local function drop_batch(self)
+-- Drop the last batch graph. With done true, its output rows close too.
+local function drop_batch(self, done)
 	local r = self.batch_replay
 	self.batch_replay = nil
 	r.g:close()
-	for _, t in pairs(r.inp) do
-		if type(t) == "userdata" then
+	for _, part in ipairs({ r.inp, table.unpack(r.inp.batch) }) do
+		for _, t in pairs(part) do
+			if type(t) == "userdata" then
+				t:close()
+			end
+		end
+	end
+	if done then
+		for _, t in ipairs(r.rows) do
 			t:close()
 		end
+	end
+end
+
+--- Drop the graph of the last batch pass.
+-- The next batch pass builds a graph again. Its compute buffers go when
+-- its logits rows close.
+-- @tparam[opt] boolean done true to close the rows now (default true)
+function M:drop_batch(done)
+	if self.batch_replay then
+		drop_batch(self, done ~= false)
 	end
 end
 
@@ -629,25 +647,58 @@ function M:free_seq(c)
 	c.pool.seqs[c] = nil
 end
 
--- Double the cells of pool p, at most p.n_ctx. The new tensors get all
--- old cells.
-local function pool_grow(self, p)
-	local cap = math.min(p.n_ctx, p.cap * 2)
+-- Raise a memory budget error when the tensors cannot grow to cap
+-- rows. A grow holds each old tensor until its new one has the rows,
+-- so the largest old tensor counts too.
+local function check_grow(list, cap, what)
+	local by = {}
+	for _, t in ipairs(list) do
+		local rows = t:shape()[1]
+		local be = t:backend()
+		local e = by[be] or { add = 0, top = 0 }
+		by[be] = e
+		e.add = e.add + (cap - rows) * (t:nbytes() // rows)
+		e.top = math.max(e.top, t:nbytes())
+	end
+	for be, e in pairs(by) do
+		local ok, err = lgml.memory_check(be, e.add + e.top, what)
+		if not ok then
+			error(err, 0)
+		end
+	end
+end
+
+-- Give pool p cap cells, or twice its cells up to p.n_ctx. The new
+-- tensors get the old cells that fit, when a block holds cells.
+local function pool_grow(self, p, cap)
+	cap = cap or math.min(p.n_ctx, p.cap * 2)
+	local list = {}
+	for _, part in ipairs({ p.k, p.v }) do
+		for _, t in pairs(part) do
+			list[#list + 1] = t
+		end
+	end
+	if cap > p.cap then
+		check_grow(list, cap, ("the KV pool from %d to %d cells"):format(p.cap, cap))
+	end
 	drop_pool_graphs(self, p)
+	local empty = p.alloc.used == 0 and p.alloc.cached == 0
 	local buf
 	for _, part in ipairs({ p.k, p.v }) do
 		for il, old in pairs(part) do
-			local bytes = old:nbytes()
+			local bytes = math.min(old:nbytes(), cap * (old:nbytes() // old:shape()[1]))
 			local new = old:backend():tensor(old:type(), { cap, old:shape()[2] })
 			new:zero()
-			if not buf or #buf < bytes then
-				if buf then
-					buf:close()
+			if not empty then
+				if not buf or #buf < bytes then
+					if buf then
+						buf:close()
+					end
+					buf = lgml.hostbuf(bytes)
 				end
-				buf = lgml.hostbuf(bytes)
+				old:to_host(buf, 0, 0, bytes)
+				new:from_host(buf, 0, 0, bytes)
 			end
-			old:to_host(buf, 0, 0, bytes)
-			new:from_host(buf, 0, 0, bytes)
 			old:close()
 			part[il] = new
 		end
@@ -655,29 +706,58 @@ local function pool_grow(self, p)
 	if buf then
 		buf:close()
 	end
-	LOG:info("pool grew", "cells", cap, "from", p.cap, "size", p.n_ctx)
+	LOG:info(cap > p.cap and "pool grew" or "pool shrank", "cells", cap, "from", p.cap, "size", p.n_ctx)
 	p.cap = cap
 	p.gen = p.gen + 1
 	p.alloc:set_cap(cap // p.block)
 end
 
+--- Set the cells that the tensors of a pool hold.
+-- The new tensors get the old cells that fit. Blocks at or past the new
+-- size must be free.
+-- @tparam table pool the pool, from `pool`
+-- @tparam integer cells the cells, a multiple of the block size, at most
+-- pool.n_ctx
+function M:pool_resize(pool, cells)
+	assert(cells % pool.block == 0 and cells <= pool.n_ctx, "pool_resize: bad cell count")
+	for b in pairs(pool.alloc.refs) do
+		assert(b < cells // pool.block, "pool_resize: a block past the new size is in use")
+	end
+	for b in pairs(pool.alloc.keys) do
+		assert(b < cells // pool.block, "pool_resize: a block past the new size is cached")
+	end
+	if cells ~= pool.cap then
+		pool_grow(self, pool, cells)
+	end
+end
+
 -- A block for pool p after block min - 1 of sequence c: a free one,
 -- else a new one when the pool can grow, else a cached one, else one
 -- that pool.pressure frees for c. The second result is true when the
--- pool grew.
+-- pool grew. A grow past the memory budget raises its error when no
+-- other block is there.
 local function new_block(self, p, c, min)
 	local b = p.alloc:take(min)
 	if b then
 		return b, false
 	end
+	local grow_err
 	if p.cap < p.n_ctx then
-		pool_grow(self, p)
-		return p.alloc:take(min), true
+		local ok, err = pcall(pool_grow, self, p)
+		if ok then
+			return p.alloc:take(min), true
+		elseif not budget.is_budget(err) then
+			error(err, 0)
+		end
+		grow_err = err
 	end
 	b = p.alloc:evict()
 	if not b and p.pressure then
 		p.pressure(p, c)
 		b = p.alloc:take(min) or p.alloc:evict()
+	end
+	if not b and grow_err then
+		error(grow_err, 0)
 	end
 	return b, false
 end
@@ -927,6 +1007,14 @@ function M:grow(cache, rows)
 	end
 	assert(rows <= cache.n_ctx, "grow: past n_ctx")
 	local cap = math.min(cache.n_ctx, math.max(cache.cap * 2, (rows + PAD - 1) // PAD * PAD))
+	local list = {}
+	for il, L in ipairs(self.layers) do
+		if cache.k[il] and not L.swa then
+			list[#list + 1] = cache.k[il]
+			list[#list + 1] = cache.v[il]
+		end
+	end
+	check_grow(list, cap, ("the KV cache from %d to %d rows"):format(cache.cap, cap))
 	replay.drop(cache)
 	local keep = math.min(cache.n_past, cache.cap)
 	local buf
@@ -1979,7 +2067,7 @@ function M:run_batch(caches, ids, opts)
 		fill_batch(self.hp, r.inp, ids)
 	else
 		if r then
-			r.g:close()
+			drop_batch(self)
 		end
 		local inp = self:batch_inputs(caches, ids, opts)
 		local g = self.be:graph()

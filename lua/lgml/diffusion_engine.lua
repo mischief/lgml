@@ -6,6 +6,7 @@
 -- the shared prefix across blocks and requests.
 -- @module lgml.diffusion_engine
 local lgml = require("lgml")
+local budget = require("lgml.budget")
 local chat = require("lgml.chat")
 local tokenizer = require("lgml.tokenizer")
 local stream = require("lgml.server.stream")
@@ -160,7 +161,7 @@ function E:chat(req, sink)
 	end
 	self:release()
 	if not ok then
-		return nil, tostring(a), 500
+		return nil, tostring(a), budget.status(a, 500)
 	end
 	return a, b, c
 end
