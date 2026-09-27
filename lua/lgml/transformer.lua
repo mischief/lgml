@@ -808,6 +808,9 @@ end
 -- opts.logits: "all" or "last" (default "all").
 -- opts.hidden: a layer count; `forward` stops after that many layers
 -- and gives the hidden state in place of the logits (default nil).
+-- opts.pool: "last" makes `forward` give the normed hidden state of the
+-- last token in place of the logits, as embedding models use (default
+-- nil).
 -- opts.embd: an `lgml.hostbuf` with n rows of n_embd f32 values, such
 -- as image embeddings; they take the place of the token embeddings,
 -- with no scale. ids still give the per-layer inputs of gemma models;
@@ -817,7 +820,7 @@ end
 -- opts.causal: false lets the tokens of this pass see each other both
 -- ways, as llama.cpp does for gemma image tokens (default true).
 -- @treturn table fields n, n_past, n_kv, n_attn, n_swa_attn, cache,
--- flash_attn, logits, hidden, causal, and the tensors ids, pos, mask,
+-- flash_attn, logits, hidden, pool, causal, and the tensors ids, pos, mask,
 -- mask_swa (with sliding layers), rows and rows_swa (with a cache), and
 -- embd (with opts.embd)
 -- @raise when the pass does not fit the cache, or n_past is not where
@@ -838,7 +841,7 @@ function M:inputs(ids, cache, opts)
 	local inp = {
 		n = n, n_attn = n_attn, n_swa_attn = n_swa_attn, cache = cache,
 		flash_attn = opts.flash_attn, logits = opts.logits or "all",
-		hidden = opts.hidden, causal = opts.causal ~= false,
+		hidden = opts.hidden, pool = opts.pool, causal = opts.causal ~= false,
 		ids = be:tensor("i32", { n }, ids),
 		pos = be:tensor("i32", { n }),
 		mask = be:tensor(mt, { n, n_attn }),
@@ -872,8 +875,8 @@ function M:replay_key(cache, n, opts)
 		self:grow(cache, cache.n_past + n)
 	end
 	local n_attn, n_swa_attn = spans(cache, cache.n_past + n)
-	return ("%d:%d:%d:%s:%s:%s:%s:%s:%s"):format(n, n_attn, n_swa_attn, tostring(opts.flash_attn),
-	    opts.logits or "all", tostring(opts.hidden), tostring(opts.embd ~= nil),
+	return ("%d:%d:%d:%s:%s:%s:%s:%s:%s:%s"):format(n, n_attn, n_swa_attn, tostring(opts.flash_attn),
+	    opts.logits or "all", tostring(opts.hidden), tostring(opts.pool), tostring(opts.embd ~= nil),
 	    tostring(opts.causal ~= false), self.lora_key or "")
 end
 
@@ -1255,7 +1258,9 @@ end
 -- @param g the graph
 -- @tparam table inp inputs from `inputs`
 -- @return logits (n, n_vocab), or (1, n_vocab) when inp.logits is "last";
--- with inp.hidden, the hidden state (n, n_embd) after that many layers
+-- with inp.hidden, the hidden state (n, n_embd) after that many layers;
+-- with inp.pool "last", the normed hidden state (1, n_embd) of the last
+-- token
 -- @treturn table named nodes for comparison, such as "embd",
 -- "ffn_out-0", "l_out-0" and "result_norm"
 function M:forward(g, inp)
@@ -1299,9 +1304,13 @@ function M:forward(g, inp)
 			return x, taps
 		end
 	end
-	if inp.logits == "last" and n > 1 then
+	if (inp.logits == "last" or inp.pool == "last") and n > 1 then
 		local row = lgml.row_size("f32", hp.n_embd)
 		x = g:view(x, { 1, hp.n_embd }, nil, (n - 1) * row)
+	end
+	if inp.pool == "last" then
+		taps.result_norm = g:mul(g:rms_norm(x, hp.eps), self.output_norm)
+		return taps.result_norm, taps
 	end
 	local logits
 	logits, taps.result_norm = M.head(g, hp, self.output_norm, self.output, x, self.lora_out)
@@ -1563,6 +1572,35 @@ function M:step(cache, ids, opts)
 		id = best:get()[1]
 	end
 	return id
+end
+
+--- Run ids from position 0 and give the pooled hidden state.
+-- The cache starts empty. Passes take at most ubatch tokens and go
+-- through `lgml.replay`; each pass computes one pooled row, so full
+-- chunks share one graph. The last pass gives the result.
+-- @tparam table cache a cache from `cache`
+-- @tparam {integer,...} ids the token ids, at least one
+-- @tparam[opt] table opts options for `inputs`, and opts.ubatch: the
+-- most tokens per pass (default cache.ubatch, else 512)
+-- @treturn {number,...} the normed hidden state of the last token,
+-- n_embd values
+-- @raise when the ids do not fit the cache
+function M:embed(cache, ids, opts)
+	local o = { pool = "last" }
+	for k, v in pairs(opts or {}) do
+		if k ~= "ubatch" then
+			o[k] = v
+		end
+	end
+	local ub = math.min(opts and opts.ubatch or UBATCH, cache.ubatch or math.huge)
+	self:rewind(cache, 0)
+	cache.n_past = 0
+	local out
+	for s = 1, #ids, ub do
+		local part = table.move(ids, s, math.min(#ids, s + ub - 1), 1, {})
+		out = replay.run(self, cache, part, o)
+	end
+	return out:get()
 end
 
 return M
