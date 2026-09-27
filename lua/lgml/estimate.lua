@@ -147,6 +147,17 @@ local function cache_size(meta, spec, cpu)
 	return per, fixed, hp.n_ctx, cper, cfixed
 end
 
+-- The slot count of a spec: its slots key, else the default of
+-- lgml.kvpool for a pool of n positions of per bytes and slots with
+-- fixed bytes each, as in lgml.engine.
+local function slot_count(spec, per, fixed, n)
+	local s = math.tointeger(tonumber(spec.slots))
+	if s then
+		return math.max(1, s)
+	end
+	return kvpool.default_seqs(per * n, fixed)
+end
+
 -- Place the weights of a chat model on a GPU by the placement keys of
 -- spec. Sets r.n_cpu_moe for "auto", moves bytes from r.files to
 -- r.extra.cpu, and returns the set of layers whose cache is on the CPU.
@@ -162,8 +173,8 @@ local function place(r, spec, meta, budget)
 		local n = 0
 		if budget and budget < math.huge then
 			local per, fixed = cache_size(meta, spec)
-			local slots = math.max(1, math.tointeger(tonumber(spec.slots)) or kvpool.SEQS)
 			local ctx = math.tointeger(tonumber(spec.ctx)) or math.min(hp.n_ctx, placement.AUTO_CTX)
+			local slots = slot_count(spec, per, fixed, math.tointeger(tonumber(spec.ctx)) or hp.n_ctx)
 			local mmproj = spec.mmproj and M.files(spec.mmproj) or 0
 			n = placement.auto(rules, tensors, hp.n_layer,
 			    budget - mmproj - M.MARGIN - fixed * slots - per * ctx)
@@ -184,7 +195,8 @@ end
 -- It is the bytes of the model files and the mmproj, plus the KV cache
 -- of a chat model, plus `MARGIN`. The KV cache of a chat model is one
 -- pool of `ctx` cells that its slots share, plus the rings and
--- recurrent states of each slot (`slots`, default `lgml.kvpool.SEQS`). An image model (`lgml.image.engine`)
+-- recurrent states of each slot (`slots`, default from
+-- `lgml.kvpool.default_seqs`). An image model (`lgml.image.engine`)
 -- with a `text_backend` of another kind than its `backend` has two
 -- parts: the text encoder file plus `TEXT_MARGIN` goes in `extra`, under
 -- the kind of `text_backend`, and the other files in `files`. For a
@@ -204,9 +216,10 @@ end
 -- @tparam[opt] number budget the memory budget in bytes of the kind of
 -- `backend`
 -- @tparam[opt] boolean gpu false when the machine has no GPU (see `kind`)
--- @treturn table `{ bytes, files, kv, margin, n_ctx, kind, extra,
+-- @treturn table `{ bytes, files, kv, margin, n_ctx, slots, kind, extra,
 -- n_cpu_moe }`; bytes is the part on the kind of `backend`; n_ctx is the
 -- context for the worker, or nil when the estimate does not know it;
+-- slots is the slot count of a chat model;
 -- extra is `{ [kind] = bytes }` for the parts on other kinds
 -- @raise on bad placement keys
 function M.model(spec, budget, gpu)
@@ -226,15 +239,15 @@ function M.model(spec, budget, gpu)
 		local per, fixed, n_train, cper, cfixed = cache_size(meta, spec, cpu)
 		if per then
 			local n = math.tointeger(tonumber(spec.ctx)) or n_train
+			-- The slots share one pool of n cells; each slot has its own
+			-- rings and recurrent states.
+			local slots = slot_count(spec, per + cper, fixed + cfixed, n)
 			if not spec.ctx and budget and budget < math.huge and per > 0 then
-				local slots = math.max(1, math.tointeger(tonumber(spec.slots)) or kvpool.SEQS)
 				local fit = (budget - r.files - fixed * slots - M.MARGIN) // per // 256 * 256
 				n = math.min(n, math.max(math.tointeger(fit) or 256, 256))
 			end
 			r.n_ctx = n
-			-- The slots share one pool of n cells; each slot has its own
-			-- rings and recurrent states.
-			local slots = math.max(1, math.tointeger(tonumber(spec.slots)) or kvpool.SEQS)
+			r.slots = slots
 			r.kv = per * n + fixed * slots
 			if cpu then
 				r.extra.cpu = r.extra.cpu + cper * n + cfixed * slots

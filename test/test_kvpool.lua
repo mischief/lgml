@@ -107,6 +107,9 @@ do
 		a:unref(b)
 	end
 	ok(a:take(3) == 3 and a:take(3) == 4 and a:take(3) == 0, "take prefers blocks from min up")
+	ok(kvpool.default_seqs(1000, 0) == 4 and kvpool.default_seqs(1000, 50) == 4 and
+	    kvpool.default_seqs(1000, 100) == 2 and kvpool.default_seqs(1000, 900) == 1,
+	    "default_seqs keeps the per-sequence state under a quarter of the pool")
 end
 
 local path = tiny.tmp(".gguf")

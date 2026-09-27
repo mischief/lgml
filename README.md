@@ -124,7 +124,7 @@ is also the most tokens of one request. The pool starts with
 to `-c`; `--kv-initial 0` gives all cells at load. The model pool
 counts the whole pool, `-c` positions, against the memory budget.
 
-`-np N` (`--parallel`, config key `slots`, default 4) sets the most
+`-np N` (`--parallel`, config key `slots`) sets the most
 sequences the model keeps. A slot is one sequence: a token list and
 the pool cells that hold its keys and values, in blocks of 64 cells. A
 sequence takes blocks as it grows. A request takes the slot that
@@ -135,6 +135,10 @@ short one-off request takes another slot and a few blocks, and a long
 chat keeps its prefix. Slots cost no cells of their own; only the
 recurrent states (qwen35, qwen3next) and the sliding-window rings
 (gemma4) are per slot, and the model pool counts them once per slot.
+The default is 4 slots, or fewer when the states and rings of 4 slots
+would take more than a quarter of the pool: gemma-4-31B at 64k keeps
+1 slot (its rings take about 640 MiB each), Qwen3.8-27B at 128k keeps
+4 (about 150 MiB each).
 
 A full block gets a key: a hash of the key of the block before it and
 of its own tokens. When a slot lets a keyed block go, the block stays

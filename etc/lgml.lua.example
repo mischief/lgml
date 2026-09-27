@@ -39,7 +39,9 @@ return {
 			-- lora = { "/home/you/adapters/tuned.gguf:1.0" },
 		},
 		-- mmproj adds image input: image_url parts with data URLs. slots
-		-- is the most sequences kept (default 4), such as one per client.
+		-- is the most sequences kept, such as one per client (default 4, or
+		-- fewer when their rings or recurrent states would take more than a
+		-- quarter of the pool).
 		-- They share one KV pool of ctx cells, which starts at kv_initial
 		-- cells and grows to ctx.
 		{ id = "gemma-4-26b", model = "/home/you/models/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",

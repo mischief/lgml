@@ -18,8 +18,22 @@ local M = {}
 local P = {}
 P.__index = P
 
---- The default count of sequences an engine keeps (`slots`).
+--- The most sequences an engine keeps by default (`slots`).
 M.SEQS = 4
+
+--- The default count of sequences for a model.
+-- It is `SEQS`, or fewer when the per-sequence state of that many
+-- (rings and recurrent states) would take more than a quarter of the
+-- bytes of the pool; at least 1.
+-- @tparam integer pool the bytes of the pool cells
+-- @tparam integer fixed the bytes of the state of one sequence
+-- @treturn integer the count
+function M.default_seqs(pool, fixed)
+	if fixed <= 0 then
+		return M.SEQS
+	end
+	return math.max(1, math.min(M.SEQS, pool // 4 // fixed))
+end
 
 --- The key of a block.
 -- @tparam string parent the key of the block before it, or a root key

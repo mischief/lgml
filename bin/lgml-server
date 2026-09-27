@@ -100,7 +100,9 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
       --kv-initial n  KV pool cells at load (default 4096); the pool
                       grows as prompts need, up to -c; 0 allocates all
                       -c cells at load
-  -np, --parallel n   slots: the most sequences kept (default 4); all
+  -np, --parallel n   slots: the most sequences kept (default 4, or
+                      fewer when their recurrent states and rings would
+                      take more than a quarter of the pool); all
                       slots share one KV pool of -c cells, and -c is
                       also the most tokens of one request; a request
                       takes the slot that shares the longest prefix

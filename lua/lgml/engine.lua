@@ -116,6 +116,16 @@ local function dev_type(be)
 	end
 end
 
+-- The cache options of a model shape: q8_0 with flash attention when
+-- it fits and no type is set, else the types of opts (default f16).
+local function shape_copts(shape, opts)
+	if opts.flash_attn ~= false and not opts.cache_type_k and not opts.cache_type_v and
+	    pcall(transformer.cache_size, shape, { type = "q8_0" }) then
+		return { type = "q8_0" }
+	end
+	return { type_k = opts.cache_type_k or "f16", type_v = opts.cache_type_v or "f16" }
+end
+
 -- Set rules.n_cpu_moe to the fewest expert layers on the CPU so the
 -- weights and the cache of the wanted context fit in free device memory.
 -- The per-sequence part of the cache counts once per slot.
@@ -130,12 +140,7 @@ local function auto_moe(be, rules, info, opts, n_slots)
 	local n = 0
 	if free then
 		local shape = { hp = hp, layers = hp.layers }
-		local copts = { type_k = opts.cache_type_k or "f16", type_v = opts.cache_type_v or "f16" }
-		if opts.flash_attn ~= false and not opts.cache_type_k and not opts.cache_type_v and
-		    pcall(transformer.cache_size, shape, { type = "q8_0" }) then
-			copts = { type = "q8_0" }
-		end
-		local per, fixed = transformer.cache_size(shape, copts)
+		local per, fixed = transformer.cache_size(shape, shape_copts(shape, opts))
 		local ctx = opts.n_ctx or math.min(hp.n_ctx, placement.AUTO_CTX)
 		local mmproj = 0
 		if opts.mmproj then
@@ -146,6 +151,25 @@ local function auto_moe(be, rules, info, opts, n_slots)
 	end
 	L:info("n_cpu_moe auto", "n_cpu_moe", n, "free_mib", free and free // 1048576)
 	rules.n_cpu_moe, rules.auto = n, nil
+end
+
+-- The slot count: opts.slots, else the default of lgml.kvpool for the
+-- pool of the wanted context. lgml.estimate counts the same.
+local function slot_count(info, opts)
+	if opts.slots then
+		return math.max(1, opts.slots)
+	end
+	local arch = info.meta["general.architecture"]
+	if not transformer.supports(arch) then
+		return kvpool.SEQS
+	end
+	local hp = transformer.config(info.meta)
+	local shape = { hp = hp, layers = hp.layers }
+	local ok, per, fixed = pcall(transformer.cache_size, shape, shape_copts(shape, opts))
+	if not ok then
+		return kvpool.SEQS
+	end
+	return kvpool.default_seqs(per * math.min(opts.n_ctx or hp.n_ctx, hp.n_ctx), fixed)
 end
 
 --- Loads a model and makes an engine.
@@ -169,12 +193,14 @@ end
 -- - `kv_initial`: cells the KV pool gets at load (default 4096); the
 --   pool doubles when its sequences need more, up to `n_ctx`. 0 gives
 --   all `n_ctx` cells at load.
--- - `slots`: the most sequences the engine keeps (default
---   `lgml.kvpool.SEQS`, 4). Each request takes the slot that shares the
---   longest prefix with its prompt, so clients that take turns keep
---   their caches; see `E:pick_slot`. Slots share the pool, so a slot
---   costs only its recurrent states and rings, not n_ctx cells. With
---   two or more, requests run at the same time in batched passes.
+-- - `slots`: the most sequences the engine keeps. Each request takes
+--   the slot that shares the longest prefix with its prompt, so clients
+--   that take turns keep their caches; see `E:pick_slot`. Slots share
+--   the pool, so a slot costs only its recurrent states and rings, not
+--   n_ctx cells. The default is 4, or fewer when the states and rings
+--   of 4 slots would take more than a quarter of the pool; see
+--   `lgml.kvpool.default_seqs`. With two or more, requests run at the
+--   same time in batched passes.
 -- - `ctx_checkpoints`: the most state checkpoints per slot, for models
 --   with recurrent layers or a sliding ring (default 8; 0 turns them off)
 -- - `lora`: LoRA adapters, a list of { path, scale } (scale default 1);
@@ -205,7 +231,7 @@ function M.new(opts)
 		rules = nil
 	end
 	local be = assert(lgml.backend(opts.backend, { threads = opts.threads, cpu = rules ~= nil }))
-	local n_slots = math.max(1, opts.slots or kvpool.SEQS)
+	local n_slots = slot_count(info, opts)
 	if rules and rules.auto then
 		auto_moe(be, rules, info, opts, n_slots)
 	end
