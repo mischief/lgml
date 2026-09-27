@@ -5,7 +5,11 @@
 -- shares a prefix with a slot computes only the rest. The pool holds
 -- n_ctx cells for all slots: a slot takes blocks of cells as its
 -- sequence grows, and an idle slot gives its blocks up when a running
--- one needs them.
+-- one needs them. Full blocks stay cached by a key of their prefix, so
+-- any slot can take them up (see `lgml.kvpool`); evicted ones spill to
+-- the RAM store. Requests have priorities: the pool keeps the cells of
+-- high ones longest, and a running request of low priority waits for
+-- a high one when the pool is full (see `E:preempt`).
 -- With a vision encoder (`mmproj`), user messages can hold images. An
 -- image takes one prompt position for each of its embeddings. In the
 -- token list such a position is the string `"img:<sha256>:<i>"`, so
@@ -54,6 +58,15 @@ local EMBD_KEEP = 8
 -- Device memory kept free for compute buffers when the engine sizes the
 -- context to fit.
 local RESERVE = 1536 << 20
+
+-- The priority of a request: LOW for decisions, HIGH for a chat that
+-- asks to keep its prefix (prompt_cache_retention "24h"), else NORMAL.
+local function prio_of(req, decision)
+	if decision then
+		return kvpool.LOW
+	end
+	return req.prompt_cache_retention == "24h" and kvpool.HIGH or kvpool.NORMAL
+end
 
 -- Reasoning block tags by chat family, for constrained answers.
 local THINK = {
@@ -319,6 +332,12 @@ function M.new(opts)
 			checkpoints = opts.ctx_checkpoints or 8,
 			special = e.tk:special().tokens,
 		})
+		-- Blocks that the pool evicts spill to the RAM store.
+		if pool and e.pc.ram > 0 then
+			pool.alloc.on_evict = function(b, key, info)
+				e:spill_block(b, key, info)
+			end
+		end
 	end
 	return e
 end
@@ -473,7 +492,7 @@ function E:evict_slot(s)
 	if pc and #s.tokens > 0 and s.key == self.lora_key then
 		local cache, ckpts = pc.cache, pc.ckpts
 		pc.cache, pc.ckpts = s.cache, s.ckpts
-		pc:save({ tokens = s.tokens })
+		pc:save({ tokens = s.tokens, prio = s.prio })
 		pc.cache, pc.ckpts = cache, ckpts
 	end
 	if pc then
@@ -489,8 +508,9 @@ function E:evict_slot(s)
 end
 
 -- The pool has no free block for want (a sequence that runs now):
--- empty idle slots, the least recently used first, until a block is
--- free. Slots that requests use keep their blocks.
+-- empty idle slots, the lowest priority and then the least recently
+-- used first, until a block is free. Slots that requests use keep
+-- their blocks.
 function E:pool_pressure(want)
 	local list = {}
 	for _, s in ipairs(self.slots) do
@@ -499,7 +519,8 @@ function E:pool_pressure(want)
 		end
 	end
 	table.sort(list, function(a, b)
-		return a.used < b.used
+		local pa, pb = a.prio or 1, b.prio or 1
+		return pa < pb or (pa == pb and a.used < b.used)
 	end)
 	local alloc = self.pool.alloc
 	for _, s in ipairs(list) do
@@ -539,6 +560,72 @@ function E:wait_room(st, req)
 	self:acquire_slot(key)
 	st.lock = true
 	self:set_lora(req.lora)
+end
+
+--- Let a running request go and take it up again later.
+-- The pool is full, and other running requests hold it. The request
+-- keeps a checkpoint of its state (models with recurrent states or
+-- rings), lets its slot and cells go, and waits until another request
+-- ends. Then it takes a slot again, finds its tokens so far in the pool,
+-- the RAM store or the state index, and runs the rest. Its cells stay
+-- cached, so it seldom runs much again.
+-- @tparam table st the request state
+-- @tparam table req the request
+-- @tparam table slot the request's slot
+-- @tparam {integer,...} rest the tokens that did not run: the sampled
+-- token, or the rest of the prompt
+-- @param sink the reply sink
+-- @treturn table the slot the request owns now
+-- @return the logits after the last token, or nil when the sink was
+-- cancelled
+function E:preempt(st, req, slot, rest, sink)
+	local toks = table.move(slot.tokens, 1, #slot.tokens, 1, {})
+	table.move(rest, 1, #rest, #toks + 1, toks)
+	self:acquire()
+	local ok, err = pcall(function()
+		if self.pc and self.fixed then
+			self:checkpoint_slot(slot)
+		end
+		self:publish_tail(slot.cache, slot.tokens)
+	end)
+	L:info("kv pool full; the request waits", "tokens", #toks, "running", self:owned() - 1,
+	    "priority", slot.prio)
+	self.preemptions = (self.preemptions or 0) + 1
+	self.waits = self.waits or {}
+	self.waits[slot.prio or 1] = (self.waits[slot.prio or 1] or 0) + 1
+	if self.pc then
+		if slot == self.slot then
+			self.pc:trim(-1)
+		else
+			self.pc:drop(slot.ckpts)
+		end
+	end
+	slot.tokens = {}
+	self:clear_cache(slot.cache)
+	if slot == self.slot then
+		self.tokens = slot.tokens
+	end
+	slot.owner, st.slot = nil, nil
+	self:release()
+	if not ok then
+		error(err, 0)
+	end
+	self:slot_freed()
+	stream.await(function(done)
+		self.slot_waiting[#self.slot_waiting + 1] = done
+	end)
+	local _, key = self:lora_for(req.lora)
+	self:acquire_slot(key)
+	st.lock = true
+	self:set_lora(req.lora)
+	self.req_prio = prio_of(req)
+	local cached = self:reuse(toks)
+	L:debug("request resumes", "tokens", #toks, "cached", cached)
+	local logits = self:prefill(toks, cached + 1, sink)
+	if not logits then
+		return nil, nil
+	end
+	return self:own_slot(st), logits
 end
 
 -- Wait for the slot. Requests queue in arrival order.
@@ -602,7 +689,7 @@ function E:end_request(st)
 		self:release()
 	end
 	if st.slot then
-		st.slot.owner = nil
+		st.slot.owner, st.slot.preempt = nil, nil
 		st.slot = nil
 		self:slot_freed()
 	end
@@ -638,6 +725,11 @@ end
 -- @return the logits node of the slot's last token, valid until the next
 -- batch pass
 function E:batch_step(slot, ids)
+	-- A request of higher priority needs the cells of this one.
+	if slot.preempt then
+		slot.preempt = nil
+		error("kv pool full: a request of higher priority needs the cells", 0)
+	end
 	-- Alone: run at once, with no trip through the event loop.
 	if #self.pending == 0 and not self.busy and self:owned() == 1 then
 		self:acquire()
@@ -664,10 +756,31 @@ function E:batch_step(slot, ids)
 	stream.await(function(done)
 		entry.done = done
 	end)
+	if entry.retry then
+		-- A request of lower priority lets its cells go; then run again.
+		stream.await(function(done)
+			self.slot_waiting[#self.slot_waiting + 1] = done
+		end)
+		return self:batch_step(slot, ids)
+	end
 	if entry.err then
 		error(entry.err, 0)
 	end
 	return entry.logits
+end
+
+-- A running request of lower priority than the one of slot, whose
+-- cells can go: the lowest priority, the least recently started first.
+function E:victim(slot)
+	local best
+	for _, s in ipairs(self.slots) do
+		if s.owner and s ~= slot and not s.preempt and (s.prio or 1) < (slot.prio or 1) and
+		    (not best or (s.prio or 1) < (best.prio or 1) or
+		    ((s.prio or 1) == (best.prio or 1) and s.used < best.used)) then
+			best = s
+		end
+	end
+	return best
 end
 
 -- Run the queued decode steps as one batched pass.
@@ -681,18 +794,33 @@ function E:flush()
 		return
 	end
 	-- Take the pool blocks of each step first: a step that gets none
-	-- fails alone.
-	local caches, ids, run = {}, {}, {}
+	-- fails alone. When a running request of lower priority can let its
+	-- cells go, it does, and the step runs again after that.
+	local run = {}
 	for _, e in ipairs(list) do
 		local c = e.slot.cache
 		local good, err = pcall(self.model.grow, self.model, c, math.min(c.n_ctx, c.n_past + #e.ids))
 		if good then
 			run[#run + 1] = e
-			caches[#run], ids[#run] = c, e.ids
 		else
 			e.err = err
+			local v = tostring(err):find("kv pool full", 1, true) and self:victim(e.slot)
+			if v then
+				v.preempt, e.retry = true, true
+			end
 		end
 	end
+	local caches, ids, kept = {}, {}, {}
+	for _, e in ipairs(run) do
+		if e.slot.preempt then
+			e.slot.preempt = nil
+			e.err = "kv pool full: a request of higher priority needs the cells"
+		else
+			kept[#kept + 1] = e
+			caches[#kept], ids[#kept] = e.slot.cache, e.ids
+		end
+	end
+	run = kept
 	local all = list
 	list = run
 	local ok, rows = true, {}
@@ -799,14 +927,16 @@ function E:pick_slot(prompt)
 			end
 		end
 		if best_n < math.min(SLOT_MIN_SHARED, #prompt) then
-			-- An empty slot, else the least recently used one.
+			-- An empty slot, else the one of the lowest priority, the
+			-- least recently used first.
 			best = nil
 			for _, s in ipairs(self.slots) do
 				if not s.owner and #s.tokens == 0 then
 					best = s
 					break
 				end
-				if not s.owner and (not best or s.used < best.used) then
+				if not s.owner and (not best or (s.prio or 1) < (best.prio or 1) or
+				    ((s.prio or 1) == (best.prio or 1) and s.used < best.used)) then
 					best = s
 				end
 			end
@@ -827,8 +957,14 @@ function E:pick_slot(prompt)
 		self:clear_cache(self.cache)
 	end
 	best.used = self.tick
+	-- The old content keeps its priority when it goes to the RAM store
+	-- (see `lgml.prompt_cache.save`); the new one has the request's.
+	self.prio = best.prio
+	best.prio = self.req_prio or kvpool.NORMAL
+	best.cache.prio = best.prio
 	return best
 end
+
 
 -- The 1-based index of a slot.
 function E:slot_index(slot)
@@ -857,8 +993,9 @@ function E:reuse(prompt)
 	if self.pc then
 		n = span_start(prompt, self.pc:reuse(self, prompt, n))
 		old = self.tokens
-		if self.state_n and self.pc.restored == 0 then
-			self.pc.restored = self.state_n
+		-- Tokens from host memory: a checkpoint, or spilled blocks.
+		if self.pc.restored == 0 then
+			self.pc.restored = self.state_n or math.min(n, self.from_ram * self.pool.block)
 		end
 	end
 	local want = n
@@ -904,18 +1041,41 @@ function E:publish(cache, tokens)
 		local parent = keys[i - 1] or self:root_key()
 		local key = kvpool.key(parent, tokens, (i - 1) * B + 1, B)
 		keys[i] = key
-		alloc:publish(cache.blocks[i], key, parent, i, table.move(tokens, (i - 1) * B + 1, i * B, 1, {}))
+		alloc:publish(cache.blocks[i], key, parent, i, table.move(tokens, (i - 1) * B + 1, i * B, 1, {}),
+		    cache.prio)
 	end
 end
 
--- Share cached pool blocks that hold a longer prefix of prompt than the
--- n tokens the active slot keeps. The slot then starts over on them. A
--- cached block that shares only part of its tokens with the prompt
--- gives a copy of those cells. Models with recurrent states or rings
--- do not share: the blocks hold no state. Returns the tokens the slot
--- holds.
+-- Copy the cells of a keyed block that the pool evicts to the RAM
+-- store of the prompt cache.
+function E:spill_block(b, key, info)
+	local pool = self.pool
+	self.pc:spill(key, info, transformer.block_bytes(pool), function(buf)
+		transformer.copy_block_host(pool, b, buf, true)
+	end)
+end
+
+-- Put a spilled block back in the pool for the active slot, after
+-- block last. Returns the block, with one reference, or nil.
+function E:unspill(key, last)
+	local e = self.pc and self.pc:unspill(key)
+	if not e then
+		return nil
+	end
+	local ok, b = pcall(self.model.take_block, self.model, self.pool, self.cache, last and last + 1)
+	if ok then
+		transformer.copy_block_host(self.pool, b, e.buf, false)
+		self.pool.alloc:publish(b, key, e.parent, e.depth, e.tokens,
+		    math.max(e.prio or kvpool.NORMAL, self.cache.prio or kvpool.NORMAL))
+		self.from_ram = (self.from_ram or 0) + 1
+	end
+	e.buf:close()
+	return ok and b or nil
+end
+
 -- The cached blocks that hold the first full blocks of prompt, at most
--- max tokens, and their keys.
+-- max tokens, and their keys. Spilled blocks come back from the RAM
+-- store. Each block holds one more reference until `drop_held`.
 function E:cached_blocks(prompt, max)
 	local B, alloc = self.pool.block, self.pool.alloc
 	local blocks, keys = {}, {}
@@ -923,13 +1083,25 @@ function E:cached_blocks(prompt, max)
 	while (#blocks + 1) * B <= max do
 		local key = kvpool.key(parent, prompt, #blocks * B + 1, B)
 		local b = alloc:lookup(key)
-		if not b then
-			break
+		if b then
+			alloc:ref(b, self.cache.prio)
+		else
+			b = self:unspill(key, blocks[#blocks])
+			if not b then
+				break
+			end
 		end
 		blocks[#blocks + 1], keys[#keys + 1] = b, key
 		parent = key
 	end
 	return blocks, keys
+end
+
+-- Drop the references that `cached_blocks` holds.
+function E:drop_held(blocks)
+	for _, b in ipairs(blocks) do
+		self.pool.alloc:unref(b)
+	end
 end
 
 -- Keep the partial last block of a pool sequence cached when the
@@ -947,7 +1119,7 @@ function E:publish_tail(cache, tokens)
 	local i = n // B + 1
 	if n % B ~= 0 and cache.blocks[i] and #cache.keys == i - 1 then
 		cache.pool.alloc:publish_part(cache.blocks[i], cache.keys[i - 1] or self:root_key(), i,
-		    table.move(tokens, (i - 1) * B + 1, n, 1, {}))
+		    table.move(tokens, (i - 1) * B + 1, n, 1, {}), cache.prio)
 	end
 end
 
@@ -963,7 +1135,7 @@ function E:share_state(cache, tokens, ckpts)
 	local j = ck.n // B
 	local parent = j == 0 and self:root_key() or cache.keys[j]
 	if parent then
-		self.pc:add_state(parent, table.move(tokens, j * B + 1, ck.n, 1, {}), ck)
+		self.pc:add_state(parent, table.move(tokens, j * B + 1, ck.n, 1, {}), ck, cache.prio)
 	end
 end
 
@@ -974,17 +1146,28 @@ end
 -- tokens the slot holds, or nil. With save, the slot goes to the RAM
 -- store before it starts over.
 function E:attach_state(prompt, keep, save)
-	local pc, cache = self.pc, self.cache
-	if not pc or #pc.states == 0 then
+	if not self.pc or #self.pc.states == 0 then
 		return nil
 	end
+	local blocks, keys = self:cached_blocks(prompt, #prompt - 1)
+	local ok, n = pcall(self.attach_edge, self, prompt, keep, save, blocks, keys)
+	self:drop_held(blocks)
+	if not ok then
+		error(n, 0)
+	end
+	return n
+end
+
+-- The search of `attach_state` over blocks, which the caller holds.
+function E:attach_edge(prompt, keep, save, blocks, keys)
+	local pc, cache = self.pc, self.cache
 	local B, alloc = self.pool.block, self.pool.alloc
 	local max = #prompt - 1
-	local blocks, keys = self:cached_blocks(prompt, max)
 	for j = #blocks, 0, -1 do
 		local parent = j == 0 and self:root_key() or keys[j]
 		for _, s in ipairs(pc:find_states(parent, prompt, j * B + 1, max)) do
 			if s.n <= keep then
+				self.from_ram = 0
 				return nil
 			end
 			local part, kid, got = s.n - j * B, nil, 0
@@ -1020,6 +1203,7 @@ function E:attach_state(prompt, keep, save)
 			end
 		end
 	end
+	self.from_ram = 0
 	return nil
 end
 
@@ -1031,7 +1215,7 @@ end
 -- Returns the tokens the slot holds.
 function E:attach(prompt, n)
 	local cache = self.cache
-	self.state_n = nil
+	self.state_n, self.from_ram = nil, 0
 	if not cache.pool then
 		return n
 	end
@@ -1048,10 +1232,24 @@ function E:attach(prompt, n)
 	-- At least one prompt token must run.
 	local max = #prompt - 1
 	local blocks, keys = self:cached_blocks(prompt, max)
+	local ok, got = pcall(self.attach_blocks, self, prompt, n, blocks, keys)
+	self:drop_held(blocks)
+	if not ok then
+		error(got, 0)
+	end
+	return got
+end
+
+-- The rest of `attach` over blocks, which the caller holds.
+function E:attach_blocks(prompt, n, blocks, keys)
+	local cache = self.cache
+	local B, alloc = cache.pool.block, cache.pool.alloc
+	local max = #prompt - 1
 	local m = #blocks * B
 	local kid, part = alloc:longest_kid(keys[#keys] or self:root_key(), prompt, m + 1,
 	    math.min(B - 1, max - m))
 	if m + part <= n then
+		self.from_ram = 0
 		return n
 	end
 	-- A slot that keeps less than half its tokens goes to the RAM store
@@ -1126,14 +1324,18 @@ end
 --- Prefill a prompt on a slot that a request owns, in batched passes.
 -- Chunks of at most UBATCH tokens join the decode steps and prompt
 -- chunks of other requests in one pass. Checkpoints come at the prompt
--- cache's planned stops, as in `prefill`.
+-- cache's planned stops, as in `prefill`. When other running requests
+-- hold the pool, the request waits for them; see `preempt`.
+-- @tparam table st the request state
+-- @tparam table req the request
 -- @tparam table slot the slot
 -- @tparam {integer,...} prompt the token ids
 -- @tparam integer from the first token to run
 -- @tparam {integer,...} stops the checkpoint positions, from the plan
 -- @param sink the reply sink; a cancelled sink stops the prefill
 -- @return the logits node of the last token, or nil when cancelled
-function E:prefill_batched(slot, prompt, from, stops, sink)
+-- @treturn table the slot the request owns at the end
+function E:prefill_batched(st, req, slot, prompt, from, stops, sink)
 	local logits
 	local i, c = from, 1
 	while i <= #prompt do
@@ -1142,24 +1344,32 @@ function E:prefill_batched(slot, prompt, from, stops, sink)
 			j = stops[c]
 		end
 		local ids = table.move(prompt, i, j, 1, {})
-		logits = self:batch_step(slot, ids)
+		local ok, lg = pcall(self.batch_step, self, slot, ids)
+		if not ok then
+			if not tostring(lg):find("kv pool full", 1, true) or self:owned() < 2 then
+				error(lg, 0)
+			end
+			local s, l = self:preempt(st, req, slot, table.move(prompt, i, #prompt, 1, {}), sink)
+			return l, s
+		end
+		logits = lg
 		table.move(prompt, i, j, #slot.tokens + 1, slot.tokens)
 		self:publish(slot.cache, slot.tokens)
 		if j == stops[c] then
 			self:acquire()
-			local ok, err = pcall(self.checkpoint_slot, self, slot)
+			local good, err = pcall(self.checkpoint_slot, self, slot)
 			self:release()
-			if not ok then
+			if not good then
 				error(err, 0)
 			end
 			c = c + 1
 		end
 		i = j + 1
 		if sink:cancelled() then
-			return nil
+			return nil, slot
 		end
 	end
-	return logits
+	return logits, slot
 end
 
 function E:prefill(prompt, from, sink)
@@ -1258,6 +1468,7 @@ function E:chat(req, sink)
 		self:end_request(st)
 		return nil, lerr, 400
 	end
+	self.req_prio = prio_of(req)
 	local ok, a, b, c = pcall(self.run, self, req, sink, st)
 	if not ok then
 		-- The cache may not match the token list now.
@@ -1306,6 +1517,7 @@ function E:decide(req, ctl)
 		self:release()
 		return nil, lerr, 400
 	end
+	self.req_prio = prio_of(req, true)
 	self.image_ms = 0
 	local ok, a, b, c = pcall(decide.run, self, req, ctl)
 	self:drop_images()
@@ -1611,7 +1823,7 @@ function E:run_prompt(req, sink, st)
 			self:share_state(self.cache, self.tokens, self.pc.ckpts)
 		end
 		slot = self:own_slot(st)
-		logits = self:prefill_batched(slot, prompt, cached + 1, stops, sink)
+		logits, slot = self:prefill_batched(st, req, slot, prompt, cached + 1, stops, sink)
 	else
 		logits = self:prefill(prompt, cached + 1, sink)
 		slot = logits and st and self.concurrent and self:own_slot(st)
@@ -1666,16 +1878,27 @@ function E:run_prompt(req, sink, st)
 		else
 			good, lg = pcall(self.eval, self, { id })
 		end
+		local resumed = false
 		if not good then
-			-- Other requests hold the rest of the pool: the reply ends.
 			if not tostring(lg):find("kv pool full", 1, true) then
 				error(lg, 0)
 			end
-			L:info("kv pool full; the reply ends", "tokens", n)
-			break
+			-- Other requests hold the rest of the pool: this one waits for
+			-- them. Alone, the reply ends.
+			if not slot or self:owned() < 2 then
+				L:info("kv pool full; the reply ends", "tokens", n)
+				break
+			end
+			slot, lg = self:preempt(st, req, slot, { id }, sink)
+			if not lg then
+				return true
+			end
+			toks, resumed = slot.tokens, true
 		end
 		logits = lg
-		toks[#toks + 1] = id
+		if not resumed then
+			toks[#toks + 1] = id
+		end
 		self:publish(slot and slot.cache or self.cache, toks)
 		stream.sleep(0)
 		if sink:cancelled() then

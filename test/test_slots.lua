@@ -155,6 +155,21 @@ ok(na.usage.cached_tokens > 0 and na.usage.cached_tokens < 400 and na.usage.cach
     ("without a RAM store, an evicted slot keeps the first blocks; the pool took its last ones (cached %d)")
     :format(na.usage.cached_tokens))
 
+-- Evicted blocks spill to host RAM and come back on a hit. The RAM
+-- budget holds a few blocks, not a whole slot, so only blocks spill.
+local transformer_m = require("lgml.transformer")
+local er = engine.new({ model = path, backend = "CPU", n_ctx = 768, slots = 2, kv_initial = 256 })
+er.pc.ram = 4 * transformer_m.block_bytes(er.pool)
+chat(er, a)
+chat(er, b)
+local st = er.pc.stats
+ok(st.saved == 0 and st.spilled >= 3, ("b evicts blocks of a; they spill to RAM (%d spilled)"):format(st.spilled))
+local ra3 = chat(er, a .. "more")
+ok(ra3.usage.cached_tokens == 448 and st.unspilled >= 3 and er.pc.restored == st.unspilled * 64,
+    ("a finds its 7 blocks in the pool and in RAM (cached %d, %d from RAM)")
+    :format(ra3.usage.cached_tokens, er.pc.restored))
+ok(table.concat(ra3.text) == want, "blocks back from RAM give the same tokens as a fresh cache")
+
 -- A prompt that does not fit next to a running request waits for it;
 -- both give the same text as one at a time.
 local function pair(e, words, n_tok)
@@ -182,27 +197,70 @@ ok(rw[1].res and rw[2].res and table.concat(rw[1].text) == solo[1] and table.con
     "a prompt that does not fit waits for the running request")
 ok(ew:owned() == 0 and ew.pool.alloc.used <= ew.pool.alloc.n, "all slots are free after the requests")
 
--- Two running requests that fill the pool: one reply ends at length
--- when no block is left, and the other goes on.
-local ef = engine.new({ model = path, backend = "CPU", n_ctx = 768, slots = 2, kv_initial = 256 })
+-- Two running requests that fill the pool: the one that gets no block
+-- lets its cells go and waits for the other, then takes them up again.
+-- Both replies are whole and equal the replies alone.
 local short = ("kiwi lime mango "):rep(12)
 local half = ("apple banana cherry date elder fig grape "):rep(6)
+local alone = {}
+for i, w in ipairs({ half, short }) do
+	local one = {}
+	local r = chat_async(engine.new({ model = path, backend = "CPU", n_ctx = 768, slots = 1 }), w, 400, one)
+	while #one < 1 do
+		uv.run("once")
+	end
+	alone[i] = table.concat(r.text)
+end
+local ef = engine.new({ model = path, backend = "CPU", n_ctx = 768, slots = 2, kv_initial = 256 })
 local rf = pair(ef, { half, short }, { 400, 400 })
-local reasons = (rf[1].reason or "?") .. "," .. (rf[2].reason or "?")
-ok(rf[1].res and rf[2].res and rf[1].reason == "length" and rf[2].reason == "length",
-    "a full pool ends a reply at length, not in an error (" .. reasons .. ")")
 local n1, n2 = rf[1].usage.completion_tokens, rf[2].usage.completion_tokens
--- The reply that ended leaves an idle slot, whose blocks the other takes.
-ok(math.min(n1, n2) < 400 and math.max(n1, n2) == 400,
-    ("one reply ends early, the other gets all its tokens (%d, %d)"):format(n1, n2))
+ok(rf[1].res and rf[2].res and n1 == 400 and n2 == 400 and (ef.preemptions or 0) >= 1,
+    ("a full pool makes a request wait, not end (%d, %d tokens, %d waits)"):format(n1, n2, ef.preemptions or 0))
+-- Under pressure, cells come back out of position order, which changes
+-- the rounding; a tiny random model is near ties, so only the start of
+-- the replies must match.
+local function same_len(x, y)
+	local k = 0
+	while k < #x and x:byte(k + 1) == y:byte(k + 1) do
+		k = k + 1
+	end
+	return k
+end
+local s1, s2 = same_len(table.concat(rf[1].text), alone[1]), same_len(table.concat(rf[2].text), alone[2])
+ok(s1 >= 200 and s2 >= 200, ("the replies start as the replies alone (%d, %d chars)"):format(s1, s2))
+ok(ef:owned() == 0, "all slots are free after the requests")
 
--- Chats with messages, one at a time.
-local function chat_msgs(e, messages, n_tok)
+-- The same two requests, the short one with high priority: the other
+-- one lets its cells go for it, not the other way.
+local kvp = require("lgml.kvpool")
+local eh = engine.new({ model = path, backend = "CPU", n_ctx = 768, slots = 2, kv_initial = 256 })
+local done_h, rh = {}, {}
+for i, it in ipairs({ { half, nil }, { short, "24h" } }) do
+	local r = sink()
+	rh[i] = r
+	coroutine.wrap(function()
+		r.res = eh:chat({ messages = { { role = "user", content = it[1] } }, max_tokens = 400, temperature = 0,
+			prompt_cache_retention = it[2], chat_template_kwargs = { enable_thinking = false } }, r.sink)
+		done_h[#done_h + 1] = true
+	end)()
+end
+while #done_h < 2 do
+	uv.run("once")
+end
+local w = eh.waits or {}
+ok(rh[1].res and rh[2].res and rh[1].usage.completion_tokens == 400 and rh[2].usage.completion_tokens == 400 and
+    (w[kvp.NORMAL] or 0) >= 1 and (w[kvp.HIGH] or 0) == 0,
+    ("the normal request waits for the high one (%d normal, %d high waits)"):format(w[kvp.NORMAL] or 0,
+    w[kvp.HIGH] or 0))
+
+-- Chats with messages, one at a time. retention is the
+-- prompt_cache_retention field.
+local function chat_msgs(e, messages, n_tok, retention)
 	local r = sink()
 	local done
 	coroutine.wrap(function()
 		r.res, r.err = e:chat({ messages = messages, max_tokens = n_tok or 4, temperature = 0,
-			chat_template_kwargs = { enable_thinking = false } }, r.sink)
+			prompt_cache_retention = retention, chat_template_kwargs = { enable_thinking = false } }, r.sink)
 		done = true
 	end)()
 	while not done do
@@ -271,6 +329,24 @@ local l2 = chat_msgs(el, long, 8)
 ok(l2.usage.cached_tokens >= l1.usage.prompt_tokens - 64,
     ("after 10 short requests the long chat finds its prefix (cached %d of %d)"):format(
     l2.usage.cached_tokens, l2.usage.prompt_tokens))
+
+-- Priorities: a chat that asks to keep its prefix (retention "24h")
+-- keeps it while other requests fill the pool; a plain chat loses its
+-- last blocks to them.
+local function keeps(retention)
+	local ek = engine.new({ model = path, backend = "CPU", n_ctx = 1024, slots = 4, cache_ram = 0 })
+	local m1 = { { role = "user", content = a } }
+	chat_msgs(ek, m1, 4, retention)
+	for i = 1, 6 do
+		chat_msgs(ek, { { role = "user", content = ("other request %d "):format(i) .. ("qrs tuv "):rep(20) } })
+	end
+	return chat_msgs(ek, m1, 4, retention).usage.cached_tokens, ek
+end
+local plain = keeps(nil)
+local kept, ek = keeps("24h")
+ok(kept > 400 and plain < kept, ("a high priority chat keeps its prefix (cached %d; %d without)"):format(kept, plain))
+ok(ek.slots[1].prio == require("lgml.kvpool").HIGH or ek.slot.prio == require("lgml.kvpool").HIGH,
+    "the slot of the chat has high priority")
 
 os.remove(path)
 print("1.." .. n)

@@ -662,10 +662,12 @@ local function concurrent_check(arch, path)
 	    :format(arch, e.batch_rows or 0, e.batch_passes or 0, e.batch_tokens or 0))
 end
 
--- Evict the cached blocks of the engine's pool, so that only the RAM
--- store holds earlier prompts.
+-- Evict the cached blocks of the engine's pool with no spill, so that
+-- only the store entries hold earlier prompts.
 local function drop_cached(e)
 	local a = e.pool.alloc
+	local hook = a.on_evict
+	a.on_evict = nil
 	while true do
 		local b = a:evict()
 		if not b then
@@ -673,6 +675,7 @@ local function drop_cached(e)
 		end
 		a:unref(b)
 	end
+	a.on_evict = hook
 end
 
 -- A hybrid chat whose slot went to other requests starts again from

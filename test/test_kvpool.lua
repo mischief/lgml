@@ -107,6 +107,25 @@ do
 		a:unref(b)
 	end
 	ok(a:take(3) == 3 and a:take(3) == 4 and a:take(3) == 0, "take prefers blocks from min up")
+	-- Priorities go before recency: low blocks go first, high ones last.
+	local p = kvpool.new({ blocks = 3, size = 4 })
+	local hi, lo, mid = p:take(), p:take(), p:take()
+	p:publish(hi, "h", "r", 1, {}, kvpool.HIGH)
+	p:publish(lo, "l", "r", 1, {}, kvpool.LOW)
+	p:publish(mid, "m", "r", 1, {}, kvpool.NORMAL)
+	p:unref(hi)
+	p:unref(mid)
+	p:unref(lo)
+	local ev = { p:evict(), p:evict(), p:evict() }
+	ok(ev[1] == lo and ev[2] == mid and ev[3] == hi,
+	    "eviction takes low, then normal, then high blocks, whatever their age")
+	local q = kvpool.new({ blocks = 2, size = 4 })
+	local s1 = q:take()
+	q:publish(s1, "s", "r", 1, {}, kvpool.LOW)
+	q:ref(s1, kvpool.HIGH)
+	q:unref(s1)
+	q:unref(s1)
+	ok(q.info[s1].prio == kvpool.HIGH, "a block keeps the highest priority of its users")
 	ok(kvpool.default_seqs(1000, 0) == 4 and kvpool.default_seqs(1000, 50) == 4 and
 	    kvpool.default_seqs(1000, 100) == 2 and kvpool.default_seqs(1000, 900) == 1,
 	    "default_seqs keeps the per-sequence state under a quarter of the pool")
