@@ -14,7 +14,7 @@ local log = require("lgml.log")
 
 local USAGE = "usage: lgml-worker --fd n (-m model | --fake) [-b backend] [-t threads] [-c n_ctx]\n" ..
     "                   [--no-fa] [--ctk type] [--ctv type] [--alias id] [--stt]\n" ..
-    "                   [--engine module] [--text-backend name]\n" ..
+    "                   [--engine module] [--text-backend name] [--image-max-side n]\n" ..
     "                   [--recipe file] [--cache-ram MiB] [--ctx-checkpoints n]\n" ..
     "                   [--kv-initial n] [--slots n]\n" ..
     "                   [--lora file[:scale]]...\n" ..
@@ -31,6 +31,7 @@ local opts, rest = getopt.parse(arg, "m:b:t:c:", {
 	model = "m", backend = "b", threads = "t", ctx = "c", ["fd="] = false,
 	["no-fa"] = false, ["alias="] = false, fake = false, stt = false,
 	["engine="] = false, ["text-backend="] = false, ["ctk="] = false, ["ctv="] = false,
+	["image-max-side="] = false,
 	["recipe="] = false, ["cache-ram="] = false, ["ctx-checkpoints="] = false, ["lora="] = false,
 	["kv-initial="] = false, ["slots="] = false,
 	["mmproj="] = false, ["image-min-tokens="] = false, ["image-max-tokens="] = false,
@@ -101,6 +102,7 @@ local function load()
 		return require(opts.engine).new({
 			model = opts.m, backend = opts.b, text_backend = opts["text-backend"],
 			threads = threads, id = opts.alias, n_ctx = opts.c and tonumber(opts.c),
+			max_side = math.tointeger(tonumber(opts["image-max-side"])),
 		})
 	end
 	local kind = require("lgml.detect").engine_of({ model = opts.m, stt = opts.stt })

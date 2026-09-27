@@ -19,6 +19,13 @@ local M = {}
 local E = {}
 E.__index = E
 
+--- The largest image side by default: 1024. The engine plans its
+-- compute buffers for this side at load.
+M.MAX_SIDE = 1024
+--- The prompt tokens, template included, of the text encoder plan at
+-- load. A longer prompt takes more memory; the memory guard checks it.
+M.TEXT_TOKENS = 512
+
 --- Load the models and make an engine.
 -- @tparam table opts the options:
 --
@@ -30,9 +37,13 @@ E.__index = E
 --   `backend`), such as "CPU" to keep its weights out of GPU memory
 -- - `threads`: CPU thread count (default: `lgml.threads()`)
 -- - `id`: model id (default: the DiT file name without .gguf)
+-- - `max_side`: the largest image side in pixels, a multiple of 16 up to
+--   `lgml.image.pipeline.MAX_SIDE` (default `MAX_SIDE`)
 -- @treturn Engine the engine
--- @raise when a model does not load
+-- @raise when a model does not load, or max_side is bad
 function M.new(opts)
+	local side = opts.max_side or M.MAX_SIDE
+	assert(pipeline.check_size(side, side))
 	local dit, llm, vae = opts.dit, opts.llm, opts.vae
 	if not (dit and llm and vae) then
 		dit, llm, vae = detect.image_files(opts.model)
@@ -45,6 +56,7 @@ function M.new(opts)
 	})
 	return setmetatable({
 		p = p, id = opts.id or dit:match("([^/]+)%.gguf$"), busy = false, waiting = {},
+		max_side = side,
 	}, E)
 end
 
@@ -55,6 +67,13 @@ end
 -- @treturn {table,...} `{ { id, context_length = 0 } }`
 function E:models()
 	return { { id = self.id, context_length = 0 } }
+end
+
+--- The memory plan of the engine, for `lgml.budget.report`.
+-- @treturn table `{ backend, compute }`: compute is the plan of a
+-- request of `max_side` pixels and `TEXT_TOKENS` prompt tokens
+function E:memory()
+	return { backend = self.p.be, compute = self.p:measure(self.max_side, M.TEXT_TOKENS) }
 end
 
 --- Returns the properties: `{ n_ctx = 0, total_slots = 1 }`.
@@ -80,9 +99,9 @@ function E:release()
 	end
 end
 
--- The largest multiple of m at most v, within the pipeline limits.
-local function fit(v, m)
-	return math.max(m, math.min(pipeline.MAX_SIDE, v // m * m))
+-- The largest multiple of m at most v, from m to max.
+local function fit(v, m, max)
+	return math.max(m, math.min(max, v // m * m))
 end
 
 function E:run(req, ctl)
@@ -96,12 +115,14 @@ function E:run(req, ctl)
 	end
 	local w, h = req.width, req.height
 	if not w then
-		w = image and fit(image.width, pipeline.MULTIPLE) or 1024
-		h = image and fit(image.height, pipeline.MULTIPLE) or 1024
+		w = image and fit(image.width, pipeline.MULTIPLE, self.max_side) or math.min(1024, self.max_side)
+		h = image and fit(image.height, pipeline.MULTIPLE, self.max_side) or math.min(1024, self.max_side)
 	end
 	local ok, err = pipeline.check_size(w, h)
 	if not ok then
 		return nil, err, 400
+	elseif w > self.max_side or h > self.max_side then
+		return nil, ("image sides above %d need a larger image_max_side"):format(self.max_side), 400
 	end
 	local steps = req.steps or pipeline.STEPS
 	local seed = req.seed or math.random(0, (1 << 31) - 1)

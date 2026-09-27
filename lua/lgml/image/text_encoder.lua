@@ -73,6 +73,7 @@ function M:encode(prompt)
 	local h = self.model:forward(g, inp)
 	g:compute(h)
 	local bytes = h:bytes()
+	h:close()
 	g:close()
 	for _, t in ipairs({ inp.ids, inp.pos, inp.mask }) do
 		t:close()

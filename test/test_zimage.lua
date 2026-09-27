@@ -203,6 +203,30 @@ g:compute(out)
 ok(not near(out:get(), a, 1e-6), "new text changes the output")
 g:close()
 zimage.close_inputs(inp)
+
+-- The pipeline plan: two DiT passes (one per condition), the VAE graphs
+-- and three latents, with the text encoder on another backend.
+do
+	local pipeline = require("lgml.image.pipeline")
+	local function scale(g2, z)
+		return g2:scale(z, 2)
+	end
+	local p = setmetatable({ be = be, dit = m, te = { be = false },
+		vae = { decode = function(_, g2, z) return scale(g2, z) end,
+			encode = function(_, g2, px) return scale(g2, px) end, has_encoder = true },
+		vae_mod = { scale = scale, unscale = scale } }, pipeline)
+	local before = lgml.memory().CPU
+	local bytes = p:measure(64, 16)
+	local x <close> = be:tensor("f32", { 1, 16, 8, 8 })
+	local v <close> = be:tensor("f32", { 1, 16, 8, 8 })
+	local di = m:inputs(16, 8, 8, x)
+	local g2 <close> = be:graph()
+	local w = g2:cpy((m:forward(g2, di)), v)
+	local dit = g2:measure(w)
+	zimage.close_inputs(di)
+	ok(bytes > 2 * dit + 3 * x:nbytes() and lgml.memory().CPU.compute == before.compute,
+	    ("the pipeline plan holds two DiT passes (%d > 2 x %d) and allocates nothing"):format(bytes, dit))
+end
 m:close()
 
 -- Base64 for the image API.

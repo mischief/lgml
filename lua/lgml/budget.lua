@@ -18,8 +18,9 @@ M.PREFIX = "memory budget:"
 --- The HTTP status of a request or load that does not fit: 507.
 M.STATUS = 507
 
---- The driver overhead of a GPU worker when the fdinfo does not give
--- it: 256 MiB.
+--- The least driver overhead of a GPU worker: 256 MiB. The fdinfo at
+-- load does not see the buffers that a backend makes at its first
+-- compute, such as the Vulkan staging and dequant buffers.
 M.OVERHEAD = 256 * MiB
 
 --- The device bytes that stay free when a worker allocates: 256 MiB.
@@ -129,11 +130,11 @@ end
 -- @tparam[opt] string backend the backend name, when the engine has no
 -- `memory` method
 -- @treturn table `{ memory, used, weights, cache, compute, overhead,
--- now, reserved, host }`: memory is the name of the memory; used is the
--- sum of the four parts; now the bytes the process holds now on it, so
--- used - now is what the model can still take; reserved is true when
--- the engine planned its worst-case graphs; host is `{ weights, tensors,
--- compute }` in host memory for a GPU backend
+-- now, reserved, drm, host }`: memory is the name of the memory; used
+-- is the sum of the four parts; now the bytes the process holds on it,
+-- so used - now is what the model can still take; reserved is true when
+-- the engine planned its worst-case graphs; drm the fdinfo bytes; host
+-- is `{ weights, tensors, compute }` in host memory for a GPU backend
 function M.report(engine, backend)
 	local em = engine.memory and engine:memory() or {}
 	local name = em.backend and em.backend:name() or backend
@@ -151,13 +152,12 @@ function M.report(engine, backend)
 	}
 	local held = k.weights + k.tensors + k.compute
 	local drm = gpu and M.drm(d.id, d.type == "igpu")
-	if drm then
-		r.overhead = math.max(0, drm - held)
-	else
-		r.overhead = gpu and M.OVERHEAD or 0
-	end
+	local seen = drm and math.max(0, drm - held) or 0
+	r.overhead = gpu and math.max(seen, M.OVERHEAD) or 0
 	r.used = r.weights + r.cache + r.compute + r.overhead
-	r.now = held + r.overhead
+	-- The delta of the load holds the overhead that fdinfo sees.
+	r.now = held + (drm and seen or r.overhead)
+	r.drm = drm
 	local h = gpu and all.CPU
 	if h then
 		r.host = { weights = h.weights, tensors = h.tensors, compute = h.peak_compute }

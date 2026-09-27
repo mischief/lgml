@@ -123,6 +123,65 @@ local function dit_graph(self, ctx, n, x, v)
 	return { g = g, inp = inp, w = g:cpy(out, v) }
 end
 
+-- Plan the graph of out and give its device bytes and those of the
+-- leaves in inp; close the leaves.
+local function plan(g, out, inp)
+	local n = g:measure(out)
+	for _, t in pairs(inp) do
+		if type(t) == "userdata" then
+			n = n + t:nbytes()
+			t:close()
+		end
+	end
+	return n
+end
+
+--- The device bytes of the largest compute buffers of a request.
+-- It plans the graphs of an image of side x side pixels and a prompt of
+-- n_txt tokens: the text encoder when it shares the backend, two DiT
+-- passes (one per condition), and the VAE decoder and encoder. The
+-- graphs run one after the other; the latents live through all of them.
+-- @tparam integer side the image side in pixels, a multiple of 16
+-- @tparam integer n_txt the prompt tokens, template included
+-- @treturn integer the bytes
+function M:measure(side, n_txt)
+	local be = self.be
+	local C, H = self.dit.hp.in_ch, side // M.FACTOR
+	local te = 0
+	if self.te.be == be then
+		local ids = {}
+		for i = 1, n_txt do
+			ids[i] = 0
+		end
+		local inp = self.te.model:inputs(ids, nil, { hidden = text_encoder.LAYERS })
+		local g <close> = be:graph()
+		te = plan(g, (self.te.model:forward(g, inp)), inp)
+	end
+	local x <close> = be:tensor("f32", { 1, C, H, H })
+	local v <close> = be:tensor("f32", { 1, C, H, H })
+	local inp = self.dit:inputs(n_txt, H, H, x)
+	local g <close> = be:graph()
+	local dit = g:measure(g:cpy((self.dit:forward(g, inp)), v))
+	for _, k in ipairs({ "ctx", "tfreq", "txt_pad", "img_pad" }) do
+		dit = dit + (inp[k] and inp[k]:nbytes() or 0)
+	end
+	for _, k in ipairs({ "pos_txt", "pos_img", "pos_all" }) do
+		for _, t in ipairs(inp[k]) do
+			dit = dit + t:nbytes()
+		end
+	end
+	zimage.close_inputs(inp)
+	local gd <close> = be:graph()
+	local dec = gd:measure(self.vae:decode(gd, self.vae_mod.unscale(gd, x)))
+	local enc = 0
+	if self.vae.has_encoder then
+		local img = { pixels = be:tensor("f32", { 1, 3, side, side }) }
+		local ge <close> = be:graph()
+		enc = plan(ge, self.vae_mod.scale(ge, self.vae:encode(ge, img.pixels)), img)
+	end
+	return math.max(te, 2 * dit, dec, enc) + 3 * x:nbytes()
+end
+
 --- Generate one image.
 -- req fields: prompt; `negative_prompt` (""), for the unconditional
 -- pass; width and height, multiples of 16 (1024); steps (8); seed (42);

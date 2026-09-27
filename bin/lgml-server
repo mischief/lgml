@@ -40,8 +40,9 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
   -l, --listen addr   address to listen on (default 127.0.0.1)
   -p, --port port     port to listen on (default 8080)
   -C, --config file   Lua file returning { listen, port, cors, vram, ram, idle,
-                      load_wait, threads, log_level, log_file, dump_prompts,
-                      state_dir, unknown_fields, models = { spec, ... } };
+                      load_wait, threads, mem_margin, log_level, log_file,
+                      dump_prompts, state_dir, unknown_fields,
+                      models = { spec, ... } };
                       each model runs in its own worker, which starts on the
                       first request for the model; when a load does not fit
                       the budget, idle models unload, least recently used
@@ -51,7 +52,10 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       many seconds without requests (default 0: off);
                       load_wait is the most seconds a load waits for other
                       models' requests to end (default 60), then it fails
-                      with 503; POST /models/load and /models/unload with
+                      with 503; a model or request that does not fit gives
+                      507; mem_margin is the MiB of device memory that each
+                      worker leaves free (default 256), also a spec key;
+                      POST /models/load and /models/unload with
                       {"model": id} load and unload a model now;
                       spec: { model = path, id, backend, threads, ctx,
                       flash_attn, stt, cache_type_k, cache_type_v, recipe,
@@ -61,6 +65,9 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       text_backend = backend of the text encoder of
                       lgml.image.engine, such as CPU; its part counts
                       against the budget of that backend,
+                      image_max_side = the largest image side of
+                      lgml.image.engine (default 1024); the worker plans
+                      its compute memory for it at load,
                       cpu_moe, n_cpu_moe, n_gpu_layers, override = weights
                       of a chat model on a GPU to keep in host memory, as
                       the flags below; override is a list of
@@ -75,7 +82,9 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       preload = true to load at startup, idle = seconds for
                       this model, mem = MiB the model takes on backend
                       (default: an estimate from its files and KV cache
-                      plus 1024, then the measure of its worker) }
+                      plus 1024, then the sum that its worker reports:
+                      weights, KV cache at ctx, planned compute buffers
+                      and driver overhead) }
   -m, --model file    gguf model file, or a Whisper model directory
   -b, --backend name  ggml backend, for example Vulkan0 or CPU (default best)
   -t, --threads n     CPU threads of each model (default: LGML_THREADS, else
@@ -254,6 +263,11 @@ local function model_engine(spec, managed)
 	if spec.text_backend and spec.engine ~= "lgml.image.engine" then
 		die("text_backend needs engine lgml.image.engine")
 	end
+	local side = spec.image_max_side and math.tointeger(tonumber(spec.image_max_side))
+	if spec.image_max_side and (spec.engine ~= "lgml.image.engine" or not side or side < 16 or
+	    side > 2048 or side % 16 ~= 0) then
+		die("image_max_side needs engine lgml.image.engine and a multiple of 16 up to 2048")
+	end
 	local okp, rules = pcall(require("lgml.placement").rules, spec)
 	if not okp then
 		die(rules)
@@ -263,7 +277,7 @@ local function model_engine(spec, managed)
 	if spec.inproc and spec.engine then
 		return require(spec.engine).new({
 			model = spec.model, backend = spec.backend, text_backend = spec.text_backend,
-			threads = threads, id = spec.id, n_ctx = n_ctx,
+			threads = threads, id = spec.id, n_ctx = n_ctx, max_side = side,
 		})
 	elseif spec.inproc and stt then
 		return require("lgml.stt_engine").new({
@@ -296,6 +310,7 @@ local function model_engine(spec, managed)
 		["--ctx-checkpoints"] = spec.ctx_checkpoints, ["--mmproj"] = spec.mmproj,
 		["--kv-initial"] = kvi, ["--slots"] = nslots,
 		["--image-min-tokens"] = imin, ["--image-max-tokens"] = imax,
+		["--image-max-side"] = side, ["--mem-margin"] = spec.mem_margin,
 	}) do
 		table.move({ flag, tostring(v) }, 1, 2, #wargs + 1, wargs)
 	end
@@ -474,6 +489,13 @@ local function config_engine(path, cfg, opts)
 		-- The threads of a spec, else --threads, else the threads key.
 		if spec.threads == nil then
 			spec.threads = opts.t or cfg.threads
+		end
+		if spec.mem_margin == nil then
+			spec.mem_margin = cfg.mem_margin
+		end
+		local mm = spec.mem_margin
+		if mm ~= nil and not (tonumber(mm) and tonumber(mm) >= 0) then
+			die(("%s: bad mem_margin %s"):format(path, tostring(mm)))
 		end
 	end
 	local engines = {}
