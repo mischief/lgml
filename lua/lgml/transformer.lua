@@ -1585,7 +1585,7 @@ end
 -- @tparam table cache a cache from `cache`
 -- @tparam {integer,...} ids the token ids, at least one
 -- @tparam[opt] table opts options for `inputs`, and opts.ubatch: the
--- most tokens per pass (default cache.ubatch, else 512)
+-- most tokens per pass (default 512; a ring takes at most cache.ubatch)
 -- @treturn {number,...} the normed hidden state of the last token,
 -- n_embd values
 -- @raise when the ids do not fit the cache
