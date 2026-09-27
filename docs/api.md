@@ -1405,8 +1405,10 @@ curl -s localhost:8080/models/unload -d '{"model": "qwen3-14b"}'
  "modalities": {"vision": false}, "build_info": "lgml"}
 ```
 
-`total_slots` is the number of KV cache slots of the model (`-np`,
-config key `slots`). With several models, the fields come from the first chat model.
+`total_slots` is the number of slots of the model (`-np`, config key
+`slots`, default 4): the most sequences it keeps. All slots share one
+KV pool of `n_ctx` cells. With several models, the fields come from
+the first chat model.
 `model_path` is the model id. `modalities` is absent when the engine
 does not give it.
 

@@ -118,22 +118,38 @@ gemma-4-26B-A4B Q4_K_M runs 24 tokens/s from 3 GB of GPU memory, and
 
 ### KV cache and slots
 
-The KV cache of a chat model starts with `--kv-initial` rows (default
-4096) and grows as prompts need, up to `-c`. `--kv-initial 0` gives all
-rows at load. `-np N` (`--parallel`, config key `slots`) keeps N caches
-on the device. A request takes the slot that shares the longest prefix
-with its prompt; a prompt that shares less than 32 tokens with every
-slot takes an empty slot or the least recently used one. Clients that
-take turns keep their caches, and the RAM prompt store (`--cache-ram`)
-holds what the slots cannot. The model pool counts each slot at `-c`
-positions.
+A chat model has one KV pool of `-c` cells for all its requests. `-c`
+is also the most tokens of one request. The pool starts with
+`--kv-initial` cells (default 4096) and doubles as sequences need, up
+to `-c`; `--kv-initial 0` gives all cells at load. The model pool
+counts the whole pool, `-c` positions, against the memory budget.
+
+`-np N` (`--parallel`, config key `slots`, default 4) sets the most
+sequences the model keeps. A slot is one sequence: a token list and
+the pool cells that hold its keys and values, in blocks of 64 cells. A
+sequence takes blocks as it grows. A request takes the slot that
+shares the longest prefix with its prompt; a prompt that shares less
+than 32 tokens with every slot takes an empty slot or the least
+recently used one. Clients that take turns keep their caches. So a
+short one-off request takes another slot and a few blocks, and a long
+chat keeps its prefix. Slots cost no cells of their own; only the
+recurrent states (qwen35, qwen3next) and the sliding-window rings
+(gemma4) are per slot, and the model pool counts them once per slot.
+
+When the pool has no free block, idle slots give theirs up, the least
+recently used first. An evicted slot goes to the RAM prompt store
+(`--cache-ram`) first, so its next request restores it from host
+memory. A prompt that does not fit next to the running requests waits
+for one of them to end. When running requests fill the pool, the reply
+that cannot grow ends with finish reason `length`.
 
 With two or more slots, requests run at the same time: prompt chunks
 (up to 512 tokens) and decode steps of all requests go into one batched
-pass. Matmuls and experts run on all rows; attention runs per slot on
-its cache, and recurrent layers (qwen35, qwen3next) per slot on their
-states. A request that runs alone takes its slot's own graph, at the
-same speed as one slot. Decode is bound by memory bandwidth, so a pass
+pass. Matmuls and experts run on all rows. Attention of each sequence
+reads the pool window of its blocks under a mask that shows only its
+own cells, and recurrent layers run per sequence on their states. A
+request that runs alone takes its slot's own graph, at the same speed
+as one slot. Decode is bound by memory bandwidth, so a pass
 of several slots costs little more than one. On a 32 GB Radeon, with
 200 tokens per request:
 

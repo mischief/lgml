@@ -96,14 +96,17 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
       --ctx-checkpoints n
                       state checkpoints per slot for hybrid and sliding
                       window models (default 8; 0 turns them off)
-      --kv-initial n  KV cache rows at load (default 4096); the cache
+      --kv-initial n  KV pool cells at load (default 4096); the pool
                       grows as prompts need, up to -c; 0 allocates all
-                      -c rows at load
-  -np, --parallel n   KV cache slots kept on the device (default 1); a
-                      request takes the slot that shares the longest
-                      prefix with its prompt, so clients that take turns
-                      keep their caches; with two or more, requests
-                      decode together in batched passes
+                      -c cells at load
+  -np, --parallel n   slots: the most sequences kept (default 4); all
+                      slots share one KV pool of -c cells, and -c is
+                      also the most tokens of one request; a request
+                      takes the slot that shares the longest prefix
+                      with its prompt, so clients that take turns keep
+                      their caches; an idle slot gives its cells to a
+                      running one when the pool is full; with two or
+                      more, requests decode together in batched passes
       --lora file[:scale]
                       apply a LoRA adapter (llama.cpp gguf or PEFT
                       directory) with this scale (default 1); repeat for
