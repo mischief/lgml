@@ -28,7 +28,12 @@ endif
 
 # The cmake package names ggml-base, which holds the op API. The
 # pkg-config file names only libggml.
-if get_option('ggml') == 'subproject'
+ggml = dependency('', required : false)
+if get_option('ggml') != 'subproject'
+  ggml = dependency('ggml', method : 'cmake', modules : ['ggml::ggml', 'ggml::ggml-base'],
+    required : get_option('ggml') == 'system')
+endif
+if not ggml.found()
   # The wrap pins a ggml revision; it builds static, with Vulkan and the CPU backend.
   cmake = import('cmake')
   ggml_opts = cmake.subproject_options()
@@ -46,8 +51,6 @@ if get_option('ggml') == 'subproject'
     ggml_proj.dependency('ggml'), ggml_proj.dependency('ggml-base'),
     ggml_proj.dependency('ggml-cpu'), ggml_proj.dependency('ggml-vulkan'),
   ])
-else
-  ggml = dependency('ggml', method : 'cmake', modules : ['ggml::ggml', 'ggml::ggml-base'])
 endif
 
 # System libraries when found, else the wraps in subprojects/, built

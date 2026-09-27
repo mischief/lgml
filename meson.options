@@ -14,5 +14,5 @@ option('vocab_dir', type : 'string', value : '',
   description : 'llama.cpp vocab test directory (ggml-vocab-*.gguf, .inp, .out); empty skips them')
 option('tok_gemma4', type : 'string', value : '',
   description : 'Gemma-4 gguf for tokenizer special token tests (reads metadata only); empty skips them')
-option('ggml', type : 'combo', choices : ['system', 'subproject'], value : 'system',
-  description : 'ggml from the system, or built from subprojects/ggml.wrap')
+option('ggml', type : 'combo', choices : ['auto', 'system', 'subproject'], value : 'auto',
+  description : 'ggml from the system, or built from subprojects/ggml.wrap; auto: the system one when found')
