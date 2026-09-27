@@ -13,10 +13,55 @@ a memory budget.
 
 ## Build
 
-You need Lua 5.4, ggml (from the system, or `-Dggml=subproject`),
-libpng, libjpeg, zlib and utf8proc. Meson builds the last four from
-the wraps in `subprojects` when the system lacks them. The Lua rocks
-install into `lua_modules`:
+You need Lua 5.4, a C compiler, meson, ggml, libpng, libjpeg, zlib
+and utf8proc. Meson uses the system ggml when it finds one, else it
+builds ggml from `subprojects/ggml.wrap` (this needs cmake and the
+Vulkan headers and glslc). `-Dggml=system` or `-Dggml=subproject`
+forces one. It builds the other four from the wraps in `subprojects`
+when the system lacks them. The default build type is debugoptimized.
+
+### Packages
+
+Debian 13 (all of this builds ggml from the wrap):
+
+```sh
+apt install build-essential git meson ninja-build cmake pkg-config \
+    lua5.4 liblua5.4-dev luarocks libpng-dev libjpeg62-turbo-dev \
+    zlib1g-dev libutf8proc-dev libvulkan-dev glslc glslang-tools \
+    spirv-headers mesa-vulkan-drivers
+```
+
+Gentoo:
+
+```sh
+emerge dev-lang/lua:5.4 dev-lua/luarocks dev-build/meson dev-build/ninja \
+    dev-build/cmake media-libs/libpng media-libs/libjpeg-turbo sys-libs/zlib \
+    dev-libs/libutf8proc media-libs/vulkan-loader dev-util/vulkan-headers \
+    media-libs/shaderc dev-util/glslang dev-util/spirv-headers
+```
+
+The GPU needs a Vulkan driver (Mesa RADV for AMD). Without one, lgml
+runs on the CPU.
+
+Older luarocks (3.8 on Debian 13) runs on Lua 5.1, so the hooks
+build type of picohttpparser must be installed for that Lua too. Prefer
+luarocks 3.12 or later: older versions on Lua 5.1 run bytecode that a
+server sends in place of a rockspec.
+
+```sh
+luarocks --local install luarocks-build-hooks
+eval "$(luarocks path)"; eval "$(luarocks --lua-version 5.4 path --append)"
+luarocks --lua-version 5.4 --local make lgml-scm-1.rockspec
+```
+
+Install with luarocks. The rock builds with meson and installs
+`lgml-server`, `lgml-worker`, `lgml-repl` and `lgml-finetune`:
+
+```sh
+luarocks --lua-version 5.4 install lgml-scm-1.rockspec
+```
+
+For work in the source tree, the Lua rocks install into `lua_modules`:
 
 ```sh
 luarocks --lua-version 5.4 --tree lua_modules install --only-deps lgml-scm-1.rockspec
