@@ -5,7 +5,8 @@
 --
 -- Each message has a type, a job id and a payload. The worker sends
 -- `HELLO` once, with id 0. Then the front starts jobs with `JOB`,
--- `TRANSCRIBE`, `SPEAK`, `DECIDE` or `GENERATE`, each with a new id.
+-- `TRANSCRIBE`, `SPEAK`, `DECIDE`, `GENERATE` or `EMBED`, each with a
+-- new id.
 -- The worker answers each job with zero or more `DELTA`, `AUDIO` or
 -- `IMAGE` messages and one `DONE`. The front sends `CANCEL` to stop a job; the job still
 -- ends with `DONE`. The JSON payload of a message that starts a job can
@@ -20,7 +21,7 @@ local M = {}
 --- Worker to front: the worker is ready.
 -- Payload: `{ models, props, caps, mem }`. models and props are the
 -- results of `Engine:models` and `Engine:props`. caps is `{ chat,
--- transcribe, speak, decide, generate }`, with true for each method the
+-- transcribe, speak, decide, generate, embed }`, with true for each method the
 -- engine has. mem is `{ used }`: the device bytes that the load took,
 -- when the worker can measure them.
 M.HELLO = 1
@@ -41,8 +42,9 @@ M.DELTA = 4
 -- success. msg and status give the error otherwise. finish is the
 -- `{ reason, usage, timings }` of `Sink:finish` for a chat job. result
 -- is the transcription for a transcribe job, `{ sample_rate }` for a
--- speech job, the result of `Engine:decide` for a decide job, or the
--- result of `Engine:generate` without images for a generate job.
+-- speech job, the result of `Engine:decide` for a decide job, the
+-- result of `Engine:generate` without images for a generate job, or the
+-- result of `Engine:embed` for an embed job.
 M.DONE = 5
 --- Front to worker: start a transcription job.
 -- Payload: the request for `Engine:transcribe`. An `AUDIO` message with
@@ -75,6 +77,9 @@ M.IMAGE = 11
 --- Worker to front: the engine did not load. The worker then exits.
 -- Payload: `{ msg }`, the error message.
 M.FAIL = 12
+--- Front to worker: start an embedding job.
+-- Payload: the request for `Engine:embed`. The worker sends `DONE`.
+M.EMBED = 13
 
 -- These types carry raw bytes, not JSON.
 local RAW = { [M.AUDIO] = true, [M.IMAGE] = true }

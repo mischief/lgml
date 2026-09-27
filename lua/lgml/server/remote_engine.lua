@@ -74,7 +74,8 @@ local function environ(extra)
 end
 
 --- A worker engine. It implements `lgml.server.engine.Engine`.
--- It has `chat`, `transcribe`, `speak`, `decide` and `generate`. The
+-- It has `chat`, `transcribe`, `speak`, `decide`, `generate` and
+-- `embed`. The
 -- worker gives the methods that its engine has in `ready().caps`.
 -- @type Remote
 
@@ -626,6 +627,54 @@ function R:generate(req, ctl)
 					local r = ev.v.result or {}
 					r.images = images
 					return r
+				end
+				return nil, ev.v.msg, ev.v.status
+			end
+		end
+	end
+end
+
+--- Runs an embedding job on the worker.
+-- @tparam table req the embedding request
+-- @tparam[opt] lgml.server.engine.Control ctl the cancel control
+-- @treturn[1] table the result of `Engine:embed`
+-- @treturn[2] nil
+-- @treturn[2] string an error message
+-- @treturn[2] int an HTTP status
+function R:embed(req, ctl)
+	local hello, rerr = self:ready()
+	if not hello then
+		return nil, rerr, 503
+	end
+	if hello.caps and not hello.caps.embed then
+		return nil, "model does not support embeddings", 400
+	end
+	if not self.ch then
+		return nil, "worker not running", 503
+	end
+	local id = self.next_id
+	self.next_id = id + 1
+	local job = setmetatable({ q = {} }, Job)
+	self.jobs[id] = job
+	local ok, err = self.ch:send(ipc.EMBED, id, tagged(req))
+	if not ok then
+		self.jobs[id] = nil
+		return nil, "send to worker: " .. tostring(err), err == "message too large" and 413 or 503
+	end
+	local cancelled = false
+	while true do
+		job:wait()
+		if not cancelled and ctl and ctl.cancelled and ctl.cancelled() then
+			cancelled = true
+			if self.ch then
+				self.ch:send(ipc.CANCEL, id)
+			end
+		end
+		while #job.q > 0 do
+			local ev = table.remove(job.q, 1)
+			if ev.t == ipc.DONE then
+				if ev.v.ok then
+					return ev.v.result
 				end
 				return nil, ev.v.msg, ev.v.status
 			end

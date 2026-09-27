@@ -1,8 +1,8 @@
 --- The engine interface that `lgml.server.openai` calls.
 -- An engine is a table with methods. It has `models` and `props`. It
--- also has `chat`, `transcribe`, `speak`, `decide`, `generate`, or
--- several of them. `lgml.engine`, `lgml.stt_engine`,
--- `lgml.diffusion_engine`, `lgml.image.engine`,
+-- also has `chat`, `transcribe`, `speak`, `decide`, `generate`,
+-- `embed`, or several of them. `lgml.engine`, `lgml.stt_engine`,
+-- `lgml.embed_engine`, `lgml.diffusion_engine`, `lgml.image.engine`,
 -- `lgml.server.router`, `lgml.server.remote_engine` and
 -- `lgml.server.fake_engine` are engines.
 --
@@ -87,7 +87,7 @@ end
 -- @tparam Engine e the engine to check
 -- @treturn Engine e
 -- @raise when e has no `models` or `props` method, or when e has none
--- of `chat`, `transcribe`, `speak`, `decide` and `generate`.
+-- of `chat`, `transcribe`, `speak`, `decide`, `generate` and `embed`.
 function M.check(e)
 	for _, name in ipairs({ "models", "props" }) do
 		if type(e[name]) ~= "function" then
@@ -96,14 +96,14 @@ function M.check(e)
 	end
 	if type(e.chat) ~= "function" and type(e.transcribe) ~= "function" and
 	    type(e.speak) ~= "function" and type(e.decide) ~= "function" and
-	    type(e.generate) ~= "function" then
-		error("engine has no method chat, transcribe, speak, decide or generate", 2)
+	    type(e.generate) ~= "function" and type(e.embed) ~= "function" then
+		error("engine has no method chat, transcribe, speak, decide, generate or embed", 2)
 	end
 	return e
 end
 
 --- The cancel control for `Engine:transcribe`, `Engine:speak`,
--- `Engine:decide` and `Engine:generate`.
+-- `Engine:decide`, `Engine:generate` and `Engine:embed`.
 -- The server makes a new control for each request.
 -- @table Control
 -- @field cancelled a function with no arguments. It returns true when
@@ -116,8 +116,8 @@ end
 -- Each entry is `{ id = string, context_length = n }`. An entry can
 -- also have `created` and `owned_by`; `/v1/models` shows them. It can
 -- have `capabilities`, a list of mode names from `lgml.detect.MODES`;
--- without it, `/v1/models` finds them from the engine methods, and
--- `vision = true` adds "multimodal". An entry can have `status`, the
+-- without it, `/v1/models` takes `Engine:modes`, else it finds them
+-- from the engine methods, and `vision = true` adds "multimodal". An entry can have `status`, the
 -- load state (`"unloaded"`, `"loading"`, `"loaded"` or `"unloading"`;
 -- default `"loaded"`), and `bytes`, the memory it takes.
 -- @treturn {table,...} the model list
@@ -215,6 +215,21 @@ end
 -- @treturn[2] int an HTTP status
 -- @function generate
 
+--- Embeds text. This method is optional.
+-- `lgml.server.embeddings.check` makes req from the request body; its
+-- fields are `model` and `input`, a non-empty list whose entries are
+-- strings or lists of token ids. Each vector has length 1. The server
+-- truncates and encodes them.
+-- @tparam table req the request
+-- @tparam Control ctl the cancel control
+-- @treturn[1] table `{ data = { vector, ... }, usage = { prompt_tokens },
+-- timings }`, a vector per input in order, each a list of numbers;
+-- timings is optional and its fields become `x-lgml-*` headers
+-- @treturn[2] nil
+-- @treturn[2] string an error message
+-- @treturn[2] int an HTTP status
+-- @function embed
+
 --- Loads a model now. This method is optional.
 -- `lgml.server.router` takes a model id; `lgml.server.pool` models
 -- take none.
@@ -248,8 +263,8 @@ end
 -- `lgml.server.router` has it. Without it, the server uses the request
 -- id when a model has it, else the first model id.
 -- @tparam ?string id the request `model`
--- @tparam string what `"chat"`, `"transcribe"`, `"speak"`, `"decide"` or
--- `"generate"`
+-- @tparam string what `"chat"`, `"transcribe"`, `"speak"`, `"decide"`,
+-- `"generate"` or `"embed"`
 -- @tparam[opt] boolean images true when the request has images
 -- @treturn ?string the model id
 -- @function model_for

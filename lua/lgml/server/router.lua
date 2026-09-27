@@ -100,8 +100,8 @@ end
 --- Picks the engine for a model id and a method.
 -- It uses the modes of each engine, so it does not start a model.
 -- @tparam ?string id the model id
--- @tparam string what `"chat"`, `"transcribe"`, `"speak"`, `"decide"` or
--- `"generate"`
+-- @tparam string what `"chat"`, `"transcribe"`, `"speak"`, `"decide"`,
+-- `"generate"` or `"embed"`
 -- @treturn ?lgml.server.engine.Engine the engine that serves id with
 -- what, else the first engine with what, else nil
 -- @treturn ?string the id of the picked model
@@ -318,6 +318,19 @@ function R:generate(req, ctl)
 		return nil, err, status
 	end
 	return e:generate(req, ctl)
+end
+
+--- Embeds text on the engine for `req.model`.
+-- @tparam table req the embedding request
+-- @tparam lgml.server.engine.Control ctl the cancel control
+-- @return the results of `Engine:embed`, or nil, a message and 400
+-- when no engine serves embeddings
+function R:embed(req, ctl)
+	local e, err, status = route(self, req.model, "embed", false, "no model serves embeddings")
+	if not e then
+		return nil, err, status
+	end
+	return e:embed(req, ctl)
 end
 
 -- The engine of model id for a load or unload, or nil, a message and a

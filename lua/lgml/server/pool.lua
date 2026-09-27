@@ -637,4 +637,12 @@ function Model:generate(req, ctl)
 	return run(self, "generate", req, ctl)
 end
 
+--- Embeds text. See `lgml.server.engine`.
+-- @tparam table req the embedding request
+-- @tparam lgml.server.engine.Control ctl the cancel control
+-- @return the results of `Engine:embed`, or nil, a message and 503
+function Model:embed(req, ctl)
+	return run(self, "embed", req, ctl)
+end
+
 return M

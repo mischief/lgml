@@ -88,7 +88,7 @@ local function caps(engine)
 	return {
 		chat = engine.chat ~= nil, transcribe = engine.transcribe ~= nil,
 		speak = engine.speak ~= nil, decide = engine.decide ~= nil,
-		generate = engine.generate ~= nil,
+		generate = engine.generate ~= nil, embed = engine.embed ~= nil,
 	}
 end
 
@@ -265,6 +265,25 @@ function M.serve(fd, engine, mem)
 			ch:send(ipc.DONE, id, { ok = r ~= nil, msg = msg, status = status, result = r })
 		end)()
 	end
+	local function embed(id, req)
+		local ctl = { stopped = false }
+		function ctl.cancelled()
+			return ctl.stopped
+		end
+		jobs[id] = ctl
+		coroutine.wrap(function()
+			local t0 = begin("embed", id, req)
+			local r, msg, status
+			if engine.embed then
+				r, msg, status = engine:embed(req, ctl)
+			else
+				msg, status = "model does not support embeddings", 400
+			end
+			jobs[id] = nil
+			finish("embed", id, t0, r ~= nil, msg, status)
+			ch:send(ipc.DONE, id, { ok = r ~= nil, msg = msg, status = status, result = r })
+		end)()
+	end
 	ch = ipc.channel(fd, function(t, id, v)
 		if t == ipc.JOB then
 			chat(id, v)
@@ -297,6 +316,8 @@ function M.serve(fd, engine, mem)
 			pending[id] = nil
 			req.image = v
 			generate(id, req)
+		elseif t == ipc.EMBED then
+			embed(id, v)
 		elseif t == ipc.CANCEL and jobs[id] then
 			jobs[id].stopped = true
 		end

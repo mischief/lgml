@@ -1,8 +1,8 @@
 --- A fake engine for tests.
 -- It streams a canned reply with reasoning, content and, when the
 -- request has tools, one tool call. Each piece waits a few milliseconds
--- on a luv timer. It also transcribes, speaks, decides and makes images
--- with canned rules.
+-- on a luv timer. It also transcribes, speaks, decides, makes images
+-- and embeds with canned rules.
 -- @module lgml.server.fake_engine
 
 local sleep = require("lgml.server.stream").sleep
@@ -426,6 +426,50 @@ function F:generate(req, ctl)
 		r.images[i], r.seeds[i] = PNG, seed + i - 1
 	end
 	return r
+end
+
+--- The length of a fake embedding.
+M.EMBED_DIM = 8
+
+--- Returns one vector of `EMBED_DIM` values with length 1 per input.
+-- Value k of a vector comes from the bytes of the input and k, so the
+-- same input gives the same vector. A token list reads as its ids
+-- joined by spaces. A string counts a quarter token per byte plus
+-- one; a token list counts its ids. Input `"fail"` gives status 500.
+-- It waits one delay, so ctl can cancel; a cancel gives status 499.
+-- @tparam table req the embedding request
+-- @tparam[opt] lgml.server.engine.Control ctl the cancel control
+-- @treturn[1] table `{ data, usage = { prompt_tokens }, timings }`
+-- @treturn[2] nil
+-- @treturn[2] string an error message
+-- @treturn[2] int an HTTP status
+function F:embed(req, ctl)
+	sleep(self.delay)
+	if ctl and ctl.cancelled and ctl.cancelled() then
+		return nil, "cancelled", 499
+	end
+	local data, n = {}, 0
+	for i, x in ipairs(req.input) do
+		if x == "fail" then
+			return nil, "fake failure", 500
+		end
+		local text = type(x) == "table" and table.concat(x, " ") or x
+		n = n + (type(x) == "table" and #x or #text // 4 + 1)
+		local v, s = {}, 0
+		for k = 1, M.EMBED_DIM do
+			local h = k
+			for j = 1, #text do
+				h = (h * 31 + text:byte(j)) % 1000003
+			end
+			v[k] = h % 201 - 100 + 0.5
+			s = s + v[k] * v[k]
+		end
+		for k = 1, M.EMBED_DIM do
+			v[k] = v[k] / math.sqrt(s)
+		end
+		data[i] = v
+	end
+	return { data = data, usage = { prompt_tokens = n }, timings = { prompt_n = n } }
 end
 
 return M

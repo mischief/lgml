@@ -141,6 +141,7 @@ ok(modes({ model = wdir }) == "transcription" and modes({ model = "d", stt = tru
     "whisper directory or stt is transcription")
 ok(modes({ model = "d", engine = "lgml.tts.orpheus" }) == "speech", "tts engine is speech")
 ok(modes({ model = "d", engine = "lgml.image.engine" }) == "image_generation", "image engine")
+ok(modes({ model = "d", engine = "lgml.embed_engine" }) == "embedding", "embedding engine")
 ok(modes({ model = "d", engine = "lgml.diffusion_engine" }) == "completion", "diffusion chat has no decide")
 ok(modes({ model = "d", engine = "my.engine", modes = { "speech", "completion" } }) == "completion,speech",
     "modes in the spec win")
@@ -155,7 +156,8 @@ for _, m in ipairs(r:models()) do
 	caps[m.id] = table.concat(m.capabilities, ",")
 end
 ok(caps.whisper == "transcription", "transcribe-only engine has transcription")
-ok(caps.a == "completion,decide,transcription,speech,image_generation", "fake engine has every mode but multimodal")
+ok(caps.a == "completion,decide,transcription,speech,image_generation,embedding",
+    "fake engine has every mode but multimodal")
 local r4 = router.new({ vis("text", false), vis("eyes", true) })
 local c4 = r4:models()
 ok(table.concat(c4[1].capabilities, ",") == "completion" and

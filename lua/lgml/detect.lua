@@ -1,4 +1,4 @@
---- Model kind from a path, without loading ggml.
+--- Model kind from a path, without starting a ggml backend.
 -- The front uses it to pick the engine for a worker, and to know the
 -- modes of a model before a worker starts.
 -- @module lgml.detect
@@ -66,13 +66,17 @@ end
 -- - `transcription`: speech to text
 -- - `speech`: text to speech
 -- - `image_generation`: image generations and edits
-M.MODES = { "completion", "multimodal", "decide", "transcription", "speech", "image_generation" }
+-- - `embedding`: embeddings
+M.MODES = {
+	"completion", "multimodal", "decide", "transcription", "speech", "image_generation", "embedding",
+}
 
 --- The engine method that serves each mode.
 -- `multimodal` is `chat` with images; decisions with images also need it.
 M.METHOD = {
 	completion = "chat", multimodal = "chat", decide = "decide",
 	transcription = "transcribe", speech = "speak", image_generation = "generate",
+	embedding = "embed",
 }
 
 -- Modes of the engine modules that lgml-worker can run.
@@ -81,12 +85,13 @@ local ENGINES = {
 	["lgml.diffusion_engine"] = { completion = true },
 	["lgml.stt_engine"] = { transcription = true },
 	["lgml.image.engine"] = { image_generation = true },
+	["lgml.embed_engine"] = { embedding = true },
 	["lgml.tts.orpheus"] = { speech = true },
 	["lgml.tts.qwen3tts"] = { speech = true },
 	["lgml.tts.vibevoice"] = { speech = true },
 	["lgml.server.fake_engine"] = {
 		completion = true, decide = true, transcription = true, speech = true,
-		image_generation = true,
+		image_generation = true, embedding = true,
 	},
 }
 
@@ -101,11 +106,47 @@ local function list(set)
 	return out
 end
 
+--- Test for a gguf embedding model.
+-- The function reads the gguf metadata with `lgml.gguf`, which loads
+-- the C module but starts no backend.
+-- @tparam string path the model path
+-- @treturn boolean true when path is a gguf file whose
+-- `<arch>.pooling_type` is set and not 0 (none)
+function M.is_embedding(path)
+	if type(path) ~= "string" or not path:match("%.gguf$") then
+		return false
+	end
+	local ok, info = pcall(function()
+		return require("lgml").gguf(path)
+	end)
+	local meta = ok and info and info.meta
+	if not meta then
+		return false
+	end
+	local v = meta[tostring(meta["general.architecture"]) .. ".pooling_type"]
+	return v ~= nil and v ~= 0
+end
+
+--- The engine module for a model spec with no `engine`.
+-- A Whisper directory or `stt` gives `lgml.stt_engine`, a gguf
+-- embedding model `lgml.embed_engine`, and other models `lgml.engine`.
+-- @tparam table spec the model spec: `model` and `stt`
+-- @treturn string the module name
+function M.engine_of(spec)
+	if spec.stt or (type(spec.model) == "string" and M.is_whisper(spec.model)) then
+		return "lgml.stt_engine"
+	elseif M.is_embedding(spec.model) then
+		return "lgml.embed_engine"
+	end
+	return "lgml.engine"
+end
+
 --- The modes of a model spec from a server config.
 -- The spec fields are `model`, `engine`, `stt`, `mmproj` and `modes`.
 -- A list in `modes` gives the modes as they are. Else the engine
--- module gives them. With no engine, a Whisper directory or `stt`
--- gives transcription, and other models are chat models
+-- module gives them. With no engine, `engine_of` picks the module: a
+-- Whisper directory or `stt` gives transcription, a gguf embedding
+-- model gives embedding, and other models are chat models
 -- (`lgml.engine`): completion and decide, and multimodal with an
 -- mmproj. The front calls this before any worker starts.
 -- @tparam table spec the model spec
@@ -126,14 +167,7 @@ function M.modes(spec)
 		end
 		return list(set)
 	end
-	local engine = spec.engine
-	if not engine then
-		if spec.stt or (type(spec.model) == "string" and M.is_whisper(spec.model)) then
-			engine = "lgml.stt_engine"
-		else
-			engine = "lgml.engine"
-		end
-	end
+	local engine = spec.engine or M.engine_of(spec)
 	local known = ENGINES[engine]
 	if not known then
 		error(("engine %s: unknown modes; give them in the spec as modes = { ... }"):format(engine), 0)
@@ -150,7 +184,7 @@ end
 --- The modes of a loaded engine, from its methods.
 -- caps is a table of method names, as the `caps` of the worker
 -- `HELLO` (see `lgml.ipc`), or the engine itself.
--- @tparam table caps `{ chat, transcribe, speak, decide, generate }`,
+-- @tparam table caps `{ chat, transcribe, speak, decide, generate, embed }`,
 -- each true or a function when the engine has that method
 -- @tparam[opt] boolean vision true when the chat model takes images
 -- @treturn {string,...} the modes, in `MODES` order

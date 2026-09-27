@@ -68,8 +68,10 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       and n_cpu_moe = "auto" fits the rest in vram,
                       engine = Lua module with new(opts), such as a TTS engine,
                       modes = list of completion, multimodal, decide,
-                      transcription, speech, image_generation (default: from
-                      the engine and files; needed for other engine modules),
+                      transcription, speech, image_generation, embedding
+                      (default: from the engine and files, where a gguf
+                      with a pooling type is an embedding model; needed
+                      for other engine modules),
                       preload = true to load at startup, idle = seconds for
                       this model, mem = MiB the model takes on backend
                       (default: an estimate from its files and KV cache
@@ -226,13 +228,15 @@ local function model_engine(spec, managed)
 		die("bad thread count " .. tostring(spec.threads))
 	end
 	local detect = require("lgml.detect")
-	local stt = not spec.engine and (spec.stt or detect.is_whisper(spec.model))
+	local kind = not spec.engine and detect.engine_of(spec)
+	local stt = kind == "lgml.stt_engine"
+	local embed = kind == "lgml.embed_engine"
 	local okm, modes = pcall(detect.modes, spec)
 	if not okm then
 		die(modes)
 	end
 	local lora = adapters(spec)
-	if #lora > 0 and (stt or spec.engine) then
+	if #lora > 0 and (stt or embed or spec.engine) then
 		die("lora needs a chat model")
 	end
 	local imin, imax = spec.image_min_tokens and math.tointeger(tonumber(spec.image_min_tokens)),
@@ -247,7 +251,7 @@ local function model_engine(spec, managed)
 	local okp, rules = pcall(require("lgml.placement").rules, spec)
 	if not okp then
 		die(rules)
-	elseif rules and (stt or spec.engine) then
+	elseif rules and (stt or embed or spec.engine) then
 		die("cpu_moe, n_cpu_moe, n_gpu_layers and override need a chat model")
 	end
 	if spec.inproc and spec.engine then
@@ -258,6 +262,12 @@ local function model_engine(spec, managed)
 	elseif spec.inproc and stt then
 		return require("lgml.stt_engine").new({
 			model = spec.model, backend = spec.backend, threads = threads, id = spec.id,
+		})
+	elseif spec.inproc and embed then
+		return require("lgml.embed_engine").new({
+			model = spec.model, backend = spec.backend, threads = threads, n_ctx = n_ctx,
+			flash_attn = spec.flash_attn ~= false, id = spec.id,
+			cache_type_k = spec.cache_type_k, cache_type_v = spec.cache_type_v, kv_initial = kvi,
 		})
 	elseif spec.inproc then
 		return require("lgml.engine").new({

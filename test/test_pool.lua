@@ -22,7 +22,7 @@ end
 
 local MiB = 1048576
 local src = debug.getinfo(1, "S").source:sub(2):match("^(.*)/test/") or "."
-local ALL = { "completion", "decide", "transcription", "speech", "image_generation" }
+local ALL = { "completion", "decide", "transcription", "speech", "image_generation", "embedding" }
 -- Pool log lines, for checks.
 local log = require("lgml.log")
 local lines = {}

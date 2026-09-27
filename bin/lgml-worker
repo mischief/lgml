@@ -99,9 +99,18 @@ local function load()
 			model = opts.m, backend = opts.b, text_backend = opts["text-backend"],
 			threads = threads, id = opts.alias, n_ctx = opts.c and tonumber(opts.c),
 		})
-	elseif opts.stt or require("lgml.detect").is_whisper(opts.m) then
+	end
+	local kind = require("lgml.detect").engine_of({ model = opts.m, stt = opts.stt })
+	if kind == "lgml.stt_engine" then
 		return require("lgml.stt_engine").new({
 			model = opts.m, backend = opts.b, threads = threads, id = opts.alias,
+		})
+	elseif kind == "lgml.embed_engine" then
+		return require("lgml.embed_engine").new({
+			model = opts.m, backend = opts.b, threads = threads, n_ctx = opts.c and tonumber(opts.c),
+			flash_attn = not opts["no-fa"], id = opts.alias,
+			cache_type_k = opts.ctk, cache_type_v = opts.ctv,
+			kv_initial = math.tointeger(tonumber(opts["kv-initial"])),
 		})
 	end
 	return require("lgml.engine").new({
