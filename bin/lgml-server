@@ -2,6 +2,15 @@
 -- lgml-server: OpenAI-shaped HTTP server.
 
 local root = ((arg and arg[0] or ""):match("^(.*)/[^/]*$") or ".") .. "/.."
+-- The interpreter is the lowest arg index: a luarocks wrapper puts -e
+-- options between it and the script.
+local LUA = "lua5.4"
+do
+	local i = -1
+	while arg and arg[i] do
+		LUA, i = arg[i], i - 1
+	end
+end
 package.path = root .. "/lua/?.lua;" .. root .. "/lua/?/init.lua;" ..
     root .. "/lua_modules/share/lua/5.4/?.lua;" .. package.path
 package.cpath = root .. "/" .. (os.getenv("LGML_BUILD") or "build") .. "/?.so;" .. root .. "/lua_modules/lib/lua/5.4/?.so;" ..
@@ -302,7 +311,7 @@ local function model_engine(spec, managed)
 	end
 	local function start(o)
 		return require("lgml.server.remote_engine").new({
-			lua = arg[-1] or "lua5.4", script = root .. "/bin/lgml-worker", args = wargs, id = spec.id,
+			lua = LUA, script = root .. "/bin/lgml-worker", args = wargs, id = spec.id,
 			modes = modes, restart = o.restart, on_exit = o.on_exit,
 		})
 	end
@@ -323,7 +332,7 @@ end
 -- The ggml devices, from a worker process, so this process does not
 -- start the Vulkan backend.
 local function devices()
-	local p = io.popen(("%s %s --devices 2>/dev/null"):format(shell_quote(arg[-1] or "lua5.4"),
+	local p = io.popen(("%s %s --devices 2>/dev/null"):format(shell_quote(LUA),
 	    shell_quote(root .. "/bin/lgml-worker")))
 	local out = p and p:read("a")
 	if p then
