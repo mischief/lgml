@@ -52,6 +52,8 @@ local E = {}
 E.__index = E
 
 local UBATCH = 512
+-- The smallest context that `reserve` cuts to before it gives up.
+local MIN_FIT_CTX = 8192
 
 -- Image embeddings kept in host memory, most recent first.
 local EMBD_KEEP = 8
@@ -438,10 +440,39 @@ end
 -- back, so a full cache that does not fit raises the budget error.
 -- @treturn ?integer the bytes, or nil for an engine without a pool
 function E:reserve()
-	local pool, model = self.pool, self.model
+	local pool = self.pool
 	if not pool then
 		return nil
 	end
+	while true do
+		local ok, r = pcall(self.reserve_ctx, self)
+		if ok then
+			return r
+		end
+		local n = pool.n_ctx * 3 // 4 // 256 * 256
+		if not budget_mod.is_budget(r) or n < MIN_FIT_CTX then
+			error(r, 0)
+		end
+		L:warn("context cut to fit the memory budget", "n_ctx", n, "from", pool.n_ctx)
+		self:cut_ctx(n)
+	end
+end
+
+-- Lower the context of the engine to n cells, a multiple of 256. The
+-- pool tensors must hold at most n cells.
+function E:cut_ctx(n)
+	local pool = self.pool
+	pool.n_ctx = n
+	pool.alloc.n = n // pool.block
+	self.n_ctx = n
+	for _, s in ipairs(self.slots) do
+		s.cache.n_ctx = math.min(s.cache.n_ctx, n)
+	end
+end
+
+-- The plans of `reserve` at the context of the engine now.
+function E:reserve_ctx()
+	local pool, model = self.pool, self.model
 	local cells = pool.cap
 	local name = self.be:name()
 	local before = budget_mod.free(name)
@@ -458,10 +489,18 @@ function E:reserve()
 				r = r + self:plan_pass(k, n, top)
 			end
 		end
+		-- The full pool is in place: the compute buffers must fit too.
+		local fits, err = lgml.memory_check(self.be, r, "the compute buffers")
+		if not fits then
+			error(err, 0)
+		end
 		return r
 	end)
 	model:pool_resize(pool, cells)
 	-- Later budget checks must see the cells that the shrink freed.
+	-- Nodes of the plans still hold the old tensors until a collect.
+	collectgarbage()
+	collectgarbage()
 	if before then
 		budget_mod.settle(name, before - (64 << 20))
 	end
@@ -479,7 +518,8 @@ end
 -- bytes of the KV cache at n_ctx cells and now, and the largest compute
 -- buffers from `reserve`
 function E:memory()
-	local r = { backend = self.be }
+	-- The reserve can cut the context; the cache sizes come after it.
+	local r = { backend = self.be, compute = self:reserve() }
 	if self.model.cache_size then
 		local per, fixed = self.model:cache_size(self.copts)
 		local n = #self.slots
@@ -494,7 +534,6 @@ function E:memory()
 			end
 		end
 	end
-	r.compute = self:reserve()
 	return r
 end
 
