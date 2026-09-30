@@ -12,6 +12,7 @@ local stream = require("lgml.server.stream")
 local detect = require("lgml.detect")
 local engine_api = require("lgml.server.engine")
 local log = require("lgml.log")
+local metrics = require("lgml.server.metrics")
 
 local L = log.new("remote")
 
@@ -173,6 +174,26 @@ function R:lost(err)
 	end
 end
 
+-- The worker stats of a DONE message, as gauges of the model.
+local STATS = {
+	{ "rss", "worker_rss_bytes", "resident bytes of the worker process" },
+	{ "swap", "worker_swap_bytes", "swapped bytes of the worker process" },
+	{ "store_bytes", "prompt_store_bytes", "bytes in the prompt cache RAM store" },
+	{ "store_items", "prompt_store_items", "entries in the prompt cache RAM store" },
+}
+
+function R:note_stats(s)
+	if type(s) ~= "table" or not self.opts.id then
+		return
+	end
+	for _, k in ipairs(STATS) do
+		local key, name, help = table.unpack(k)
+		if type(s[key]) == "number" then
+			metrics.set(name, help, self.opts.id, s[key])
+		end
+	end
+end
+
 function R:message(t, id, v)
 	if t == ipc.HELLO then
 		self.hello = v
@@ -186,6 +207,7 @@ function R:message(t, id, v)
 	if job then
 		if t == ipc.DONE then
 			self.jobs[id] = nil
+			self:note_stats(v and v.stats)
 		end
 		job:push({ t = t, v = v })
 	end

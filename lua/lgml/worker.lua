@@ -84,6 +84,33 @@ local function finish(kind, id, t0, ok, msg, status)
 	end
 end
 
+-- The memory stats of the worker after a job: its resident and
+-- swapped bytes, and the fill of the prompt cache RAM store.
+local function stats(engine)
+	local r = {}
+	local f = io.open("/proc/self/status")
+	if f then
+		for line in f:lines() do
+			local k, v = line:match("^(Vm%a+):%s+(%d+) kB")
+			if k == "VmRSS" then
+				r.rss = tonumber(v) * 1024
+			elseif k == "VmSwap" then
+				r.swap = tonumber(v) * 1024
+			end
+		end
+		f:close()
+	end
+	local pc = engine.pc
+	if pc and pc.bytes then
+		local n = #(pc.store or {}) + #(pc.states or {})
+		for _ in pairs(pc.blocks or {}) do
+			n = n + 1
+		end
+		r.store_bytes, r.store_items = pc.bytes, n
+	end
+	return r
+end
+
 local function caps(engine)
 	return {
 		chat = engine.chat ~= nil, transcribe = engine.transcribe ~= nil,
@@ -173,6 +200,10 @@ end
 function M.serve(fd, engine, mem)
 	local jobs, pending, deciding = {}, {}, {}
 	local ch
+	local function done(id, v)
+		v.stats = stats(engine)
+		ch:send(ipc.DONE, id, v)
+	end
 	local function chat(id, req)
 		local sink = proxy(ch, id)
 		jobs[id] = sink
@@ -186,7 +217,7 @@ function M.serve(fd, engine, mem)
 			end
 			jobs[id] = nil
 			finish("chat", id, t0, ok, msg, status)
-			ch:send(ipc.DONE, id, {
+			done(id, {
 				ok = ok == true, msg = msg, status = status, finish = sink.done,
 			})
 		end)()
@@ -213,7 +244,7 @@ function M.serve(fd, engine, mem)
 			end
 			jobs[id] = nil
 			finish("transcribe", id, t0, r ~= nil, msg, status)
-			ch:send(ipc.DONE, id, { ok = r ~= nil, msg = msg, status = status, result = r })
+			done(id, { ok = r ~= nil, msg = msg, status = status, result = r })
 		end)()
 	end
 	-- r.audio is an lgml audio object, or r.wav holds WAV bytes.
@@ -242,7 +273,7 @@ function M.serve(fd, engine, mem)
 				end
 			end
 			finish("speak", id, t0, r ~= nil, msg, status)
-			ch:send(ipc.DONE, id, { ok = r ~= nil, msg = msg, status = status, result = result })
+			done(id, { ok = r ~= nil, msg = msg, status = status, result = result })
 		end)()
 	end
 	local function decide(id, req)
@@ -261,7 +292,7 @@ function M.serve(fd, engine, mem)
 			end
 			jobs[id] = nil
 			finish("decide", id, t0, r ~= nil, msg, status)
-			ch:send(ipc.DONE, id, { ok = r ~= nil, msg = msg, status = status, result = r })
+			done(id, { ok = r ~= nil, msg = msg, status = status, result = r })
 		end)()
 	end
 	-- The result images go out as IMAGE messages; DONE has the rest.
@@ -293,7 +324,7 @@ function M.serve(fd, engine, mem)
 				r.images = nil
 			end
 			finish("generate", id, t0, r ~= nil, msg, status)
-			ch:send(ipc.DONE, id, { ok = r ~= nil, msg = msg, status = status, result = r })
+			done(id, { ok = r ~= nil, msg = msg, status = status, result = r })
 		end)()
 	end
 	local function embed(id, req)
@@ -312,7 +343,7 @@ function M.serve(fd, engine, mem)
 			end
 			jobs[id] = nil
 			finish("embed", id, t0, r ~= nil, msg, status)
-			ch:send(ipc.DONE, id, { ok = r ~= nil, msg = msg, status = status, result = r })
+			done(id, { ok = r ~= nil, msg = msg, status = status, result = r })
 		end)()
 	end
 	ch = ipc.channel(fd, function(t, id, v)
