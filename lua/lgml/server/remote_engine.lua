@@ -222,7 +222,9 @@ end
 -- its exit status
 function R:ready()
 	while not self.hello do
-		if self.failed and not self.proc and (self.opts.restart == false or self.stopping) then
+		-- A worker that will not start again fails the wait; else the
+		-- caller waits forever.
+		if self.failed and not self.proc and (self.opts.restart == false or self.stopping or self.down) then
 			return nil, self.failed
 		end
 		if coroutine.isyieldable() then
@@ -239,7 +241,8 @@ end
 --- Lists the models of the worker engine.
 -- @treturn {table,...} the model list
 function R:models()
-	return self:ready().models
+	local h = self:ready()
+	return h and h.models or {}
 end
 
 --- Lists the modes of the worker's model.
@@ -250,6 +253,9 @@ function R:modes()
 		return self.opts.modes
 	end
 	local h = self:ready()
+	if not h then
+		return {}
+	end
 	local m = h.models[1]
 	return detect.modes_of(h.caps or {}, m and m.vision)
 end
@@ -258,7 +264,8 @@ end
 -- The `lora` field has the global scales that `lora_adapters` set.
 -- @treturn table the properties
 function R:props()
-	local p = self:ready().props
+	local h = self:ready()
+	local p = h and h.props or {}
 	if not self.lora then
 		return p
 	end

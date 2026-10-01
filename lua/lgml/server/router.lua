@@ -35,7 +35,8 @@ local function modes(e, m)
 	elseif m and m.capabilities then
 		return m.capabilities
 	end
-	local caps = e.ready and e:ready().caps
+	local h = e.ready and e:ready()
+	local caps = h and h.caps
 	return detect.modes_of(caps or e, m and m.vision)
 end
 
