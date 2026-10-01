@@ -372,7 +372,8 @@ local function nimble_field(q)
 		add(true, "1", q.yes or "Yes")
 	elseif q.type == "choice" then
 		for _, o in ipairs(q.options) do
-			add(o.key, o.key, o.text or o.key)
+			-- A null description is the option name, as Ollama gives it.
+			add(o.key, o.key, o.null and o.key or o.text)
 		end
 	else
 		for i, d in ipairs(q.levels) do

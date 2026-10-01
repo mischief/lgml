@@ -402,7 +402,7 @@ local function check_choice(q, loc, out)
 			bad(at(loc, "criteria"), "choice option names must be non-empty")
 		end
 		content(c[k], at(loc, "criteria", k), true)
-		out.options[i] = { key = k, text = M.describe(c[k]) }
+		out.options[i] = { key = k, text = M.describe(c[k]), null = c[k] == json.null or nil }
 	end
 end
 
