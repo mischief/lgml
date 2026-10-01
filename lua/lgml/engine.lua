@@ -209,7 +209,8 @@ end
 --   (default q8_0 with flash attention when the head size fits, else f16)
 -- - `id`: model id (default: the gguf `general.name`, or `"lgml"`)
 -- - `recipe`: a decision recipe for `decide`, from `lgml.decide.recipe`
---   or a recipe file path (default `lgml.decide.default_recipe`)
+--   a recipe file path, or "jevify" (the default) or "nimble" (see
+--   `lgml.decide.nimble_recipe`)
 -- - `cache_ram`: MiB of host RAM for the prompt store and the state
 --   index (default 8192; 0 turns them off, -1 means no limit); see
 --   `lgml.prompt_cache`
@@ -316,7 +317,11 @@ function M.new(opts)
 		cache = cache, tokens = {},
 		busy = false, waiting = {}, adapters = adapters,
 	}, E)
-	if type(opts.recipe) == "string" then
+	if opts.recipe == "nimble" then
+		e.recipe = decide.nimble_recipe()
+	elseif opts.recipe == "jevify" then
+		e.recipe = decide.default_recipe()
+	elseif type(opts.recipe) == "string" then
 		e.recipe = assert(decide.load_recipe(opts.recipe))
 	else
 		e.recipe = opts.recipe or decide.default_recipe()

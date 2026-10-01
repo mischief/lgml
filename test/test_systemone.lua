@@ -120,8 +120,24 @@ local function test_check()
 	    "body.questions.q.criteria.a", "number option text")
 	check_fails('{"state": "s", "questions": {"q": {"type": "score", "criteria": ["a"]}}}',
 	    "body.questions.q.criteria", "one level")
-	check_fails('{"state": "s", "questions": {"q": {"type": "score", "criteria": ' ..
-	    '["0","1","2","3","4","5","6","7","8","9","10"]}}}', "body.questions.q.criteria", "11 levels")
+	local levels = {}
+	for i = 1, 27 do
+		levels[i] = ('"%d"'):format(i - 1)
+	end
+	check_fails('{"state": "s", "questions": {"q": {"type": "score", "criteria": [' ..
+	    table.concat(levels, ",") .. ']}}}', "body.questions.q.criteria", "27 levels")
+	ok(so.check('{"state": "s", "questions": {"q": {"type": "score", "criteria": [' ..
+	    table.concat(levels, ",", 1, 26) .. ']}}}') ~= nil, "26 levels pass")
+	local qs = {}
+	for i = 1, 65 do
+		qs[i] = ('"q%d": %s'):format(i, NOUL)
+	end
+	check_fails('{"state": "s", "questions": {' .. table.concat(qs, ", ") .. '}}', "body.questions",
+	    "65 questions")
+	ok(so.check('{"state": "s", "keep_alive": "5m", "questions": {"q": ' .. NOUL .. '}}') ~= nil,
+	    "keep_alive passes")
+	check_fails('{"state": "s", "keep_alive": true, "questions": {"q": ' .. NOUL .. '}}',
+	    "body.keep_alive", "keep_alive type")
 	check_fails('{"state": "s", "questions": {"q": {"type": "score", "criteria": ["a", null]}}}',
 	    "body.questions.q.criteria.1", "null level")
 	check_fails('{"state": "s", "questions": {"q": {"type": "noul", "criteria": {"maybe": "x"}}}}',
@@ -199,6 +215,49 @@ end
 
 -- prompt and recipe
 
+-- The nimble format on Ollama's decision guide example: the user turn
+-- holds the context and schema as Go writes them, then the field.
+local function test_nimble()
+	local r = assert(so.check([[{"model": "nimble",
+	 "state": {"ticket": "I was charged twice. Please refund the extra payment."},
+	 "questions": {
+	  "refund": {"type": "noul", "instructions": "Is the customer requesting a refund?",
+	   "criteria": {"false": "No refund is requested", "true": "The customer requests a refund"}},
+	  "urgency": {"type": "score", "instructions": "How urgently does this ticket need a response?",
+	   "criteria": ["Routine: no time pressure", "Soon: a customer is inconvenienced",
+	    "Immediate: a critical service is unavailable"]}}}]]))
+	local family = { render = function(msgs, opts)
+		return msgs[1].content .. "|" .. msgs[2].content .. "|" .. tostring(opts.enable_thinking)
+	end }
+	local rds = decide.render_nimble(family, r.state_compact, r.questions)
+	local data = '{"context":"{\\"ticket\\":\\"I was charged twice. Please refund the extra payment.\\"}",' ..
+	    '"schema":[{"name":"refund","description":"Is the customer requesting a refund?","choices":[' ..
+	    '{"code":"A","value":false,"description":"No refund is requested"},' ..
+	    '{"code":"B","value":true,"description":"The customer requests a refund"}]},' ..
+	    '{"name":"urgency","description":"How urgently does this ticket need a response?","choices":[' ..
+	    '{"code":"A","value":"0","description":"Routine: no time pressure"},' ..
+	    '{"code":"B","value":"1","description":"Soon: a customer is inconvenienced"},' ..
+	    '{"code":"C","value":"2","description":"Immediate: a critical service is unavailable"}]}]}'
+	ok(rds[1].text == decide.NIMBLE_SYSTEM_PROMPT .. "|" .. data .. '\n\nRequested field: "refund"|false',
+	    "nimble: the prompt of the first field")
+	ok(rds[2].text:find('Requested field: "urgency"|', 1, true) ~= nil and
+	    table.concat(rds[2].candidates) == "ABC" and table.concat(rds[1].keys, ",") == "0,1",
+	    "nimble: codes and keys")
+	local esc = decide.render_nimble(family, "a<b & \"c\"\n", { r.questions[1] })[1].text
+	ok(esc:find('"context":"a\\u003cb \\u0026 \\"c\\"\\n"', 1, true) ~= nil, "nimble: Go escapes")
+	ok(near(so.entropy_confidence({ 0.0125, 0.9781, 0.0093 }), 0.8906, 5e-4),
+	    "nimble: entropy confidence of the docs example")
+	local out = json.decode(so.reply(r, json.decode([[{"questions": {
+	  "refund": {}, "urgency": {"criteria": ["a", "b", "c"]}}}]]), {
+		format = "nimble", answers = {
+			refund = { yes = 0.99891234 },
+			urgency = { probabilities = { 0.25, 0.5, 0.25 } },
+		} }))
+	ok(out.answers.refund.noul == 0.99891234, "nimble: noul not rounded")
+	ok(near(out.answers.urgency.score, 1) and out.answers.urgency.legend["1"] == "b" and
+	    near(out.answers.urgency.confidence, 1 - 1.0397207708 / math.log(3), 1e-6), "nimble: score answer")
+end
+
 local function test_render()
 	local r = assert(so.check(body("Paris is nice.", { { "q", [[{"type": "choice",
 	 "instructions": "  Which of these is the capital of France?\n",
@@ -230,9 +289,8 @@ local function test_render()
 	rd = decide.render(r.state, r.questions[2], { content_free = true })
 	ok(rd.prefix:find("^State:\nN/A\n\n"), "content-free state")
 
-	local long = string.rep("é", decide.MAX_STATE_CHARS + 5)
-	ok(decide.render_state(long) == string.rep("é", decide.MAX_STATE_CHARS) .. "\n…[truncated]",
-	    "long state is cut by characters")
+	local long = string.rep("é", 20000)
+	ok(decide.render_state(long) == long, "a long state is not cut")
 	ok(decide.strip("\u{3000} a b\t\n") == "a b", "strip")
 
 	local family = { render = function(msgs, o)
@@ -430,6 +488,7 @@ local function main()
 	test_check()
 	test_attachments()
 	test_stats()
+	test_nimble()
 	test_render()
 	test_tokenize()
 	test_finalize()

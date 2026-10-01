@@ -1204,6 +1204,15 @@ answer. It reads a state and scores the allowed answers of typed
 questions in one pass each. A chat model with capability `decide`
 serves it. The fields `lgml` and `attachments` are lgml extensions.
 
+Each model has a prompt format, set by `--recipe` (config `recipe`):
+
+- `jevify` (the default): Jevify's prompt and recipe, and Jev's
+  rounding and confidence rules, as below.
+- `nimble`: the prompt of Ollama's `/v1/systemone` and of
+  Bespoke-Nimble. Use it with a Nimble model. The context and the
+  schema of every question go into one JSON user turn, and the answer
+  is a code `A..Z`. See [Nimble format](#nimble-format).
+
 ### Request
 
 ```json
@@ -1223,10 +1232,14 @@ Top-level fields. Any other field gives 422.
 
 - `state` (required): a string, an object or an array. A JSON state
   becomes its indented JSON text (as Python `json.dumps(indent=2)`).
-  The prompt keeps the first 12000 characters.
+  The state is never cut: a prompt that does not fit the context
+  gives 400.
 - `model`: a string. See [Model selection](#model-selection).
-- `questions` (required): an object of questions by id, with at least
-  one. The answers keep this order. A repeated id gives 422.
+- `questions` (required): an object of 1 to 64 questions by id. The
+  answers keep this order. A repeated id gives 422.
+- `keep_alive` (Ollama): a duration string or a number. It is
+  accepted and has no effect; the pool unloads models by its idle
+  time.
 - `lgml` (lgml): an object with `raw` and `recipe`; see below.
 - `attachments` (lgml): an array of images for the state. Each item is
   a data URL string (`data:image/png;base64,...`) or an OpenAI part
@@ -1243,7 +1256,7 @@ Question fields. Any other field gives 422.
     and `"false"`, which describe each answer.
   - choice: required. An object of 2 to 255 options, from name to
     description. Names are not empty and not repeated.
-  - score: required. An array of 2 to 10 levels, lowest first. Each
+  - score: required. An array of 2 to 26 levels, lowest first. Each
     level is a string, an object or an array.
 
 A description that is not a string goes into the prompt as one-line
@@ -1266,8 +1279,8 @@ JSON.
   - `bias`: log-odds added to the noul answer. Default 0.
   - `temp_k_slope`: for K > 2 options, the temperature grows by
     `temp_k_slope * log2(K / 2)`. Default 0.
-  - `mode` must be `index`, `state_last` must be false, and `prompt`
-    must be `jevify`, when given.
+  - `mode` must be `index` and `state_last` must be false, when given.
+    `prompt` is `jevify` or `nimble`.
 
   A recipe that fails these rules gives 422 with a `detail` list, and
   `loc` is `["body", "lgml", "recipe"]`.
@@ -1298,6 +1311,29 @@ JSON.
 The body is formatted as Python `json.dumps` formats it, with the key
 order of the request. The reply has the headers `x-lgml-elapsed-ms`
 and `x-jevify-latency-ms`.
+
+### Nimble format
+
+A model with `recipe = "nimble"` answers as Ollama's `/v1/systemone`
+does with the Bespoke-Nimble model:
+
+- The prompt has Nimble's system prompt, then one user turn: the JSON
+  `{"context": state, "schema": [fields]}` as Go's `json.Marshal`
+  writes it, then `Requested field: "<id>"`. A JSON state is its
+  compact JSON text. Thinking is off.
+- A field is `{name, description, choices}`. Each choice is `{code,
+  value, description}` with codes `A`, `B`, `C`... A noul has the
+  values `false` and `true` (descriptions `No` and `Yes` by default), a
+  score the values `"0"`, `"1"`..., and a choice option without a
+  description uses its name.
+- A question has at most 26 candidates; more gives 400. Images give
+  400.
+- One option order, a softmax at temperature 1, no prior.
+- Answers are not rounded. `confidence` of choice and score is
+  `1 - H(p) / ln K`, with H the entropy.
+
+The questions share the prompt up to the requested field, so they
+share the KV cache and run in batched passes.
 
 ### System One errors
 

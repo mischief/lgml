@@ -21,8 +21,10 @@ M.MAX_ATTACHMENT_BYTES = 20 << 20
 M.MAX_CHOICE_OPTIONS = 255
 --- Fewest levels of a score question (2).
 M.MIN_SCORE_LEVELS = 2
---- Most levels of a score question (10).
-M.MAX_SCORE_LEVELS = 10
+--- Most levels of a score question (26, as Ollama allows).
+M.MAX_SCORE_LEVELS = 26
+--- Most questions of a request (64, as Ollama allows).
+M.MAX_QUESTIONS = 64
 --- The model name of a request with no `model`.
 M.DEFAULT_MODEL = "jevify-latest"
 --- Decimal places of reported probabilities: Jev rounds to 0.01.
@@ -275,6 +277,27 @@ function M.dumps(v, indent)
 	return enc(v, "")
 end
 
+--- Returns a JSON value as compact text with no spaces, as Go's
+-- json.Compact gives it. Keys keep their order.
+-- @param v the value
+-- @treturn string the JSON text
+function M.compact(v)
+	if type(v) ~= "table" or v == json.null then
+		return tojson.encode(v)
+	end
+	local parts = {}
+	if tojson.kind(v) == "array" then
+		for i = 1, #v do
+			parts[i] = M.compact(v[i])
+		end
+		return "[" .. table.concat(parts, ",") .. "]"
+	end
+	for i, k in ipairs(tojson.keys(v)) do
+		parts[i] = tojson.string(tostring(k)) .. ":" .. M.compact(v[k])
+	end
+	return "{" .. table.concat(parts, ",") .. "}"
+end
+
 --- Returns the prompt text of a JSON value, as Jevify's `_describe`.
 -- nil and null give `""`, a string gives itself, and other values give
 -- their one-line JSON.
@@ -418,6 +441,9 @@ local function check_question(id, q)
 	end
 	content(q.instructions, at(loc, "instructions"), true)
 	local out = { id = id, type = kind, instructions = M.describe(q.instructions) }
+	if type(q.instructions) == "table" then
+		out.instructions_compact = M.compact(q.instructions)
+	end
 	CHECK[kind](q, loc, out)
 	return out
 end
@@ -501,7 +527,8 @@ local function check_attachments(list)
 	return out
 end
 
-local TOP = { state = true, model = true, questions = true, lgml = true, attachments = true }
+local TOP = { state = true, model = true, questions = true, lgml = true, attachments = true,
+	keep_alive = true }
 
 local function check_body(b)
 	if not is_object(b) then
@@ -524,12 +551,22 @@ local function check_body(b)
 		bad({ "body", "questions" }, "at least one question is required")
 	elseif mt.__dups then
 		bad({ "body", "questions" }, ("duplicate question %q"):format(mt.__dups))
+	elseif #mt.__order > M.MAX_QUESTIONS then
+		bad({ "body", "questions" }, ("at most %d questions, got %d"):format(M.MAX_QUESTIONS, #mt.__order))
+	end
+	-- keep_alive is Ollama's; the pool unloads by its own idle time.
+	local ka = b.keep_alive
+	if ka ~= nil and ka ~= json.null and type(ka) ~= "string" and type(ka) ~= "number" then
+		bad({ "body", "keep_alive" }, "must be a duration string or a number of seconds")
 	end
 	local req = {
 		model = b.model,
 		state = type(b.state) == "string" and b.state or M.dumps(b.state, 2),
 		questions = json.array(),
 	}
+	if type(b.state) == "table" then
+		req.state_compact = M.compact(b.state)
+	end
 	for i, id in ipairs(mt.__order) do
 		req.questions[i] = check_question(id, qs[id])
 	end
@@ -546,9 +583,10 @@ end
 --- Reads and checks a request body.
 -- The checks are those of `jevify.wire.SystemOneRequest`: unknown
 -- fields, question types, 2 to 255 choice options with non-empty
--- names, 2 to 10 score levels, and string, object or array content.
--- lgml also rejects a repeated question id or option name, which
--- Python would drop in silence.
+-- names, and string, object or array content. Score levels (2 to 26),
+-- questions (at most 64) and `keep_alive` follow Ollama's rules. lgml
+-- also rejects a repeated question id or option name, which Python
+-- would drop in silence.
 --
 -- lgml extension to the Jev contract: `attachments`, the images of the
 -- state. It is an array of up to `MAX_ATTACHMENTS` items. An item is a
@@ -714,7 +752,63 @@ local function ordered(t, keys)
 	return setmetatable(t, { __jsontype = "object", __order = keys })
 end
 
-local function answer(q, src, a)
+--- Returns Ollama's confidence: `1 - H(p) / ln N`, with H the entropy.
+-- @tparam {number,...} p the probabilities
+-- @treturn number the confidence, from 0 to 1
+function M.entropy_confidence(p)
+	local h = 0.0
+	for _, v in ipairs(p) do
+		if v > 0 then
+			h = h - v * math.log(v)
+		end
+	end
+	return clip01(1 - h / math.log(#p))
+end
+
+-- An answer of the nimble format, as Ollama gives it: no rounding and
+-- the entropy confidence.
+local function answer_nimble(q, src, a)
+	if q.type == "noul" then
+		return ordered({ type = "noul", noul = clip01(a.yes) }, { "type", "noul" })
+	end
+	local keys = {}
+	if q.type == "choice" then
+		for i, o in ipairs(q.options) do
+			keys[i] = o.key
+		end
+	else
+		for i = 1, #q.levels do
+			keys[i] = tostring(i - 1)
+		end
+	end
+	local p = a.probabilities
+	local probs, best = ordered({}, keys), 1
+	for i, k in ipairs(keys) do
+		probs[k] = p[i]
+		if p[i] > p[best] then
+			best = i
+		end
+	end
+	local conf = M.entropy_confidence(p)
+	if q.type == "choice" then
+		return ordered({ type = "choice", choice = keys[best], probabilities = probs, confidence = conf },
+		    { "type", "choice", "probabilities", "confidence" })
+	end
+	local legend = ordered({}, keys)
+	for i, k in ipairs(keys) do
+		legend[k] = src.criteria[i]
+	end
+	return ordered({ type = "score", score = M.score_expectation(p), legend = legend,
+		probabilities = probs, confidence = conf },
+	    { "type", "score", "legend", "probabilities", "confidence" })
+end
+
+local function answer(q, src, a, format)
+	if format == "nimble" then
+		local out = answer_nimble(q, src, a)
+		out.lgml = a.lgml
+		return out
+	end
 	local out
 	if q.type == "noul" then
 		local p = round_to(clip01(a.yes), M.PLACES)
@@ -778,7 +872,7 @@ function M.reply(req, body, result)
 		ids[i] = q.id
 		local a = result.answers[q.id]
 		assert(a, "engine gave no answer for question " .. q.id)
-		answers[q.id] = answer(q, body.questions[q.id], a)
+		answers[q.id] = answer(q, body.questions[q.id], a, result.format)
 	end
 	local u = result.usage or {}
 	local out = ordered({
