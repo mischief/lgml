@@ -19,6 +19,9 @@ return {
 	-- The most seconds a load waits for requests of other models to end,
 	-- when it needs their memory (default 60).
 	load_wait = 60,
+	-- Device memory in MiB that each worker leaves free (default 256). A
+	-- load or a prompt that would pass it gets status 507.
+	-- mem_margin = 256,
 	-- CPU threads of each model (default: the LGML_THREADS environment
 	-- variable, else the physical cores). A model spec can set its own.
 	threads = 16,
@@ -43,10 +46,17 @@ return {
 		-- fewer when their rings or recurrent states would take more than a
 		-- quarter of the pool).
 		-- They share one KV pool of ctx cells, which starts at kv_initial
-		-- cells and grows to ctx.
+		-- cells and grows to ctx. cache_ram is the host RAM in MiB for
+		-- stored prefixes and checkpoints (default 8192). A gemma
+		-- checkpoint is about 55 MiB, so the default fills in minutes.
 		{ id = "gemma-4-26b", model = "/home/you/models/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
 			mmproj = "/home/you/models/gemma-4-26B-A4B-it-mmproj-F16.gguf", backend = "Vulkan0",
-			ctx = 16384, slots = 2 },
+			ctx = 16384, slots = 2, cache_ram = 2048 },
+		-- recipe sets the /v1/systemone format: "jevify" (the default),
+		-- "nimble" (Ollama's format, for Bespoke-Nimble), or a Jevify
+		-- recipe.json file. The Ollama blob of nimble is a gguf.
+		{ id = "nimble", model = "/home/you/models/Bespoke-Nimble-9B-Q8_0.gguf",
+			backend = "Vulkan0", ctx = 8192, recipe = "nimble", cache_ram = 2048 },
 		-- n_cpu_moe keeps the routed experts of the first N layers in host
 		-- memory, where the CPU runs them; "auto" picks the fewest layers
 		-- that fit vram. That part counts against ram. cpu_moe = true
