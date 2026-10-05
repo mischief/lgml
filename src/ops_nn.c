@@ -65,6 +65,14 @@ static int op_log(lua_State *L) { return unop(L, ggml_log, "log"); }
  */
 static int op_step(lua_State *L) { return unop(L, ggml_step, "step"); }
 
+/*** Elementwise sign: 1 where a > 0, -1 where a < 0, else 0.
+ * @tparam tensor a f32 input with contiguous rows
+ * @treturn tensor node with the shape of a
+ * @raise if a is not f32 or its rows are not contiguous
+ * @function graph:sgn
+ */
+static int op_sgn(lua_State *L) { return unop(L, ggml_sgn, "sgn"); }
+
 /*** Elementwise softplus: log(1 + exp(a)).
  * @tparam tensor a f32 input with contiguous rows
  * @treturn tensor node with the shape of a
@@ -275,6 +283,41 @@ op_argsort_top_k(lua_State *L)
 	luaL_argcheck(L, k >= 1 && k <= a->t->ne[0], 3, "k out of range");
 	lgml_reserve(L, g, 2);
 	return lgml_push_node(L, g, ggml_argsort_top_k(g->ctx, a->t, (int)k), a->rank);
+}
+
+/*** Lightning indexer scores, as in DeepSeek sparse attention.
+ * Score (t, j) is mask[t, j] plus the sum over heads h of
+ * w[t, h] * relu(q[t, h] . k[j]). The weights come prescaled.
+ * @tparam tensor q f32 (T, H, D) queries
+ * @tparam tensor k (P, 1, D) keys, f32 or another type with a float
+ * conversion
+ * @tparam tensor w f32 (T, H) head weights
+ * @tparam tensor mask f16 (T, P) mask
+ * @treturn tensor f32 (T, P) node
+ * @raise on bad types or shapes
+ * @function graph:lightning_indexer
+ */
+static int
+op_lightning_indexer(lua_State *L)
+{
+	struct graph *g = lgml_check_graph(L, 1);
+	struct tensor *q = lgml_operand(L, g, 2);
+	struct tensor *k = lgml_operand(L, g, 3);
+	struct tensor *w = lgml_operand(L, g, 4);
+	struct tensor *m = lgml_operand(L, g, 5);
+	const struct ggml_tensor *tq = q->t, *tk = k->t, *tw = w->t, *tm = m->t;
+
+	check_f32(L, tq, "lightning_indexer", "q");
+	check_f32(L, tw, "lightning_indexer", "w");
+	if (tm->type != GGML_TYPE_F16)
+		return luaL_error(L, "lightning_indexer: mask must be f16");
+	if (tq->ne[3] != 1 || tk->ne[3] != 1 || tk->ne[1] != 1 || tk->ne[0] != tq->ne[0] ||
+	    tw->ne[0] != tq->ne[1] || tw->ne[1] != tq->ne[2] || tw->ne[2] != 1 ||
+	    tm->ne[0] != tk->ne[2] || tm->ne[1] != tq->ne[2] || tm->ne[2] != 1 || tm->ne[3] != 1)
+		return luaL_error(L, "lightning_indexer: need q (T, H, D), k (P, 1, D), w (T, H), "
+		    "mask (T, P)");
+	lgml_reserve(L, g, 1);
+	return lgml_push_node(L, g, ggml_lightning_indexer(g->ctx, q->t, k->t, w->t, m->t), 2);
 }
 
 /*** Mixture-of-experts matrix product.
@@ -658,6 +701,7 @@ op_hadamard(lua_State *L)
 static const luaL_Reg ops[] = {
 	{ "log", op_log },
 	{ "step", op_step },
+	{ "sgn", op_sgn },
 	{ "softplus", op_softplus },
 	{ "expm1", op_expm1 },
 	{ "cumsum", op_cumsum },
@@ -670,6 +714,7 @@ static const luaL_Reg ops[] = {
 	{ "group_norm", op_group_norm },
 	{ "argsort", op_argsort },
 	{ "argsort_top_k", op_argsort_top_k },
+	{ "lightning_indexer", op_lightning_indexer },
 	{ "mul_mat_id", op_mul_mat_id },
 	{ "add_id", op_add_id },
 	{ "ssm_conv", op_ssm_conv },
