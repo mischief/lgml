@@ -209,6 +209,9 @@ if lua_bin.found()
   test('gemma4', lua_bin, args : [files('test/test_gemma4.lua')],
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
     timeout : 120)
+  test('qwen4exp', lua_bin, args : [files('test/test_qwen4exp.lua')],
+    env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
+    timeout : 300)
   test('zimage', lua_bin, args : [files('test/test_zimage.lua')],
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
     timeout : 120)
