@@ -29,7 +29,7 @@ local USAGE = [=[
 usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b backend]
                    [-t threads] [-c n_ctx] [--no-fa] [--ctk type] [--ctv type] [--alias id]
                    [--recipe file] [--cache-ram MiB] [--ctx-checkpoints n]
-                   [--kv-initial n] [-np n]
+                   [--kv-initial n] [-np n] [--repeat-stop n]
                    [--lora file[:scale]]... [--mmproj file] [--image-min-tokens n]
                    [--image-max-tokens n] [--inproc] [--stt] [--engine module]
                    [--text-backend name] [--cpu-moe] [--n-cpu-moe n|auto]
@@ -40,8 +40,9 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
   -l, --listen addr   address to listen on (default 127.0.0.1)
   -p, --port port     port to listen on (default 8080)
   -C, --config file   Lua file returning { listen, port, cors, vram, ram, idle,
-                      load_wait, threads, mem_margin, log_level, log_file,
-                      dump_prompts, state_dir, unknown_fields,
+                      load_wait, threads, mem_margin, repeat_stop_tokens,
+                      log_level, log_file, dump_prompts, state_dir,
+                      unknown_fields,
                       models = { spec, ... } };
                       each model runs in its own worker, which starts on the
                       first request for the model; when a load does not fit
@@ -55,6 +56,8 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       with 503; a model or request that does not fit gives
                       507; mem_margin is the MiB of device memory that each
                       worker leaves free (default 256), also a spec key;
+                      repeat_stop_tokens is --repeat-stop for each model,
+                      also a spec key;
                       POST /models/load and /models/unload with
                       {"model": id} load and unload a model now;
                       spec: { model = path, id, backend, threads, ctx,
@@ -120,6 +123,9 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       their caches; an idle slot gives its cells to a
                       running one when the pool is full; with two or
                       more, requests decode together in batched passes
+      --repeat-stop n a reply that samples one token n times in a row
+                      ends with finish reason length (default 256; 0
+                      turns the guard off)
       --lora file[:scale]
                       apply a LoRA adapter (llama.cpp gguf or PEFT
                       directory) with this scale (default 1); repeat for
@@ -239,6 +245,10 @@ local function model_engine(spec, managed)
 	if spec.slots and not (nslots and nslots >= 1 and nslots <= 64) then
 		die("bad slot count " .. tostring(spec.slots))
 	end
+	local rst = spec.repeat_stop_tokens and math.tointeger(tonumber(spec.repeat_stop_tokens))
+	if spec.repeat_stop_tokens and not (rst and rst >= 0) then
+		die("bad repeat_stop_tokens " .. tostring(spec.repeat_stop_tokens))
+	end
 	local threads = spec.threads and math.tointeger(tonumber(spec.threads))
 	if spec.threads and not (threads and threads >= 1 and threads <= 1024) then
 		die("bad thread count " .. tostring(spec.threads))
@@ -296,7 +306,7 @@ local function model_engine(spec, managed)
 			flash_attn = spec.flash_attn ~= false, id = spec.id,
 			cache_type_k = spec.cache_type_k, cache_type_v = spec.cache_type_v,
 			recipe = spec.recipe, cache_ram = ram, ctx_checkpoints = ckpt, lora = lora,
-			kv_initial = kvi, slots = nslots,
+			kv_initial = kvi, slots = nslots, repeat_stop_tokens = rst,
 			mmproj = spec.mmproj, image_min_tokens = imin, image_max_tokens = imax,
 			cpu_moe = spec.cpu_moe, n_cpu_moe = spec.n_cpu_moe, n_gpu_layers = spec.n_gpu_layers,
 			override = spec.override,
@@ -309,7 +319,7 @@ local function model_engine(spec, managed)
 		["--ctk"] = spec.cache_type_k, ["--ctv"] = spec.cache_type_v,
 		["--recipe"] = spec.recipe, ["--cache-ram"] = spec.cache_ram,
 		["--ctx-checkpoints"] = spec.ctx_checkpoints, ["--mmproj"] = spec.mmproj,
-		["--kv-initial"] = kvi, ["--slots"] = nslots,
+		["--kv-initial"] = kvi, ["--slots"] = nslots, ["--repeat-stop"] = rst,
 		["--image-min-tokens"] = imin, ["--image-max-tokens"] = imax,
 		["--image-max-side"] = side, ["--mem-margin"] = spec.mem_margin,
 	}) do
@@ -494,6 +504,9 @@ local function config_engine(path, cfg, opts)
 		if spec.mem_margin == nil then
 			spec.mem_margin = cfg.mem_margin
 		end
+		if spec.repeat_stop_tokens == nil then
+			spec.repeat_stop_tokens = cfg.repeat_stop_tokens
+		end
 		local mm = spec.mem_margin
 		if mm ~= nil and not (tonumber(mm) and tonumber(mm) >= 0) then
 			die(("%s: bad mem_margin %s"):format(path, tostring(mm)))
@@ -526,6 +539,7 @@ local function make_engine(opts, cfg)
 			cache_type_k = opts.ctk, cache_type_v = opts.ctv, recipe = opts.recipe,
 			cache_ram = opts["cache-ram"], ctx_checkpoints = opts["ctx-checkpoints"],
 			kv_initial = opts["kv-initial"], slots = opts.parallel,
+			repeat_stop_tokens = opts["repeat-stop"],
 			engine = opts.engine, lora = opts.lora, mmproj = opts.mmproj,
 			image_min_tokens = opts["image-min-tokens"],
 			image_max_tokens = opts["image-max-tokens"],
@@ -604,7 +618,7 @@ local function main(args)
 		threads = "t", ctx = "c", fake = false, ["no-fa"] = false, ["alias="] = false,
 		inproc = false, stt = false, ["ctk="] = false, ["ctv="] = false, ["engine="] = false,
 		["recipe="] = false, ["cache-ram="] = false, ["ctx-checkpoints="] = false,
-		["kv-initial="] = false, ["parallel="] = false,
+		["kv-initial="] = false, ["parallel="] = false, ["repeat-stop="] = false,
 		["lora="] = false, ["cors="] = false, ["vram="] = false, ["idle="] = false,
 		["mmproj="] = false, ["image-min-tokens="] = false, ["image-max-tokens="] = false,
 		["text-backend="] = false, ["state-dir="] = false, ["unknown-fields="] = false,

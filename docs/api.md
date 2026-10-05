@@ -438,6 +438,26 @@ grammar that does not compile gives 400. With thinking on, the
 reasoning block stays free; the constraint applies to the answer after
 it.
 
+### Repeat guard
+
+A model can get stuck on one token, such as a newline or a dash, and
+repeat it until `max_tokens`. The gguf chat engine stops such a reply:
+when it samples the same token N times in a row, the reply ends. The
+reply keeps the N tokens. It ends as at the token limit:
+
+| API | Ending |
+| --- | --- |
+| Chat completions | `finish_reason: "length"` |
+| Messages | `stop_reason: "max_tokens"` |
+| Responses | `status: "incomplete"`, `incomplete_details.reason: "max_output_tokens"` |
+
+The timings of the reply have `repeat_stop: 1` (header
+`x-lgml-repeat-stop`), the server logs a warning with the token id,
+and `lgml_repeat_stops_total` counts the reply (see
+[Metrics](#metrics)). N is 256 by default. `--repeat-stop n`, or the
+config key `repeat_stop_tokens` (server-wide, or in a model spec), sets
+it; 0 turns the guard off.
+
 ### Response
 
 ```json
@@ -471,6 +491,8 @@ it.
   `prompt_ms`, `prompt_per_token_ms`, `prompt_per_second`,
   `predicted_n`, `predicted_ms`, `predicted_per_token_ms`,
   `predicted_per_second`. See [Response headers](#response-headers).
+  A reply that the [repeat guard](#repeat-guard) ended also has
+  `repeat_stop: 1`.
 
 ### Log probabilities
 
@@ -1537,6 +1559,7 @@ its first event.
 | `lgml_predicted_seconds_total` | counter | Time spent making tokens. |
 | `lgml_cache_tokens_total` | counter | Prompt tokens reused from the KV cache. |
 | `lgml_restored_tokens_total` | counter | Prompt tokens restored from host memory. |
+| `lgml_repeat_stops_total` | counter | Chat replies that the [repeat guard](#repeat-guard) ended. |
 | `lgml_transcribed_seconds_total` | counter | Audio seconds transcribed. |
 | `lgml_spoken_seconds_total` | counter | Audio seconds of speech made. |
 | `lgml_embedding_tokens_total` | counter | Tokens of embedding inputs. |

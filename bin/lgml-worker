@@ -16,7 +16,7 @@ local USAGE = "usage: lgml-worker --fd n (-m model | --fake) [-b backend] [-t th
     "                   [--no-fa] [--ctk type] [--ctv type] [--alias id] [--stt]\n" ..
     "                   [--engine module] [--text-backend name] [--image-max-side n]\n" ..
     "                   [--recipe file] [--cache-ram MiB] [--ctx-checkpoints n]\n" ..
-    "                   [--kv-initial n] [--slots n]\n" ..
+    "                   [--kv-initial n] [--slots n] [--repeat-stop n]\n" ..
     "                   [--lora file[:scale]]...\n" ..
     "                   [--mmproj file] [--image-min-tokens n] [--image-max-tokens n]\n" ..
     "                   [--cpu-moe] [--n-cpu-moe n|auto] [--n-gpu-layers n]\n" ..
@@ -33,7 +33,7 @@ local opts, rest = getopt.parse(arg, "m:b:t:c:", {
 	["engine="] = false, ["text-backend="] = false, ["ctk="] = false, ["ctv="] = false,
 	["image-max-side="] = false,
 	["recipe="] = false, ["cache-ram="] = false, ["ctx-checkpoints="] = false, ["lora="] = false,
-	["kv-initial="] = false, ["slots="] = false,
+	["kv-initial="] = false, ["slots="] = false, ["repeat-stop="] = false,
 	["mmproj="] = false, ["image-min-tokens="] = false, ["image-max-tokens="] = false,
 	["fake-size="] = false, ["fake-load-ms="] = false, ["fake-delay="] = false,
 	["fake-delta="] = false, ["mem-margin="] = false, ["mem-limit="] = false,
@@ -127,6 +127,7 @@ local function load()
 		ctx_checkpoints = math.tointeger(tonumber(opts["ctx-checkpoints"])),
 		kv_initial = math.tointeger(tonumber(opts["kv-initial"])),
 		slots = math.tointeger(tonumber(opts.slots)),
+		repeat_stop_tokens = math.tointeger(tonumber(opts["repeat-stop"])),
 		lora = lora,
 		mmproj = opts.mmproj,
 		image_min_tokens = math.tointeger(tonumber(opts["image-min-tokens"])),

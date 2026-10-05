@@ -1,7 +1,7 @@
 -- The Anthropic Messages and OpenAI Responses APIs on the gguf chat
 -- engine with a tiny qwen3 model of random weights: stop sequences,
--- forced tool calls, thinking on and off, the reasoning budget and
--- token counts. TAP output.
+-- forced tool calls, thinking on and off, the reasoning budget, the
+-- repeat guard and token counts. TAP output.
 local json = require("lgml.json")
 local engine = require("lgml.engine")
 local httpd = require("lgml.server.httpd")
@@ -176,8 +176,43 @@ local function test_responses()
 	ok(cnt.input_tokens == base.usage.input_tokens, "input_tokens matches the prompt of a reply")
 end
 
+-- A bias on one token makes the model repeat it; the guard ends each
+-- reply with the length reason of its API.
+local function test_repeat()
+	local metrics = require("lgml.server.metrics")
+	local one = { [tostring(token_id("a"))] = 100 }
+	local rep = setmetatable({}, { __index = e })
+	function rep.chat(_, req, sink)
+		req.logit_bias = one
+		return e:chat(req, sink)
+	end
+	local s2 = httpd.new()
+	openai.install(s2, rep, { key = ("t"):rep(32) })
+	e.repeat_stop = 5
+	metrics.reset()
+	local _, c = inproc.json(s2, "POST", "/v1/chat/completions", { model = "tiny", max_tokens = 24,
+		temperature = 0, reasoning_effort = "none", messages = { { role = "user", content = "Hi there" } } })
+	ok(c.choices[1].finish_reason == "length" and c.usage.completion_tokens == 5,
+	    ("repeat guard: chat ends with length after 5 tokens (%d)"):format(c.usage.completion_tokens))
+	local _, m = inproc.json(s2, "POST", "/v1/messages", { model = "tiny", max_tokens = 24, temperature = 0,
+		thinking = { type = "disabled" }, messages = { { role = "user", content = "Hi there" } } }, HEADERS)
+	ok(m.stop_reason == "max_tokens" and m.usage.output_tokens == 5, "repeat guard: messages ends with max_tokens")
+	local _, r = inproc.json(s2, "POST", "/v1/responses", { model = "tiny", max_output_tokens = 24,
+		temperature = 0, reasoning = { effort = "none" }, input = "Hi there" })
+	ok(r.status == "incomplete" and r.incomplete_details.reason == "max_output_tokens" and
+	    r.usage.output_tokens == 5, "repeat guard: responses is incomplete with max_output_tokens")
+	ok(metrics.render():find('lgml_repeat_stops_total{model="tiny"} 3', 1, true),
+	    "repeat guard: /metrics counts the stops")
+	e.repeat_stop = 0
+	_, c = inproc.json(s2, "POST", "/v1/chat/completions", { model = "tiny", max_tokens = 24,
+		temperature = 0, reasoning_effort = "none", messages = { { role = "user", content = "Hi there" } } })
+	ok(c.usage.completion_tokens == 24, "repeat guard: 0 turns it off")
+	e.repeat_stop = 256
+end
+
 test_messages()
 test_budget()
+test_repeat()
 test_responses()
 os.remove(path)
 print("1.." .. n)

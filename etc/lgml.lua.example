@@ -22,6 +22,10 @@ return {
 	-- Device memory in MiB that each worker leaves free (default 256). A
 	-- load or a prompt that would pass it gets status 507.
 	-- mem_margin = 256,
+	-- A reply that samples one token this many times in a row ends with
+	-- finish reason length (default 256; 0 turns the guard off). A model
+	-- spec can set its own.
+	-- repeat_stop_tokens = 256,
 	-- CPU threads of each model (default: the LGML_THREADS environment
 	-- variable, else the physical cores). A model spec can set its own.
 	threads = 16,

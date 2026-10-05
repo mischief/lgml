@@ -178,9 +178,10 @@ end
 
 --- How a reply ended.
 -- `"tool_calls"`: the reply has tool calls. `"length"`: the token limit.
--- `"context"`: the context filled before the token limit.
+-- `"context"`: the context filled before the token limit. A reply that
+-- the repeat guard ended (`repeat_stop` in the timings) is `"length"`.
 -- `"stop_sequence"`: a stop string. `"stop"`: the model ended the reply.
--- @tparam ?table f the finish: `{ reason, usage }`
+-- @tparam ?table f the finish: `{ reason, usage, timings }`
 -- @tparam int ntools the number of tool calls
 -- @tparam[opt] int max the token limit of the request
 -- @treturn string the ending
@@ -190,7 +191,8 @@ function M.ending(f, ntools, max)
 	end
 	local u = f.usage or {}
 	if f.reason == "length" then
-		if max and u.completion_tokens and u.completion_tokens < max then
+		local guard = f.timings and f.timings.repeat_stop
+		if max and u.completion_tokens and u.completion_tokens < max and not guard then
 			return "context"
 		end
 		return "length"

@@ -52,6 +52,8 @@ local E = {}
 E.__index = E
 
 local UBATCH = 512
+-- The default count of one token in a row that ends a reply.
+local REPEAT_STOP = 256
 -- The smallest context that `reserve` cuts to before it gives up.
 local MIN_FIT_CTX = 8192
 
@@ -240,6 +242,9 @@ end
 --   the CPU so the weights and the cache of `n_ctx` positions (default:
 --   at most `lgml.placement.AUTO_CTX`) fit in free device memory. They
 --   apply only on a GPU backend.
+-- - `repeat_stop_tokens`: a reply that samples the same token this many
+--   times in a row ends with reason `length` (default 256; 0 turns the
+--   guard off). The finish timings then have `repeat_stop = 1`.
 -- @treturn Engine the engine
 -- @raise when the backend, the model or its tokenizer does not load,
 -- when no chat template fits the model, an adapter does not fit it, the
@@ -316,6 +321,7 @@ function M.new(opts)
 		id = opts.id or info.meta["general.name"] or "lgml",
 		cache = cache, tokens = {},
 		busy = false, waiting = {}, adapters = adapters,
+		repeat_stop = opts.repeat_stop_tokens or REPEAT_STOP,
 	}, E)
 	if opts.recipe == "nimble" then
 		e.recipe = decide.nimble_recipe()
@@ -2027,6 +2033,20 @@ function E:logprobs(smp, id, k)
 end
 
 -- The first lines of a grammar, for logs.
+-- A function of each sampled token id that returns true at the nth
+-- same id in a row. nil when n is 0 or nil.
+local function repeat_guard(n)
+	if not n or n <= 0 then
+		return nil
+	end
+	local last, run = nil, 0
+	return function(id)
+		run = id == last and run + 1 or 1
+		last = id
+		return run >= n
+	end
+end
+
 local function first_lines(text, n)
 	local out = {}
 	for l in text:gmatch("[^\n]+") do
@@ -2161,6 +2181,7 @@ function E:run_prompt(req, sink, st)
 	-- At the reasoning budget, the tokens of the block end replace sampling.
 	local budget = think and THINK_END[self.family_name] and math.tointeger(req.reasoning_budget)
 	local forced
+	local guard, repeated = repeat_guard(self.repeat_stop), nil
 	while n < max do
 		local id
 		if forced and #forced > 0 then
@@ -2191,6 +2212,11 @@ function E:run_prompt(req, sink, st)
 		if budget and not forced and out:in_reasoning() and out.reasoning_tokens >= budget then
 			forced = self.tk:encode(THINK_END[self.family_name])
 			L:debug("reasoning budget", "tokens", out.reasoning_tokens)
+		end
+		if guard and guard(id) then
+			L:warn("the same token repeats; the reply ends", "id", id, "count", self.repeat_stop, "tokens", n)
+			reason, repeated = "length", 1
+			break
 		end
 		if n >= max then
 			break
@@ -2249,7 +2275,7 @@ function E:run_prompt(req, sink, st)
 		predicted_n = n, predicted_ms = (t2 - t1) * 1000,
 		predicted_per_token_ms = (t2 - t1) * 1000 / math.max(n, 1),
 		predicted_per_second = n / math.max(t2 - t1, 1e-9),
-		images = #images, image_encode_ms = self.image_ms,
+		images = #images, image_encode_ms = self.image_ms, repeat_stop = repeated,
 	})
 	return true
 end

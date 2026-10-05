@@ -51,6 +51,7 @@ function M.request(model, kind, ok)
 end
 
 --- Count the timings of a finished chat request.
+-- `repeat_stop` counts the replies that the repeat guard ended.
 -- @tparam string model the model id
 -- @tparam table t llama.cpp-style timings from the engine
 function M.chat(model, t)
@@ -60,6 +61,7 @@ function M.chat(model, t)
 	M.add("predicted_seconds_total", "time spent generating", model, (t.predicted_ms or 0) / 1000)
 	M.add("cache_tokens_total", "prompt tokens reused from the cache", model, t.cache_n)
 	M.add("restored_tokens_total", "prompt tokens restored from host memory", model, t.restored_n)
+	M.add("repeat_stops_total", "replies that ended on one token repeated", model, t.repeat_stop)
 end
 
 -- Header value: integers as they are, other numbers with 3 decimals.
