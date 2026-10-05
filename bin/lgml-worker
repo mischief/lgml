@@ -17,7 +17,7 @@ local USAGE = "usage: lgml-worker --fd n (-m model | --fake) [-b backend] [-t th
     "                   [--engine module] [--text-backend name] [--image-max-side n]\n" ..
     "                   [--recipe file] [--cache-ram MiB] [--ctx-checkpoints n]\n" ..
     "                   [--kv-initial n] [--slots n] [--repeat-stop n]\n" ..
-    "                   [--reasoning-budget n] [--ubatch n|auto] [--spec n]\n" ..
+    "                   [--reasoning-budget n] [--ubatch n|auto] [--spec n] [--spec-mtp file]\n" ..
     "                   [--lora file[:scale]]...\n" ..
     "                   [--mmproj file] [--image-min-tokens n] [--image-max-tokens n]\n" ..
     "                   [--cpu-moe] [--n-cpu-moe n|auto] [--n-gpu-layers n]\n" ..
@@ -39,7 +39,7 @@ local opts, rest = getopt.parse(arg, "m:b:t:c:", {
 	["recipe="] = false, ["cache-ram="] = false, ["ctx-checkpoints="] = false, ["lora="] = false,
 	["kv-initial="] = false, ["slots="] = false, ["repeat-stop="] = false,
 	["reasoning-budget="] = false, ["ubatch="] = false,
-	["spec="] = false,
+	["spec="] = false, ["spec-mtp="] = false,
 	["mmproj="] = false, ["image-min-tokens="] = false, ["image-max-tokens="] = false,
 	["fake-size="] = false, ["fake-load-ms="] = false, ["fake-delay="] = false,
 	["fake-delta="] = false, ["mem-margin="] = false, ["mem-limit="] = false,
@@ -139,7 +139,7 @@ local function load()
 		reasoning_budget_tokens = math.tointeger(tonumber(opts["reasoning-budget"])),
 		ubatch = opts.ubatch == "auto" and "auto" or math.tointeger(tonumber(opts.ubatch)),
 		speculative = (math.tointeger(tonumber(opts.spec)) or 0) > 0 and
-		    { max = math.tointeger(tonumber(opts.spec)) } or nil,
+		    { max = math.tointeger(tonumber(opts.spec)), mtp = opts["spec-mtp"] } or nil,
 		lora = lora,
 		mmproj = opts.mmproj,
 		image_min_tokens = math.tointeger(tonumber(opts["image-min-tokens"])),

@@ -230,6 +230,12 @@ end
 -- Set rules.n_cpu_moe to the fewest expert layers on the CPU so the
 -- weights and the cache of the wanted context fit in free device memory.
 -- The per-sequence part of the cache counts once per slot.
+-- The MTP gguf that the speculative options name, or nil.
+local function mtp_file(opts)
+	local so = opts.speculative
+	return type(so) == "table" and type(so.mtp) == "string" and so.mtp or nil
+end
+
 local function auto_moe(be, rules, info, opts, n_slots)
 	local hp = transformer.config(info.meta)
 	local free
@@ -244,9 +250,9 @@ local function auto_moe(be, rules, info, opts, n_slots)
 		local per, fixed = transformer.cache_size(shape, shape_copts(shape, opts))
 		local ctx = opts.n_ctx or math.min(hp.n_ctx, placement.AUTO_CTX)
 		local mmproj = 0
-		if opts.mmproj then
-			local st = require("luv").fs_stat(opts.mmproj)
-			mmproj = st and st.size or 0
+		for _, extra in ipairs({ opts.mmproj or false, mtp_file(opts) or false }) do
+			local st = extra and require("luv").fs_stat(extra)
+			mmproj = mmproj + (st and st.size or 0)
 		end
 		n = placement.auto(rules, transformer.weight_tensors(info, hp), hp.n_layer, free - RESERVE - mmproj - fixed * n_slots - per * ctx)
 	end
@@ -333,7 +339,10 @@ end
 --   (false drafts `max` tokens at each step, default true), and
 --   `ngram_min`, `ngram_max` for the prompt lookup drafter (see
 --   `lgml.spec.lookup`). `drafter`, a function of the request that
---   returns a drafter, replaces prompt lookup (see `lgml.spec`).
+--   returns a drafter, replaces prompt lookup (see `lgml.spec`). `mtp`:
+--   the path of an MTP gguf for a qwen4exp model, or false to leave the
+--   MTP layer of the model file unused. A model with an MTP layer
+--   drafts with it first (see `lgml.spec.mtp`).
 -- - `moe_cache`: an adaptive expert cache (see `lgml.xcache`): every
 --   routed expert stays in host memory, and device slots hold the most
 --   used ones. A number is the MiB of the slots; `"auto"` or true fills
@@ -363,12 +372,17 @@ function M.new(opts)
 	if rules and rules.auto then
 		auto_moe(be, rules, info, opts, n_slots)
 	end
+	-- Speculation loads the MTP layer of a model that has one.
+	local so = opts.speculative
+	local mtp = (so == true or type(so) == "table") and arch == "qwen4exp" and
+	    (mtp_file(opts) or (type(so) ~= "table" or so.mtp ~= false)) or nil
 	local model = (transformer.supports(arch) and transformer or require("lgml." .. arch))
-	    .load(be, opts.model, rules and {
+	    .load(be, opts.model, (rules or mtp) and {
 		placement = rules,
 		-- An integrated GPU shares RAM with the CPU, so pinned memory
 		-- gives no speed, and it counts against the GPU memory limit.
 		pinned = dev_type(be) ~= "igpu",
+		mtp = mtp,
 	    } or nil)
 	if rules then
 		local dev, host = model.w:size()
@@ -451,6 +465,11 @@ function M.new(opts)
 	so = type(so) == "table" and so or {}
 	e.spec_opts = { max = so.max or 16, ngram_min = so.ngram_min, ngram_max = so.ngram_max,
 	    drafter = so.drafter, adaptive = so.adaptive }
+	if not so.drafter and model.mtp then
+		e.spec_opts.drafter = function()
+			return spec.mtp(model, { ngram_min = so.ngram_min, ngram_max = so.ngram_max, flash_attn = fa })
+		end
+	end
 	e.spec_costs = spec.costs()
 	e.eog = {}
 	for _, id in ipairs(e.tk:special().eog or {}) do

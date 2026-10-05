@@ -562,6 +562,13 @@ guesses gives k + 1 tokens.
   earlier place in the prompt or the reply and guesses the tokens that
   followed there. It gains most when the reply repeats the prompt, as
   in code edits.
+- A Qwen3.8-Flash-Next model (gguf arch qwen4exp) drafts with its MTP
+  head first: one more layer that guesses up to 3 tokens from the
+  state of the last layer, each guess from the one before. Prompt
+  lookup drafts when the head cannot. The head comes from the model
+  file when it holds the layer, or from an MTP gguf: the model setting
+  `spec_mtp` (`--spec-mtp`). With the head, every pass also runs the
+  MTP layer, so that its cache follows the prompt and the reply.
 - The engine drafts only when it pays. It measures the time of passes
   of each size, and for each request, the part of the guesses that
   stays. It drafts the length (1, 2, 4, 8 or 16 tokens) that gives the

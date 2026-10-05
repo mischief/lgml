@@ -67,7 +67,8 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       cache_ram, ctx_checkpoints, kv_initial, slots,
                       ubatch, repeat_stop_tokens, reasoning_budget_tokens
                       (--reasoning-budget), speculative = true, false or
-                      the most draft tokens (--spec), lora = "file[:scale]" or a
+                      the most draft tokens (--spec), spec_mtp (--spec-mtp),
+                      lora = "file[:scale]" or a
                       list of them or of { path, scale }, mmproj,
                       image_min_tokens, image_max_tokens,
                       text_backend = backend of the text encoder of
@@ -124,7 +125,10 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       -c cells at load
       --spec n        speculative decoding with prompt lookup drafts of
                       at most n tokens (default 0: off); a request can
-                      turn it on or off with "speculative"
+                      turn it on or off with "speculative"; a qwen4exp
+                      model with an MTP layer drafts with it first
+      --spec-mtp file an MTP gguf for the draft head of a qwen4exp model
+                      (spec key spec_mtp)
   -np, --parallel n   slots: the most sequences kept (default 4, or
                       fewer when their recurrent states and rings would
                       take more than a quarter of the pool); all
@@ -362,7 +366,7 @@ local function model_engine(spec, managed)
 			recipe = spec.recipe, cache_ram = ram, ctx_checkpoints = ckpt, lora = lora,
 			kv_initial = kvi, slots = nslots, repeat_stop_tokens = rst,
 			reasoning_budget_tokens = rbt, ubatch = ub,
-			speculative = sp and sp > 0 and { max = sp } or nil,
+			speculative = sp and sp > 0 and { max = sp, mtp = spec.spec_mtp } or nil,
 			mmproj = spec.mmproj, image_min_tokens = imin, image_max_tokens = imax,
 			cpu_moe = spec.cpu_moe, n_cpu_moe = spec.n_cpu_moe, n_gpu_layers = spec.n_gpu_layers,
 			override = spec.override, moe_cache = spec.moe_cache,
@@ -380,6 +384,7 @@ local function model_engine(spec, managed)
 		["--kv-initial"] = kvi, ["--slots"] = nslots, ["--repeat-stop"] = rst,
 		["--reasoning-budget"] = rbt, ["--ubatch"] = ub,
 		["--spec"] = sp and sp > 0 and sp or nil,
+		["--spec-mtp"] = sp and sp > 0 and spec.spec_mtp or nil,
 		["--image-min-tokens"] = imin, ["--image-max-tokens"] = imax,
 		["--image-max-side"] = side, ["--mem-margin"] = spec.mem_margin,
 		["--moe-cache-max"] = spec.moe_cache_max, ["--moe-cache-profile"] = spec.moe_cache_profile,
@@ -611,7 +616,7 @@ local function make_engine(opts, cfg)
 			kv_initial = opts["kv-initial"], slots = opts.parallel,
 			repeat_stop_tokens = opts["repeat-stop"], reasoning_budget_tokens = opts["reasoning-budget"],
 			ubatch = opts.ubatch,
-			speculative = opts.spec,
+			speculative = opts.spec, spec_mtp = opts["spec-mtp"],
 			engine = opts.engine, lora = opts.lora, mmproj = opts.mmproj,
 			image_min_tokens = opts["image-min-tokens"],
 			image_max_tokens = opts["image-max-tokens"],
@@ -694,7 +699,7 @@ local function main(args)
 		["recipe="] = false, ["cache-ram="] = false, ["ctx-checkpoints="] = false,
 		["kv-initial="] = false, ["parallel="] = false, ["repeat-stop="] = false,
 		["reasoning-budget="] = false, ["ubatch="] = false,
-		["spec="] = false,
+		["spec="] = false, ["spec-mtp="] = false,
 		["lora="] = false, ["cors="] = false, ["vram="] = false, ["idle="] = false,
 		["mmproj="] = false, ["image-min-tokens="] = false, ["image-max-tokens="] = false,
 		["text-backend="] = false, ["state-dir="] = false, ["unknown-fields="] = false,

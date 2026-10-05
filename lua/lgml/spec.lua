@@ -92,6 +92,64 @@ function Lookup:draft(ctx, k)
 	return {}
 end
 
+local Mtp = {}
+Mtp.__index = Mtp
+
+--- An MTP drafter: the model's own draft head (see
+-- `lgml.qwen4exp.mtp_draft`), then prompt lookup when the head cannot
+-- draft. The head takes the state of the trunk at the row that gave
+-- the last token, so the engine runs each decode step through the
+-- verify path.
+-- @param model the model, with mtp
+-- @tparam[opt] table opts `max` (the most guesses of the head, default
+-- 3), `flash_attn`, and the options of `lookup`
+-- @treturn table the drafter
+function M.mtp(model, opts)
+	opts = opts or {}
+	return setmetatable({ model = model, max = opts.max or 3, flash = opts.flash_attn,
+		lookup = M.lookup(opts), hidden = true, drafted = 0, used = 0 }, Mtp)
+end
+
+-- The trunk streams of rows 1 .. n of the hidden node, in a host buffer.
+local function host_rows(hidden, n)
+	local lgml = require("lgml")
+	local sh = hidden:shape()
+	local row = lgml.row_size("f32", sh[2] * sh[3])
+	local buf = lgml.hostbuf(n * row)
+	hidden:to_host(buf, 0, 0, n * row)
+	return buf
+end
+
+function Mtp:draft(ctx, k)
+	local seq, cache = ctx.seq, ctx.cache
+	local n0 = cache.n_past
+	local pend = table.move(seq, n0 + 1, #seq, 1, {})
+	local ok = #pend >= 1
+	for _, id in ipairs(pend) do
+		ok = ok and math.type(id) == "integer"
+	end
+	-- Tokens the cache lacks besides the last one need their trunk rows,
+	-- which the last verify pass gave from the position n0 on.
+	local h_rest
+	if ok and #pend > 1 then
+		ok = ctx.hidden ~= nil and ctx.hidden_row == #pend - 1
+		h_rest = ok and host_rows(ctx.hidden, #pend - 1) or nil
+	end
+	local out = {}
+	if ok and cache.mtp_h then
+		out = require("lgml.qwen4exp").mtp_draft(self.model, cache, pend, h_rest, math.min(k, self.max),
+		    self.flash)
+		self.used = self.used + 1
+	end
+	if h_rest then
+		h_rest:close()
+	end
+	if #out == 0 then
+		return self.lookup:draft(ctx, k)
+	end
+	return out
+end
+
 --- Pass times by row count, for the draft length choice.
 -- Each entry is a moving average of the seconds of a pass with that
 -- many rows. A count with no entry gets an estimate from its neighbors.
@@ -275,9 +333,9 @@ function M.state_copy(model)
 	local function build(cache)
 		close_graphs()
 		local by = {}
-		-- The PLE conv state of qwen4exp is recurrent too.
-		local parts = { conv = cache.conv, ssm = cache.ssm, pconv = cache.pconv or {} }
-		for _, part in ipairs({ "conv", "ssm", "pconv" }) do
+		-- The PLE conv state and the MTP input state are recurrent too.
+		local parts = { conv = cache.conv, ssm = cache.ssm, pconv = cache.pconv or {}, mtp = { cache.mtp_h } }
+		for _, part in ipairs({ "conv", "ssm", "pconv", "mtp" }) do
 			for il, t in pairs(parts[part]) do
 				local key = part .. il
 				local be = t:backend()
