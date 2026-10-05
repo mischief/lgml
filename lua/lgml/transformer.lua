@@ -631,11 +631,15 @@ end
 
 --- Drop the graph of the last batch pass.
 -- The next batch pass builds a graph again. Its compute buffers go when
--- its logits rows close.
+-- its logits rows close. With done false, a request can still read a
+-- row; a garbage collection then frees the buffers when none does.
 -- @tparam[opt] boolean done true to close the rows now (default true)
 function M:drop_batch(done)
 	if self.batch_replay then
 		drop_batch(self, done ~= false)
+		if done == false then
+			collectgarbage()
+		end
 	end
 end
 
@@ -2244,7 +2248,14 @@ function M:run_batch(caches, ids, opts)
 	opts = opts or {}
 	local key = self:batch_key(caches, ids, opts)
 	local r = self.batch_replay
-	if r and r.key == key then
+	if r and r.key ~= key then
+		-- Requests can still read rows of the last pass; the collector
+		-- frees its buffers when none does.
+		drop_batch(self)
+		collectgarbage()
+		r = nil
+	end
+	if r then
 		for _, b in ipairs(r.inp.batch) do
 			check_pass(self, b.cache, b.n)
 		end
@@ -2253,9 +2264,6 @@ function M:run_batch(caches, ids, opts)
 			q4.batch(self, r.inp, ids)
 		end
 	else
-		if r then
-			drop_batch(self)
-		end
 		local inp = self:batch_inputs(caches, ids, opts)
 		local g = self.be:graph()
 		local out = self:forward(g, inp)

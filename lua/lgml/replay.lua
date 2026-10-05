@@ -43,7 +43,9 @@ end
 
 --- Drop the graphs that a cache holds.
 -- Their compute buffers go when their output nodes close. With done
--- true, they close now, as the caller reads them no more.
+-- true, they close now, as the caller reads them no more. The graphs of
+-- the caches in `cache.subs` (such as a draft head's view of the
+-- cache) go too.
 -- @tparam table cache the model cache
 -- @tparam[opt] boolean done true to close the output nodes
 function M.drop(cache, done)
@@ -56,16 +58,23 @@ function M.drop(cache, done)
 		free(r, done)
 	end
 	M.drop_kept(cache)
+	for sub in pairs(rawget(cache, "subs") or {}) do
+		M.drop(sub, done)
+	end
 end
 
---- Drop the earlier graphs that a cache keeps, but not the last one.
--- Their outputs are from earlier passes, so they close too.
+--- Drop the earlier graphs that a cache keeps, but not the last one,
+-- also in the caches of `cache.subs`. Their outputs are from earlier
+-- passes, so they close too.
 -- @tparam table cache the model cache
 function M.drop_kept(cache)
 	local kept = cache.replay_kept
 	cache.replay_kept = nil
 	for _, r in ipairs(kept or {}) do
 		free(r, true)
+	end
+	for sub in pairs(rawget(cache, "subs") or {}) do
+		M.drop_kept(sub)
 	end
 end
 

@@ -959,6 +959,10 @@ local function proxy_of(head, cache)
 			end
 		end })
 		head.proxies[cache] = p
+		-- Dropping the graphs of the cache drops the head's too.
+		local subs = rawget(cache, "subs") or setmetatable({}, { __mode = "k" })
+		subs[p] = true
+		rawset(cache, "subs", subs)
 	end
 	return p
 end
