@@ -159,9 +159,15 @@ function M.new(model, opts)
 						self.bytes = self.bytes + c:nbytes()
 					end
 				end
-				xc.map = be:tensor("i32", { hp.n_expert, 1 }, nil, { weights = true })
-				xc.hit = be:tensor("f32", { hp.n_expert, 1 }, nil, { weights = true })
-				self.bytes = self.bytes + xc.map:nbytes() + xc.hit:nbytes()
+				-- The tables go where the router runs, so that only
+				-- the ids and weights of the device picks cross over.
+				local tb = L.gate_inp:backend()
+				xc.map = tb:tensor("i32", { hp.n_expert, 1 }, nil, { weights = true })
+				xc.hit = tb:tensor("f32", { hp.n_expert, 1 }, nil, { weights = true })
+				if tb == be then
+					self.bytes = self.bytes + xc.map:nbytes() + xc.hit:nbytes()
+				end
+				xc.router_cpu = tb ~= be
 			end
 			self.layers[il] = xc
 			self.expert_bytes = math.max(self.expert_bytes, eb)

@@ -130,6 +130,15 @@ for _, kind in ipairs({ "split", "fused", "q8_0" }) do
 		xc:close()
 		ok(m.layers[1].xc == nil and m.before_pass == nil, tag .. "close detaches the cache")
 	end
+	-- The rest of the model on the CPU too: the router runs there.
+	do
+		local m = transformer.load(be, path, { placement = placement.rules({ cpu_moe = true,
+		    n_gpu_layers = 0 }) })
+		local xc = xcache.new(m, { slots = 5, swap = 1 << 30, halflife = 3, margin = 0 })
+		local d = maxdiff(want, rows(m, ids))
+		ok(xc.layers[1].router_cpu and d < TOL,
+		    ("%s, router on the CPU: logits equal one backend (max error %.3g)"):format(kind, d))
+	end
 	-- Slots that change before every pass, at most one expert each.
 	do
 		local m = transformer.load(be, path, { placement = rules })

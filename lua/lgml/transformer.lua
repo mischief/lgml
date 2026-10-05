@@ -1683,9 +1683,16 @@ local function cached_experts(g, hp, L, x3, sel, w)
 		return sum_picks(g, experts(g, hp, xc, x3, dsel, w))
 	end
 	local wd = g:mul(w, g:reshape(g:get_rows(xc.hit, flat), { n, K, 1 }))
-	local csel = xc.state:remap(g, xc.il, sel)
+	local wc = g:sub(w, wd)
+	local csel = xc.state:remap(g, xc.il, g:reshape(flat, { n, K }))
+	-- With the router on the CPU, the routing nodes go first, so that the
+	-- scheduler keeps them there: only x, the device ids and weights go
+	-- to the device, and one sum comes back.
+	if xc.router_cpu then
+		g:expand(w, wd, wc, csel, dsel)
+	end
 	local dev = sum_picks(g, experts(g, hp, xc, x3, dsel, wd))
-	return g:add(dev, sum_picks(g, experts(g, hp, L, x3, csel, g:sub(w, wd))))
+	return g:add(dev, sum_picks(g, experts(g, hp, L, x3, csel, wc)))
 end
 
 --- Build the routed experts of one layer.
