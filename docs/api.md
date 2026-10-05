@@ -272,6 +272,7 @@ usage, the event stream framing and the tool call fragments.
 | `json_schema` | llama.cpp | supported | A JSON schema for the answer. |
 | `chat_template_kwargs` | llama.cpp | supported | `enable_thinking`, `reasoning_effort` (a string for the template), `preserve_thinking` (false drops old reasoning). |
 | `lora` | llama.cpp | supported | Adapter scales for this request: `[{"id": 0, "scale": 0.5}]`. Adapters that the list does not name get scale 0. Without `lora`, the global scales apply; see [Server properties and adapters](#server-properties-and-adapters). |
+| `reasoning_budget_tokens` | lgml | supported | A positive integer: the most reasoning tokens before the engine ends the reasoning block. See [Reasoning budget](#reasoning-budget). |
 
 ### Reply fields
 
@@ -350,6 +351,30 @@ values): with thinking, temperature 0.6, top_k 20, top_p 0.95, min_p 0;
 without thinking, temperature 0.7, top_k 20, top_p 0.8, min_p 0.
 Request fields override them. The other settings have the llama.cpp
 defaults.
+
+### Reasoning budget
+
+`reasoning_budget_tokens: N` (lgml; Responses has the same field, and
+Messages has `thinking.budget_tokens`) is a hard cap on the reasoning.
+When the reasoning block of the reply reaches N tokens, the gguf chat
+engine ends it. It adds this wrap-up line to the reasoning:
+
+```
+Considering the limited time by the user, I have to give the solution based on the thinking directly now.
+```
+
+Then it adds the end tag of the block, as the chat template writes it
+(`</think>` for Qwen3 and Qwen3.5, `<channel|>` for Gemma 4). The model
+then writes the answer on the same cache; nothing runs again. The
+wrap-up line and the tag count as reasoning tokens, so the reasoning
+can have N plus about 30 tokens. A constraint (`response_format`,
+`grammar`, a forced tool call) applies to the answer after the block,
+as without a budget. With thinking off, or with a template that has no
+reasoning block, the budget does nothing.
+
+A model can have a default budget for requests that set none: the
+config key `reasoning_budget_tokens` in its spec, or
+`--reasoning-budget n` with `-m`. A request value replaces it.
 
 ### Messages
 
@@ -682,9 +707,10 @@ forced call also works with thinking on (Anthropic gives 400 there).
 
 - `thinking` absent, or `{"type": "adaptive"}`: thinking is on when the
   template has it.
-- `{"type": "enabled", "budget_tokens": N}`: N is at least 1024. The
-  engine closes the reasoning block after N reasoning tokens. N can be
-  more than `max_tokens`.
+- `{"type": "enabled", "budget_tokens": N}`: N is at least 1024. N is
+  a hard cap: the engine ends the reasoning block after N reasoning
+  tokens, as [Reasoning budget](#reasoning-budget) says. N can be more
+  than `max_tokens`.
 - `{"type": "disabled"}`: thinking off.
 - `display`: `summarized` (default) gives the reasoning text;
   `omitted` gives `thinking: ""` and puts the text in the signature.
@@ -888,6 +914,7 @@ the replies.
 | `prompt` | OpenAI | rejected | No stored prompts. |
 | `moderation` | OpenAI | rejected | No moderation. |
 | `context_management` | OpenAI | rejected | No server-side compaction. |
+| `reasoning_budget_tokens` | lgml | supported | As for chat completions; see [Reasoning budget](#reasoning-budget). |
 
 ### Responses input
 

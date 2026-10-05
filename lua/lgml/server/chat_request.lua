@@ -497,6 +497,8 @@ M.FIELDS = {
 	{ "json_schema", "table", is_object, "an object", status = "supported", label = "llama.cpp" },
 	{ "chat_template_kwargs", "table", is_object, "an object", status = "supported", label = "llama.cpp" },
 	{ "lora", "table", is_list, "an array of { id, scale }", status = "supported", label = "llama.cpp" },
+	{ "reasoning_budget_tokens", "number", int_in(1), "a positive integer", status = "supported",
+	    label = "lgml" },
 }
 
 -- Checks the type and the value of field c in b.
@@ -566,6 +568,9 @@ local function check_body(b, raw)
 	if type(b.stop) == "string" then
 		b.stop = json.array({ b.stop })
 	end
+	if b.reasoning_budget_tokens then
+		b.reasoning_budget, b.reasoning_budget_tokens = b.reasoning_budget_tokens, nil
+	end
 	if raw and type(b.response_format) == "table" then
 		local o = require("lgml.json_schema").decode(raw)
 		if type(o) == "table" and type(o.response_format) == "table" then
@@ -592,7 +597,8 @@ end
 -- the check of its field, and for a bad message. A string `stop`
 -- becomes an array of one string. `tool_choice` `"none"` removes
 -- `tools`; `allowed_tools` keeps the tools that it names and becomes
--- its mode. It turns `grammar`, `response_format` or `json_schema` into
+-- its mode. `reasoning_budget_tokens` becomes `reasoning_budget`, the
+-- field of the engines. It turns `grammar`, `response_format` or `json_schema` into
 -- GBNF text in `grammar` and checks it (see `lgml.grammar`); with raw,
 -- schema properties keep their order. `stream_options` needs `stream`.
 -- An assistant `reasoning` field becomes `reasoning_content`.

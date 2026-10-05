@@ -303,8 +303,10 @@ local function test_request_extras()
 	local think = { [tostring(token_id("<think>"))] = 100 }
 	local long = chat({ max_tokens = 30, logit_bias = think, chat_template_kwargs = { enable_thinking = true } })
 	ok(long.usage.reasoning_tokens == 30, "a biased model reasons to the token limit")
-	local close = #e.tk:encode("\n</think>\n\n")
-	local cut = chat({ max_tokens = 30, logit_bias = think, reasoning_budget = 5,
+	-- The wrap-up line and the end of the block.
+	local close = #e.tk:encode("\n\nConsidering the limited time by the user, I have to give the solution " ..
+	    "based on the thinking directly now.\n</think>\n\n")
+	local cut = chat({ max_tokens = 30 + close, logit_bias = think, reasoning_budget = 5,
 		chat_template_kwargs = { enable_thinking = true } })
 	ok(cut.usage.reasoning_tokens >= 5 and cut.usage.reasoning_tokens <= 5 + close,
 	    ("the reasoning budget closes the block: %d reasoning tokens"):format(cut.usage.reasoning_tokens))

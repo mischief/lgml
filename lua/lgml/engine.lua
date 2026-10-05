@@ -87,6 +87,11 @@ local THINK = {
 	gemma4 = { "<|channel>thought", "<channel|>" },
 }
 
+-- The line that the engine adds to the reasoning at the reasoning
+-- budget, before the end of the block.
+local WRAP_UP = "\n\nConsidering the limited time by the user, I have to give the solution " ..
+    "based on the thinking directly now."
+
 -- The text that closes a reasoning block at the reasoning budget, as
 -- the chat template renders the end of the block.
 local THINK_END = {
@@ -245,6 +250,8 @@ end
 -- - `repeat_stop_tokens`: a reply that samples the same token this many
 --   times in a row ends with reason `length` (default 256; 0 turns the
 --   guard off). The finish timings then have `repeat_stop = 1`.
+-- - `reasoning_budget_tokens`: the reasoning budget of a request
+--   without `reasoning_budget` (default none); see `E:chat`
 -- @treturn Engine the engine
 -- @raise when the backend, the model or its tokenizer does not load,
 -- when no chat template fits the model, an adapter does not fit it, the
@@ -322,6 +329,7 @@ function M.new(opts)
 		cache = cache, tokens = {},
 		busy = false, waiting = {}, adapters = adapters,
 		repeat_stop = opts.repeat_stop_tokens or REPEAT_STOP,
+		reasoning_budget = opts.reasoning_budget_tokens,
 	}, E)
 	if opts.recipe == "nimble" then
 		e.recipe = decide.nimble_recipe()
@@ -1756,8 +1764,11 @@ end
 -- `preserve_thinking`. `grammar` (GBNF) or `response_format` (see
 -- `lgml.grammar.from_request`) constrain the answer; a reasoning block
 -- before it stays free. A bad grammar returns status 400. A Lua error
--- resets the cache and returns status 500. `reasoning_budget` closes
--- the reasoning block after that many reasoning tokens. `count_only`
+-- resets the cache and returns status 500. `reasoning_budget` (default:
+-- the `reasoning_budget_tokens` of the engine) ends the reasoning block
+-- after that many reasoning tokens: the engine adds a short wrap-up
+-- line and the end tag of the block, then the model writes the answer.
+-- These tokens count as reasoning. `count_only`
 -- renders and tokenizes the prompt and ends with its size, with no
 -- prefill. The sink gets `prompt` before the prefill, and the finish
 -- usage has `stop_sequence` when a stop string ended the reply.
@@ -2179,7 +2190,8 @@ function E:run_prompt(req, sink, st)
 	local n, reason, stopped = 0, "length", false
 	local tracing = log.level >= log.TRACE
 	-- At the reasoning budget, the tokens of the block end replace sampling.
-	local budget = think and THINK_END[self.family_name] and math.tointeger(req.reasoning_budget)
+	local budget = think and THINK_END[self.family_name] and
+	    (math.tointeger(req.reasoning_budget) or self.reasoning_budget)
 	local forced
 	local guard, repeated = repeat_guard(self.repeat_stop), nil
 	while n < max do
@@ -2210,7 +2222,7 @@ function E:run_prompt(req, sink, st)
 			return true
 		end
 		if budget and not forced and out:in_reasoning() and out.reasoning_tokens >= budget then
-			forced = self.tk:encode(THINK_END[self.family_name])
+			forced = self.tk:encode(WRAP_UP .. THINK_END[self.family_name])
 			L:debug("reasoning budget", "tokens", out.reasoning_tokens)
 		end
 		if guard and guard(id) then

@@ -41,6 +41,13 @@ local THINK = { [tostring(token_id("<think>"))] = 100 }
 
 local HEADERS = { ["anthropic-version"] = "2023-06-01" }
 
+-- The line that the engine adds at the reasoning budget.
+local WRAP_UP = "Considering the limited time by the user"
+-- Its tokens with the end of the block; the tiny vocabulary spells
+-- most of it in bytes.
+local WRAP_N = #e.tk:encode("\n\n" .. WRAP_UP .. ", I have to give the solution based on the " ..
+    "thinking directly now.\n</think>\n\n")
+
 local function messages(extra)
 	local b = { model = "tiny", max_tokens = 24, temperature = 0, thinking = { type = "disabled" },
 		messages = { { role = "user", content = "Hi there" } } }
@@ -124,7 +131,7 @@ local function test_budget()
 	local anthropic = require("lgml.server.anthropic")
 	local translate = require("lgml.server.translate")
 	local ctx = translate.context()
-	local chat = assert(anthropic.translate(json.decode(json.encode({ model = "tiny", max_tokens = 40,
+	local chat = assert(anthropic.translate(json.decode(json.encode({ model = "tiny", max_tokens = 40 + WRAP_N,
 		temperature = 0, thinking = { type = "enabled", budget_tokens = 1024 },
 		messages = { { role = "user", content = "Hi there" } } })), ctx))
 	ok(chat.reasoning_budget == 1024 and chat.chat_template_kwargs.enable_thinking == true,
@@ -140,9 +147,49 @@ local function test_budget()
 		require("luv").run("once")
 	end
 	local u = sink.finished.usage
-	ok(u.reasoning_tokens >= 6 and u.reasoning_tokens < 20 and sink.list[1].kind == "reasoning" and
-	    sink.list[2] and sink.list[2].kind == "text",
-	    ("the budget ends the reasoning block and the text follows (%d reasoning tokens)"):format(u.reasoning_tokens))
+	local wrap = WRAP_N
+	ok(u.reasoning_tokens > wrap and u.reasoning_tokens < 20 + wrap and sink.list[1].kind == "reasoning" and
+	    translate.text(sink.list[1]):find(WRAP_UP, 1, true) and sink.list[2] and sink.list[2].kind == "text",
+	    ("the budget ends the reasoning block with the wrap-up line and the text follows (%d reasoning tokens)")
+	    :format(u.reasoning_tokens))
+	-- The chat field, with a schema for the answer after the block. The
+	-- grammar masks the think tag there; a smaller bias on "{" starts
+	-- the object, as the random model would write blanks forever.
+	local bias = { [tostring(token_id("<think>"))] = 100, [tostring(token_id("{"))] = 50 }
+	local schema = { type = "object", properties = { city = { enum = { "Paris", "Rome" } } },
+		required = { "city" }, additionalProperties = false }
+	local _, c = inproc.json(srv, "POST", "/v1/chat/completions", { model = "tiny", max_tokens = 200 + WRAP_N,
+		temperature = 0, logit_bias = bias, reasoning_budget_tokens = 6,
+		response_format = { type = "json_schema", json_schema = { name = "c", schema = schema } },
+		messages = { { role = "user", content = "Hi there" } } })
+	local m = c.choices[1].message
+	local r = c.usage.completion_tokens_details.reasoning_tokens
+	local v = json.decode(m.content or "")
+	ok(r > wrap and r < 20 + wrap and m.reasoning_content:find(WRAP_UP, 1, true) and
+	    type(v) == "table" and (v.city == "Paris" or v.city == "Rome"),
+	    ("chat: reasoning_budget_tokens ends the block and the schema answer follows (%d, %q)")
+	    :format(r, tostring(m.content)))
+	-- The model default applies to a request without a budget.
+	e.reasoning_budget = 6
+	_, c = inproc.json(srv, "POST", "/v1/chat/completions", { model = "tiny", max_tokens = 40 + WRAP_N,
+		temperature = 0, logit_bias = THINK, messages = { { role = "user", content = "Hi there" } } })
+	e.reasoning_budget = nil
+	r = c.usage.completion_tokens_details.reasoning_tokens
+	ok(r > wrap and r < 20 + wrap and #c.choices[1].message.content > 0,
+	    ("the model default budget applies (%d reasoning tokens)"):format(r))
+	-- Responses has no logit_bias: a wrapper engine adds it.
+	local think = setmetatable({}, { __index = e })
+	function think.chat(_, req, s)
+		req.logit_bias = THINK
+		return e:chat(req, s)
+	end
+	local s2 = httpd.new()
+	openai.install(s2, think, { key = ("t"):rep(32) })
+	local _, b = inproc.json(s2, "POST", "/v1/responses", { model = "tiny", max_output_tokens = 40 + WRAP_N,
+		temperature = 0, reasoning_budget_tokens = 6, input = "Hi there" })
+	r = b.usage.output_tokens_details.reasoning_tokens
+	ok(r > wrap and r < 20 + wrap and b.output[1].type == "reasoning" and b.output[2] and
+	    b.output[2].type == "message", ("responses: reasoning_budget_tokens ends the block (%d)"):format(r))
 end
 
 local function test_responses()

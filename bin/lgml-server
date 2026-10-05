@@ -29,7 +29,7 @@ local USAGE = [=[
 usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b backend]
                    [-t threads] [-c n_ctx] [--no-fa] [--ctk type] [--ctv type] [--alias id]
                    [--recipe file] [--cache-ram MiB] [--ctx-checkpoints n]
-                   [--kv-initial n] [-np n] [--repeat-stop n]
+                   [--kv-initial n] [-np n] [--repeat-stop n] [--reasoning-budget n]
                    [--lora file[:scale]]... [--mmproj file] [--image-min-tokens n]
                    [--image-max-tokens n] [--inproc] [--stt] [--engine module]
                    [--text-backend name] [--cpu-moe] [--n-cpu-moe n|auto]
@@ -62,7 +62,9 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       {"model": id} load and unload a model now;
                       spec: { model = path, id, backend, threads, ctx,
                       flash_attn, stt, cache_type_k, cache_type_v, recipe,
-                      cache_ram, ctx_checkpoints, kv_initial, slots, lora = "file[:scale]" or a
+                      cache_ram, ctx_checkpoints, kv_initial, slots,
+                      repeat_stop_tokens, reasoning_budget_tokens
+                      (--reasoning-budget), lora = "file[:scale]" or a
                       list of them or of { path, scale }, mmproj,
                       image_min_tokens, image_max_tokens,
                       text_backend = backend of the text encoder of
@@ -126,6 +128,11 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
       --repeat-stop n a reply that samples one token n times in a row
                       ends with finish reason length (default 256; 0
                       turns the guard off)
+      --reasoning-budget n
+                      the reasoning budget of a chat request that sets
+                      none: after n reasoning tokens, the engine ends the
+                      reasoning block and the model answers (default: no
+                      budget)
       --lora file[:scale]
                       apply a LoRA adapter (llama.cpp gguf or PEFT
                       directory) with this scale (default 1); repeat for
@@ -249,6 +256,13 @@ local function model_engine(spec, managed)
 	if spec.repeat_stop_tokens and not (rst and rst >= 0) then
 		die("bad repeat_stop_tokens " .. tostring(spec.repeat_stop_tokens))
 	end
+	local rbt = spec.reasoning_budget_tokens and math.tointeger(tonumber(spec.reasoning_budget_tokens))
+	if spec.reasoning_budget_tokens and not (rbt and rbt >= 0) then
+		die("bad reasoning_budget_tokens " .. tostring(spec.reasoning_budget_tokens))
+	end
+	if rbt == 0 then
+		rbt = nil
+	end
 	local threads = spec.threads and math.tointeger(tonumber(spec.threads))
 	if spec.threads and not (threads and threads >= 1 and threads <= 1024) then
 		die("bad thread count " .. tostring(spec.threads))
@@ -307,6 +321,7 @@ local function model_engine(spec, managed)
 			cache_type_k = spec.cache_type_k, cache_type_v = spec.cache_type_v,
 			recipe = spec.recipe, cache_ram = ram, ctx_checkpoints = ckpt, lora = lora,
 			kv_initial = kvi, slots = nslots, repeat_stop_tokens = rst,
+			reasoning_budget_tokens = rbt,
 			mmproj = spec.mmproj, image_min_tokens = imin, image_max_tokens = imax,
 			cpu_moe = spec.cpu_moe, n_cpu_moe = spec.n_cpu_moe, n_gpu_layers = spec.n_gpu_layers,
 			override = spec.override,
@@ -320,6 +335,7 @@ local function model_engine(spec, managed)
 		["--recipe"] = spec.recipe, ["--cache-ram"] = spec.cache_ram,
 		["--ctx-checkpoints"] = spec.ctx_checkpoints, ["--mmproj"] = spec.mmproj,
 		["--kv-initial"] = kvi, ["--slots"] = nslots, ["--repeat-stop"] = rst,
+		["--reasoning-budget"] = rbt,
 		["--image-min-tokens"] = imin, ["--image-max-tokens"] = imax,
 		["--image-max-side"] = side, ["--mem-margin"] = spec.mem_margin,
 	}) do
@@ -539,7 +555,7 @@ local function make_engine(opts, cfg)
 			cache_type_k = opts.ctk, cache_type_v = opts.ctv, recipe = opts.recipe,
 			cache_ram = opts["cache-ram"], ctx_checkpoints = opts["ctx-checkpoints"],
 			kv_initial = opts["kv-initial"], slots = opts.parallel,
-			repeat_stop_tokens = opts["repeat-stop"],
+			repeat_stop_tokens = opts["repeat-stop"], reasoning_budget_tokens = opts["reasoning-budget"],
 			engine = opts.engine, lora = opts.lora, mmproj = opts.mmproj,
 			image_min_tokens = opts["image-min-tokens"],
 			image_max_tokens = opts["image-max-tokens"],
@@ -619,6 +635,7 @@ local function main(args)
 		inproc = false, stt = false, ["ctk="] = false, ["ctv="] = false, ["engine="] = false,
 		["recipe="] = false, ["cache-ram="] = false, ["ctx-checkpoints="] = false,
 		["kv-initial="] = false, ["parallel="] = false, ["repeat-stop="] = false,
+		["reasoning-budget="] = false,
 		["lora="] = false, ["cors="] = false, ["vram="] = false, ["idle="] = false,
 		["mmproj="] = false, ["image-min-tokens="] = false, ["image-max-tokens="] = false,
 		["text-backend="] = false, ["state-dir="] = false, ["unknown-fields="] = false,

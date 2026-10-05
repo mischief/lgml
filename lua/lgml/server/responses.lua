@@ -169,6 +169,8 @@ M.FIELDS = {
 	{ "moderation", "table", never("moderation", "moderation"), "absent", status = "rejected", label = "OpenAI" },
 	{ "context_management", "table", never("context_management", "context management"), "absent",
 	    status = "rejected", label = "OpenAI" },
+	{ "reasoning_budget_tokens", "number", int_in(1), "a positive integer", status = "supported",
+	    label = "lgml" },
 }
 
 local function unknown(path)
@@ -679,6 +681,7 @@ function M.translate(body, ctx, history)
 	chat.prompt_cache_retention = body.prompt_cache_retention
 	chat.temperature, chat.top_p = body.temperature, body.top_p
 	chat.max_completion_tokens = body.max_output_tokens
+	chat.reasoning_budget_tokens = body.reasoning_budget_tokens
 	local param, code
 	ok, err, param, code = chat_request.check(chat)
 	if not ok then

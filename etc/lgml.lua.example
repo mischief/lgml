@@ -53,9 +53,12 @@ return {
 		-- cells and grows to ctx. cache_ram is the host RAM in MiB for
 		-- stored prefixes and checkpoints (default 8192). A gemma
 		-- checkpoint is about 55 MiB, so the default fills in minutes.
+		-- reasoning_budget_tokens is the reasoning budget of a request that
+		-- sets none: after that many reasoning tokens the engine ends the
+		-- block and the model answers.
 		{ id = "gemma-4-26b", model = "/home/you/models/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
 			mmproj = "/home/you/models/gemma-4-26B-A4B-it-mmproj-F16.gguf", backend = "Vulkan0",
-			ctx = 16384, slots = 2, cache_ram = 2048 },
+			ctx = 16384, slots = 2, cache_ram = 2048, reasoning_budget_tokens = 4096 },
 		-- recipe sets the /v1/systemone format: "jevify" (the default),
 		-- "nimble" (Ollama's format, for Bespoke-Nimble), or a Jevify
 		-- recipe.json file. The Ollama blob of nimble is a gguf.

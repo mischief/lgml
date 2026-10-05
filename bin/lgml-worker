@@ -17,6 +17,7 @@ local USAGE = "usage: lgml-worker --fd n (-m model | --fake) [-b backend] [-t th
     "                   [--engine module] [--text-backend name] [--image-max-side n]\n" ..
     "                   [--recipe file] [--cache-ram MiB] [--ctx-checkpoints n]\n" ..
     "                   [--kv-initial n] [--slots n] [--repeat-stop n]\n" ..
+    "                   [--reasoning-budget n]\n" ..
     "                   [--lora file[:scale]]...\n" ..
     "                   [--mmproj file] [--image-min-tokens n] [--image-max-tokens n]\n" ..
     "                   [--cpu-moe] [--n-cpu-moe n|auto] [--n-gpu-layers n]\n" ..
@@ -34,6 +35,7 @@ local opts, rest = getopt.parse(arg, "m:b:t:c:", {
 	["image-max-side="] = false,
 	["recipe="] = false, ["cache-ram="] = false, ["ctx-checkpoints="] = false, ["lora="] = false,
 	["kv-initial="] = false, ["slots="] = false, ["repeat-stop="] = false,
+	["reasoning-budget="] = false,
 	["mmproj="] = false, ["image-min-tokens="] = false, ["image-max-tokens="] = false,
 	["fake-size="] = false, ["fake-load-ms="] = false, ["fake-delay="] = false,
 	["fake-delta="] = false, ["mem-margin="] = false, ["mem-limit="] = false,
@@ -128,6 +130,7 @@ local function load()
 		kv_initial = math.tointeger(tonumber(opts["kv-initial"])),
 		slots = math.tointeger(tonumber(opts.slots)),
 		repeat_stop_tokens = math.tointeger(tonumber(opts["repeat-stop"])),
+		reasoning_budget_tokens = math.tointeger(tonumber(opts["reasoning-budget"])),
 		lora = lora,
 		mmproj = opts.mmproj,
 		image_min_tokens = math.tointeger(tonumber(opts["image-min-tokens"])),

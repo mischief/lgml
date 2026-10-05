@@ -265,7 +265,7 @@ local function messages_schemas(c)
 		}, { "type" }),
 		thinking = obj({
 			type = { type = "string", enum = json.array({ "enabled", "adaptive", "disabled" }) },
-			budget_tokens = int("At least 1024; the most reasoning tokens."),
+			budget_tokens = int("At least 1024; the engine ends the reasoning after this many tokens."),
 			display = { type = "string", enum = json.array({ "summarized", "omitted" }) },
 		}, { "type" }),
 		output_config = obj({
