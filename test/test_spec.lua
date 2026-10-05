@@ -1,10 +1,9 @@
--- Speculative decoding (lgml.spec through lgml.engine) on tiny models:
--- greedy replies match plain decoding, rejected guesses leave the
--- cache as plain decoding does (attention, delta net and sliding ring
--- models), and sampled replies keep their distribution. Output is TAP.
--- The engines run without flash attention: on the CPU its kernel gives
--- slightly other logits for a pass of several rows than for one row,
--- and the comparisons here are exact.
+-- Speculative decoding on tiny models: greedy replies match plain
+-- decoding, rejected guesses leave the cache as plain decoding does
+-- (attention, delta net and ring models), and sampled replies keep
+-- their distribution. Output is TAP. The engines run without flash
+-- attention: its CPU kernel gives slightly other logits for a pass of
+-- several rows than for one row, and these comparisons are exact.
 local here = debug.getinfo(1, "S").source:match("^@(.*/)") or "./"
 package.path = here .. "?.lua;" .. package.path
 local uv = require("luv")

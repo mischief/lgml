@@ -49,15 +49,12 @@ local function vocab_kv()
 	}, #tokens
 end
 
--- Write a tiny model of arch ("llama", "qwen3" or "qwen3next") to path.
--- qwen3next has a delta net layer, then an attention layer, and dense
--- feed-forward blocks. opts.quant
--- ("q8_0" or "q4_0") stores the 2-D weights of the layers quantized.
--- opts.tied leaves out output.weight. opts.n_ctx sets the context length
--- (default 256). opts.override gives f32 values
--- by tensor name in place of the random ones. opts.kv adds metadata
--- entries { name, type, value }. Returns the tensors, { name =
--- { shape, values } }, for tests that compute by hand.
+-- Write a tiny model of arch to path: "llama", "qwen3", or "qwen3next"
+-- (a delta net layer, then an attention layer). opts.quant ("q8_0" or
+-- "q4_0") quantizes the 2-D layer weights. opts.tied leaves out
+-- output.weight. opts.n_ctx: context length (default 256). opts.override
+-- gives f32 values by tensor name. opts.kv adds { name, type, value }
+-- entries. Returns the tensors, { name = { shape, values } }.
 function M.write(path, arch, opts)
 	opts = opts or {}
 	local r = M.rng(#arch * 7919 + (opts.seed or 0))
