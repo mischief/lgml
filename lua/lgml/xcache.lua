@@ -22,6 +22,16 @@ M.__index = M
 -- The expert weight fields of a layer, as `lgml.transformer` names them.
 local FIELDS = { "gate_up_exps", "gate_exps", "up_exps", "down_exps" }
 
+-- Read the routed experts of a model layer into memory with threads,
+-- before the copies out of them.
+local function prefault(layer)
+	for _, f in ipairs(FIELDS) do
+		if layer[f] then
+			layer[f]:prefault()
+		end
+	end
+end
+
 --- Default bytes moved into slots per pass: 16 MiB.
 M.SWAP = 16 << 20
 
@@ -200,13 +210,39 @@ function M.new(model, opts)
 		error(err, 0)
 	end
 	if n > 0 then
-		-- Fill every slot now, the experts of most score first.
-		self:apply(self.state:plan(n * #model.layers, self.decay, self.margin))
-	end
-	if opts.zerocopy and n > 0 and n < hp.n_expert then
-		local zc, why = self:zerocopy()
-		if not zc then
-			L:warn(why .. "; the CPU computes the misses")
+		-- Fill every slot now, and make the host copy of zero-copy, one
+		-- layer at a time: the threads of prefault read the layer of a
+		-- file mapping once, before the copies.
+		local plan = self.state:plan(n * #model.layers, self.decay, self.margin)
+		table.sort(plan, function(a, b)
+			return a[1] < b[1] or (a[1] == b[1] and a[3] < b[3])
+		end)
+		local zc, why = false, nil
+		if opts.zerocopy and n < hp.n_expert then
+			local held = {}
+			for _, c in ipairs(plan) do
+				held[c[1]] = (held[c[1]] or 0) + 1
+			end
+			zc, why = self:host_ok(self:host_bytes(held))
+			if not zc then
+				L:warn(why .. "; the CPU computes the misses")
+			end
+		end
+		local i = 1
+		while i <= #plan do
+			local il, part = plan[i][1], {}
+			while plan[i] and plan[i][1] == il do
+				part[#part + 1] = plan[i]
+				i = i + 1
+			end
+			prefault(model.layers[il])
+			self:apply(part)
+			if zc then
+				self:host_layer(il)
+			end
+		end
+		if zc then
+			self.swap = 0
 		end
 	end
 	for il, xc in pairs(self.layers) do
@@ -252,16 +288,21 @@ function M.pin_budget()
 	return b
 end
 
--- The bytes of the host copy that `zerocopy` makes.
-function M:host_bytes()
+-- The bytes of the host copy that `zerocopy` makes. held gives the count
+-- of experts in slots by layer; without it, the slot tables give them.
+function M:host_bytes(held)
 	local K, n = self.model.hp.n_used, 0
 	for il in pairs(self.layers) do
 		local layer = self.model.layers[il]
-		local _, hit = self.state:tables(il)
-		local rows = K
-		for e = 1, self.ne do
-			if hit[e] == 0 then
-				rows = rows + 1
+		local rows = K + self.ne
+		if held then
+			rows = rows - (held[il] or 0)
+		else
+			local _, hit = self.state:tables(il)
+			for e = 1, self.ne do
+				if hit[e] ~= 0 then
+					rows = rows - 1
+				end
 			end
 		end
 		for _, f in ipairs(FIELDS) do
@@ -273,6 +314,70 @@ function M:host_bytes()
 	return n
 end
 
+-- True when a host copy of need bytes can go to the device; else false
+-- and the reason.
+function M:host_ok(need)
+	local be = self.model.be
+	if be:name():upper():match("^CPU") or not lgml.vk_host_read() then
+		return false, "zero-copy experts need the Vulkan host read hook of the lgml ggml patch"
+	end
+	local budget = M.pin_budget()
+	if need > budget then
+		return false, ("zero-copy experts need %.1f MiB of pinned memory, %.1f MiB free")
+		    :format(need / 1048576, math.max(0, budget) / 1048576)
+	end
+	return true
+end
+
+-- Make the host copy of layer il from its slot tables.
+function M:host_layer(il)
+	local be = self.model.be
+	local xc = self.layers[il]
+	local L = self.model.layers[il]
+	local _, hit = self.state:tables(il)
+	local rows, hmap = {}, {}
+	local held = {}
+	for e = 1, self.ne do
+		if hit[e] == 0 then
+			rows[#rows + 1] = e - 1
+			hmap[e] = #rows - 1
+		else
+			held[#held + 1] = e
+		end
+	end
+	-- A held expert maps to the first dummy row.
+	for _, e in ipairs(held) do
+		hmap[e] = #rows
+	end
+	-- Rows #rows .. #rows + K - 1 hold one dummy expert per pick
+	-- position, for held picks: a token never names a row twice.
+	local K = self.model.hp.n_used
+	local host = {}
+	for _, f in ipairs(FIELDS) do
+		local t = L[f]
+		if t then
+			local s = t:shape()
+			s[1] = #rows + K
+			local h = be:tensor(t:type(), s, nil, { weights = true, host_read = true })
+			for i, e in ipairs(rows) do
+				h:set_slice(i - 1, t, e)
+			end
+			for k = 0, K - 1 do
+				h:set_slice(#rows + k, t, rows[1])
+			end
+			host[f] = h
+		end
+	end
+	local dummy = {}
+	for k = 1, K do
+		dummy[k] = #rows + k - 1
+	end
+	xc.host = host
+	local tb = L.gate_inp:backend()
+	xc.hmap = tb:tensor("f32", { self.ne, 1 }, hmap, { weights = true })
+	xc.hzero = tb:tensor("f32", { 1, K }, dummy, { weights = true })
+end
+
 --- Give the device a pinned host copy of the experts that no slot holds,
 -- which it reads over PCIe: the misses then run on the device, and a pass
 -- needs no CPU part. The slots stay as they are (no moves). xc.host holds
@@ -281,59 +386,18 @@ end
 -- reason, and changes nothing, when the Vulkan backend lacks the host
 -- read hook or the copy does not fit `pin_budget`.
 function M:zerocopy()
-	local be = self.model.be
-	if be:name():upper():match("^CPU") or not lgml.vk_host_read() then
-		return false, "zero-copy experts need the Vulkan host read hook of the lgml ggml patch"
+	local ok, why = self:host_ok(self:host_bytes())
+	if not ok then
+		return false, why
 	end
-	local need, budget = self:host_bytes(), M.pin_budget()
-	if need > budget then
-		return false, ("zero-copy experts need %.1f MiB of pinned memory, %.1f MiB free")
-		    :format(need / 1048576, math.max(0, budget) / 1048576)
+	local order = {}
+	for il in pairs(self.layers) do
+		order[#order + 1] = il
 	end
-	for il, xc in pairs(self.layers) do
-		local L = self.model.layers[il]
-		local map, hit = self.state:tables(il)
-		local rows, hmap = {}, {}
-		local held = {}
-		for e = 1, self.ne do
-			if hit[e] == 0 then
-				rows[#rows + 1] = e - 1
-				hmap[e] = #rows - 1
-			else
-				held[#held + 1] = e
-			end
-		end
-		-- A held expert maps to the first dummy row.
-		for _, e in ipairs(held) do
-			hmap[e] = #rows
-		end
-		-- Rows #rows .. #rows + K - 1 hold one dummy expert per pick
-		-- position, for held picks: a token never names a row twice.
-		local K = self.model.hp.n_used
-		local host = {}
-		for _, f in ipairs(FIELDS) do
-			local t = L[f]
-			if t then
-				local s = t:shape()
-				s[1] = #rows + K
-				local h = be:tensor(t:type(), s, nil, { weights = true, host_read = true })
-				for i, e in ipairs(rows) do
-					h:set_slice(i - 1, t, e)
-				end
-				for k = 0, K - 1 do
-					h:set_slice(#rows + k, t, rows[1])
-				end
-				host[f] = h
-			end
-		end
-		local dummy = {}
-		for k = 1, K do
-			dummy[k] = #rows + k - 1
-		end
-		xc.host = host
-		local tb = L.gate_inp:backend()
-		xc.hmap = tb:tensor("f32", { self.ne, 1 }, hmap, { weights = true })
-		xc.hzero = tb:tensor("f32", { 1, K }, dummy, { weights = true })
+	table.sort(order)
+	for _, il in ipairs(order) do
+		prefault(self.model.layers[il])
+		self:host_layer(il)
 	end
 	self.swap = 0
 	return true

@@ -9,7 +9,10 @@
  * ids it must compute. Lua copies experts into slots.
  */
 
+#include <sys/mman.h>
+
 #include <math.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -804,6 +807,70 @@ tensor_set_slice(lua_State *L)
 	return 0;
 }
 
+struct prefault_job {
+	pthread_t	 tid;
+	char		*p;
+	size_t		 len;
+};
+
+/* Read in the pages of one part, in parallel with the other parts. */
+static void *
+prefault_part(void *arg)
+{
+	struct prefault_job *j = arg;
+	volatile char sum = 0;
+	size_t off;
+
+#ifdef MADV_POPULATE_READ
+	if (madvise(j->p, j->len, MADV_POPULATE_READ) == 0)
+		return NULL;
+#endif
+	for (off = 0; off < j->len; off += 4096)
+		sum += j->p[off];
+	(void)sum;
+	return NULL;
+}
+
+/*** Read the pages of a host tensor into memory now, with threads.
+ * For a tensor of a file mapping: the reads of each thread go to the
+ * disk at once, where page faults one by one wait for small reads.
+ * A tensor not in host memory is left alone.
+ * @tparam[opt] int threads the thread count (default 8)
+ * @function tensor:prefault
+ */
+static int
+tensor_prefault(lua_State *L)
+{
+	struct tensor *t = lgml_check_tensor(L, 1);
+	lua_Integer n = luaL_optinteger(L, 2, 8);
+	struct prefault_job jobs[32];
+	uintptr_t a, b, page = 4096;
+	size_t part;
+	int i;
+
+	luaL_argcheck(L, n >= 1 && n <= 32, 2, "1 to 32 threads");
+	if (t->t->buffer == NULL || t->t->data == NULL || !ggml_backend_buffer_is_host(t->t->buffer))
+		return 0;
+	a = (uintptr_t)t->t->data & ~(page - 1);
+	b = (uintptr_t)t->t->data + ggml_nbytes(t->t);
+	part = ((b - a) / (size_t)n + page - 1) & ~(page - 1);
+	for (i = 0; i < n; i++) {
+		uintptr_t s = a + (size_t)i * part;
+
+		jobs[i].p = (char *)s;
+		jobs[i].len = s >= b ? 0 : (s + part > b ? b - s : part);
+		if (jobs[i].len == 0 || pthread_create(&jobs[i].tid, NULL, prefault_part, &jobs[i]) != 0) {
+			if (jobs[i].len > 0)
+				prefault_part(&jobs[i]);
+			jobs[i].len = 0;
+		}
+	}
+	for (i = 0; i < n; i++)
+		if (jobs[i].len > 0)
+			pthread_join(jobs[i].tid, NULL);
+	return 0;
+}
+
 void
 lgml_open_xcache(lua_State *L)
 {
@@ -827,6 +894,7 @@ lgml_open_xcache(lua_State *L)
 	};
 	static const luaL_Reg tfns[] = {
 		{ "set_slice", tensor_set_slice },
+		{ "prefault", tensor_prefault },
 		{ NULL, NULL }
 	};
 
