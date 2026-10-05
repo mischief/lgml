@@ -319,6 +319,42 @@ local function placement_check(path)
 	os.remove(p2)
 end
 
+-- Expert cache: every routed expert on the CPU and some in device slots
+-- that change between passes give the logits of one backend. The KV
+-- cache is f32, so that f16 rounding does not grow sum-order changes.
+local function xcache_check(m, path)
+	local placement = require("lgml.placement")
+	local replay = require("lgml.replay")
+	local xcache = require("lgml.xcache")
+	local ids = {}
+	for i = 1, 20 do
+		ids[i] = (i * 37) % 250 + 1
+	end
+	local function rows(model)
+		local c = model:cache(64, { type = "f32" })
+		local out = {}
+		for i, id in ipairs(ids) do
+			out[i] = replay.run(model, c, { id }, { logits = "last" }):get()
+		end
+		return out
+	end
+	local want = rows(m)
+	local sb <close> = assert(lgml.backend("CPU", { cpu = true }))
+	local s = transformer.load(sb, path, { placement = placement.rules({ cpu_moe = true }) })
+	local n = math.max(1, s.hp.n_expert // 2)
+	local xc = xcache.new(s, { slots = n, swap = 1 << 30, halflife = 3, margin = 0 })
+	local got = rows(s)
+	local e = 0
+	for i = 1, #want do
+		e = math.max(e, maxdiff(want[i], got[i]))
+	end
+	local h, mi = xc:stats()
+	ok(e < 1e-4 and h > 0 and mi > 0 and xc.moved > xc.bytes // 2,
+	    ("expert cache of %d slots: logits equal one backend (max error %.3g, %d of %d picks held)")
+	    :format(n, e, h, h + mi))
+	s:close()
+end
+
 -- Snapshots: a full snapshot and a state checkpoint go back to their
 -- position, and the next pass gives the same logits.
 local function snapshot_check(m)
@@ -582,6 +618,7 @@ end
 hash_check(m)
 reader_check(m, path)
 placement_check(path)
+xcache_check(m, path)
 dense_check(m, path)
 
 local long = {}
