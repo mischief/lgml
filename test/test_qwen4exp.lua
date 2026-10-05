@@ -310,6 +310,10 @@ local function placement_check(path)
 	local want = 0
 	for _, t in ipairs(transformer.weight_tensors(assert(lgml.gguf(p1)), transformer.config(lgml.gguf(p1).meta))) do
 		want = want + t.size
+		-- The hc norms on the CPU get a scaled copy (see fold_hc).
+		if t.name:match("hc_%a*_*norm%.weight$") then
+			want = want + t.size
+		end
 	end
 	local sb <close> = assert(lgml.backend("CPU", { cpu = true }))
 	collectgarbage()

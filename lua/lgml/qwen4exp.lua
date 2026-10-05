@@ -217,6 +217,32 @@ local function shards(path, meta)
 	return list
 end
 
+-- Put the 1 / hc of hc_mix and hc_add into the hc norm weights, so the
+-- graphs need no scale ops. With hc a power of 2 the result is exact.
+local function fold_hc(m)
+	local HC = m.hp.hc
+	-- Weights on the CPU can map the file read-only; they get a copy.
+	local function scale(t)
+		local v = t:get()
+		for i = 1, #v do
+			v[i] = v[i] / HC
+		end
+		local be = t:backend()
+		if be:name():upper():match("^CPU") then
+			return be:tensor("f32", t:shape(), v, { weights = true })
+		end
+		t:set(v)
+		return t
+	end
+	for _, L in ipairs(m.mtp and { m.mtp.L, table.unpack(m.layers) } or m.layers) do
+		for _, f in ipairs({ "hc_attn_norm", "hc_ffn_norm", "hc_head_norm" }) do
+			if L[f] then
+				L[f] = scale(L[f])
+			end
+		end
+	end
+	m.hc_head_norm = scale(m.hc_head_norm)
+end
 
 --- Load a model of this arch.
 -- It reads every file of a split gguf. The n-gram table stays in its
@@ -338,6 +364,7 @@ function M.load(be, path, opts, info, hp)
 	if opts.replay == false then
 		m.replay_key = false
 	end
+	fold_hc(m)
 	return m
 end
 
@@ -639,28 +666,32 @@ function M.batch(self, inp, ids)
 end
 
 -- Mix the hc streams x (n, hc, E) into one (n, E), and give the
--- (n, hc) inject weights when wi is set.
+-- (n, hc) inject weights / hc when wi is set. wn holds the norm weights
+-- / hc (see fold_hc): the down input, the mean and inject take 1 / hc
+-- from it.
 local function hc_mix(g, hp, x, wn, wd, wu, wi)
 	local n, E, HC = x:shape()[1], hp.n_embd, hp.hc
 	local xn = g:mul(g:rms_norm(x, hp.eps), g:reshape(wn, { HC, E }))
 	xn = g:reshape(xn, { n, HC * E })
-	local lo = g:silu(g:scale(g:mul_mat(wd, xn), 1 / HC))
+	local lo = g:silu(g:mul_mat(wd, xn))
 	local gate = g:mul_mat(wu, lo)
 	local gated = g:reshape(g:mul(xn, g:sigmoid(gate)), { n, HC, E })
 	local st = gated:strides()
-	local mixed = g:cont(g:view(gated, { n, E }, { st[1] }))
+	local mixed = g:view(gated, { n, E }, { st[1] })
 	for s = 1, HC - 1 do
 		mixed = g:add(mixed, g:view(gated, { n, E }, { st[1] }, s * st[2]))
 	end
-	mixed = g:scale(mixed, 1 / HC)
+	if HC == 1 then
+		mixed = g:cont(mixed)
+	end
 	return mixed, wi and g:mul_mat(wi, xn)
 end
 
 -- Add the block output o (n, E) to each stream of res (n, hc, E),
--- scaled by 2 * sigmoid(inject / hc).
+-- scaled by 2 * sigmoid(inj), with inj the inject weights / hc.
 local function hc_add(g, hp, res, o, inj)
 	local n, E, HC = res:shape()[1], hp.n_embd, hp.hc
-	local w = g:scale(g:sigmoid(g:scale(inj, 1 / HC)), 2)
+	local w = g:scale(g:sigmoid(inj), 2)
 	local b = g:tile(g:reshape(o, { n, 1, E }), res)
 	return g:add(res, g:mul(b, g:reshape(w, { n, HC, 1 })))
 end
