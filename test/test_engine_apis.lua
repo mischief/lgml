@@ -177,6 +177,23 @@ local function test_budget()
 	r = c.usage.completion_tokens_details.reasoning_tokens
 	ok(r > wrap and r < 20 + wrap and #c.choices[1].message.content > 0,
 	    ("the model default budget applies (%d reasoning tokens)"):format(r))
+	-- reasoning_effort picks a budget, at most the model default.
+	local low = engine.EFFORT_BUDGET.low
+	engine.EFFORT_BUDGET.low = 6
+	_, c = inproc.json(srv, "POST", "/v1/chat/completions", { model = "tiny", max_tokens = 40 + WRAP_N,
+		temperature = 0, logit_bias = THINK, reasoning_effort = "low",
+		messages = { { role = "user", content = "Hi there" } } })
+	r = c.usage.completion_tokens_details.reasoning_tokens
+	ok(r > wrap and r < 20 + wrap, ("reasoning_effort low gives its budget (%d reasoning tokens)"):format(r))
+	engine.EFFORT_BUDGET.low = 1024
+	e.reasoning_budget = 6
+	_, c = inproc.json(srv, "POST", "/v1/chat/completions", { model = "tiny", max_tokens = 40 + WRAP_N,
+		temperature = 0, logit_bias = THINK, reasoning_effort = "low",
+		messages = { { role = "user", content = "Hi there" } } })
+	e.reasoning_budget = nil
+	engine.EFFORT_BUDGET.low = low
+	r = c.usage.completion_tokens_details.reasoning_tokens
+	ok(r > wrap and r < 20 + wrap, ("the model default caps the effort budget (%d reasoning tokens)"):format(r))
 	-- Responses has no logit_bias: a wrapper engine adds it.
 	local think = setmetatable({}, { __index = e })
 	function think.chat(_, req, s)

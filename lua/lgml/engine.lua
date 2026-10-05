@@ -379,7 +379,8 @@ end
 --   times in a row ends with reason `length` (default 256; 0 turns the
 --   guard off). The finish timings then have `repeat_stop = 1`.
 -- - `reasoning_budget_tokens`: the reasoning budget of a request
---   without `reasoning_budget` (default none); see `E:chat`
+--   without `reasoning_budget`, and the cap of a `reasoning_effort`
+--   budget (default none); see `E:chat`
 -- - `lazy_tool_grammar`: false turns off the grammar that keeps tool
 --   calls to the request tools under tool_choice "auto" (default on)
 -- - `ubatch`: the most prompt tokens per pass (default 512), or
@@ -1396,6 +1397,25 @@ local function thinking(req)
 	return req.reasoning_effort ~= "none"
 end
 
+--- Reasoning budgets by `reasoning_effort`, as LiteLLM maps effort to
+-- the thinking budget of older Claude models. See `E:chat`.
+M.EFFORT_BUDGET = { minimal = 1024, low = 1024, medium = 2048, high = 4096, xhigh = 8192, max = 16384 }
+
+-- The reasoning budget of a request: its reasoning_budget, else the
+-- budget of its reasoning_effort, at most the engine budget, else the
+-- engine budget.
+local function reasoning_budget(req, default)
+	local b = math.tointeger(req.reasoning_budget)
+	if b then
+		return b
+	end
+	b = M.EFFORT_BUDGET[req.reasoning_effort]
+	if b and default then
+		return math.min(b, default)
+	end
+	return b or default
+end
+
 -- The sampler options of a request over the preset: the model's gguf
 -- values, then the request values, added to extra.
 local function sampler_opts_table(req, model, extra)
@@ -2140,9 +2160,11 @@ end
 -- `preserve_thinking`. `grammar` (GBNF) or `response_format` (see
 -- `lgml.grammar.from_request`) constrain the answer; a reasoning block
 -- before it stays free. A bad grammar returns status 400. A Lua error
--- resets the cache and returns status 500. `reasoning_budget` (default:
--- the `reasoning_budget_tokens` of the engine) ends the reasoning block
--- after that many reasoning tokens: the engine adds a short wrap-up
+-- resets the cache and returns status 500. `reasoning_budget` ends the
+-- reasoning block after that many reasoning tokens. Without it, the
+-- budget comes from `reasoning_effort` (`EFFORT_BUDGET`, at most the
+-- `reasoning_budget_tokens` of the engine), else from
+-- `reasoning_budget_tokens`. At the budget, the engine adds a short wrap-up
 -- line and the end tag of the block, then the model writes the answer.
 -- These tokens count as reasoning. `count_only`
 -- renders and tokenizes the prompt and ends with its size, with no
@@ -2853,8 +2875,7 @@ function E:run_prompt(req, sink, st)
 	local n, reason, stopped = 0, "length", false
 	local tracing = log.level >= log.TRACE
 	-- At the reasoning budget, the tokens of the block end replace sampling.
-	local budget = think and THINK_END[self.family_name] and
-	    (math.tointeger(req.reasoning_budget) or self.reasoning_budget)
+	local budget = think and THINK_END[self.family_name] and reasoning_budget(req, self.reasoning_budget)
 	local forced
 	local guard, repeated = repeat_guard(self.repeat_stop), nil
 	-- With speculation, a verify pass samples several tokens ahead: they

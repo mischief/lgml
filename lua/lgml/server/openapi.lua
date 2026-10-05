@@ -144,7 +144,7 @@ local function chat_extras()
 		json_schema = { type = "object", description = "JSON schema for the answer (llama.cpp)." },
 		seed = int("Sampler seed."),
 		top_k = int("Top-k sampling."),
-		reasoning_effort = str('"none" turns thinking off; other values leave it on.'),
+		reasoning_effort = str('"none" turns thinking off. minimal and low give a reasoning budget of 1024 tokens, medium 2048, high 4096, xhigh 8192 and max 16384, at most the server budget.'),
 		tools = arr(ref("Tool")),
 		chat_template_kwargs = ext(obj({
 			enable_thinking = { type = "boolean" },
