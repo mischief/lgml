@@ -17,6 +17,8 @@
 #include <lua.h>
 #include <lauxlib.h>
 
+#include <ggml-cpu.h>
+
 #include "lgml.h"
 
 #define XCACHE_MT	"lgml_expert_cache"
@@ -325,6 +327,226 @@ xcache_remap(lua_State *L)
 	return lgml_push_node(L, g, r, 2);
 }
 
+/*
+ * The CPU part of the experts: only the picks that no slot holds. The
+ * first op writes silu(gate x) * up x of each such pick, the second adds
+ * down of it times the router weight into the token output.
+ */
+
+/* The picks of a pass that no slot holds, as t * K + k. */
+static int64_t
+misses_of(const struct xlayer *l, const struct ggml_tensor *sel, int64_t *out)
+{
+	int64_t K = sel->ne[0], T = sel->ne[1], t, j, n = 0;
+
+	for (t = 0; t < T; t++)
+		for (j = 0; j < K; j++)
+			if (l->slot[pick(sel, t, j)] < 0)
+				out[n++] = t * K + j;
+	return n;
+}
+
+/* Count the picks of a pass, as remap_op does. */
+static void
+count_picks(struct xlayer *l, const struct ggml_tensor *sel)
+{
+	int64_t K = sel->ne[0], T = sel->ne[1], t, j;
+	uint64_t hits = 0, misses = 0;
+	int32_t id;
+
+	for (t = 0; t < T; t++) {
+		for (j = 0; j < K; j++) {
+			id = pick(sel, t, j);
+			l->pend[id]++;
+			if (l->slot[id] < 0)
+				misses++;
+			else
+				hits++;
+		}
+	}
+	l->ntok += T;
+	l->x->hits += hits;
+	l->x->misses += misses;
+}
+
+/* Quantize a row of n floats to the vec_dot type of a weight type. */
+static const void *
+quant_row(enum ggml_type wt, const float *x, int64_t n, void **buf, size_t *cap)
+{
+	const struct ggml_type_traits_cpu *tr = ggml_get_type_traits_cpu(wt);
+	size_t sz;
+
+	if (tr->vec_dot_type == GGML_TYPE_F32)
+		return x;
+	sz = ggml_row_size(tr->vec_dot_type, n);
+	if (sz > *cap) {
+		free(*buf);
+		if ((*buf = malloc(sz)) == NULL)
+			abort();
+		*cap = sz;
+	}
+	ggml_get_type_traits_cpu(tr->vec_dot_type)->from_float(x, *buf, n);
+	return *buf;
+}
+
+/* Dot of row r of expert e of w (ne = [n, rows, experts]) with q. */
+static float
+expert_dot(const struct ggml_tensor *w, int64_t e, int64_t r, const void *q)
+{
+	float s;
+
+	ggml_get_type_traits_cpu(w->type)->vec_dot((int)w->ne[0], &s, 0,
+	    (const char *)w->data + e * w->nb[2] + r * w->nb[1], 0, q, 0, 1);
+	return s;
+}
+
+/* src: x (T, 1, E) f32, sel i32 (T, K), gate, up (or fused gate_up). */
+static void
+miss_act_op(struct ggml_tensor *dst, int ith, int nth, void *ud)
+{
+	struct xlayer *l = ud;
+	const struct ggml_tensor *x = dst->src[0], *sel = dst->src[1];
+	const struct ggml_tensor *gate = dst->src[2], *up = dst->src[3];
+	int64_t K = sel->ne[0], F = dst->ne[0], n, i, i0, i1, per, cur = -1;
+	int64_t *ms;
+	void *bg = NULL, *bu = NULL;
+	size_t cg = 0, cu = 0;
+	const void *qg = NULL, *qu = NULL;
+
+	if ((ms = malloc(sizeof(*ms) * (size_t)(sel->ne[0] * sel->ne[1] + 1))) == NULL)
+		abort();
+	n = misses_of(l, sel, ms);
+	per = (n * F + nth - 1) / nth;
+	i0 = per * ith;
+	i1 = i0 + per < n * F ? i0 + per : n * F;
+	for (i = i0; i < i1; i++) {
+		int64_t m = ms[i / F], r = i % F, t = m / K;
+		int32_t e = pick(sel, t, m % K);
+		const float *xr = (const float *)((const char *)x->data + t * x->nb[2]);
+		float gv, uv;
+
+		if (t != cur) {
+			qg = quant_row(gate->type, xr, x->ne[0], &bg, &cg);
+			qu = up != NULL ? quant_row(up->type, xr, x->ne[0], &bu, &cu) : qg;
+			cur = t;
+		}
+		gv = expert_dot(gate, e, r, qg);
+		uv = up != NULL ? expert_dot(up, e, r, qu) : expert_dot(gate, e, F + r, qg);
+		((float *)((char *)dst->data + m * dst->nb[1]))[r] = gv / (1.0f + expf(-gv)) * uv;
+	}
+	free(bg);
+	free(bu);
+	free(ms);
+	if (ith == 0)
+		count_picks(l, sel);
+}
+
+/* src: act (T * K, F) f32, sel i32 (T, K), w f32 (T, K, 1), down. */
+static void
+miss_down_op(struct ggml_tensor *dst, int ith, int nth, void *ud)
+{
+	struct xlayer *l = ud;
+	const struct ggml_tensor *act = dst->src[0], *sel = dst->src[1];
+	const struct ggml_tensor *w = dst->src[2], *down = dst->src[3];
+	enum ggml_type vt = ggml_get_type_traits_cpu(down->type)->vec_dot_type;
+	int64_t K = sel->ne[0], E = dst->ne[0], T = dst->ne[1], F = act->ne[0];
+	int64_t n, i, j, j0, j1, per, t;
+	int64_t *ms;
+	size_t rs = ggml_row_size(vt, F);
+	char *q;
+
+	if ((ms = malloc(sizeof(*ms) * (size_t)(K * T + 1))) == NULL)
+		abort();
+	n = misses_of(l, sel, ms);
+	if ((q = malloc(rs * (size_t)(n + 1))) == NULL)
+		abort();
+	for (i = 0; i < n; i++) {
+		const float *a = (const float *)((const char *)act->data + ms[i] * act->nb[1]);
+
+		if (vt == GGML_TYPE_F32)
+			memcpy(q + i * rs, a, rs);
+		else
+			ggml_get_type_traits_cpu(vt)->from_float(a, q + i * rs, F);
+	}
+	per = (E + nth - 1) / nth;
+	j0 = per * ith;
+	j1 = j0 + per < E ? j0 + per : E;
+	for (t = 0; t < T; t++) {
+		float *o = (float *)((char *)dst->data + t * dst->nb[1]);
+
+		for (j = j0; j < j1; j++)
+			o[j] = 0;
+	}
+	for (i = 0; i < n; i++) {
+		int64_t tt = ms[i] / K, k = ms[i] % K;
+		int32_t e = pick(sel, tt, k);
+		float wt = *(const float *)((const char *)w->data + tt * w->nb[2] + k * w->nb[1]);
+		float *o = (float *)((char *)dst->data + tt * dst->nb[1]);
+
+		for (j = j0; j < j1; j++)
+			o[j] += wt * expert_dot(down, e, j, q + i * rs);
+	}
+	free(q);
+	free(ms);
+}
+
+/*** Add the CPU part of the experts of a layer to a graph.
+ * It computes only the picks that no slot holds, with SwiGLU, and sums
+ * their outputs times the router weights. It runs on the CPU and counts
+ * the picks, as `remap` does.
+ * @tparam graph g the graph
+ * @tparam int il the layer
+ * @tparam tensor x f32 (T, 1, E) expert input, contiguous
+ * @tparam tensor sel i32 (T, K) expert ids of the router
+ * @tparam tensor w f32 (T, K, 1) router weights
+ * @tparam tensor gate the gate experts, or the fused gate and up experts
+ * @tparam tensor|nil up the up experts, nil when gate is fused
+ * @tparam tensor down the down experts
+ * @treturn tensor f32 (T, E)
+ * @function expert_cache:misses
+ */
+static int
+xcache_misses(lua_State *L)
+{
+	struct xcache *xc = check_xcache(L, 1);
+	struct graph *g = lgml_check_graph(L, 2);
+	struct xlayer *l = check_layer(L, xc, 3);
+	struct tensor *x = lgml_operand(L, g, 4);
+	struct tensor *sel = lgml_operand(L, g, 5);
+	struct tensor *w = lgml_operand(L, g, 6);
+	struct tensor *gate = lgml_operand(L, g, 7);
+	struct tensor *up = lua_isnoneornil(L, 8) ? NULL : lgml_operand(L, g, 8);
+	struct tensor *down = lgml_operand(L, g, 9);
+	struct ggml_tensor *a1[4], *a2[4], *act, *r;
+	int64_t T = sel->t->ne[1], K = sel->t->ne[0], E = x->t->ne[0];
+	int64_t F = up != NULL ? gate->t->ne[1] : gate->t->ne[1] / 2;
+
+	if (sel->t->type != GGML_TYPE_I32 || x->t->type != GGML_TYPE_F32 ||
+	    w->t->type != GGML_TYPE_F32 || x->t->ne[2] != T || gate->t->ne[0] != E ||
+	    down->t->ne[0] != F || down->t->ne[1] != E || !ggml_is_contiguous(x->t))
+		return luaL_error(L, "misses: shapes do not match");
+	/* The graph keeps the state alive. */
+	lua_getiuservalue(L, 2, UV_EXTRA);
+	lua_pushvalue(L, 1);
+	lua_pushboolean(L, 1);
+	lua_rawset(L, -3);
+	lua_pop(L, 1);
+	a1[0] = x->t;
+	a1[1] = sel->t;
+	a1[2] = gate->t;
+	a1[3] = up != NULL ? up->t : NULL;
+	lgml_reserve(L, g, 2);
+	act = ggml_custom_4d(g->ctx, GGML_TYPE_F32, F, T * K, 1, 1, a1, up != NULL ? 4 : 3,
+	    miss_act_op, GGML_N_TASKS_MAX, l);
+	a2[0] = act;
+	a2[1] = sel->t;
+	a2[2] = w->t;
+	a2[3] = down->t;
+	r = ggml_custom_4d(g->ctx, GGML_TYPE_F32, E, T, 1, 1, a2, 4, miss_down_op,
+	    GGML_N_TASKS_MAX, l);
+	return lgml_push_node(L, g, r, 2);
+}
+
 struct cand {
 	double	 gain;
 	int	 il;
@@ -595,6 +817,7 @@ lgml_open_xcache(lua_State *L)
 		{ "assign", xcache_assign },
 		{ "tables", xcache_tables },
 		{ "remap", xcache_remap },
+		{ "misses", xcache_misses },
 		{ "plan", xcache_plan },
 		{ "scores", xcache_scores },
 		{ "seed", xcache_seed },

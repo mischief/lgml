@@ -1706,6 +1706,10 @@ local function sum_picks(g, ex)
 	return out
 end
 
+--- Passes of fewer tokens take the expert cache path. It is the op
+-- offload batch of ggml-vulkan (GGML_OP_OFFLOAD_MIN_BATCH, default 32).
+M.XCACHE_MAX_BATCH = tonumber(os.getenv("GGML_OP_OFFLOAD_MIN_BATCH") or 32)
+
 -- The expert outputs of a layer with an expert cache (see
 -- `lgml.xcache`). The device computes the picks in slots, the CPU the
 -- rest; a mask of the router weights keeps each pick on one side.
@@ -1721,6 +1725,14 @@ local function cached_experts(g, hp, L, x3, sel, w)
 	local hit = g:reshape(g:get_rows(xc.hit, flat), { n, K })
 	local dsel = g:cast(g:add(g:mul(g:sub(slot, xc.zero), hit), xc.zero), "i32")
 	local wd = g:mul(w, g:reshape(hit, { n, K, 1 }))
+	if not hp.gemma and not xc.router_cpu then
+		-- The CPU computes only the picks that no slot holds.
+		local up = not L.gate_up_exps and L.up_exps or nil
+		local dev = sum_picks(g, experts(g, hp, xc, x3, dsel, wd))
+		local cpu = xc.state:misses(g, xc.il, g:cont(x3), g:reshape(flat, { n, K }), w,
+		    L.gate_up_exps or L.gate_exps, up, L.down_exps)
+		return g:add(dev, cpu)
+	end
 	local wc = g:sub(w, wd)
 	local csel = xc.state:remap(g, xc.il, g:reshape(flat, { n, K }))
 	-- With the router on the CPU, the routing nodes go first, so that the
@@ -1773,7 +1785,10 @@ function M.moe(g, hp, L, x, h, taps, sfx)
 		taps["ffn_moe_topk" .. sfx] = sel
 		taps["ffn_moe_weights" .. sfx] = w
 	end
-	if L.xc and L.xc.n > 0 then
+	-- From XCACHE_MAX_BATCH tokens up, the scheduler moves the CPU experts
+	-- to the device with the used experts copied: the cache adds nothing,
+	-- and its CPU ids there gave NaN on Vulkan.
+	if L.xc and L.xc.n > 0 and n < M.XCACHE_MAX_BATCH then
 		return cached_experts(g, hp, L, x3, sel, w)
 	end
 	return sum_picks(g, experts(g, hp, L, x3, sel, w))
