@@ -205,6 +205,32 @@ for _, m in ipairs({ { "qwen3", qpath, 200 }, { "qwen3next", hpath, 200 }, { "ge
 	end
 end
 
+-- A drafter with hidden = true gets the state after the last layer at
+-- the row of the last token, as a model-native draft head needs.
+do
+	local e = engine.new({ model = qpath, backend = "CPU", n_ctx = 2048, slots = 1, kv_initial = 256,
+		flash_attn = false, speculative = { max = 4, drafter = test_drafter } })
+	local rec = recorder()
+	next_drafter = rec
+	local want = chat(e, req_of(e, REPEAT, { max_tokens = 40 })).out
+	local ref = rec.seq
+	local seen, good = 0, true
+	local d = oracle(ref)
+	d.hidden = true
+	local draft = d.draft
+	function d:draft(ctx, k)
+		if ctx.hidden then
+			local sh = ctx.hidden:shape()
+			seen = seen + 1
+			good = good and sh[2] == tiny.E and ctx.hidden_row >= 1 and ctx.hidden_row <= sh[1]
+		end
+		return draft(self, ctx, k)
+	end
+	next_drafter = d
+	local r = chat(e, req_of(e, REPEAT, { max_tokens = 40 }))
+	ok(r.out == want and seen >= 10 and good, ("hidden states reach the drafter (%d steps)"):format(seen))
+end
+
 -- A request that speculates alone goes on in batched passes when a
 -- second request comes; kept tokens that wait for a pass go with it.
 do

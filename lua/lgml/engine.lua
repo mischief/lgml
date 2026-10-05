@@ -2268,16 +2268,17 @@ function E:spec_step(sp, slot, toks, pend, smp, lim)
 	end
 	local ids = table.move(pend, 1, #pend, 1, {})
 	table.move(drafts, 1, #drafts, #ids + 1, ids)
-	if cache.pool and not pcall(model.grow, model, cache, math.min(cache.n_ctx, cache.n_past + #ids)) then
-		return nil
-	end
 	if slot then
 		self:acquire()
-		if model.drop_batch then
+	end
+	-- A full pool sends the step to the plain path, which can wait.
+	local ok, res = true, nil
+	if not cache.pool or pcall(model.grow, model, cache, math.min(cache.n_ctx, cache.n_past + #ids)) then
+		if slot and model.drop_batch then
 			model:drop_batch(false)
 		end
+		ok, res = pcall(self.verify, self, sp, cache, toks, ids, #pend, drafts, smp, lim)
 	end
-	local ok, res = pcall(self.verify, self, sp, cache, toks, ids, #pend, drafts, smp, lim)
 	if slot then
 		self:release()
 	end
