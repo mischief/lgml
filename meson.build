@@ -186,6 +186,9 @@ if lua_bin.found()
   test('placement', lua_bin, args : [files('test/test_placement.lua')],
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
     timeout : 60)
+  test('xcache', lua_bin, args : [files('test/test_xcache.lua')],
+    env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
+    timeout : 120)
   test('chat', lua_bin, args : [files('test/test_chat.lua')], timeout : 60)
   test('sample', lua_bin, args : [files('test/test_sample.lua')], timeout : 120)
   test('grammar', lua_bin, args : [files('test/test_grammar.lua')], timeout : 60)

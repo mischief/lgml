@@ -11,6 +11,8 @@
 -- A model with weights on a device and its CPU (see `lgml.placement`)
 -- runs through the ggml scheduler; a replay reuses its splits and
 -- buffers as well.
+-- A model with a `before_pass` method gets a call before each compute,
+-- such as an expert cache that moves experts between passes.
 -- At trace level each pass logs its key and whether it built a graph or
 -- replayed one, and a new graph logs its scheduler splits (see
 -- `lgml.log`).
@@ -116,6 +118,9 @@ function M.run(model, cache, ids, opts, finish)
 		local inp = model:inputs(ids, nil, opts)
 		local g = model.be:graph()
 		local outs = { finish(g, model:forward(g, inp)) }
+		if model.before_pass then
+			model:before_pass()
+		end
 		g:compute(table.unpack(outs))
 		return table.unpack(outs)
 	end
@@ -147,6 +152,9 @@ function M.run(model, cache, ids, opts, finish)
 		local g = model.be:graph()
 		r = { key = key, g = g, inp = inp, outs = { finish(g, model:forward(g, inp)) } }
 		cache.replay = r
+	end
+	if model.before_pass then
+		model:before_pass()
 	end
 	r.g:compute(table.unpack(r.outs))
 	if not hit and log.level >= log.TRACE then

@@ -1640,6 +1640,54 @@ function M.attn_out(g, hp, L, o, gate, x)
 	return g:add(o, x)
 end
 
+-- The weighted outputs (n, K, n_embd) of the experts of W that sel picks.
+local function experts(g, hp, W, x3, sel, w)
+	local gate, up
+	if W.gate_up_exps then
+		local gu = g:mul_mat_id(W.gate_up_exps, x3, sel)
+		local n, K, F = gu:shape()[1], gu:shape()[2], gu:shape()[3] // 2
+		local st = gu:strides()
+		gate = g:view(gu, { n, K, F }, { st[1], st[2] })
+		up = g:view(gu, { n, K, F }, { st[1], st[2] }, lgml.row_size("f32", F))
+	else
+		gate = g:mul_mat_id(W.gate_exps, x3, sel)
+		up = g:mul_mat_id(W.up_exps, x3, sel)
+	end
+	local act = hp.gemma and g:geglu_split(gate, up) or g:swiglu_split(gate, up)
+	return g:mul(g:mul_mat_id(W.down_exps, act, sel), w)
+end
+
+-- The sum over the K picks of ex (n, K, E).
+local function sum_picks(g, ex)
+	local n, K, E = table.unpack(ex:shape())
+	local st = ex:strides()
+	local out = g:view(ex, { n, E }, { st[1] })
+	for j = 1, K - 1 do
+		out = g:add(out, g:view(ex, { n, E }, { st[1] }, j * st[2]))
+	end
+	if K == 1 then
+		out = g:cont(out)
+	end
+	return out
+end
+
+-- The expert outputs of a layer with an expert cache (see
+-- `lgml.xcache`). The device computes the picks in slots, the CPU the
+-- rest; a mask of the router weights keeps each pick on one side.
+local function cached_experts(g, hp, L, x3, sel, w)
+	local xc = L.xc
+	local n, K = sel:shape()[1], sel:shape()[2]
+	local flat = g:reshape(g:cont(sel), { n * K })
+	local dsel = g:reshape(g:get_rows(xc.map, flat), { n, K })
+	if xc.full then
+		return sum_picks(g, experts(g, hp, xc, x3, dsel, w))
+	end
+	local wd = g:mul(w, g:reshape(g:get_rows(xc.hit, flat), { n, K, 1 }))
+	local csel = xc.state:remap(g, xc.il, sel)
+	local dev = sum_picks(g, experts(g, hp, xc, x3, dsel, wd))
+	return g:add(dev, sum_picks(g, experts(g, hp, L, x3, csel, g:sub(w, wd))))
+end
+
 --- Build the routed experts of one layer.
 -- The router picks the top n_used experts; their weights sum to 1
 -- when hp.norm_topk is set. Gemma routes on the rms-normed residual.
@@ -1676,32 +1724,14 @@ function M.moe(g, hp, L, x, h, taps, sfx)
 		w = g:mul(w, g:get_rows(s, sel))
 	end
 	local x3 = g:reshape(h, { n, 1, E })
-	local gate, up
-	if L.gate_up_exps then
-		local gu = g:mul_mat_id(L.gate_up_exps, x3, sel)
-		local F = gu:shape()[3] // 2
-		local st = gu:strides()
-		gate = g:view(gu, { n, K, F }, { st[1], st[2] })
-		up = g:view(gu, { n, K, F }, { st[1], st[2] }, lgml.row_size("f32", F))
-	else
-		gate = g:mul_mat_id(L.gate_exps, x3, sel)
-		up = g:mul_mat_id(L.up_exps, x3, sel)
-	end
-	local act = hp.gemma and g:geglu_split(gate, up) or g:swiglu_split(gate, up)
-	local ex = g:mul(g:mul_mat_id(L.down_exps, act, sel), w)
 	if taps then
 		taps["ffn_moe_topk" .. sfx] = sel
 		taps["ffn_moe_weights" .. sfx] = w
 	end
-	local st = ex:strides()
-	local out = g:view(ex, { n, E }, { st[1] })
-	for j = 1, K - 1 do
-		out = g:add(out, g:view(ex, { n, E }, { st[1] }, j * st[2]))
+	if L.xc and L.xc.n > 0 then
+		return cached_experts(g, hp, L, x3, sel, w)
 	end
-	if K == 1 then
-		out = g:cont(out)
-	end
-	return out
+	return sum_picks(g, experts(g, hp, L, x3, sel, w))
 end
 
 --- Build the FFN block of one layer, with its residual.
@@ -2195,6 +2225,9 @@ function M:run_batch(caches, ids, opts)
 			r.rows[i] = g:cont(g:view(out, { 1, V }, nil, (i - 1) * rb))
 		end
 		self.batch_replay = r
+	end
+	if self.before_pass then
+		self:before_pass()
 	end
 	r.g:compute(table.unpack(r.rows))
 	for i, c in ipairs(caches) do

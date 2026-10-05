@@ -988,6 +988,48 @@ local function engine_check(path)
 	ok(b.usage.cached_tokens > 0, "engine: the second request reuses the prefix")
 end
 
+-- Expert cache: with every routed expert on the CPU and some of them in
+-- device slots that change between passes, decode steps give the
+-- logits of one backend. The KV cache is f32, so that f16 rounding
+-- does not grow the small differences of the sum order.
+local function xcache_check(tag, path, ids, tol)
+	local placement = require("lgml.placement")
+	local replay = require("lgml.replay")
+	local xcache = require("lgml.xcache")
+	local transformer = require("lgml.transformer")
+	local dev = os.getenv("LGML_DEVICE") or "CPU"
+	local function rows(m)
+		local c = m:cache(#ids + 8, { type = "f32" })
+		local out = {}
+		for i, id in ipairs(ids) do
+			out[i] = replay.run(m, c, { id }, { logits = "last" }):get()
+		end
+		return out
+	end
+	local one <close> = assert(lgml.backend(dev))
+	local want = rows(transformer.load(one, path))
+	local sb <close> = assert(lgml.backend(dev, { cpu = true }))
+	local rules = placement.rules({ cpu_moe = true })
+	local ne
+	for _, frac in ipairs({ 0.1, 0.5, 0.9 }) do
+		local m = transformer.load(sb, path, { placement = rules })
+		ne = m.hp.n_expert
+		local n = math.max(1, math.min(ne - 1, math.floor(ne * frac)))
+		local xc = xcache.new(m, { slots = n, swap = 1 << 30, halflife = 3, margin = 0 })
+		local got = rows(m)
+		local d = #got == #want and 0 or math.huge
+		for i = 1, #want do
+			for j = 1, #want[i] do
+				d = math.max(d, math.abs(want[i][j] - (got[i][j] or math.huge)))
+			end
+		end
+		local h, mi = xc:stats()
+		ok(d < tol and h > 0 and mi > 0 and xc.moved > xc.bytes // 2,
+		    ("%s: expert cache of %d slots: logits equal one backend (max error %.3g, %d of %d picks held)")
+		    :format(tag, n, d, h, h + mi))
+		m:close()
+	end
+end
 -- Weight placement: experts or the first layers on a second CPU backend
 -- give the same logits as one backend, and replay keeps its graphs.
 local function offload_check(kind, path, m, ref, long)
@@ -1077,6 +1119,9 @@ for _, kind in ipairs({ "dense", "moe" }) do
 	end
 	if kind == "moe" and ref and #ref > 0 then
 		offload_check(kind, path, m, ref, long)
+	end
+	if kind == "moe" then
+		xcache_check(kind, path, table.move(long, 1, 24, 1, {}), GPU and 2e-3 or 1e-4)
 	end
 	if kind == "dense" then
 		engine_check(path)

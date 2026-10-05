@@ -1,5 +1,5 @@
--- Tiny dense llama and qwen3 ggufs for tests, with a byte-level vocab
--- and random weights. Shapes are in torch order.
+-- Tiny llama, qwen3, qwen3next and qwen3moe ggufs for tests, with a
+-- byte-level vocab and random weights. Shapes are in torch order.
 local lgml = require("lgml")
 local here = debug.getinfo(1, "S").source:match("^@(.*/)") or "./"
 package.path = here .. "?.lua;" .. package.path
@@ -53,8 +53,11 @@ end
 -- (a delta net layer, then an attention layer). opts.quant ("q8_0" or
 -- "q4_0") quantizes the 2-D layer weights. opts.tied leaves out
 -- output.weight. opts.n_ctx: context length (default 256). opts.override
--- gives f32 values by tensor name. opts.kv adds { name, type, value }
--- entries. Returns the tensors, { name = { shape, values } }.
+-- gives f32 values by tensor name. opts.moe, such as { n = 16, used =
+-- 4, ff = 32, fused = true }, gives each layer routed experts in place
+-- of the dense FFN (arch "qwen3moe"); fused puts gate and up in one
+-- tensor. opts.kv adds { name, type, value } entries. Returns the
+-- tensors, { name = { shape, values } }.
 function M.write(path, arch, opts)
 	opts = opts or {}
 	local r = M.rng(#arch * 7919 + (opts.seed or 0))
@@ -92,7 +95,7 @@ function M.write(path, arch, opts)
 	local function w(name, shape, gain)
 		local s = (gain or 1) * math.sqrt(3 / shape[#shape])
 		local v = {}
-		for i = 1, shape[1] * shape[2] do
+		for i = 1, shape[1] * shape[2] * (shape[3] or 1) do
 			v[i] = -s + 2 * s * r()
 		end
 		add(name, shape, v, name:match("^blk"))
@@ -131,6 +134,12 @@ function M.write(path, arch, opts)
 	key("attention.value_length", gguf.UINT32, D)
 	key("attention.layer_norm_rms_epsilon", gguf.FLOAT32, 1e-6)
 	key("rope.freq_base", gguf.FLOAT32, 1e4)
+	local moe = opts.moe
+	if moe then
+		key("expert_count", gguf.UINT32, moe.n)
+		key("expert_used_count", gguf.UINT32, moe.used)
+		key("expert_feed_forward_length", gguf.UINT32, moe.ff)
+	end
 	w("token_embd.weight", { nv, E }, 3)
 	norm("output_norm.weight", E)
 	if not opts.tied then
@@ -159,9 +168,20 @@ function M.write(path, arch, opts)
 			end
 		end
 		norm(p .. (hybrid and "post_attention_norm.weight" or "ffn_norm.weight"), E)
-		w(p .. "ffn_gate.weight", { F, E })
-		w(p .. "ffn_up.weight", { F, E })
-		w(p .. "ffn_down.weight", { E, F })
+		if moe then
+			w(p .. "ffn_gate_inp.weight", { moe.n, E }, 3)
+			if moe.fused then
+				w(p .. "ffn_gate_up_exps.weight", { moe.n, 2 * moe.ff, E })
+			else
+				w(p .. "ffn_gate_exps.weight", { moe.n, moe.ff, E })
+				w(p .. "ffn_up_exps.weight", { moe.n, moe.ff, E })
+			end
+			w(p .. "ffn_down_exps.weight", { moe.n, E, moe.ff })
+		else
+			w(p .. "ffn_gate.weight", { F, E })
+			w(p .. "ffn_up.weight", { F, E })
+			w(p .. "ffn_down.weight", { E, F })
+		end
 	end
 	for _, e in ipairs(opts.kv or {}) do
 		kv[#kv + 1] = e
