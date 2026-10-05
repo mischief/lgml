@@ -37,6 +37,7 @@ local media = require("lgml.chat.media")
 local output = require("lgml.chat.output")
 local placement = require("lgml.placement")
 local log = require("lgml.log")
+local spec = require("lgml.spec")
 
 local L = log.new("engine")
 
@@ -60,6 +61,10 @@ local REPEAT_STOP = 256
 local PROGRESS_MS = 1000
 -- The smallest context that `reserve` cuts to before it gives up.
 local MIN_FIT_CTX = 8192
+
+-- Graphs of small passes that a speculating slot keeps, besides the
+-- last one: decode steps and verify passes of a few lengths.
+local SPEC_GRAPHS = 6
 
 -- Image embeddings kept in host memory, most recent first.
 local EMBD_KEEP = 8
@@ -260,6 +265,13 @@ end
 --   `"auto"`: the largest of 4096, 2048, 1024 and 512 whose compute
 --   buffers fit the memory budget, as `E:reserve` plans them. A model
 --   without a KV pool takes 512 for auto.
+-- - `speculative`: true, or a table, turns speculative decoding on by
+--   default; a request can turn it on or off with `speculative`. The
+--   table holds `max` (the most draft tokens, default 16), `adaptive`
+--   (false drafts `max` tokens at each step, default true), and
+--   `ngram_min`, `ngram_max` for the prompt lookup drafter (see
+--   `lgml.spec.lookup`). `drafter`, a function of the request that
+--   returns a drafter, replaces prompt lookup (see `lgml.spec`).
 -- @treturn Engine the engine
 -- @raise when the backend, the model or its tokenizer does not load,
 -- when no chat template fits the model, an adapter does not fit it, the
@@ -351,6 +363,12 @@ function M.new(opts)
 	else
 		e.recipe = opts.recipe or decide.default_recipe()
 	end
+	local so = opts.speculative
+	e.spec_on = so == true or type(so) == "table"
+	so = type(so) == "table" and so or {}
+	e.spec_opts = { max = so.max or 16, ngram_min = so.ngram_min, ngram_max = so.ngram_max,
+	    drafter = so.drafter, adaptive = so.adaptive }
+	e.spec_costs = spec.costs()
 	e.eog = {}
 	for _, id in ipairs(e.tk:special().eog or {}) do
 		e.eog[id] = true
@@ -729,7 +747,7 @@ end
 
 -- Empty a slot's cache: no positions, and no pool blocks.
 function E:clear_cache(cache)
-	cache.n_past = 0
+	cache.n_past, cache.replay_keep = 0, nil
 	if cache.pool then
 		self.model:truncate(cache, 0)
 	end
@@ -2192,6 +2210,194 @@ function E:note(sink, slot, state, done, total)
 	end
 end
 
+-- The speculation session of a request, or nil when it is off. The
+-- request field `speculative` wins over the engine default. Models
+-- without pool sequences or truncation decode plainly.
+function E:spec_start(req, prompt)
+	local want = req.speculative
+	if want == nil then
+		want = self.spec_on
+	end
+	if not want or not self.model.truncate then
+		return nil
+	end
+	local o = self.spec_opts
+	local drafter = o.drafter and o.drafter(req) or spec.lookup(o)
+	local sp = spec.session(drafter, self.spec_costs, { max = o.max, recurrent = self.model.recurrent,
+	    adaptive = o.adaptive })
+	sp.seq = table.move(prompt, 1, #prompt, 1, {})
+	-- A saved state from an earlier request does not fit this one.
+	if self.states then
+		self.states.cache = nil
+	end
+	return sp
+end
+
+--- Run one decode step with speculation, alone on the device.
+-- pend are the tokens that the cache lacks: tokens that an earlier
+-- verify pass kept but could not keep in a recurrent state, then the
+-- last sampled token. The drafter adds guesses when they pay (see
+-- `lgml.spec.Session.choose`). `verify` runs them all in one pass.
+-- Other running requests decode in batched passes, with no guesses.
+-- @return nil when the step must run as a plain decode step, else a
+-- table: `ready` (the sampled tokens, each `{ id, logprobs }`) and
+-- `redo` (kept tokens that the next pass must run again)
+function E:spec_step(sp, slot, toks, pend, smp, lim)
+	if slot and (slot.preempt or #self.pending > 0 or self.busy or self:owned() ~= 1) then
+		return nil
+	end
+	local model = self.model
+	local cache = slot and slot.cache or self.cache
+	cache.replay_keep = SPEC_GRAPHS
+	-- A pass takes at most ubatch tokens; a ring takes at most its own.
+	local room = math.min(lim.k, cache.n_ctx - cache.n_past, cache.ubatch or self.ubatch) - #pend
+	local k = sp:choose(room)
+	local drafts = {}
+	if k > 0 then
+		drafts = sp.drafter:draft({ seq = sp.seq, logits = sp.logits, row = sp.row, hidden = sp.hidden,
+		    hidden_row = sp.hidden_row, cache = cache }, k)
+		-- An end token stays out of a draft: it ends the reply anyway.
+		for j = 1, #drafts do
+			if j > k or self.eog[drafts[j]] then
+				for x = #drafts, j, -1 do
+					drafts[x] = nil
+				end
+				break
+			end
+		end
+	end
+	local ids = table.move(pend, 1, #pend, 1, {})
+	table.move(drafts, 1, #drafts, #ids + 1, ids)
+	if cache.pool and not pcall(model.grow, model, cache, math.min(cache.n_ctx, cache.n_past + #ids)) then
+		return nil
+	end
+	if slot then
+		self:acquire()
+		if model.drop_batch then
+			model:drop_batch(false)
+		end
+	end
+	local ok, res = pcall(self.verify, self, sp, cache, toks, ids, #pend, drafts, smp, lim)
+	if slot then
+		self:release()
+	end
+	if not ok then
+		error(res, 0)
+	end
+	return res
+end
+
+-- The verify pass of `spec_step`: run ids, the np pending tokens and
+-- the drafts, sample each row from the last pending one on, and drop
+-- the rejected positions from the cache. A recurrent state goes back
+-- to its copy from before the pass; the kept tokens run again in the
+-- next pass.
+function E:verify(sp, cache, toks, ids, np, drafts, smp, lim)
+	local model, nd = self.model, #drafts
+	local n0 = cache.n_past
+	local saved = nd > 0 and model.recurrent
+	local t0 = lgml.clock()
+	if saved then
+		self.states = self.states or spec.state_copy(model)
+		self.states.save(cache)
+	end
+	local opts = { logits = nd > 0 and "all" or "last", flash_attn = self.flash_attn }
+	local finish
+	if sp.drafter.hidden then
+		local name = "l_out-" .. (model.hp.n_layer - 1)
+		opts.tag = "hidden"
+		finish = function(_, out, taps)
+			return out, taps[name]
+		end
+	end
+	local logits, hidden = replay.run(model, cache, ids, opts, finish)
+	if cache.replay_hit and (nd > 0 or #ids == 1) then
+		sp.costs:add(#ids, lgml.clock() - t0)
+	end
+	-- Rows: the last pending token, then one per draft.
+	local first = nd > 0 and np or 1
+	local ready, a = {}, 0
+	for j = 1, nd + 1 do
+		local row = first + j - 1
+		local id = smp:sample(logits, row)
+		smp:accept(id)
+		sp.seq[#sp.seq + 1] = id
+		ready[j] = { id, lim.lp and self:logprobs(smp, id, lim.top) or nil }
+		if j > nd or id ~= drafts[j] then
+			sp.row, sp.hidden_row = row, np + j - 1
+			break
+		end
+		a = j
+	end
+	sp.logits, sp.hidden = logits, hidden
+	sp:update(nd, a)
+	local keep, redo = n0 + np + a, {}
+	if a < nd and saved then
+		self.states.restore(cache)
+		if cache.pool then
+			model:truncate(cache, n0)
+		end
+		redo = table.move(ids, 1, np + a, 1, {})
+		return { ready = ready, redo = redo }
+	elseif a < nd then
+		if model.rewind and model:rewind(cache, keep) ~= keep then
+			error("speculation: the ring lost the kept positions", 0)
+		end
+		cache.n_past = keep
+		if cache.pool then
+			model:truncate(cache, keep)
+		end
+	end
+	table.move(ids, 1, np + a, #toks + 1, toks)
+	return { ready = ready, redo = redo }
+end
+
+-- At the end of a reply, drop the tokens past keep that verify passes
+-- left in the cache, so the slot holds what a plain decode leaves. A
+-- recurrent state goes back to its saved copy, when it has one. The
+-- slot lets its kept graphs go.
+function E:spec_end(sp, slot, toks, keep)
+	self.spec_drafted = (self.spec_drafted or 0) + sp.drafted
+	self.spec_accepted = (self.spec_accepted or 0) + sp.accepted
+	L:debug("speculation", "drafted", sp.drafted, "accepted", sp.accepted, "passes", sp.passes,
+	    "rate", ("%.2f"):format(sp:rate()))
+	local model = self.model
+	local cache = slot and slot.cache or self.cache
+	cache.replay_keep = nil
+	replay.drop_kept(cache)
+	if #toks <= keep then
+		return
+	end
+	if slot then
+		self:acquire()
+	end
+	local ok, err = pcall(function()
+		local sc = self.states
+		if model.recurrent then
+			if not (sc and sc.cache == cache and sc.n <= keep) then
+				return
+			end
+			sc.restore(cache)
+			keep = sc.n
+		elseif model.rewind and model:rewind(cache, keep) ~= keep then
+			return
+		end
+		cache.n_past = math.min(cache.n_past, keep)
+		if cache.pool then
+			model:truncate(cache, keep)
+		end
+		for i = #toks, keep + 1, -1 do
+			toks[i] = nil
+		end
+	end)
+	if slot then
+		self:release()
+	end
+	if not ok then
+		error(err, 0)
+	end
+end
+
 function E:run(req, sink, st)
 	self.image_ms = 0
 	self.acts[sink] = { request_id = log.request_id(), state = "wait", sent = 0 }
@@ -2319,14 +2525,28 @@ function E:run_prompt(req, sink, st)
 	    (math.tointeger(req.reasoning_budget) or self.reasoning_budget)
 	local forced
 	local guard, repeated = repeat_guard(self.repeat_stop), nil
+	-- With speculation, a verify pass samples several tokens ahead: they
+	-- wait in ready. redo holds kept tokens that a recurrent state lost
+	-- at a rejection; the next pass runs them first.
+	local sp = self:spec_start(req, prompt)
+	local ready, ri, redo = {}, 0, {}
+	local aborted = false
 	while n < max do
-		local id
-		if forced and #forced > 0 then
-			id = table.remove(forced, 1)
+		local id, lp
+		if ri < #ready then
+			ri = ri + 1
+			id, lp = ready[ri][1], ready[ri][2]
 		else
-			id = smp:sample(logits)
+			if forced and #forced > 0 then
+				id = table.remove(forced, 1)
+			else
+				id = smp:sample(logits)
+			end
+			smp:accept(id)
+			if sp then
+				sp.seq[#sp.seq + 1] = id
+			end
 		end
-		smp:accept(id)
 		n = n + 1
 		if self.eog[id] then
 			if tracing then
@@ -2339,12 +2559,16 @@ function E:run_prompt(req, sink, st)
 		if tracing then
 			L:trace("token", "n", n, "id", id, "text", piece)
 		end
-		local r = out:token(piece, want_lp and self:logprobs(smp, id, top_lp) or nil)
+		if want_lp and not lp then
+			lp = self:logprobs(smp, id, top_lp)
+		end
+		local r = out:token(piece, lp)
 		if r == "stop" then
 			reason, stopped = "stop", true
 			break
 		elseif not r then
-			return true
+			aborted = true
+			break
 		end
 		self:note(sink, slot or self.slot, "answer", n)
 		if budget and not forced and out:in_reasoning() and out.reasoning_tokens >= budget then
@@ -2359,38 +2583,69 @@ function E:run_prompt(req, sink, st)
 		if n >= max then
 			break
 		end
-		local good, lg
-		if slot then
-			good, lg = pcall(self.decode_step, self, slot, id)
-		else
-			good, lg = pcall(self.eval, self, { id })
-		end
-		local resumed = false
-		if not good then
-			if not tostring(lg):find("kv pool full", 1, true) then
-				error(lg, 0)
+		-- The pass of the last sampled token, after the redo tokens.
+		if ri >= #ready then
+			local pend = redo
+			pend[#pend + 1] = id
+			redo, ready, ri = {}, {}, 0
+			local res
+			if sp and not (forced and #forced > 0) then
+				-- Guesses stop before the token limit and the reasoning
+				-- budget: past them, the reply ends or forced tokens follow.
+				local k = max - n - 1
+				if budget and not forced then
+					k = math.min(k, budget - out.reasoning_tokens - 1)
+				end
+				res = self:spec_step(sp, slot, toks, pend, smp, { k = k, lp = want_lp, top = top_lp })
 			end
-			-- Other requests hold the rest of the pool: this one waits for
-			-- them. Alone, the reply ends.
-			if not slot or self:owned() < 2 then
-				L:info("kv pool full; the reply ends", "tokens", n)
+			if res then
+				ready, redo = res.ready, res.redo
+			else
+				local good, lg
+				if slot then
+					good, lg = pcall(self.batch_step, self, slot, pend)
+				else
+					good, lg = pcall(self.eval, self, pend)
+				end
+				local resumed = false
+				if not good then
+					if not tostring(lg):find("kv pool full", 1, true) then
+						error(lg, 0)
+					end
+					-- Other requests hold the rest of the pool: this one waits
+					-- for them. Alone, the reply ends.
+					if not slot or self:owned() < 2 then
+						L:info("kv pool full; the reply ends", "tokens", n)
+						break
+					end
+					slot, lg = self:preempt(st, req, slot, pend, sink)
+					if not lg then
+						aborted = true
+						break
+					end
+					toks, resumed = slot.tokens, true
+				end
+				logits = lg
+				if sp then
+					sp.logits, sp.row, sp.hidden = lg, nil, nil
+				end
+				if not resumed then
+					table.move(pend, 1, #pend, #toks + 1, toks)
+				end
+			end
+			self:publish(slot and slot.cache or self.cache, toks)
+			stream.sleep(0)
+			if sink:cancelled() then
+				aborted = true
 				break
 			end
-			slot, lg = self:preempt(st, req, slot, { id }, sink)
-			if not lg then
-				return true
-			end
-			toks, resumed = slot.tokens, true
 		end
-		logits = lg
-		if not resumed then
-			toks[#toks + 1] = id
-		end
-		self:publish(slot and slot.cache or self.cache, toks)
-		stream.sleep(0)
-		if sink:cancelled() then
-			return true
-		end
+	end
+	if sp then
+		self:spec_end(sp, slot, toks, #prompt + n - 1)
+	end
+	if aborted then
+		return true
 	end
 	-- After a stop string, the rest of the output does not go out.
 	if not stopped then
@@ -2414,6 +2669,7 @@ function E:run_prompt(req, sink, st)
 		predicted_per_token_ms = (t2 - t1) * 1000 / math.max(n, 1),
 		predicted_per_second = n / math.max(t2 - t1, 1e-9),
 		images = #images, image_encode_ms = self.image_ms, repeat_stop = repeated,
+		draft_n = sp and sp.drafted or nil, draft_accepted = sp and sp.accepted or nil,
 	})
 	return true
 end

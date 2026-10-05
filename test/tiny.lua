@@ -49,7 +49,9 @@ local function vocab_kv()
 	}, #tokens
 end
 
--- Write a tiny model of arch ("llama" or "qwen3") to path. opts.quant
+-- Write a tiny model of arch ("llama", "qwen3" or "qwen3next") to path.
+-- qwen3next has a delta net layer, then an attention layer, and dense
+-- feed-forward blocks. opts.quant
 -- ("q8_0" or "q4_0") stores the 2-D weights of the layers quantized.
 -- opts.tied leaves out output.weight. opts.n_ctx sets the context length
 -- (default 256). opts.override gives f32 values
@@ -98,12 +100,25 @@ function M.write(path, arch, opts)
 		end
 		add(name, shape, v, name:match("^blk"))
 	end
-	local function norm(name, d)
+	local function norm(name, d, lo, hi)
+		lo, hi = lo or 0.9, hi or 1.1
 		local v = {}
 		for i = 1, d do
-			v[i] = 0.9 + 0.2 * r()
+			v[i] = lo + (hi - lo) * r()
 		end
 		add(name, { d }, v)
+	end
+	local hybrid = arch == "qwen3next"
+	-- Delta net sizes: 2 key heads, 4 value heads, head size 16.
+	local NK, NV, S, K = 2, 4, 16, 4
+	if hybrid then
+		key("rope.dimension_count", gguf.UINT32, 8)
+		key("ssm.conv_kernel", gguf.UINT32, K)
+		key("ssm.state_size", gguf.UINT32, S)
+		key("ssm.group_count", gguf.UINT32, NK)
+		key("ssm.time_step_rank", gguf.UINT32, NV)
+		key("ssm.inner_size", gguf.UINT32, NV * S)
+		key("full_attention_interval", gguf.UINT32, 2)
 	end
 	kv[#kv + 1] = { "general.architecture", gguf.STRING, arch }
 	kv[#kv + 1] = { "general.name", gguf.STRING, "tiny " .. arch }
@@ -125,15 +140,26 @@ function M.write(path, arch, opts)
 	for i = 0, M.NL - 1 do
 		local p = "blk." .. i .. "."
 		norm(p .. "attn_norm.weight", E)
-		w(p .. "attn_q.weight", { H * D, E })
-		w(p .. "attn_k.weight", { HKV * D, E })
-		w(p .. "attn_v.weight", { HKV * D, E })
-		w(p .. "attn_output.weight", { E, H * D })
-		if arch ~= "llama" then
-			norm(p .. "attn_q_norm.weight", D)
-			norm(p .. "attn_k_norm.weight", D)
+		if hybrid and i % 2 == 0 then
+			local kd, vd = NK * S, NV * S
+			w(p .. "ssm_in.weight", { 2 * kd + 2 * vd, E })
+			w(p .. "ssm_ba.weight", { 2 * NV, E })
+			w(p .. "ssm_conv1d.weight", { 2 * kd + vd, K })
+			norm(p .. "ssm_dt.bias", NV, -1, 1)
+			norm(p .. "ssm_a", NV, -1.5, -0.2)
+			norm(p .. "ssm_norm.weight", S)
+			w(p .. "ssm_out.weight", { E, vd })
+		else
+			w(p .. "attn_q.weight", { H * D * (hybrid and 2 or 1), E })
+			w(p .. "attn_k.weight", { HKV * D, E })
+			w(p .. "attn_v.weight", { HKV * D, E })
+			w(p .. "attn_output.weight", { E, H * D })
+			if arch ~= "llama" then
+				norm(p .. "attn_q_norm.weight", D)
+				norm(p .. "attn_k_norm.weight", D)
+			end
 		end
-		norm(p .. "ffn_norm.weight", E)
+		norm(p .. (hybrid and "post_attention_norm.weight" or "ffn_norm.weight"), E)
 		w(p .. "ffn_gate.weight", { F, E })
 		w(p .. "ffn_up.weight", { F, E })
 		w(p .. "ffn_down.weight", { E, F })
@@ -143,6 +169,90 @@ function M.write(path, arch, opts)
 	end
 	gguf.write(path, kv, ts)
 	return byname, nv
+end
+
+-- Write a tiny gemma4 model to path: a sliding layer (window 6) and a
+-- global layer, with the gemma4 test vocab. opts.n_ctx sets the
+-- context length (default 256).
+function M.write_gemma4(path, opts)
+	opts = opts or {}
+	local bpe_vocab = require("bpe_vocab")
+	local r = M.rng(7 * 7919 + (opts.seed or 0))
+	local kv = bpe_vocab.gemma4_kv()
+	local nv
+	for _, e in ipairs(kv) do
+		if e[1] == "tokenizer.ggml.tokens" then
+			nv = #e[3]
+		end
+	end
+	local E, H, D, DS, FF = 64, 4, 32, 16, 96
+	local ts = {}
+	local function key(k, t, v)
+		kv[#kv + 1] = { "gemma4." .. k, t, v }
+	end
+	local function vals(c, lo, hi)
+		local v = {}
+		for i = 1, c do
+			v[i] = lo + (hi - lo) * r()
+		end
+		return v
+	end
+	local function w(name, shape, gain)
+		local s = (gain or 1) * math.sqrt(3 / shape[#shape])
+		ts[#ts + 1] = { name, shape, vals(shape[1] * shape[2], -s, s) }
+	end
+	local function norm(name, d)
+		ts[#ts + 1] = { name, { d }, vals(d, 0.8, 1.2) }
+	end
+	local swa, hkv = { true, false }, { 2, 1 }
+	kv[#kv + 1] = { "general.architecture", gguf.STRING, "gemma4" }
+	kv[#kv + 1] = { "general.name", gguf.STRING, "tiny gemma4" }
+	key("block_count", gguf.UINT32, 2)
+	key("context_length", gguf.UINT32, opts.n_ctx or 256)
+	key("embedding_length", gguf.UINT32, E)
+	key("feed_forward_length", gguf.UINT32, FF)
+	key("attention.head_count", gguf.UINT32, H)
+	key("attention.head_count_kv", { gguf.ARRAY, gguf.INT32 }, hkv)
+	key("attention.key_length", gguf.UINT32, D)
+	key("attention.value_length", gguf.UINT32, D)
+	key("attention.key_length_swa", gguf.UINT32, DS)
+	key("attention.value_length_swa", gguf.UINT32, DS)
+	key("attention.layer_norm_rms_epsilon", gguf.FLOAT32, 1e-6)
+	key("attention.sliding_window", gguf.UINT32, 6)
+	key("attention.sliding_window_pattern", { gguf.ARRAY, gguf.BOOL }, swa)
+	key("rope.dimension_count", gguf.UINT32, D)
+	key("rope.dimension_count_swa", gguf.UINT32, DS)
+	key("rope.freq_base", gguf.FLOAT32, 1e6)
+	key("rope.freq_base_swa", gguf.FLOAT32, 1e4)
+	key("final_logit_softcapping", gguf.FLOAT32, 30)
+	w("token_embd.weight", { nv, E }, 0.3)
+	norm("output_norm.weight", E)
+	local freqs = {}
+	for i = 1, D // 2 do
+		freqs[i] = i <= D // 4 and 1 or 1e30
+	end
+	ts[#ts + 1] = { "rope_freqs.weight", { D // 2 }, freqs }
+	for i = 0, 1 do
+		local p = "blk." .. i .. "."
+		local d = swa[i + 1] and DS or D
+		norm(p .. "attn_norm.weight", E)
+		w(p .. "attn_q.weight", { H * d, E })
+		w(p .. "attn_k.weight", { hkv[i + 1] * d, E })
+		norm(p .. "attn_k_norm.weight", d)
+		if swa[i + 1] then
+			w(p .. "attn_v.weight", { hkv[i + 1] * d, E })
+		end
+		w(p .. "attn_output.weight", { E, H * d })
+		norm(p .. "attn_q_norm.weight", d)
+		norm(p .. "post_attention_norm.weight", E)
+		norm(p .. "ffn_norm.weight", E)
+		w(p .. "ffn_gate.weight", { FF, E })
+		w(p .. "ffn_up.weight", { FF, E })
+		w(p .. "ffn_down.weight", { E, FF })
+		norm(p .. "post_ffw_norm.weight", E)
+		ts[#ts + 1] = { p .. "layer_output_scale.weight", { 1 }, { 0.8 + 0.3 * i } }
+	end
+	gguf.write(path, kv, ts)
 end
 
 -- A temporary file name that os.remove cleans up.
