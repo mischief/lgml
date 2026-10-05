@@ -13,7 +13,11 @@
 /* fseeko and off_t. */
 #define _POSIX_C_SOURCE 200809L
 
+#include <sys/mman.h>
+#include <sys/stat.h>
+
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <math.h>
 #include <stdint.h>
@@ -71,8 +75,11 @@ store_release(struct store *s)
 	lgml_store_unaccount(s);
 	if (s->buf != NULL)
 		ggml_backend_buffer_free(s->buf);
+	if (s->map != NULL)
+		munmap(s->map, s->maplen);
 	ggml_free(s->ctx);
 	s->buf = NULL;
+	s->map = NULL;
 	s->ctx = NULL;
 	s->b->refs--;
 	backend_release(s->b);
@@ -580,6 +587,8 @@ push_store(lua_State *L, int bidx, struct ggml_context *ctx, ggml_backend_buffer
 	s->b = b;
 	s->ctx = ctx;
 	s->buf = buf;
+	s->map = NULL;
+	s->maplen = 0;
 	s->refs = 0;
 	s->closed = 0;
 	s->mem_bytes = 0;
@@ -751,6 +760,38 @@ split_ctx(lua_State *L, int hidx, struct ggml_context **ctx, struct ggml_context
 }
 
 /*
+ * Replace *ctx with a new context of its tensors that the set at sidx
+ * names (keep true) or does not name (keep false). Return -1 when
+ * ggml_init fails; *ctx then stays.
+ */
+static int
+filter_ctx(lua_State *L, int sidx, int keep, struct ggml_context **ctx)
+{
+	struct ggml_init_params ip = { 0, NULL, true };
+	struct ggml_context *d, *c = *ctx;
+	struct ggml_tensor *gt, *nt;
+	int n = 0, on;
+
+	for (gt = ggml_get_first_tensor(c); gt != NULL; gt = ggml_get_next_tensor(c, gt))
+		n++;
+	ip.mem_size = (size_t)(n + 1) * ggml_tensor_overhead();
+	if ((d = ggml_init(ip)) == NULL)
+		return -1;
+	for (gt = ggml_get_first_tensor(c); gt != NULL; gt = ggml_get_next_tensor(c, gt)) {
+		lua_getfield(L, sidx, ggml_get_name(gt));
+		on = lua_toboolean(L, -1);
+		lua_pop(L, 1);
+		if (on == keep) {
+			nt = ggml_dup_tensor(d, gt);
+			ggml_set_name(nt, ggml_get_name(gt));
+		}
+	}
+	ggml_free(c);
+	*ctx = d;
+	return 0;
+}
+
+/*
  * Allocate the tensors of ctx in bt as weights. NULL for no tensors.
  * A failed allocation leaves the tensors without data, for a retry.
  */
@@ -778,10 +819,12 @@ alloc_weights(struct ggml_context *ctx, ggml_backend_buffer_type_t bt, ggml_back
  * backend (see `backend:cpu`); `weights:get` finds tensors of both parts.
  * They go to pinned host memory of the device when it has some, so that
  * the device can read them fast for large batches, else to plain memory.
+ * With `opts.skip`, the tensors it names stay in the file.
  * @tparam string path gguf file
  * @tparam[opt] table opts `cpu`: a set of tensor names, `{ [name] =
  * true }`, to put on the CPU backend; `pinned`: false to use plain
- * memory for them (default true)
+ * memory for them (default true); `skip`: a set of tensor names not to
+ * load
  * @treturn[1] weights the tensors
  * @return[2] nil if the file is not a gguf file
  * @treturn[2] string error message
@@ -801,13 +844,17 @@ backend_load(lua_State *L)
 	ggml_backend_buffer_type_t hbt, cbt;
 	char *chunk;
 	FILE *f;
-	int e, hidx = 0, sidx, nh = 0, pinned = 1;
+	int e, hidx = 0, sidx, nh = 0, pinned = 1, skip = 0;
 
 	if (!lua_isnoneornil(L, 3)) {
 		luaL_checktype(L, 3, LUA_TTABLE);
 		if (lua_getfield(L, 3, "pinned") != LUA_TNIL)
 			pinned = lua_toboolean(L, -1);
 		lua_pop(L, 1);
+		if (lua_getfield(L, 3, "skip") != LUA_TNIL) {
+			luaL_checktype(L, -1, LUA_TTABLE);
+			skip = lua_gettop(L);
+		}
 		if (lua_getfield(L, 3, "cpu") != LUA_TNIL) {
 			luaL_checktype(L, -1, LUA_TTABLE);
 			hidx = lua_gettop(L);
@@ -820,6 +867,11 @@ backend_load(lua_State *L)
 		luaL_pushfail(L);
 		lua_pushfstring(L, "%s: not a gguf file", path);
 		return 2;
+	}
+	if (skip != 0 && filter_ctx(L, skip, 0, &ctx) != 0) {
+		gguf_free(gctx);
+		ggml_free(ctx);
+		return luaL_error(L, "ggml_init failed");
 	}
 	if (hidx != 0 && (nh = split_ctx(L, hidx, &ctx, &hctx)) != 0) {
 		if (nh > 0 && b->cpu != NULL) {
@@ -902,6 +954,98 @@ refuse:
 	if (hctx != NULL)
 		ggml_free(hctx);
 	return lua_error(L);
+}
+
+/*** Map tensors of a gguf file into host memory, read only.
+ * The tensors stay in the file: the kernel reads their pages when a
+ * graph reads them, and may drop them again. They live on the CPU
+ * backend of this backend (see `backend:cpu`), or on this backend when
+ * it is a CPU. They take no lgml memory budget.
+ * @tparam string path gguf file
+ * @tparam {string,...} names the tensors to map
+ * @treturn weights the tensors
+ * @raise if the file does not open or is not a gguf file, a name is not
+ * in it, or the backend has no CPU
+ * @function backend:map
+ */
+static int
+backend_map(lua_State *L)
+{
+	struct backend *b = check_backend(L, 1);
+	const char *path = luaL_checkstring(L, 2);
+	struct gguf_init_params gp = { true, NULL };
+	struct gguf_context *gctx;
+	struct ggml_context *ctx = NULL;
+	struct ggml_tensor *gt;
+	ggml_backend_buffer_t buf;
+	ggml_backend_dev_t dev;
+	struct store *s;
+	struct stat st;
+	size_t base;
+	void *map;
+	int fd, bidx = 1, n = 0, i;
+
+	luaL_checktype(L, 3, LUA_TTABLE);
+	if (b->cpu != NULL) {
+		lua_getiuservalue(L, 1, UV_CPU);
+		bidx = lua_gettop(L);
+		b = b->cpu;
+	} else if (ggml_backend_dev_type(ggml_backend_get_device(b->be)) !=
+	    GGML_BACKEND_DEVICE_TYPE_CPU)
+		return luaL_error(L, "map: the backend has no CPU backend");
+	lua_newtable(L);
+	for (i = 1; lua_rawgeti(L, 3, i) != LUA_TNIL; i++) {
+		lua_pushboolean(L, 1);
+		lua_settable(L, -3);
+		n++;
+	}
+	lua_pop(L, 1);
+	gp.ctx = &ctx;
+	if ((gctx = gguf_init_from_file(path, gp)) == NULL)
+		return luaL_error(L, "%s: not a gguf file", path);
+	base = gguf_get_data_offset(gctx);
+	if (filter_ctx(L, lua_gettop(L), 1, &ctx) != 0) {
+		gguf_free(gctx);
+		ggml_free(ctx);
+		return luaL_error(L, "ggml_init failed");
+	}
+	for (gt = ggml_get_first_tensor(ctx); gt != NULL; gt = ggml_get_next_tensor(ctx, gt))
+		n--;
+	if (n != 0) {
+		gguf_free(gctx);
+		ggml_free(ctx);
+		return luaL_error(L, "%s: a tensor to map is not in the file", path);
+	}
+	if ((fd = open(path, O_RDONLY)) < 0 || fstat(fd, &st) != 0 ||
+	    (map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0)) == MAP_FAILED) {
+		i = errno;
+		if (fd >= 0)
+			close(fd);
+		gguf_free(gctx);
+		ggml_free(ctx);
+		return luaL_error(L, "%s: %s", path, strerror(i));
+	}
+	close(fd);
+	/* Rows of an embedding table come in no order. */
+	posix_madvise(map, (size_t)st.st_size, POSIX_MADV_RANDOM);
+	dev = ggml_backend_get_device(b->be);
+	buf = ggml_backend_dev_buffer_from_host_ptr(dev, map, (size_t)st.st_size, (size_t)st.st_size);
+	if (buf == NULL) {
+		munmap(map, (size_t)st.st_size);
+		gguf_free(gctx);
+		ggml_free(ctx);
+		return luaL_error(L, "map: the CPU backend cannot use a host buffer");
+	}
+	ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+	for (gt = ggml_get_first_tensor(ctx); gt != NULL; gt = ggml_get_next_tensor(ctx, gt))
+		ggml_backend_tensor_alloc(buf, gt, (char *)map + base +
+		    gguf_get_tensor_offset(gctx, gguf_find_tensor(gctx, ggml_get_name(gt))));
+	gguf_free(gctx);
+	s = push_store(L, bidx, ctx, buf);
+	s->map = map;
+	s->maplen = (size_t)st.st_size;
+	lgml_store_unaccount(s);
+	return 1;
 }
 
 /*** Make an empty graph on this backend.
@@ -3422,6 +3566,26 @@ hostbuf_bytes(lua_State *L)
 	return 1;
 }
 
+/*** Write a string of bytes.
+ * @tparam int off first byte
+ * @tparam string s the bytes
+ * @raise if the range is out of bounds
+ * @function hostbuf:set
+ */
+static int
+hostbuf_set(lua_State *L)
+{
+	struct hostbuf *hb = check_hostbuf(L, 1);
+	lua_Integer off = luaL_checkinteger(L, 2);
+	size_t n;
+	const char *s = luaL_checklstring(L, 3, &n);
+
+	luaL_argcheck(L, off >= 0 && (lua_Unsigned)off <= hb->size && n <= hb->size - (size_t)off,
+	    2, "range out of bounds");
+	memcpy(hb->p + off, s, n);
+	return 0;
+}
+
 static const luaL_Reg backend_meta[] = {
 	{ "__gc", backend_close },
 	{ "__close", backend_close },
@@ -3435,6 +3599,7 @@ static const luaL_Reg backend_methods[] = {
 	{ "cpu", backend_cpu },
 	{ "tensor", backend_tensor },
 	{ "load", backend_load },
+	{ "map", backend_map },
 	{ "graph", backend_graph },
 	{ NULL, NULL }
 };
@@ -3551,6 +3716,7 @@ static const luaL_Reg hostbuf_methods[] = {
 	{ "close", hostbuf_close },
 	{ "len", hostbuf_len },
 	{ "bytes", hostbuf_bytes },
+	{ "set", hostbuf_set },
 	{ NULL, NULL }
 };
 

@@ -47,6 +47,8 @@ struct store {
 	int			 mem_key;	/* see lgml_store_account */
 	int			 mem_part;
 	size_t			 mem_bytes;
+	void			*map;		/* a file map that the store unmaps, or NULL */
+	size_t			 maplen;
 };
 
 /*
