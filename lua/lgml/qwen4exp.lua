@@ -11,6 +11,9 @@ local lgml = require("lgml")
 
 local M = {}
 
+-- The name of the n-gram table.
+local TABLE = "per_layer_token_embd.weight"
+
 -- The transformer module, loaded by the time a model exists.
 local function T()
 	return package.loaded["lgml.transformer"]
@@ -153,6 +156,22 @@ function M.load_layer(w, hp, i)
 	return L
 end
 
+--- The tensors of a gguf that `load` puts on a backend: all but the
+-- n-gram table and the MTP layers.
+-- @tparam table tensors the tensor list, as from `lgml.gguf`
+-- @tparam table hp the config
+-- @treturn table the list
+function M.weight_tensors(tensors, hp)
+	local out = {}
+	for _, t in ipairs(tensors) do
+		local il = tonumber(t.name:match("^blk%.(%d+)%."))
+		if t.name ~= TABLE and not (il and il >= hp.n_layer) then
+			out[#out + 1] = t
+		end
+	end
+	return out
+end
+
 -- Weights from several stores: get looks in each in turn.
 local Multi = {}
 Multi.__index = Multi
@@ -198,8 +217,6 @@ local function shards(path, meta)
 	return list
 end
 
--- The name of the n-gram table.
-local TABLE = "per_layer_token_embd.weight"
 
 --- Load a model of this arch.
 -- It reads every file of a split gguf. The n-gram table stays in its
@@ -257,17 +274,28 @@ function M.load(be, path, opts, info, hp)
 				mapped = true
 			end
 		end
-		if mmap then
-			local names = {}
-			for _, t in ipairs(finfo.tensors) do
-				if not skip[t.name] then
-					names[#names + 1] = t.name
-				end
+		local names = {}
+		for _, t in ipairs(finfo.tensors) do
+			if not skip[t.name] then
+				names[#names + 1] = t.name
 			end
+		end
+		-- A file of the n-gram table alone has nothing to load.
+		if #names == 0 then
+			goto next
+		end
+		if mmap then
 			w[#w + 1] = be:map(file, names)
 		else
-			w[#w + 1] = assert(be:load(file, { cpu = cpu, pinned = opts.pinned, skip = skip }))
+			local s = assert(be:load(file, { cpu = cpu, pinned = opts.pinned, skip = skip }))
+			w[#w + 1] = s
+			-- An lgml C module without load skips would load the table.
+			if skip[TABLE] and s:get(TABLE) then
+				s:close()
+				error(file .. ": the lgml C module does not skip tensors; rebuild it")
+			end
 		end
+		::next::
 	end
 	local function get(name)
 		return assert(w:get(name), name)

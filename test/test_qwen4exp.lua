@@ -265,6 +265,60 @@ local function reader_check(m, path)
 	o:close()
 end
 
+-- A placement split loads the weights to a backend and its CPU, as on
+-- a GPU, but not the n-gram table: the reader serves it. The model
+-- files are split as the real ones are, with the table alone in the
+-- second. The memory budget holds every other weight and no more.
+local function placement_check(path)
+	local gguf = require("gguf")
+	local placement = require("lgml.placement")
+	local kv, ts = q4t.build()
+	local one, two = {}, {}
+	for _, t in ipairs(ts) do
+		table.insert(t[1] == "per_layer_token_embd.weight" and two or one, t)
+	end
+	local base = tiny.tmp("")
+	local p1, p2 = base .. "-00001-of-00002.gguf", base .. "-00002-of-00002.gguf"
+	kv[#kv + 1] = { "split.count", gguf.UINT32, 2 }
+	gguf.write(p1, kv, one)
+	gguf.write(p2, { { "general.architecture", gguf.STRING, "qwen4exp" }, { "split.count", gguf.UINT32, 2 } }, two)
+	local want = 0
+	for _, t in ipairs(transformer.weight_tensors(assert(lgml.gguf(p1)), transformer.config(lgml.gguf(p1).meta))) do
+		want = want + t.size
+	end
+	local sb <close> = assert(lgml.backend("CPU", { cpu = true }))
+	collectgarbage()
+	collectgarbage()
+	local function weights()
+		local n = 0
+		for _, v in pairs(lgml.memory()) do
+			n = n + v.weights
+		end
+		return n
+	end
+	local w0 = weights()
+	local s = transformer.load(sb, p1, { placement = placement.rules({ n_cpu_moe = 2 }) })
+	local dev, host = s.w:size()
+	ok(s.ngram and s.w:get("per_layer_token_embd.weight") == nil and host > 0 and dev > 0,
+	    "placement: the weights split and the table stays in its file")
+	-- Buffers pad their size a little; the table is far larger.
+	local got, tbl = weights() - w0, assert(lgml.gguf(p2)).tensors[1].size
+	ok(got >= want and got - want < 1024 and tbl > 4096,
+	    ("placement: the budget holds the weights (%d bytes for %d) and not the table (%d)"):format(got, want, tbl))
+	local a = eval(s, s:cache(256), batches[1])
+	local m1 = transformer.load(sb, p1, { ngram = false, mmap = false })
+	local b = eval(m1, m1:cache(256), batches[1])
+	local e = 0
+	for i = 1, #a do
+		e = math.max(e, maxdiff(a[i], b[i]))
+	end
+	ok(e < 1e-4, ("placement: the split model gives the logits of one backend (max error %.3g)"):format(e))
+	s:close()
+	m1:close()
+	os.remove(p1)
+	os.remove(p2)
+end
+
 -- Snapshots: a full snapshot and a state checkpoint go back to their
 -- position, and the next pass gives the same logits.
 local function snapshot_check(m)
@@ -527,6 +581,7 @@ end
 
 hash_check(m)
 reader_check(m, path)
+placement_check(path)
 dense_check(m, path)
 
 local long = {}

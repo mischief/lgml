@@ -223,6 +223,15 @@ function M.config(meta)
 	return hp
 end
 
+--- The tensors of a gguf that `load` puts on a backend, for weight
+-- placement plans.
+-- @tparam table info the gguf info, as from `lgml.gguf`
+-- @tparam table hp the config, from `config`
+-- @treturn table the tensor list
+function M.weight_tensors(info, hp)
+	return hp.hc and q4.weight_tensors(info.tensors, hp) or info.tensors
+end
+
 --- Load the weights of one layer.
 -- The config says which weights must exist. Other weights are
 -- optional, and the blocks use them when they exist.

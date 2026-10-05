@@ -186,7 +186,7 @@ local function auto_moe(be, rules, info, opts, n_slots)
 			local st = require("luv").fs_stat(opts.mmproj)
 			mmproj = st and st.size or 0
 		end
-		n = placement.auto(rules, info.tensors, hp.n_layer, free - RESERVE - mmproj - fixed * n_slots - per * ctx)
+		n = placement.auto(rules, transformer.weight_tensors(info, hp), hp.n_layer, free - RESERVE - mmproj - fixed * n_slots - per * ctx)
 	end
 	L:info("n_cpu_moe auto", "n_cpu_moe", n, "free_mib", free and free // 1048576)
 	rules.n_cpu_moe, rules.auto = n, nil
