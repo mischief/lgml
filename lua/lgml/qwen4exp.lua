@@ -652,7 +652,7 @@ end
 -- holds the layer inputs of the sequence, ikw the indexer keys after
 -- this pass wrote them. With at most top_k / ratio blocks in the span
 -- it is the base mask.
-local function qsa_mask(g, hp, L, cur, pos, ikw, lo, span, mask, qpos, qw, flash)
+local function qsa_mask(g, hp, L, cur, pos, ikw, lo, span, mask, qpos, qw)
 	local I = hp.idx
 	local R, P, K = I.ratio, span // I.ratio, I.top_k // I.ratio
 	if not qpos or P <= K then
@@ -684,13 +684,9 @@ local function qsa_mask(g, hp, L, cur, pos, ikw, lo, span, mask, qpos, qw, flash
 	local zero = g:scale(g:step(g:get_rows(g:reshape(score, { n, P, 1 }), top)), 0)
 	local drop = g:exp(mt == "f32" and vis or g:cast(vis, "f32"))
 	drop = g:set_rows(g:reshape(drop, { n, P, 1 }), zero, top)
-	local cut = g:scale(g:reshape(drop, { n, P }), -1e30)
-	local base = g:reshape(mt == "f32" and mask or g:cast(mask, "f32"), { n, P, R })
-	local full = g:reshape(g:add(base, g:tile(g:reshape(cut, { n, P, 1 }), base)), { n, span })
-	if flash then
-		full = g:cast(full, "f16")
-	end
-	return full
+	-- The add keeps the mask type: f16 turns -1e30 into -inf.
+	local cut = g:scale(drop, -1e30)
+	return g:reshape(g:add(g:reshape(mask, { n, P, R }), cut), { n, span })
 end
 
 -- A QSA layer on its input cur: indexer, attention, output gate and
@@ -710,15 +706,14 @@ local function qsa_layer(self, g, inp, L, il, cur, shared)
 				local ci = g:cont(rows_of(g, cur, b.off, b.n))
 				local pi = g:cont(rows_of(g, inp.pos, b.off, b.n))
 				local wi = g:cont(rows_of(g, inp.qsa_w, b.off, b.n))
-				local m = qsa_mask(g, hp, L, ci, pi, ikw, b.lo, b.n_attn, b.mask, b.qsa_pos, wi, inp.flash_attn)
+				local m = qsa_mask(g, hp, L, ci, pi, ikw, b.lo, b.n_attn, b.mask, b.qsa_pos, wi)
 				list[i] = setmetatable({ mask = m }, { __index = b })
 			end
 			a = setmetatable({ batch = list }, { __index = inp })
 		else
 			local c = inp.cache
 			local ikw = g:set_rows((c.pool or c).x[il], kraw, inp.rows)
-			local m = qsa_mask(g, hp, L, cur, inp.pos, ikw, inp.lo, inp.n_attn, inp.mask, inp.qsa_pos, inp.qsa_w,
-			    inp.flash_attn)
+			local m = qsa_mask(g, hp, L, cur, inp.pos, ikw, inp.lo, inp.n_attn, inp.mask, inp.qsa_pos, inp.qsa_w)
 			a = setmetatable({ mask = m }, { __index = inp })
 		end
 	end

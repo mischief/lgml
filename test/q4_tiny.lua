@@ -82,6 +82,12 @@ function M.build(opts)
 	local function vec(name, d, lo, hi)
 		ts[#ts + 1] = { name, { d }, rand(d, lo, hi) }
 	end
+	-- Store tensor t as f16, as the real model stores some.
+	local function f16(t)
+		local be <close> = assert(lgml.backend("CPU"))
+		local h <close> = be:tensor("f16", t[2], t[3])
+		t[3], t[4] = h:bytes(), gguf.F16
+	end
 	local function hc(prefix, inject)
 		norm(prefix .. "_norm.weight", CE)
 		w(prefix .. "_down.weight", { R, CE })
@@ -148,12 +154,7 @@ function M.build(opts)
 	hc("output_hc", false)
 	-- The n-gram table is f16, as the reader takes no f32 table.
 	w("per_layer_token_embd.weight", { rows + 8, PD }, 3)
-	do
-		local t = ts[#ts]
-		local be <close> = assert(lgml.backend("CPU"))
-		local h <close> = be:tensor("f16", t[2], t[3])
-		t[3], t[4] = h:bytes(), gguf.F16
-	end
+	f16(ts[#ts])
 	local kd, vd = M.NK * M.S, M.NV * M.S
 	for i = 0, M.NL - 1 do
 		local p = "blk." .. i .. "."
@@ -188,6 +189,7 @@ function M.build(opts)
 			norm(p .. "ple_norm_query.weight", CE)
 			norm(p .. "ple_norm_conv.weight", CE)
 			w(p .. "ple_conv1d.weight", { CE, 4 })
+			f16(ts[#ts])
 		end
 		w(p .. "ffn_gate_inp.weight", { M.X, E }, 3)
 		w(p .. "ffn_gate_exps.weight", { M.X, M.F, E })
