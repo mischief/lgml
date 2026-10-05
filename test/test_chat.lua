@@ -581,10 +581,47 @@ local qwen35_cases = {
 		{ B(0, "get_weather"), A(0, '{"city":"a\\n</parameter\\nb</parameter>\\n\\n"}'), E(0) },
 	},
 	{
-		"no newline after the call tag",
+		"no newline after the call tag: the tag is content, then a bare call",
 		"<tool_call><function=now>\n</function>\n</tool_call>",
 		QOFF,
-		{ C("<tool_call><function=now>\n</function>\n</tool_call>") },
+		{ C("<tool_call>"), B(0, "now"), A(0, "{}"), E(0) },
+	},
+	{
+		"bare call to a declared tool, text around it",
+		"Hi.\n<function=get_weather>\n<parameter=city>\na\n<b> & </c>\n</parameter>\n" ..
+			"<parameter=days>\n3\n</parameter>\n</function>\nDone.",
+		QOFF,
+		{ C("Hi."), B(0, "get_weather"), A(0, '{"city":"a\\n<b> & </c>","days":3}'), E(0), C("Done.") },
+	},
+	{
+		"bare call with the close tag, then a second bare call",
+		"<function=now>\n</function>\n</tool_call>\n<function=now>\n</function>\n",
+		QOFF,
+		{ B(0, "now"), A(0, "{}"), E(0), B(1, "now"), A(1, "{}"), E(1) },
+	},
+	{
+		"bare call, then text like the close tag",
+		"<function=now>\n</function>\n</tool_x> y",
+		QOFF,
+		{ B(0, "now"), A(0, "{}"), E(0), C("</tool_x> y") },
+	},
+	{
+		"bare call to an undeclared tool is content",
+		"See <function=glob>\n</function>\n and <function=now",
+		QOFF,
+		{ C("See <function=glob>\n</function>\n and <function=now") },
+	},
+	{
+		"function-like text is content",
+		"#include <functional>\nx <function=now> y",
+		QOFF,
+		{ C("#include <functional>\nx <function=now> y") },
+	},
+	{
+		"bare call with a missing required parameter",
+		"<function=get_weather>\n<parameter=days>\n3\n</parameter>\n</function>\nok",
+		QOFF,
+		{ B(0, "get_weather"), A(0, '{"days":3}'), E(0, BAD), C("ok") },
 	},
 	{
 		"truncated value",

@@ -3,7 +3,9 @@
 -- `lgml.chat.qwen35_call`). It is a subclass of
 -- `lgml.chat.hermes.Parser`, and the events are the same as the hermes
 -- parser gives. The Qwen3.5 prompt opens `<think>` itself, so the
--- parser starts in reasoning unless thinking is off.
+-- parser starts in reasoning unless thinking is off. As in llama.cpp,
+-- `<function=NAME>` for a declared NAME also opens a call without
+-- `<tool_call>` (Qwen3-Coder).
 -- @module lgml.chat.qwen35_parser
 local hermes = require("lgml.chat.hermes")
 local call = require("lgml.chat.qwen35_call")
@@ -13,6 +15,19 @@ local M = {}
 local P = setmetatable({}, { __index = hermes.P })
 P.__index = P
 P.call_tag = "<tool_call>\n"
+
+local FOPEN = "<function="
+local MAX_NAME = 512
+
+-- Length of the longest suffix of s that is a proper prefix of tag.
+local function partial(s, tag)
+	for k = math.min(#s, #tag - 1), 1, -1 do
+		if s:sub(-k) == tag:sub(1, k) then
+			return k
+		end
+	end
+	return 0
+end
 
 --- Makes a parser.
 -- @tparam[opt] table opts the options:
@@ -40,14 +55,74 @@ function M.new_parser(opts)
 	}, P)
 end
 
-function P:step_content(final)
-	if not self:scan("content", P.call_tag, final) then
-		return false
+-- Where a bare call starts in buf from i: "call" when the name is a
+-- declared tool, "wait" when more text must decide, else nil.
+function P:bare_at(i, final)
+	local from = i + #FOPEN
+	local gt = self.buf:find("[>\n<]", from)
+	if not gt then
+		return not final and #self.buf - from < MAX_NAME and "wait" or nil
 	end
+	local name = self.buf:sub(from, gt - 1)
+	if self.buf:sub(gt, gt) == ">" and self.tools and self.tools[name] then
+		return "call"
+	end
+	return nil
+end
+
+function P:start_call(at, skip, bare)
+	self:emit("content", self.buf:sub(1, at - 1))
+	self.buf = self.buf:sub(at + skip)
 	self.pre_ws, self.hold = self.hold, ""
 	self.state = "call"
-	self.call = call.new(self.tools)
+	self.call = call.new(self.tools, { bare = bare })
 	return true
+end
+
+function P:step_content(final)
+	local buf, pos = self.buf, 1
+	while true do
+		local a = buf:find(P.call_tag, pos, true)
+		local b = buf:find(FOPEN, pos, true)
+		if a and (not b or a < b) then
+			return self:start_call(a, #P.call_tag, false)
+		elseif not b then
+			break
+		end
+		local r = self:bare_at(b, final)
+		if r == "call" then
+			return self:start_call(b, 0, true)
+		elseif r == "wait" then
+			self:emit("content", buf:sub(1, b - 1))
+			self.buf = buf:sub(b)
+			return false
+		end
+		pos = b + 1
+	end
+	local k = final and 0 or math.max(partial(buf, P.call_tag), partial(buf, FOPEN))
+	self:emit("content", buf:sub(1, #buf - k))
+	self.buf = buf:sub(#buf - k + 1)
+	return false
+end
+
+-- A bare call that is not a call: its "<" is content, and the scan
+-- goes on after it.
+function P:fallback(raw)
+	if not self.call.bare then
+		return hermes.P.fallback(self, raw)
+	end
+	self.state, self.hold, self.lead = "content", self.pre_ws, false
+	self:emit("content", "<")
+	self.buf = raw:sub(2) .. self.buf
+end
+
+-- Bytes that a bare call took after its end go back to the text.
+function P:on_call_event(ev, rest)
+	local back = self.call and self.call.back
+	if back and (ev == "end" or ev == "error") then
+		rest = back .. rest
+	end
+	return hermes.P.on_call_event(self, ev, rest)
 end
 
 return M

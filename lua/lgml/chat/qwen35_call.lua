@@ -87,6 +87,14 @@ local function is_string(s, root, seen)
 	return false
 end
 
+--- Tests whether a schema lets the value be a string.
+-- @tparam table s the schema
+-- @tparam table root the schema that "#/..." refs resolve against
+-- @treturn boolean true when the value may be a string
+function M.is_string(s, root)
+	return is_string(s, root, {})
+end
+
 --- Makes the tool table for `new`.
 -- A tool given as a name has no schema: any parameter is allowed, and
 -- a value that is valid JSON is kept as JSON, else it is a string.
@@ -124,10 +132,16 @@ function M.tools(tools)
 end
 
 --- Makes a matcher.
+-- With `bare`, the call has no `<tool_call>` around it: the text starts
+-- at `<function=`, and `</tool_call>` after `</function>` is optional.
+-- Then the matcher keeps in `back` the bytes after the call that it
+-- took but that are not part of it.
 -- @tparam[opt] table tools a table from `tools`; nil allows any call
+-- @tparam[opt] table opts `bare`
 -- @treturn Call the matcher
-function M.new(tools)
+function M.new(tools, opts)
 	return setmetatable({
+		bare = opts and opts.bare or nil,
 		phase = "head",
 		raw = "",
 		name = "",
@@ -353,15 +367,23 @@ end
 -- Space, then "</tool_call>".
 function C:step_tail(c)
 	local t = self.tail or 0
+	if self.bare then
+		self.back = (self.back or "") .. c
+	end
 	if t == 0 and WS[c] then
 		return nil, true
 	elseif c ~= CLOSE:sub(t + 1, t + 1) then
+		if self.bare then
+			self.back = self.back:sub(1, -2)
+			return self:missing() and "error" or "end", false
+		end
 		return "error", false
 	end
 	self.tail = t + 1
 	if self.tail < #CLOSE then
 		return nil, true
 	end
+	self.back = nil
 	return self:missing() and "error" or "end", true
 end
 
@@ -380,6 +402,7 @@ function C:step(c)
 end
 
 --- Ends the output. A call after `</function>` counts as complete.
+-- A bare call keeps the bytes after `</function>` in `back`.
 -- @treturn string `"end"`, `"fail"` or `"error"`
 function C:finish()
 	if self.phase == "head" then
