@@ -75,6 +75,12 @@ return {
 		-- places tensors by Lua pattern.
 		{ id = "qwen3.5-35b", model = "/home/you/models/Qwen3.5-35B-A3B-Q4_K_M.gguf",
 			backend = "Vulkan0", ctx = 32768, n_cpu_moe = "auto" },
+		-- moe_cache keeps every routed expert in host memory and the most
+		-- used ones in a vram cache that adapts as the model runs: MiB, or
+		-- "auto" for the vram left after the KV cache, at most
+		-- moe_cache_max MiB. moe_cache_profile seeds it from a profile.
+		-- { id = "gemma-4-26b", model = "/home/you/models/gemma-4-26B-A4B-Q4_K_M.gguf",
+		-- 	backend = "Vulkan0", ctx = 32768, moe_cache = "auto", moe_cache_max = 8192 },
 		-- idle = 0 keeps this model loaded until another load needs room.
 		{ id = "whisper", model = "/home/you/models/whisper-large-v3-turbo", backend = "Vulkan0",
 			idle = 0 },

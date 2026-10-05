@@ -1,10 +1,9 @@
--- Time a stack of MoE layers with the experts on the device, on the
--- CPU, or split between the two, to see if the scheduler runs the CPU
--- and the device parts at the same time. The sizes are those of
--- gemma-4-26B-A4B; a dense product stands in for attention.
+-- Time MoE layers of gemma-4-26B-A4B size with the experts on the
+-- device, on the CPU, or split, to see if the scheduler runs the two
+-- parts at the same time. A dense product stands in for attention.
 -- Usage: lua5.4 scripts/moe_overlap.lua [device] [tokens] [layers]
--- Environment: QT (weight type, default q4_0), NE (experts), REPS,
--- LOGDBG (ggml debug log; with GGML_SCHED_DEBUG=2 it shows the splits).
+-- Environment: QT, NE, REPS, HALVES (device experts of the splits),
+-- STATIC (layer counts with all experts on the device), LOGDBG.
 local lgml = require("lgml")
 if os.getenv("LOGDBG") then
 	lgml.log("debug")
@@ -106,7 +105,7 @@ local function build(mode, gw, cw, half)
 	local g = be:graph()
 	local x = x0
 	local gmap, cmap
-	if mode ~= "gpu" and mode ~= "cpu" then
+	if mode ~= "gpu" and mode ~= "cpu" and mode ~= "static" then
 		-- Experts below half are on the device; slot half is all zero.
 		gmap = idmap(be, function(i) return i < half and i or nil end, half)
 		cmap = idmap(be, function(i) return i >= half and i or nil end, half)
@@ -121,6 +120,8 @@ local function build(mode, gw, cw, half)
 			out = ffn(g, gw, h, sel)
 		elseif mode == "cpu" then
 			out = ffn(g, cw, h, sel)
+		elseif mode == "static" then
+			out = ffn(g, l <= half and gw or cw, h, sel)
 		elseif mode == "base" then
 			out = g:scale(h, 0)
 		elseif mode == "gpart" then
@@ -161,7 +162,17 @@ g:close()
 g, x = build("base", nil, nil, 1)
 local base = time("base", g, x)
 g:close()
-for _, half in ipairs({ 32, 64, 96 }) do
+for k in (os.getenv("STATIC") or ""):gmatch("%d+") do
+	-- The experts of the first k layers on the device, as n_cpu_moe does.
+	g, x = build("static", gw_all, cw_all, tonumber(k))
+	time(("static %d/%d"):format(tonumber(k), NL), g, x)
+	g:close()
+end
+local halves = {}
+for v in (os.getenv("HALVES") or "32,64,96"):gmatch("%d+") do
+	halves[#halves + 1] = tonumber(v)
+end
+for _, half in ipairs(halves) do
 	-- The device cache holds `half` experts and a zero slot.
 	local gw = cache(gw_all, half + 1)
 	for _, t in pairs(gw) do
