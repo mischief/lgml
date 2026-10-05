@@ -437,6 +437,8 @@ function M.new(opts)
 		placement = rules,
 		pinned = pin_host(be, rules, info, opts),
 		mtp = mtp,
+		-- Zero-copy copies each expert out of the file once: no RAM copy.
+		map_experts = xopts and xopts.zerocopy and lgml.vk_host_read() or nil,
 	    } or nil)
 	if rules then
 		local dev, host = model.w:size()

@@ -313,6 +313,21 @@ function M.load(be, path, opts, info, hp)
 				mapped = true
 			end
 		end
+		-- map_experts: the routed experts of the trunk stay in the file,
+		-- mapped; a zero-copy expert cache copies them out once.
+		if opts.map_experts and not mmap then
+			local mapped_x = {}
+			for _, t in ipairs(finfo.tensors) do
+				local il = tonumber(t.name:match("^blk%.(%d+)%.ffn_[%a_]+_exps%.weight$"))
+				if il and il < hp.n_layer and not skip[t.name] then
+					mapped_x[#mapped_x + 1] = t.name
+					skip[t.name] = true
+				end
+			end
+			if #mapped_x > 0 then
+				w[#w + 1] = be:map(file, mapped_x)
+			end
+		end
 		local names = {}
 		for _, t in ipairs(finfo.tensors) do
 			if not skip[t.name] then
