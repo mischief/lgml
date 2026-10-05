@@ -143,6 +143,18 @@ local function test_tool_grammars()
 	ok(matches(t, root, '<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>'),
 	    "gemma4 grammar takes a call")
 	ok(not matches(t, root, '<|tool_call>call:get_time{}<tool_call|>'), "gemma4 grammar takes the tools only")
+	-- Lazy grammars: one call from a trigger.
+	local trig
+	t, root, trig = tool_grammar.hermes({ WEATHER, TIME }, { lazy = true, parallel = true })
+	ok(matches(t, root, call) and not matches(t, root, call .. "\n" .. call) and
+	    table.concat(trig, " ") == "<tool_call>", "hermes lazy: one call, trigger <tool_call>")
+	t, root, trig = tool_grammar.qwen35({ WEATHER, TIME }, { lazy = true })
+	ok(matches(t, root, x) and matches(t, root, x:sub(#"<tool_call>\n" + 1)) and
+	    table.concat(trig, " ") == "<tool_call> <function=get_weather> <function=get_time>",
+	    "qwen35 lazy: a call with or without the opener, a trigger per tool")
+	t, root, trig = tool_grammar.gemma4({ WEATHER }, { lazy = true })
+	ok(matches(t, root, '<|tool_call>call:get_weather{}<tool_call|>') and trig[1] == "<|tool_call>",
+	    "gemma4 lazy: trigger <|tool_call>")
 end
 
 local path = tiny.tmp(".gguf")

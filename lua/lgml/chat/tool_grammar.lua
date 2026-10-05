@@ -1,9 +1,11 @@
---- Grammars that force tool calls, for `tool_choice` `"required"` or a
--- named function.
--- Each function takes OpenAI function tools and gives GBNF text and its
--- start rule. The grammar allows only calls in the syntax of the chat
--- template, to the given tools, with nothing around them but white
--- space. With `parallel`, it allows one or more calls, else one.
+--- Grammars of tool calls: forced calls for `tool_choice` `"required"`
+-- or a named function, and lazy grammars for `"auto"`.
+-- Each function takes OpenAI function tools and gives GBNF text, its
+-- start rule and the trigger strings. The grammar allows only calls in
+-- the syntax of the chat template, to the given tools, with nothing
+-- around them but white space. With `parallel`, it allows one or more
+-- calls, else one. With `lazy`, it allows one call that starts at a
+-- trigger; the sampler starts it there (see `lgml.sampler`).
 -- @module lgml.chat.tool_grammar
 local grammar = require("lgml.grammar")
 local json_schema = require("lgml.json_schema")
@@ -40,9 +42,11 @@ end
 -- `<tool_call>\n{"name": ..., "arguments": {...}}\n</tool_call>`.
 -- The arguments follow the parameter schema of the tool.
 -- @tparam {table,...} tools OpenAI function tools
--- @tparam[opt] table opts `parallel`: allow more than one call
+-- @tparam[opt] table opts `parallel`: allow more than one call; `lazy`:
+-- one call from a trigger
 -- @treturn[1] string the GBNF text
 -- @treturn[1] string the start rule
+-- @treturn[1] {string,...} the triggers: `<tool_call>`
 -- @treturn[2] nil
 -- @treturn[2] string an error message
 function M.hermes(tools, opts)
@@ -70,8 +74,8 @@ function M.hermes(tools, opts)
 	if not text then
 		return nil, err
 	end
-	return text .. calls(opts and opts.parallel) ..
-	    'lgml-call ::= "<tool_call>\\n" root "\\n</tool_call>"\n', "lgml-tools"
+	return text .. calls(opts and opts.parallel and not opts.lazy) ..
+	    'lgml-call ::= "<tool_call>\\n" root "\\n</tool_call>"\n', "lgml-tools", { "<tool_call>" }
 end
 
 -- The parameter names of a tool, as a group of literals, or nil when
@@ -94,37 +98,50 @@ end
 --- The grammar of Qwen3.5 XML calls:
 -- `<tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n...</function>\n</tool_call>`.
 -- Parameter names come from the schema of the tool; values are free
--- text.
+-- text. The lazy grammar also takes a call without `<tool_call>\n`, as
+-- llama.cpp does for Qwen3-Coder, and has a trigger for that per tool.
 -- @tparam {table,...} tools OpenAI function tools
--- @tparam[opt] table opts `parallel`: allow more than one call
+-- @tparam[opt] table opts `parallel`: allow more than one call; `lazy`:
+-- one call from a trigger
 -- @treturn string the GBNF text
 -- @treturn string the start rule
+-- @treturn {string,...} the triggers: `<tool_call>`, then
+-- `<function=NAME>` for each tool
 function M.qwen35(tools, opts)
-	local rules, alts = {}, {}
+	local rules, alts, triggers = {}, {}, { "<tool_call>" }
 	for i, t in ipairs(tools) do
 		local f = fn(t)
+		triggers[#triggers + 1] = "<function=" .. f.name .. ">"
 		local keys = param_names(f) or '[^>\\n]+'
 		alts[i] = ("%s %s lgml-params-%d"):format(grammar.literal(f.name), grammar.literal(">\n"), i)
 		rules[#rules + 1] = ('lgml-params-%d ::= ("<parameter=" %s ">\\n" lgml-value-0)*\n'):format(i, keys)
 	end
 	rules[#rules + 1] = grammar.until_text("lgml-value", "\n</parameter>\n")
-	rules[#rules + 1] = ('lgml-call ::= "<tool_call>\\n<function=" (%s) "</function>\\n</tool_call>"\n')
+	rules[#rules + 1] = ('lgml-body ::= "<function=" (%s) "</function>\\n</tool_call>"\n')
 	    :format(table.concat(alts, " | "))
-	return table.concat(rules) .. calls(opts and opts.parallel), "lgml-tools"
+	if opts and opts.lazy then
+		rules[#rules + 1] = 'lgml-call ::= "<tool_call>\\n"? lgml-body\n'
+	else
+		rules[#rules + 1] = 'lgml-call ::= "<tool_call>\\n" lgml-body\n'
+	end
+	return table.concat(rules) .. calls(opts and opts.parallel and not opts.lazy), "lgml-tools", triggers
 end
 
 --- The grammar of Gemma 4 calls: `<|tool_call>call:NAME{...}<tool_call|>`.
 -- The text in the braces is free.
 -- @tparam {table,...} tools OpenAI function tools
--- @tparam[opt] table opts `parallel`: allow more than one call
+-- @tparam[opt] table opts `parallel`: allow more than one call; `lazy`:
+-- one call from a trigger
 -- @treturn string the GBNF text
 -- @treturn string the start rule
+-- @treturn {string,...} the triggers: `<|tool_call>`
 function M.gemma4(tools, opts)
 	local rules = {
 		('lgml-call ::= "<|tool_call>call:" %s "{" lgml-args-0\n'):format(names(tools)),
 		grammar.until_text("lgml-args", "}<tool_call|>"),
 	}
-	return table.concat(rules) .. calls(opts and opts.parallel), "lgml-tools"
+	return table.concat(rules) .. calls(opts and opts.parallel and not opts.lazy), "lgml-tools",
+	    { "<|tool_call>" }
 end
 
 return M
