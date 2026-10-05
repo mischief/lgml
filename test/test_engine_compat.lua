@@ -136,8 +136,52 @@ local function test_tool_grammars()
 	t, root = tool_grammar.qwen35({ WEATHER, TIME }, { parallel = true })
 	local x = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>"
 	ok(matches(t, root, x), "qwen35 grammar takes a call")
-	ok(matches(t, root, "<tool_call>\n<function=get_time>\n<parameter=any>\n1\n</parameter>\n</function>\n" ..
-	    "</tool_call>"), "qwen35: a tool with no schema takes any parameter")
+	ok(not matches(t, root, "<tool_call>\n<function=get_time>\n<parameter=any>\n1\n</parameter>\n</function>\n" ..
+	    "</tool_call>") and matches(t, root, "<tool_call>\n<function=get_time>\n</function>\n</tool_call>"),
+	    "qwen35: a tool with no schema takes no parameter")
+	ok(not matches(t, root, "<tool_call>\n<function=get_weather>\n</function>\n</tool_call>"),
+	    "qwen35: a required parameter must come")
+	local function xcall(params)
+		local body = ""
+		for _, kv in ipairs(params) do
+			body = body .. "<parameter=" .. kv[1] .. ">\n" .. kv[2] .. "\n</parameter>\n"
+		end
+		return "<tool_call>\n<function=get_weather>\n" .. body .. "</function>\n</tool_call>"
+	end
+	ok(matches(t, root, xcall({ { "city", "Rome" }, { "days", "3" } })) and
+	    not matches(t, root, xcall({ { "days", "3" }, { "city", "Rome" } })),
+	    "qwen35: required parameters first, as in llama.cpp")
+	ok(not matches(t, root, xcall({ { "city", "Rome" }, { "days", "three" } })) and
+	    not matches(t, root, xcall({ { "city", "Rome" }, { "days", "3 " } })),
+	    "qwen35: an integer value follows its schema")
+	ok(matches(t, root, xcall({ { "city", "Oslo" } })), "qwen35: a string enum is raw text, as in llama.cpp")
+	local TYPED = { type = "function", ["function"] = { name = "t", parameters = { type = "object", properties = {
+		b = { type = "boolean" }, o = { type = "object", properties = { k = { type = "integer" } },
+		required = { "k" } }, a = { type = "array", items = { type = "string" } },
+		s = { type = "string" }, m = { type = { "string", "integer" } } }, required = { "b", "s" } } } }
+	local tt, troot = assert(tool_grammar.qwen35({ TYPED }))
+	-- b and s are required; another parameter k comes after them.
+	local function tcall(k, v, rev)
+		local vals = { b = "false", s = "x" }
+		local function param(n)
+			return "<parameter=" .. n .. ">\n" .. (n == k and v or vals[n]) .. "\n</parameter>\n"
+		end
+		local body = rev and param("s") .. param("b") or param("b") .. param("s")
+		if not vals[k] then
+			body = body .. param(k)
+		end
+		return "<tool_call>\n<function=t>\n" .. body .. "</function>\n</tool_call>"
+	end
+	ok(matches(tt, troot, tcall("m", "1", true)), "qwen35: required parameters in any order")
+	ok(matches(tt, troot, tcall("b", "true")) and not matches(tt, troot, tcall("b", "yes")),
+	    "qwen35: a boolean value")
+	ok(matches(tt, troot, tcall("o", '{"k": 1}')) and not matches(tt, troot, tcall("o", '{"k": "1"}')),
+	    "qwen35: an object value")
+	ok(matches(tt, troot, tcall("a", '["x", "y"]')) and not matches(tt, troot, tcall("a", "[1]")),
+	    "qwen35: an array value")
+	ok(matches(tt, troot, tcall("s", "a\n<b>\n</parameter> c")) and matches(tt, troot, tcall("m", "any text")) and
+	    not matches(tt, troot, tcall("s", "a\n</parameter>\nb")),
+	    "qwen35: a string value is raw text without the close")
 	ok(not matches(t, root, x:gsub("=city", "=town")), "qwen35 parameter names follow the schema")
 	t, root = tool_grammar.gemma4({ WEATHER })
 	ok(matches(t, root, '<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>'),
@@ -149,7 +193,7 @@ local function test_tool_grammars()
 	ok(matches(t, root, call) and not matches(t, root, call .. "\n" .. call) and
 	    table.concat(trig, " ") == "<tool_call>", "hermes lazy: one call, trigger <tool_call>")
 	t, root, trig = tool_grammar.qwen35({ WEATHER, TIME }, { lazy = true })
-	ok(matches(t, root, x) and matches(t, root, x:sub(#"<tool_call>\n" + 1)) and
+	ok(matches(t, root, x) and matches(t, root, x:sub(#"<tool_call>\n" + 1, -#"</tool_call>" - 1)) and
 	    table.concat(trig, " ") == "<tool_call> <function=get_weather> <function=get_time>",
 	    "qwen35 lazy: a call with or without the opener, a trigger per tool")
 	t, root, trig = tool_grammar.gemma4({ WEATHER }, { lazy = true })

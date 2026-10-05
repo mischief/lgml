@@ -9,6 +9,7 @@
 -- @module lgml.chat.tool_grammar
 local grammar = require("lgml.grammar")
 local json_schema = require("lgml.json_schema")
+local call = require("lgml.chat.qwen35_call")
 
 local M = {}
 
@@ -78,51 +79,138 @@ function M.hermes(tools, opts)
 	    'lgml-call ::= "<tool_call>\\n" root "\\n</tool_call>"\n', "lgml-tools", { "<tool_call>" }
 end
 
--- The parameter names of a tool, as a group of literals, or nil when
--- the schema lists none.
-local function param_names(f)
-	local p = type(f.parameters) == "table" and f.parameters.properties
+-- Property names of a schema object, in source order when the decoder
+-- kept it, else sorted.
+local function prop_keys(props)
+	local mt = getmetatable(props)
+	local order = mt and type(mt.__order) == "table" and mt.__order
 	local list = {}
-	for k in pairs(type(p) == "table" and p or {}) do
+	if order then
+		for _, k in ipairs(order) do
+			if type(k) == "string" and props[k] ~= nil then
+				list[#list + 1] = k
+			end
+		end
+		return list
+	end
+	for k in pairs(props) do
 		if type(k) == "string" then
-			list[#list + 1] = grammar.literal(k)
+			list[#list + 1] = k
 		end
 	end
-	if #list == 0 then
-		return nil
-	end
 	table.sort(list)
-	return "(" .. table.concat(list, " | ") .. ")"
+	return list
+end
+
+-- The rule of required args in any order, as llama.cpp permute builds
+-- it: one rule per set of args left. More than 6 args stay in order.
+local function permute(rules, prefix, args)
+	if #args == 0 then
+		return ""
+	elseif #args == 1 or #args > 6 then
+		return table.concat(args, " ")
+	end
+	local function left(mask)
+		if mask == 0 then
+			return ""
+		end
+		local name = ("%s-%d"):format(prefix, mask)
+		if not rules[name] then
+			rules[name] = true
+			local alts = {}
+			for i, a in ipairs(args) do
+				local bit = 1 << (i - 1)
+				if mask & bit ~= 0 then
+					alts[#alts + 1] = (a .. " " .. left(mask & ~bit)):gsub("%s+$", "")
+				end
+			end
+			rules[#rules + 1] = ("%s ::= %s\n"):format(name, table.concat(alts, " | "))
+		end
+		return name
+	end
+	return left((1 << #args) - 1)
+end
+
+-- The rules of the parameters of tool i; returns the args rule name.
+-- A string value is raw text up to "\n</parameter>\n"; another value
+-- follows the JSON schema of its parameter.
+local function xml_params(rules, i, f)
+	local params = type(f.parameters) == "table" and f.parameters or {}
+	local props = type(params.properties) == "table" and params.properties or {}
+	local req = {}
+	for _, k in ipairs(type(params.required) == "table" and params.required or {}) do
+		req[k] = true
+	end
+	local need, opt = {}, {}
+	for j, k in ipairs(prop_keys(props)) do
+		local s, arg = props[k], ("lgml-t%d-a%d"):format(i, j)
+		local value = "lgml-value-0"
+		if not call.is_string(s, params) then
+			-- A copy with the defs of the tool, for local refs.
+			local sub = {}
+			if type(s) == "table" then
+				for key, v in pairs(s) do
+					sub[key] = v
+				end
+				setmetatable(sub, getmetatable(s))
+			end
+			for _, d in ipairs({ "$defs", "definitions" }) do
+				if sub[d] == nil then
+					sub[d] = params[d]
+				end
+			end
+			local text, err = json_schema.to_grammar(sub)
+			if not text then
+				return nil, err
+			end
+			rules[#rules + 1] = grammar.rename(text, arg .. "-")
+			value = arg .. '-root "\\n</parameter>\\n"'
+		end
+		rules[#rules + 1] = ('%s ::= "<parameter=" %s ">\\n" %s\n'):format(arg, grammar.literal(k), value)
+		local list = req[k] and need or opt
+		list[#list + 1] = arg
+	end
+	local name = ("lgml-t%d-args"):format(i)
+	local body = permute(rules, name .. "-req", need)
+	if #opt > 0 then
+		body = body .. " (" .. table.concat(opt, " | ") .. ")*"
+	end
+	rules[#rules + 1] = ("%s ::= %s\n"):format(name, body == "" and '""' or body)
+	return name
 end
 
 --- The grammar of Qwen3.5 XML calls:
 -- `<tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n...</function>\n</tool_call>`.
--- Parameter names come from the schema of the tool; values are free
--- text. The lazy grammar also takes a call without `<tool_call>\n`, as
--- llama.cpp does for Qwen3-Coder, and has a trigger for that per tool.
+-- As in llama.cpp, the required parameters come once each in any
+-- order, then optional ones. A string value is free text; another
+-- value follows the parameter schema. The lazy grammar also takes a
+-- call without `<tool_call>\n` and `</tool_call>` (Qwen3-Coder).
 -- @tparam {table,...} tools OpenAI function tools
 -- @tparam[opt] table opts `parallel`: allow more than one call; `lazy`:
 -- one call from a trigger
--- @treturn string the GBNF text
--- @treturn string the start rule
--- @treturn {string,...} the triggers: `<tool_call>`, then
+-- @treturn[1] string the GBNF text
+-- @treturn[1] string the start rule
+-- @treturn[1] {string,...} the triggers: `<tool_call>`, then
 -- `<function=NAME>` for each tool
+-- @treturn[2] nil
+-- @treturn[2] string an error message
 function M.qwen35(tools, opts)
 	local rules, alts, triggers = {}, {}, { "<tool_call>" }
 	for i, t in ipairs(tools) do
 		local f = fn(t)
 		triggers[#triggers + 1] = "<function=" .. f.name .. ">"
-		local keys = param_names(f) or '[^>\\n]+'
-		alts[i] = ("%s %s lgml-params-%d"):format(grammar.literal(f.name), grammar.literal(">\n"), i)
-		rules[#rules + 1] = ('lgml-params-%d ::= ("<parameter=" %s ">\\n" lgml-value-0)*\n'):format(i, keys)
+		local args, err = xml_params(rules, i, f)
+		if not args then
+			return nil, err
+		end
+		alts[i] = ("%s %s %s"):format(grammar.literal(f.name), grammar.literal(">\n"), args)
 	end
 	rules[#rules + 1] = grammar.until_text("lgml-value", "\n</parameter>\n")
-	rules[#rules + 1] = ('lgml-body ::= "<function=" (%s) "</function>\\n</tool_call>"\n')
-	    :format(table.concat(alts, " | "))
+	rules[#rules + 1] = ('lgml-body ::= "<function=" (%s) "</function>\\n"\n'):format(table.concat(alts, " | "))
 	if opts and opts.lazy then
-		rules[#rules + 1] = 'lgml-call ::= "<tool_call>\\n"? lgml-body\n'
+		rules[#rules + 1] = 'lgml-call ::= "<tool_call>\\n" lgml-body "</tool_call>" | lgml-body\n'
 	else
-		rules[#rules + 1] = 'lgml-call ::= "<tool_call>\\n" lgml-body\n'
+		rules[#rules + 1] = 'lgml-call ::= "<tool_call>\\n" lgml-body "</tool_call>"\n'
 	end
 	return table.concat(rules) .. calls(opts and opts.parallel and not opts.lazy), "lgml-tools", triggers
 end
