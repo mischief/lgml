@@ -1,17 +1,11 @@
 [wrap-git]
 url = https://github.com/ggml-org/ggml.git
-revision = 353b63b439f27ab2cc19dac97ab1681ba6d2d084
+revision = ffa4e8b80930029a35991f94e7c8a93cd67730ab
 depth = 1
 method = cmake
-# ggml-vulkan-0N: Vulkan fixes from llama.cpp that ggml has not synced yet;
-# 06 and 07 are lgml's: custom ops with SPIR-V shaders (see src/ops_fused.c),
-# and device reads of pinned host tensors (see lgml.vk_host_read).
+# ggml-vulkan-02: a Vulkan fix from llama.cpp that ggml has not synced yet.
+# ggml-vulkan-lgml: custom ops with SPIR-V shaders (see src/ops_fused.c) and
+# device reads of pinned host tensors (see lgml.vk_host_read).
 diff_files = ggml-vulkan-release.patch,
-	ggml-vulkan-00-vulkan-int8-coopmat1-matmul-for-AMD-RDNA3-and-RDNA4.patch,
-	ggml-vulkan-01-vulkan-fix-rdna4-mat_vec-tuning-29934.patch,
 	ggml-vulkan-02-vulkan-MOE-aware-mat_mul_id-tile-selecti.patch,
-	ggml-vulkan-03-vulkan-Tune-GDN-kernel-fix-Intel-perform.patch,
-	ggml-vulkan-04-vulkan-reuse-descriptor-sets-when-bindin.patch,
-	ggml-vulkan-05-vulkan-Load-F32-A-matrix-2-at-a-time-whe.patch,
-	ggml-vulkan-06-custom-op-shaders.patch,
-	ggml-vulkan-07-host-read.patch
+	ggml-vulkan-lgml.patch
