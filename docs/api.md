@@ -246,7 +246,7 @@ usage, the event stream framing and the tool call fragments.
 | `logprobs` | OpenAI | supported | `choices[].logprobs.content` lists the content tokens, in the stream too; see [Log probabilities](#log-probabilities). |
 | `top_logprobs` | OpenAI | supported | From 0 to 20. It needs `logprobs: true`. |
 | `logit_bias` | OpenAI | supported | Token ids of the model's tokenizer to a bias from -100 to 100. An id that the tokenizer does not have gives 400. |
-| `tools` | OpenAI | limited | Function tools only. A `custom` tool gives 400. `strict` is accepted, but the arguments follow the parameter schema only when `tool_choice` forces a call on a Qwen3 template; see [Tool choice](#tool-choice). |
+| `tools` | OpenAI | limited | Function tools only. A `custom` tool gives 400. `strict` is accepted. Calls go only to the given tools; the arguments follow the parameter schema on a Qwen3 template; see [Tool choice](#tool-choice). |
 | `tool_choice` | OpenAI | supported | `none`, `auto`, `required`, `{"type": "function", "function": {"name": ...}}` or `allowed_tools`. A `custom` choice gives 400. See [Tool choice](#tool-choice). |
 | `parallel_tool_calls` | OpenAI | supported | `false` ends the reply after the first tool call. |
 | `response_format` | OpenAI | supported | See [Constrained output](#constrained-output). |
@@ -434,6 +434,21 @@ reply with only tool calls has no content to format.
 | Qwen3 (hermes) | The name and the arguments; the arguments follow the parameter schema. |
 | Qwen3.5 | The name and the parameter names; the values are free text. |
 | Gemma 4 | The name; the argument text is free. |
+
+With `tools` and `auto`, the same grammar applies to each call, as in
+llama.cpp: the model writes free text, and when it writes a call
+opener, the call from there to its end follows the grammar. The model
+cannot call a tool that is not in `tools`. After the call, the text is
+free again, and the next opener starts the grammar again (parallel
+calls). An opener in the reasoning block does nothing. A
+`response_format` or `grammar` replaces this grammar: the answer
+follows the format or grammar instead.
+
+| Template | Call openers |
+| --- | --- |
+| Qwen3 (hermes) | `<tool_call>` |
+| Qwen3.5 | `<tool_call>`, and `<function=NAME>` for each tool. A call without `<tool_call>` follows the grammar, but the reply gives it as content. |
+| Gemma 4 | `<\|tool_call>` |
 
 The diffusion engine cannot force a call; there `required` and a named
 function give 400.
