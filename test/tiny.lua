@@ -97,11 +97,13 @@ function M.write(path, arch, opts)
 		end
 		add(name, shape, v, name:match("^blk"))
 	end
-	local function norm(name, d, lo, hi)
-		lo, hi = lo or 0.9, hi or 1.1
+	-- Values in [lo, lo + width); the default keeps the values of
+	-- older files exact.
+	local function norm(name, d, lo, width)
+		lo, width = lo or 0.9, width or 0.2
 		local v = {}
 		for i = 1, d do
-			v[i] = lo + (hi - lo) * r()
+			v[i] = lo + width * r()
 		end
 		add(name, { d }, v)
 	end
@@ -142,8 +144,8 @@ function M.write(path, arch, opts)
 			w(p .. "ssm_in.weight", { 2 * kd + 2 * vd, E })
 			w(p .. "ssm_ba.weight", { 2 * NV, E })
 			w(p .. "ssm_conv1d.weight", { 2 * kd + vd, K })
-			norm(p .. "ssm_dt.bias", NV, -1, 1)
-			norm(p .. "ssm_a", NV, -1.5, -0.2)
+			norm(p .. "ssm_dt.bias", NV, -1, 2)
+			norm(p .. "ssm_a", NV, -1.5, 1.3)
 			norm(p .. "ssm_norm.weight", S)
 			w(p .. "ssm_out.weight", { E, vd })
 		else

@@ -167,6 +167,39 @@ do
 	same("max_tokens", { max_tokens = 7 })
 end
 
+-- The repeat guard counts kept guesses too: a reply that repeats one
+-- token ends at the same token as plain decoding. Guesses stop before
+-- the reasoning budget, and the wrap-up text runs plainly.
+do
+	local e = engine.new({ model = qpath, backend = "CPU", n_ctx = 2048, slots = 1, kv_initial = 256,
+		flash_attn = false, repeat_stop_tokens = 20, speculative = { max = 8, adaptive = false } })
+	local lb = { ["120"] = 100 }
+	local plain = chat(e, req_of(e, REPEAT, { logit_bias = lb, speculative = false }))
+	local sp = chat(e, req_of(e, REPEAT, { logit_bias = lb }))
+	ok(plain.timings.repeat_stop == 1 and sp.timings.repeat_stop == 1 and sp.out == plain.out and
+	    sp.usage.completion_tokens == 20 and sp.timings.draft_accepted > 0,
+	    ("repeat guard: the reply ends after 20 tokens (%d of %d guesses kept)"):format(
+	    sp.timings.draft_accepted or 0, sp.timings.draft_n or 0))
+	local rec = recorder()
+	local d = engine.new({ model = qpath, backend = "CPU", n_ctx = 2048, slots = 1, kv_initial = 256,
+		flash_attn = false, speculative = { max = 8, adaptive = false, drafter = test_drafter } })
+	next_drafter = rec
+	-- A bias on <think> keeps the model in its reasoning block.
+	local tid
+	for id = 0, d.tk:n_vocab() - 1 do
+		tid = tid or (d.tk:token(id) == "<think>" and id or nil)
+	end
+	local think = { chat_template_kwargs = { enable_thinking = true }, reasoning_budget = 12, max_tokens = 80,
+		logit_bias = { [tostring(tid)] = 100 } }
+	local want = chat(d, req_of(d, REPEAT, think))
+	local od = oracle(rec.seq)
+	next_drafter = od
+	local got = chat(d, req_of(d, REPEAT, think))
+	ok(got.out == want.out and got.usage.reasoning_tokens == want.usage.reasoning_tokens and
+	    got.usage.reasoning_tokens >= 12 and got.timings.draft_accepted > 0, ("reasoning budget: the reply matches (%d reasoning tokens, %d of %d kept)"):format(
+	    got.usage.reasoning_tokens, got.timings.draft_accepted, got.timings.draft_n))
+end
+
 -- 3. Rejected guesses roll back: an oracle drafter with spoiled guesses
 -- on a dense model, a delta net hybrid and a sliding ring model whose
 -- reply wraps the ring.
@@ -208,7 +241,7 @@ end
 -- the row of the last token, as a model-native draft head needs.
 do
 	local e = engine.new({ model = qpath, backend = "CPU", n_ctx = 2048, slots = 1, kv_initial = 256,
-		flash_attn = false, speculative = { max = 4, drafter = test_drafter } })
+		flash_attn = false, speculative = { max = 4, adaptive = false, drafter = test_drafter } })
 	local rec = recorder()
 	next_drafter = rec
 	local want = chat(e, req_of(e, REPEAT, { max_tokens = 40 })).out

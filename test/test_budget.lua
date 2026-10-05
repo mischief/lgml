@@ -171,6 +171,10 @@ do
 	local e = engine.new({ model = path, backend = "CPU", n_ctx = 4096, slots = 1, kv_initial = 256,
 		cache_ram = 0 })
 	local grow = transformer.block_bytes(e.pool) // e.pool.block * 256
+	-- Graphs of the last block must go first: the limit counts compute
+	-- memory that only this engine holds.
+	collectgarbage()
+	collectgarbage()
 	local old = lgml.memory_guard({ limit = cpu().weights + cpu().tensors + cpu().compute + grow })
 	local r = chats(e, { words(1500, 3) })[1]
 	ok(r.res == nil and r.status == 507 and budget.is_budget(r.err) and
