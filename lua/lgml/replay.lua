@@ -55,36 +55,56 @@ function M.drop(cache, done)
 	if r then
 		free(r, done)
 	end
-	M.drop_kept(cache, done)
+	M.drop_kept(cache)
 end
 
 --- Drop the earlier graphs that a cache keeps, but not the last one.
+-- Their outputs are from earlier passes, so they close too.
 -- @tparam table cache the model cache
--- @tparam[opt] boolean done true to close the output nodes
-function M.drop_kept(cache, done)
+function M.drop_kept(cache)
 	local kept = cache.replay_kept
 	cache.replay_kept = nil
 	for _, r in ipairs(kept or {}) do
-		free(r, done)
+		free(r, true)
 	end
 end
 
+--- The compute bytes of the graphs that a cache keeps, besides the last.
+-- @tparam table cache the model cache
+-- @treturn integer the bytes, device and host together
+function M.kept_bytes(cache)
+	local n = 0
+	for _, r in ipairs(cache.replay_kept or {}) do
+		n = n + r.bytes
+	end
+	return n
+end
+
 -- Put graph r aside when the cache keeps graphs and r is small, else
--- free it. The oldest kept graph goes first.
+-- free it. Kept graphs stay within cache.replay_keep graphs and
+-- cache.replay_keep_bytes bytes; the oldest goes first. The outputs of
+-- r are from the pass before, so a freed r closes them: its compute
+-- memory goes now, not at the next garbage collection.
 local function park(cache, r)
 	if not r then
 		return
 	end
-	local keep = cache.replay_keep or 0
-	if keep < 1 or r.inp.n > SMALL then
-		free(r)
+	local keep, cap = cache.replay_keep or 0, cache.replay_keep_bytes or math.huge
+	if keep < 1 or r.inp.n > SMALL or r.bytes > cap then
+		free(r, true)
 		return
 	end
 	local kept = cache.replay_kept or {}
 	cache.replay_kept = kept
 	table.insert(kept, 1, r)
-	while #kept > keep do
-		free(table.remove(kept))
+	local total = 0
+	for _, x in ipairs(kept) do
+		total = total + x.bytes
+	end
+	while #kept > keep or total > cap do
+		local x = table.remove(kept)
+		total = total - x.bytes
+		free(x, true)
 	end
 end
 
@@ -150,16 +170,19 @@ function M.run(model, cache, ids, opts, finish)
 		park(cache, r)
 		local inp = model:inputs(ids, cache, opts)
 		local g = model.be:graph()
-		r = { key = key, g = g, inp = inp, outs = { finish(g, model:forward(g, inp)) } }
+		r = { key = key, g = g, inp = inp, outs = { finish(g, model:forward(g, inp)) }, bytes = 0 }
 		cache.replay = r
 	end
 	if model.before_pass then
 		model:before_pass()
 	end
 	r.g:compute(table.unpack(r.outs))
-	if not hit and log.level >= log.TRACE then
+	if not hit then
 		local dev, host = r.g:buffer_size()
-		L:trace("graph planned", "splits", r.g:splits(), "buffer", dev, "buffer_cpu", host)
+		r.bytes = dev + (host or 0)
+		if log.level >= log.TRACE then
+			L:trace("graph planned", "splits", r.g:splits(), "buffer", dev, "buffer_cpu", host)
+		end
 	end
 	cache.n_past = r.inp.n_kv
 	return table.unpack(r.outs)
