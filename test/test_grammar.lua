@@ -378,6 +378,10 @@ end
 do
 	local G = require("lgml.grammar")
 	ok(G.from_request({}) == nil, "no grammar in a plain request")
+	local src = "root ::= a-b \"x-y\" [a-z] <t-k> \"\\\"q\" # c-d\na-b ::= [\\]] \"z\"{1,2}\n"
+	ok(G.rename(src, "p-") ==
+	    "p-root ::= p-a-b \"x-y\" [a-z] <t-k> \"\\\"q\" # c-d\np-a-b ::= [\\]] \"z\"{1,2}\n",
+	    "rename puts the prefix on rule names only")
 	ok(G.from_request({ grammar = "root ::= \"a\"" }) == "root ::= \"a\"", "raw grammar")
 	ok(G.from_request({ response_format = { type = "text" } }) == nil, "text format")
 	local obj = G.from_request({ response_format = { type = "json_object" } })

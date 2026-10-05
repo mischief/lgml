@@ -152,6 +152,47 @@ function M.literal(s)
 	end) .. '"'
 end
 
+--- Puts a prefix on each rule name of GBNF text.
+-- Rule names in definitions and references get the prefix; literals,
+-- classes, `<token>` names, counts and comments stay as they are.
+-- @tparam string text the grammar
+-- @tparam string prefix the prefix, such as `"tool-1-"`
+-- @treturn string the new grammar text
+function M.rename(text, prefix)
+	local out, i, n = {}, 1, #text
+	-- The end of a quoted run that starts at i, with backslash escapes.
+	local function quoted(close)
+		local j = i + 1
+		while j <= n and text:sub(j, j) ~= close do
+			j = j + (text:sub(j, j) == "\\" and 2 or 1)
+		end
+		return j
+	end
+	while i <= n do
+		local c = text:sub(i, i)
+		local j
+		if c == '"' then
+			j = quoted('"')
+		elseif c == "[" then
+			j = quoted("]")
+		elseif c == "<" then
+			j = text:find(">", i + 1, true) or n
+		elseif c == "{" then
+			j = text:find("}", i + 1, true) or n
+		elseif c == "#" then
+			j = text:find("\n", i + 1, true) or n
+		elseif c:find("[%w%-]") then
+			j = select(2, text:find("^[%w%-]+", i))
+			out[#out + 1] = prefix
+		else
+			j = i
+		end
+		out[#out + 1] = text:sub(i, j)
+		i = j + 1
+	end
+	return table.concat(out)
+end
+
 --- Wraps a grammar so that a reasoning block before the answer is free.
 -- The block is `open`, any text without `close`, then `close`; the
 -- answer may follow after white space. See `until_text`.
