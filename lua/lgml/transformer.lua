@@ -665,7 +665,7 @@ function M:free_seq(c)
 			end
 		end
 	end
-	for _, part in ipairs({ c.k, c.v, c.conv or {}, c.ssm or {}, c.pconv or {} }) do
+	for _, part in ipairs({ c.k, c.v, c.conv or {}, c.ssm or {}, c.pconv or {}, { c.mtp_h } }) do
 		for il, t in pairs(part) do
 			t:close()
 			part[il] = nil
@@ -1047,6 +1047,14 @@ function M:cache_size(opts)
 	if hp.ple then
 		s.cpu[1] = s.cpu[1] + 4
 	end
+	local mt = self.mtp
+	if mt then
+		local L = mt.L
+		local p = L.cpu and s.cpu or s.dev
+		p[1] = p[1] + lgml.row_size(tk, L.Hkv * L.D) + lgml.row_size(tv, L.Hkv * L.D) +
+		    (L.idx and lgml.row_size("f16", L.idx) or 0)
+		p[2] = p[2] + 4 * hp.hc * hp.n_embd
+	end
 	return s.dev[1], s.dev[2], s.cpu[1], s.cpu[2]
 end
 
@@ -1079,6 +1087,13 @@ function M:grow(cache, rows)
 	end
 	for il in pairs(cache.x or {}) do
 		slots[#slots + 1] = { cache.x, il }
+	end
+	-- Rows of layers past the trunk, such as an MTP layer.
+	for il in pairs(cache.k) do
+		if not self.layers[il] then
+			slots[#slots + 1] = { cache.k, il }
+			slots[#slots + 1] = { cache.v, il }
+		end
 	end
 	for i, sl in ipairs(slots) do
 		list[i] = sl[1][sl[2]]
@@ -1116,7 +1131,7 @@ end
 -- @treturn integer bytes of the K, V, ring and recurrent tensors
 function M.cache_bytes(cache)
 	local n = 0
-	for _, part in ipairs({ cache.k, cache.v, cache.conv or {}, cache.ssm or {}, cache.x or {}, cache.pconv or {} }) do
+	for _, part in ipairs({ cache.k, cache.v, cache.conv or {}, cache.ssm or {}, cache.x or {}, cache.pconv or {}, { cache.mtp_h } }) do
 		for _, t in pairs(part) do
 			n = n + t:nbytes()
 		end
@@ -1198,6 +1213,19 @@ local function snap_parts(self, cache, rows, state, hi)
 				local row = t:nbytes() // t:shape()[1]
 				add(t, rows * row, row)
 			end
+		end
+	end
+	local mt = self.mtp
+	if mt then
+		local src = cache.pool or cache
+		if rows then
+			for _, t in ipairs({ src.k[mt.il], src.v[mt.il], src.x and src.x[mt.il] }) do
+				local row = t:nbytes() // t:shape()[1]
+				add(t, rows * row, row)
+			end
+		end
+		if state and cache.mtp_h then
+			add(cache.mtp_h, cache.mtp_h:nbytes())
 		end
 	end
 	local tok = rows and (cache.pool or cache).x
@@ -1352,6 +1380,9 @@ local function check_pass(self, cache, n)
 			end
 			for _, t in pairs(cache.pconv or {}) do
 				t:zero()
+			end
+			if cache.mtp_h then
+				cache.mtp_h:zero()
 			end
 		elseif cache.n_past ~= cache.rs_pos then
 			error(("recurrent state is at %d, not %d"):format(cache.rs_pos, cache.n_past))
@@ -2079,6 +2110,9 @@ local function fill_batch(hp, inp, ids)
 			end
 			for _, t in pairs(c.pconv or {}) do
 				t:zero()
+			end
+			if c.mtp_h then
+				c.mtp_h:zero()
 			end
 		end
 		if b.mask then

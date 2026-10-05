@@ -223,13 +223,15 @@ end
 -- file: an `lgml.ngram` reader in model.ngram reads the rows that a
 -- pass needs. With opts.ngram false, a map of the table serves
 -- `get_rows` on the CPU instead, or the table loads when the backend
--- has no CPU. MTP layers past n_layer do not load.
+-- has no CPU. The MTP layer (layer n_layer of the file, or of the
+-- file opts.mtp names) loads only with opts.mtp; see `mtp_draft`.
 -- @param be the backend
 -- @tparam string path a gguf file of the model
 -- @tparam table opts the options of `lgml.transformer.load`, and
 -- opts.ngram (false for get_rows on the table) and opts.mmap (true to
 -- map the weights on the CPU backend in place of a load; default true
--- on a CPU backend without a placement)
+-- on a CPU backend without a placement) and opts.mtp (true for the MTP
+-- layer of the model files, or the path of an MTP gguf)
 -- @tparam table info the gguf info of path
 -- @tparam table hp the config
 -- @treturn Model the model, with the metatable of `lgml.transformer`
@@ -251,7 +253,7 @@ function M.load(be, path, opts, info, hp)
 		local skip = {}
 		for _, t in ipairs(finfo.tensors) do
 			local il = tonumber(t.name:match("^blk%.(%d+)%."))
-			if il and il >= hp.n_layer then
+			if il and (il > hp.n_layer or (il == hp.n_layer and opts.mtp ~= true)) then
 				skip[t.name] = true
 			end
 		end
@@ -320,10 +322,44 @@ function M.load(be, path, opts, info, hp)
 		L.cpu = L.hc_attn_norm:backend() ~= be or nil
 		m.layers[i] = L
 	end
+	if opts.mtp == true and w:get("blk." .. hp.n_layer .. ".nextn.eh_proj.weight") then
+		M.load_mtp(m, w)
+	elseif type(opts.mtp) == "string" then
+		local skip = {}
+		for _, t in ipairs(assert(lgml.gguf(opts.mtp)).tensors) do
+			if not t.name:match("^blk%." .. hp.n_layer .. "%.") then
+				skip[t.name] = true
+			end
+		end
+		local s = assert(be:load(opts.mtp, { skip = skip }))
+		w[#w + 1] = s
+		M.load_mtp(m, s)
+	end
 	if opts.replay == false then
 		m.replay_key = false
 	end
 	return m
+end
+
+--- Load the MTP layer of a model from w.
+-- The layer is a QSA layer as the others, with nextn weights that join
+-- the token embedding and the streams of the trunk. It sets m.mtp: L
+-- (the layer) and il (its cache index, n_layer + 1).
+-- @tparam Model m the model
+-- @param w the weights that hold layer n_layer
+function M.load_mtp(m, w)
+	local hp = m.hp
+	local il = hp.n_layer + 1
+	local d = { recr = false, D = hp.head_dim, Hkv = hp.n_head_kv, n_rot = hp.n_rot, base = hp.rope_base,
+		idx = hp.idx and hp.idx.dim }
+	local hpm = setmetatable({ layers = setmetatable({ [il] = d }, { __index = hp.layers }) }, { __index = hp })
+	local L = M.load_layer(w, hpm, il)
+	local p = "blk." .. (il - 1) .. ".nextn."
+	for _, f in ipairs({ "eh_proj", "enorm", "hnorm", "hc_head_norm", "hc_head_down", "hc_head_up" }) do
+		L[f] = assert(w:get(p .. f .. ".weight"), p .. f)
+	end
+	L.cpu = L.hc_attn_norm:backend() ~= m.be or nil
+	m.mtp = { L = L, il = il }
 end
 
 -- The CPU backend that holds the token ids of the cells.
@@ -363,6 +399,27 @@ function M.add_cache(self, c, rows, global)
 	if hp.ple and global then
 		c.x[0] = host(self):tensor("i32", { rows, 1 })
 		c.x[0]:zero()
+	end
+	-- The MTP layer: its rows, and the trunk streams of the last cached
+	-- position, the input of the next row.
+	local mt = self.mtp
+	if mt then
+		local lbe = mt.L.cpu and self.be:cpu() or self.be
+		if global then
+			local L = mt.L
+			c.k[mt.il] = lbe:tensor(c.type_k, { rows, L.Hkv * L.D })
+			c.v[mt.il] = lbe:tensor(c.type_v, { rows, L.Hkv * L.D })
+			c.k[mt.il]:zero()
+			c.v[mt.il]:zero()
+			if L.idx then
+				c.x[mt.il] = lbe:tensor("f16", { rows, L.idx })
+				c.x[mt.il]:zero()
+			end
+		end
+		if c.conv then
+			c.mtp_h = lbe:tensor("f32", { 1, hp.hc, hp.n_embd })
+			c.mtp_h:zero()
+		end
 	end
 end
 
@@ -767,6 +824,43 @@ local function moe(g, hp, L, x, taps, sfx)
 	return out
 end
 
+-- The MTP layer on ids with the trunk streams hin (n, hc, n_embd) of
+-- the positions before: it joins the normed token embedding and each
+-- normed stream, then runs a QSA layer. Returns its streams.
+local function mtp_block(self, g, inp, ids, hin)
+	local hp, mt = self.hp, self.mtp
+	local L, E, HC = mt.L, hp.n_embd, hp.hc
+	local n = hin:shape()[1]
+	local e = g:mul(g:rms_norm(g:get_rows(self.tok_embd, ids), hp.eps), L.enorm)
+	e = g:tile(g:reshape(e, { n, 1, E }), hin)
+	local h = g:mul(g:rms_norm(hin, hp.eps), g:reshape(L.hnorm, { HC, E }))
+	local res = g:mul_mat(L.eh_proj, g:concat(e, h, 3))
+	local cur, inj = hc_mix(g, hp, res, L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up, L.hc_attn_inject)
+	res = hc_add(g, hp, res, qsa_layer(self, g, inp, L, mt.il, cur, {}), inj)
+	cur, inj = hc_mix(g, hp, res, L.hc_ffn_norm, L.hc_ffn_down, L.hc_ffn_up, L.hc_ffn_inject)
+	return hc_add(g, hp, res, moe(g, hp, L, cur), inj)
+end
+
+-- The MTP rows of a pass: the layer runs on each token with the trunk
+-- streams of the position before, so its cache follows the trunk's.
+-- The streams of the last row become the state of the next pass.
+local function mtp_rows(self, g, inp, res)
+	local E, HC = self.hp.n_embd, self.hp.hc
+	local list = inp.batch or { { cache = inp.cache, off = 0, n = inp.n } }
+	local hin
+	for _, b in ipairs(list) do
+		local h = b.cache.mtp_h
+		if b.n > 1 then
+			h = g:concat(h, g:cont(rows_of(g, res, b.off, b.n - 1)), 1)
+		end
+		hin = hin and g:concat(hin, h, 1) or h
+	end
+	g:expand(mtp_block(self, g, inp, inp.ids, hin))
+	for _, b in ipairs(list) do
+		g:expand(g:cpy(g:reshape(rows_of(g, res, b.off + b.n - 1, 1), { 1, HC, E }), b.cache.mtp_h))
+	end
+end
+
 --- Build the forward graph, as `lgml.transformer` forward does.
 -- With inp.hidden the result is the streams (n, hc, n_embd) after that
 -- many layers; the normed hidden state is the final stream mix.
@@ -811,6 +905,9 @@ function M.forward(self, g, inp)
 			return res, taps
 		end
 	end
+	if self.mtp and (inp.cache or inp.batch) then
+		mtp_rows(self, g, inp, res)
+	end
 	local function pick(t, rows)
 		local m = rows:shape()[1]
 		return g:reshape(g:get_rows(g:reshape(res, { n, HC * E }), rows), { m, HC, E })
@@ -832,6 +929,123 @@ function M.forward(self, g, inp)
 		return h, taps
 	end
 	return g:mul_mat(self.output, h), taps
+end
+
+-- The MTP head as a model for `lgml.replay`: its passes run the MTP
+-- layer alone on the cache of a sequence, at a position of its own.
+local Head = {}
+
+local function head_of(m)
+	if not m.mtp_head then
+		local hp = setmetatable({ ple = false }, { __index = m.hp })
+		m.mtp_head = setmetatable({ be = m.be, hp = hp, main = m, mtp = m.mtp, tok_embd = m.tok_embd,
+			output = m.output, layers = {}, proxies = setmetatable({}, { __mode = "k" }) },
+			{ __index = function(_, k) return Head[k] or T()[k] end })
+	end
+	return m.mtp_head
+end
+
+-- The proxy of a cache: the head's passes keep their own position and
+-- graphs there, and leave the trunk's untouched.
+local function proxy_of(head, cache)
+	local p = head.proxies[cache]
+	if not p then
+		local own = { replay = true, replay_kept = true, replay_hit = true }
+		p = setmetatable({ rs_pos = false, replay_keep = 4 }, { __index = function(_, k)
+			if not own[k] then
+				return cache[k]
+			end
+		end })
+		head.proxies[cache] = p
+	end
+	return p
+end
+
+function Head:replay_key(cache, n, opts)
+	return T().replay_key(self, cache, n, opts) .. ":" .. tostring(cache.gen) .. ":" .. tostring(opts.first)
+end
+
+-- Load the streams of the rows after the first, for a first pass.
+local function load_h(inp, opts)
+	if inp.h_rest then
+		inp.h_rest:from_host(opts.h_rest, 0, 0, inp.h_rest:nbytes())
+	end
+end
+
+function Head:inputs(ids, cache, opts)
+	local inp = T().inputs(self, ids, cache, opts)
+	local hp = self.hp
+	if opts.first and #ids > 1 then
+		inp.h_rest = self.be:tensor("f32", { #ids - 1, hp.hc, hp.n_embd })
+		load_h(inp, opts)
+	end
+	inp.first = opts.first
+	return inp
+end
+
+function Head:refill(inp, ids, cache, opts)
+	T().refill(self, inp, ids, cache, opts)
+	load_h(inp, opts)
+end
+
+function Head:forward(g, inp)
+	local hp = self.hp
+	local hb = self.main.mtp_hbuf
+	local hin = inp.first and inp.cache.mtp_h or hb
+	if inp.h_rest then
+		hin = g:concat(hin, inp.h_rest, 1)
+	end
+	local res = mtp_block(self, g, inp, inp.ids, hin)
+	local n = inp.n
+	local last = g:cont(g:reshape(rows_of(g, res, n - 1, 1), { 1, hp.hc, hp.n_embd }))
+	local h = hc_mix(g, hp, last, self.mtp.L.hc_head_norm, self.mtp.L.hc_head_down, self.mtp.L.hc_head_up)
+	local logits = g:mul_mat(self.output, h)
+	return logits, { h = g:cpy(last, hb) }
+end
+
+--- Draft up to k tokens with the MTP head.
+-- pend are the tokens the cache lacks, the last one the token the next
+-- pass runs; h_rest (a host buffer or nil) holds the trunk streams of
+-- the positions of pend but the last. The first step runs the MTP
+-- layer on pend; each next step runs it on its last guess with its own
+-- streams. The rows it writes past the cache stay until the next pass
+-- writes them.
+-- @tparam Model self the model, with mtp
+-- @tparam table cache the cache, at the position of pend[1]
+-- @tparam {integer,...} pend the tokens
+-- @param h_rest the streams of pend but the last, (#pend - 1, hc, n_embd)
+-- @tparam integer k the most guesses
+-- @tparam[opt] boolean flash true for flash attention
+-- @tparam[opt] table rows gets the logits of each step, as lists
+-- @treturn {integer,...} the guesses
+function M.mtp_draft(self, cache, pend, h_rest, k, flash, rows)
+	local hp = self.hp
+	if not self.mtp_hbuf then
+		self.mtp_hbuf = self.be:tensor("f32", { 1, hp.hc, hp.n_embd })
+	end
+	local replay = require("lgml.replay")
+	local head = head_of(self)
+	local px = proxy_of(head, cache)
+	self:grow(cache, math.min(cache.n_ctx, cache.n_past + #pend + k))
+	px.n_past = cache.n_past
+	local out, ids = {}, pend
+	local function argmax(g, logits, taps)
+		return g:argmax(logits), taps.h, logits
+	end
+	for j = 1, k do
+		if px.n_past + #ids > cache.n_ctx then
+			break
+		end
+		local o = { logits = "last", flash_attn = flash, first = j == 1, h_rest = j == 1 and h_rest or nil,
+			tag = "mtp" }
+		local best, _, logits = replay.run(head, px, ids, o, argmax)
+		out[j] = best:get()[1]
+		if rows then
+			rows[j] = logits:get()
+		end
+		ids = { out[j] }
+	end
+	return out
 end
 
 return M
