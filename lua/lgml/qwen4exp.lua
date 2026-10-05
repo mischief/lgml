@@ -211,7 +211,8 @@ local TABLE = "per_layer_token_embd.weight"
 -- @tparam string path a gguf file of the model
 -- @tparam table opts the options of `lgml.transformer.load`, and
 -- opts.ngram (false for get_rows on the table) and opts.mmap (true to
--- map the weights on the CPU backend in place of a load)
+-- map the weights on the CPU backend in place of a load; default true
+-- on a CPU backend without a placement)
 -- @tparam table info the gguf info of path
 -- @tparam table hp the config
 -- @treturn Model the model, with the metatable of `lgml.transformer`
@@ -220,6 +221,10 @@ function M.load(be, path, opts, info, hp)
 	local cpu = opts.placement and placement.plan(opts.placement, info.tensors, hp.n_layer)
 	if cpu and not be:cpu() then
 		error(path .. ": the placement moves weights to the CPU; open the backend with cpu = true")
+	end
+	local mmap = opts.mmap
+	if mmap == nil then
+		mmap = not cpu and be:name():upper():match("^CPU") ~= nil
 	end
 	local w = setmetatable({}, Multi)
 	local files = shards(path, info.meta)
@@ -252,7 +257,7 @@ function M.load(be, path, opts, info, hp)
 				mapped = true
 			end
 		end
-		if opts.mmap then
+		if mmap then
 			local names = {}
 			for _, t in ipairs(finfo.tensors) do
 				if not skip[t.name] then
