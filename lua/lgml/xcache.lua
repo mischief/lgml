@@ -203,9 +203,11 @@ function M.new(model, opts)
 		-- Fill every slot now, the experts of most score first.
 		self:apply(self.state:plan(n * #model.layers, self.decay, self.margin))
 	end
-	if opts.zerocopy and n > 0 and n < hp.n_expert and not self:zerocopy() then
-		L:warn("zero-copy experts need the Vulkan host read hook of the lgml ggml patch; " ..
-		    "the CPU computes the misses")
+	if opts.zerocopy and n > 0 and n < hp.n_expert then
+		local zc, why = self:zerocopy()
+		if not zc then
+			L:warn(why .. "; the CPU computes the misses")
+		end
 	end
 	for il, xc in pairs(self.layers) do
 		model.layers[il].xc = xc
@@ -215,16 +217,78 @@ function M.new(model, opts)
 	return self
 end
 
+--- The most of RAM that pinned host memory may take: 0.4.
+M.PIN_MAX = 0.4
+
+--- Free bytes left in the GTT under this, so other users still fit: 1 GiB.
+M.GTT_MARGIN = 1 << 30
+
+local function read_number(path, pattern)
+	local f = io.open(path)
+	if not f then
+		return nil
+	end
+	local s = f:read("a")
+	f:close()
+	return tonumber(s:match(pattern or "%d+"))
+end
+
+--- The bytes of pinned host memory that the device may still take:
+-- `PIN_MAX` of RAM, and at most the free GTT, less `GTT_MARGIN`, of each
+-- amdgpu device. math.huge when neither is known.
+function M.pin_budget()
+	local b = math.huge
+	local kb = read_number("/proc/meminfo", "MemTotal:%s*(%d+)")
+	if kb then
+		b = kb * 1024 * M.PIN_MAX
+	end
+	for i = 0, 15 do
+		local dir = ("/sys/class/drm/card%d/device/"):format(i)
+		local total, used = read_number(dir .. "mem_info_gtt_total"), read_number(dir .. "mem_info_gtt_used")
+		if total and used then
+			b = math.min(b, total - used - M.GTT_MARGIN)
+		end
+	end
+	return b
+end
+
+-- The bytes of the host copy that `zerocopy` makes.
+function M:host_bytes()
+	local K, n = self.model.hp.n_used, 0
+	for il in pairs(self.layers) do
+		local layer = self.model.layers[il]
+		local _, hit = self.state:tables(il)
+		local rows = K
+		for e = 1, self.ne do
+			if hit[e] == 0 then
+				rows = rows + 1
+			end
+		end
+		for _, f in ipairs(FIELDS) do
+			if layer[f] then
+				n = n + layer[f]:nbytes() // self.ne * rows
+			end
+		end
+	end
+	return n
+end
+
 --- Give the device a pinned host copy of the experts that no slot holds,
 -- which it reads over PCIe: the misses then run on the device, and a pass
 -- needs no CPU part. The slots stay as they are (no moves). xc.host holds
 -- the experts per field, xc.hmap (f32) the host row of each expert; held
--- experts map to a dummy row, read at weight 0. Returns false, and changes
--- nothing, when the Vulkan backend lacks the host read hook.
+-- experts map to a dummy row, read at weight 0. Returns false and a
+-- reason, and changes nothing, when the Vulkan backend lacks the host
+-- read hook or the copy does not fit `pin_budget`.
 function M:zerocopy()
 	local be = self.model.be
 	if be:name():upper():match("^CPU") or not lgml.vk_host_read() then
-		return false
+		return false, "zero-copy experts need the Vulkan host read hook of the lgml ggml patch"
+	end
+	local need, budget = self:host_bytes(), M.pin_budget()
+	if need > budget then
+		return false, ("zero-copy experts need %.1f MiB of pinned memory, %.1f MiB free")
+		    :format(need / 1048576, math.max(0, budget) / 1048576)
 	end
 	for il, xc in pairs(self.layers) do
 		local L = self.model.layers[il]
@@ -270,7 +334,6 @@ function M:zerocopy()
 		local tb = L.gate_inp:backend()
 		xc.hmap = tb:tensor("f32", { self.ne, 1 }, hmap, { weights = true })
 		xc.hzero = tb:tensor("f32", { 1, K }, dummy, { weights = true })
-		xc.static = true
 	end
 	self.swap = 0
 	return true
@@ -381,6 +444,9 @@ function M:close()
 			if type(v) == "userdata" and k ~= "state" then
 				v:close()
 			end
+		end
+		for _, t in pairs(xc.host or {}) do
+			t:close()
 		end
 	end
 	self.layers = {}

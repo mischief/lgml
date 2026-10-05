@@ -162,6 +162,20 @@ for _, kind in ipairs({ "split", "fused", "q8_0" }) do
 		ok(d < TOL and db < (DEV == "CPU" and TOL or 1e-2),
 		    ("%s, zero-copy %s: logits equal one backend (max error %.3g, batch %.3g)")
 		    :format(kind, zc and "on" or "off", d, db))
+		ok(xc:host_bytes() > 0, kind .. ", the host copy has a size")
+		xc:close()
+		ok(m.layers[1].xc == nil, kind .. ", zero-copy: close detaches the cache")
+		-- Under a pin budget of 0, zero-copy is off and the CPU computes
+		-- the misses.
+		local pin = xcache.PIN_MAX
+		xcache.PIN_MAX = 0
+		local m0 = transformer.load(be, path, { placement = rules })
+		local x0 = xcache.new(m0, { slots = 5, zerocopy = true })
+		xcache.PIN_MAX = pin
+		d = maxdiff(want, rows(m0, ids))
+		ok(x0.layers[1].host == nil and d < TOL,
+		    ("%s, zero-copy over the pin budget: off, logits equal one backend (max error %.3g)")
+		    :format(kind, d))
 	end
 	-- Slots that change before every pass, at most one expert each.
 	do

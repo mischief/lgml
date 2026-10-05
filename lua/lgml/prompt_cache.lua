@@ -17,6 +17,9 @@
 -- back to the pool on a hit.
 -- @module lgml.prompt_cache
 local lgml = require("lgml")
+local log = require("lgml.log")
+
+local L = log.new("prompt_cache")
 
 local M = {}
 local P = {}
@@ -313,6 +316,8 @@ function P:save(eng, keep)
 		bytes = bytes + ck.bytes
 	end
 	if not self:room(bytes, keep) then
+		L:debug("slot not saved: no room", "tokens", #toks, "mib", bytes // 1048576, "ram_mib",
+		    self.ram // 1048576)
 		return
 	end
 	local ckpts = {}

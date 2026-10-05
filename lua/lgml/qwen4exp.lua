@@ -1106,11 +1106,15 @@ function M.mtp_draft(self, cache, pend, h_rest, k, flash, rows, min_p)
 	self:grow(cache, math.min(cache.n_ctx, cache.n_past + #pend + k))
 	px.n_past = cache.n_past
 	local out, ids = {}, pend
-	-- The best token and its probability, for the min_p gate.
+	-- The best token, and with the min_p gate its probability.
+	local gate = min_p and min_p > 0
 	local function argmax(g, logits, taps)
 		local best = g:argmax(logits)
-		local n = logits:shape()[2]
-		local p = g:get_rows(g:reshape(g:soft_max(logits), { n, 1 }), best)
+		local p
+		if gate then
+			local n = logits:shape()[2]
+			p = g:get_rows(g:reshape(g:soft_max(logits), { n, 1 }), best)
+		end
 		return best, taps.h, logits, p
 	end
 	for j = 1, k do
@@ -1118,10 +1122,10 @@ function M.mtp_draft(self, cache, pend, h_rest, k, flash, rows, min_p)
 			break
 		end
 		local o = { logits = "last", flash_attn = flash, first = j == 1, h_rest = j == 1 and h_rest or nil,
-			tag = "mtp" }
+			tag = gate and "mtp-p" or "mtp" }
 		local best, _, logits, p = replay.run(head, px, ids, o, argmax)
 		-- An unsure guess ends the draft: it would likely be rejected.
-		if min_p and min_p > 0 and p:get()[1] < min_p then
+		if gate and p:get()[1] < min_p then
 			break
 		end
 		out[j] = best:get()[1]
