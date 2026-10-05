@@ -279,6 +279,24 @@ local function slot_count(info, opts)
 	return kvpool.default_seqs(per * math.min(opts.n_ctx or hp.n_ctx, hp.n_ctx), fixed)
 end
 
+-- The sampler options of the gguf general.sampling keys, as llama.cpp
+-- reads them, or nil when the file has none.
+local GGUF_SAMPLING = {
+	temp = "temperature", top_k = "top_k", top_p = "top_p", min_p = "min_p",
+	penalty_repeat = "repeat_penalty", penalty_last_n = "repeat_last_n",
+}
+local function model_sampling(meta)
+	local o
+	for key, opt in pairs(GGUF_SAMPLING) do
+		local v = meta["general.sampling." .. key]
+		if type(v) == "number" then
+			o = o or {}
+			o[opt] = v
+		end
+	end
+	return o
+end
+
 --- Loads a model and makes an engine.
 -- @tparam table opts the options:
 --
@@ -447,6 +465,7 @@ function M.new(opts)
 		-- shared blocks.
 		fixed = model.recurrent or (cache.ring ~= nil and cache.ring < n_ctx),
 		id = opts.id or info.meta["general.name"] or "lgml",
+		sampling = model_sampling(info.meta),
 		cache = cache, tokens = {},
 		busy = false, waiting = {}, adapters = adapters, acts = {}, queued = 0,
 		repeat_stop = opts.repeat_stop_tokens or REPEAT_STOP,
@@ -1343,15 +1362,24 @@ local function thinking(req)
 	return req.reasoning_effort ~= "none"
 end
 
-local function sampler_opts(req, think, extra)
+-- The sampler options of a request over the preset: the model's gguf
+-- values, then the request values, added to extra.
+local function sampler_opts_table(req, model, extra)
 	local o = extra or {}
+	for k, v in pairs(model or {}) do
+		o[k] = v
+	end
 	for _, k in ipairs({ "temperature", "top_p", "top_k", "min_p", "seed",
 	    "presence_penalty", "frequency_penalty", "repeat_penalty" }) do
 		if type(req[k]) == "number" then
 			o[k] = req[k]
 		end
 	end
-	return sampler.new(think and "qwen3_think" or "qwen3", o)
+	return o
+end
+
+local function sampler_opts(req, think, extra, model)
+	return sampler.new(think and "qwen3_think" or "qwen3", sampler_opts_table(req, model, extra))
 end
 
 -- Free memory that later passes can make again, for a pass on cache
@@ -2723,12 +2751,12 @@ function E:run_prompt(req, sink, st)
 		return nil, gerr, 400
 	end
 	local want_lp, top_lp = req.logprobs == true, math.tointeger(req.top_logprobs) or 0
-	local good, smp = pcall(sampler_opts, req, think, gopts)
+	local good, smp = pcall(sampler_opts, req, think, gopts, self.sampling)
 	if not good and gopts.triggers then
 		-- A tool schema that the grammar cannot take leaves calls free.
 		L:warn("tool call grammar", "error", tostring(smp))
 		gopts = { logit_bias = gopts.logit_bias }
-		good, smp = pcall(sampler_opts, req, think, gopts)
+		good, smp = pcall(sampler_opts, req, think, gopts, self.sampling)
 	end
 	if not good then
 		return nil, tostring(smp):gsub("^.-grammar: ", "grammar: "), 400
@@ -2736,7 +2764,7 @@ function E:run_prompt(req, sink, st)
 	local _ <close> = smp
 	if L:on(log.DEBUG) then
 		local preset = think and "qwen3_think" or "qwen3"
-		L:debug("sampling", "preset", preset, "settings", sampler.settings(preset, req),
+		L:debug("sampling", "preset", preset, "settings", sampler.settings(preset, sampler_opts_table(req, self.sampling)),
 		    "seed", req.seed or "random", "max_tokens", max, "thinking", think,
 		    "grammar", gopts.grammar and first_lines(gopts.grammar, 6), "root", gopts.grammar_root,
 		    "triggers", gopts.triggers and #gopts.triggers)

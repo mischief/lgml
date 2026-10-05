@@ -285,7 +285,30 @@ local function test_progress()
 	ok(st.id == "tiny" and st.slots[1].state == "idle" and st.queued == 0, "status: idle after the request")
 end
 
+-- The gguf general.sampling values replace the preset when a request
+-- sets none: temperature 0 gives one reply for every seed.
+local function test_sampling()
+	local gguf = require("gguf")
+	local p2 = tiny.tmp(".gguf")
+	tiny.write(p2, "qwen3", { n_ctx = 1024, kv = { { "general.sampling.temp", gguf.FLOAT32, 0 },
+		{ "general.sampling.top_k", gguf.INT32, 7 } } })
+	local e2 = engine.new({ model = p2, backend = "CPU", n_ctx = 1024, id = "tiny" })
+	local s2 = httpd.new()
+	openai.install(s2, e2, { key = ("t"):rep(32) })
+	local texts = {}
+	for i = 1, 3 do
+		local _, c = inproc.json(s2, "POST", "/v1/chat/completions", { model = "tiny", max_tokens = 12,
+			seed = i, reasoning_effort = "none", messages = { { role = "user", content = "Hi there" } } })
+		texts[i] = c.choices[1].message.content
+	end
+	ok(e2.sampling.temperature == 0 and e2.sampling.top_k == 7 and texts[1] == texts[2] and texts[2] == texts[3],
+	    ("sampling: the gguf temperature applies (%q)"):format(texts[1]))
+	ok(e.sampling == nil, "sampling: a gguf without the keys keeps the preset")
+	os.remove(p2)
+end
+
 test_messages()
+test_sampling()
 test_progress()
 test_budget()
 test_repeat()

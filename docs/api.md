@@ -352,8 +352,9 @@ Thinking is on by default for templates that have it.
 Sampler defaults of the gguf chat engine (the Qwen3 model card
 values): with thinking, temperature 0.6, top_k 20, top_p 0.95, min_p 0;
 without thinking, temperature 0.7, top_k 20, top_p 0.8, min_p 0.
-Request fields override them. The other settings have the llama.cpp
-defaults.
+The `general.sampling` keys of the gguf (temp, top_k, top_p, min_p,
+penalty_repeat, penalty_last_n) override them. Request fields override
+both. The other settings have the llama.cpp defaults.
 
 ### Reasoning budget
 
