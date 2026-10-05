@@ -210,7 +210,8 @@ local TABLE = "per_layer_token_embd.weight"
 -- @param be the backend
 -- @tparam string path a gguf file of the model
 -- @tparam table opts the options of `lgml.transformer.load`, and
--- opts.ngram (false for get_rows on the table)
+-- opts.ngram (false for get_rows on the table) and opts.mmap (true to
+-- map the weights on the CPU backend in place of a load)
 -- @tparam table info the gguf info of path
 -- @tparam table hp the config
 -- @treturn Model the model, with the metatable of `lgml.transformer`
@@ -244,14 +245,24 @@ function M.load(be, path, opts, info, hp)
 			end
 			skip[TABLE] = true
 		elseif has_table and hp.ple then
-			local ok, s = pcall(be.map, be, file, { TABLE })
+			local ok, s = pcall(be.map, be, file, { TABLE }, { random = true })
 			if ok then
 				w[#w + 1] = s
 				skip[TABLE] = true
 				mapped = true
 			end
 		end
-		w[#w + 1] = assert(be:load(file, { cpu = cpu, pinned = opts.pinned, skip = skip }))
+		if opts.mmap then
+			local names = {}
+			for _, t in ipairs(finfo.tensors) do
+				if not skip[t.name] then
+					names[#names + 1] = t.name
+				end
+			end
+			w[#w + 1] = be:map(file, names)
+		else
+			w[#w + 1] = assert(be:load(file, { cpu = cpu, pinned = opts.pinned, skip = skip }))
+		end
 	end
 	local function get(name)
 		return assert(w:get(name), name)

@@ -963,6 +963,9 @@ refuse:
  * it is a CPU. They take no lgml memory budget.
  * @tparam string path gguf file
  * @tparam {string,...} names the tensors to map
+ * @tparam[opt] table opts `random`: true when reads come in no order,
+ * such as rows of an embedding table; the kernel then reads no pages
+ * ahead (default false)
  * @treturn weights the tensors
  * @raise if the file does not open or is not a gguf file, a name is not
  * in it, or the backend has no CPU
@@ -983,9 +986,15 @@ backend_map(lua_State *L)
 	struct stat st;
 	size_t base;
 	void *map;
-	int fd, bidx = 1, n = 0, i;
+	int fd, bidx = 1, n = 0, i, random = 0;
 
 	luaL_checktype(L, 3, LUA_TTABLE);
+	if (!lua_isnoneornil(L, 4)) {
+		luaL_checktype(L, 4, LUA_TTABLE);
+		lua_getfield(L, 4, "random");
+		random = lua_toboolean(L, -1);
+		lua_pop(L, 1);
+	}
 	if (b->cpu != NULL) {
 		lua_getiuservalue(L, 1, UV_CPU);
 		bidx = lua_gettop(L);
@@ -1026,8 +1035,8 @@ backend_map(lua_State *L)
 		return luaL_error(L, "%s: %s", path, strerror(i));
 	}
 	close(fd);
-	/* Rows of an embedding table come in no order. */
-	posix_madvise(map, (size_t)st.st_size, POSIX_MADV_RANDOM);
+	if (random)
+		posix_madvise(map, (size_t)st.st_size, POSIX_MADV_RANDOM);
 	dev = ggml_backend_get_device(b->be);
 	buf = ggml_backend_dev_buffer_from_host_ptr(dev, map, (size_t)st.st_size, (size_t)st.st_size);
 	if (buf == NULL) {
