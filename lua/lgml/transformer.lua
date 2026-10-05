@@ -1713,11 +1713,14 @@ local function cached_experts(g, hp, L, x3, sel, w)
 	local xc = L.xc
 	local n, K = sel:shape()[1], sel:shape()[2]
 	local flat = g:reshape(g:cont(sel), { n * K })
-	local dsel = g:reshape(g:get_rows(xc.map, flat), { n, K })
+	local slot = g:reshape(g:get_rows(xc.map, flat), { n, K })
 	if xc.full then
-		return sum_picks(g, experts(g, hp, xc, x3, dsel, w))
+		return sum_picks(g, experts(g, hp, xc, x3, g:cast(slot, "i32"), w))
 	end
-	local wd = g:mul(w, g:reshape(g:get_rows(xc.hit, flat), { n, K, 1 }))
+	-- A pick that no slot holds goes to the zero slot of its position.
+	local hit = g:reshape(g:get_rows(xc.hit, flat), { n, K })
+	local dsel = g:cast(g:add(g:mul(g:sub(slot, xc.zero), hit), xc.zero), "i32")
+	local wd = g:mul(w, g:reshape(hit, { n, K, 1 }))
 	local wc = g:sub(w, wd)
 	local csel = xc.state:remap(g, xc.il, g:reshape(flat, { n, K }))
 	-- With the router on the CPU, the routing nodes go first, so that the

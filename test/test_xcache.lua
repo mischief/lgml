@@ -86,6 +86,12 @@ local function rows(m, ids)
 	return out
 end
 
+-- The last logits of one pass of all ids.
+local function batch_row(m, ids)
+	local c = m:cache(128, { type = "f32" })
+	return { replay.run(m, c, ids, { logits = "last" }):get() }
+end
+
 local function maxdiff(a, b)
 	if #a ~= #b then
 		return math.huge
@@ -112,6 +118,7 @@ for _, kind in ipairs({ "split", "fused", "q8_0" }) do
 	local TOL = TOLS[kind]
 	local one <close> = assert(lgml.backend(DEV))
 	local want = rows(transformer.load(one, path), ids)
+	local want_batch = batch_row(transformer.load(one, path), ids)
 	local be <close> = assert(lgml.backend(DEV, { cpu = true }))
 	local rules = placement.rules({ cpu_moe = true })
 	for _, slots in ipairs({ 0, 1, 5, NE - 1, NE }) do
@@ -127,6 +134,11 @@ for _, kind in ipairs({ "split", "fused", "q8_0" }) do
 			    ("%scounts every pick (%d held, %d not)"):format(tag, h, mi))
 			ok(xc.moved > xc.bytes // 2, tag .. "experts moved between passes")
 		end
+		-- A batch rounds in other ways on a GPU: the device computes
+		-- the expert matmuls in f16 tiles.
+		d = maxdiff(want_batch, batch_row(m, ids))
+		ok(d < (DEV == "CPU" and TOL or 1e-2),
+		    ("%sa batch pass equals one backend (max error %.3g)"):format(tag, d))
 		xc:close()
 		ok(m.layers[1].xc == nil and m.before_pass == nil, tag .. "close detaches the cache")
 	end
@@ -228,7 +240,8 @@ do
 	local mc = transformer.load(be, path, { placement = placement.rules({ cpu_moe = true }) })
 	local layers, sum = xcache.layers(mc)
 	ok(layers[1] and layers[2] and sum > 0, "layers lists the layers with experts on the CPU")
-	ok(xcache.slots_for(mc, sum * 3 + 1024) == 3, "slots_for divides the bytes by the layers")
+	ok(xcache.slots_for(mc, sum * 3 + 1024) == 1 and xcache.slots_for(mc, sum * 4 + 1024) == 4,
+	    "slots_for divides the bytes by the layers, less a zero slot per pick")
 	ok(xcache.slots_for(mc, 1 << 40) == 4, "slots_for gives at most the expert count")
 	os.remove(path)
 end

@@ -68,7 +68,12 @@ function M.slots_for(model, bytes)
 		return 0
 	end
 	bytes = bytes - n * model.hp.n_expert * 8
-	return math.max(0, math.min(model.hp.n_expert, bytes // sum))
+	local s = bytes // sum
+	if s >= model.hp.n_expert then
+		return model.hp.n_expert
+	end
+	-- The zero slots of the pick positions take room too.
+	return math.max(0, s - model.hp.n_used)
 end
 
 -- Read a profile file: a header line, then the scores of one layer per
@@ -142,6 +147,10 @@ function M.new(model, opts)
 		for il, eb in pairs(layers) do
 			local L = model.layers[il]
 			local xc = { il = il, n = n, full = n == hp.n_expert, state = self.state }
+			-- A pick that no slot holds goes to the zero slot n + k of
+			-- its position k. The device ids of a token then never
+			-- repeat: Vulkan mul_mat_id drops rows of a repeated id.
+			xc.rows = xc.full and n or n + hp.n_used
 			self.state:resize(il, n)
 			if prof and prof[il] then
 				self.state:seed(il, prof[il])
@@ -151,10 +160,15 @@ function M.new(model, opts)
 					local t = L[f]
 					if t then
 						local s = t:shape()
-						s[1] = n
+						s[1] = xc.rows
 						local c = be:tensor(t:type(), s, nil, { weights = true })
 						-- Empty slots must hold no NaN: a weight 0 picks them.
+						-- The miss slots hold expert 0. With zero bytes
+						-- there, IQ2_XS experts give NaN on Vulkan.
 						c:zero()
+						for r = n, xc.rows - 1 do
+							c:set_slice(r, t, 0)
+						end
 						xc[f] = c
 						self.bytes = self.bytes + c:nbytes()
 					end
@@ -162,10 +176,15 @@ function M.new(model, opts)
 				-- The tables go where the router runs, so that only
 				-- the ids and weights of the device picks cross over.
 				local tb = L.gate_inp:backend()
-				xc.map = tb:tensor("i32", { hp.n_expert, 1 }, nil, { weights = true })
+				xc.map = tb:tensor("f32", { hp.n_expert, 1 }, nil, { weights = true })
 				xc.hit = tb:tensor("f32", { hp.n_expert, 1 }, nil, { weights = true })
+				local zero = {}
+				for k = 1, hp.n_used do
+					zero[k] = n + k - 1
+				end
+				xc.zero = tb:tensor("f32", { 1, hp.n_used }, zero, { weights = true })
 				if tb == be then
-					self.bytes = self.bytes + xc.map:nbytes() + xc.hit:nbytes()
+					self.bytes = self.bytes + xc.map:nbytes() + xc.hit:nbytes() + xc.zero:nbytes()
 				end
 				xc.router_cpu = tb ~= be
 			end
@@ -203,7 +222,7 @@ function M:apply(plan)
 		for _, f in ipairs(FIELDS) do
 			if xc[f] then
 				xc[f]:set_slice(slot, L[f], e)
-				self.moved = self.moved + xc[f]:nbytes() // self.n
+				self.moved = self.moved + xc[f]:nbytes() // xc.rows
 			end
 		end
 		self.state:assign(il, slot, e)
