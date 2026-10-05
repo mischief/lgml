@@ -1733,14 +1733,14 @@ end
 -- @static
 -- @param g the graph
 -- @tparam table hp the config
--- @tparam table L the layer
+-- @tparam table L the layer; L.n_expert overrides hp.n_expert
 -- @param x the residual (n, n_embd)
 -- @param h the normed expert input (n, n_embd)
 -- @tparam[opt] table taps gets "ffn_moe_topk" and "ffn_moe_weights"
 -- @tparam[opt] string sfx the tap name suffix
 -- @return the weighted sum of the chosen expert outputs (n, n_embd)
 function M.moe(g, hp, L, x, h, taps, sfx)
-	local n, E, NE, K = x:shape()[1], hp.n_embd, hp.n_expert, hp.n_used
+	local n, E, NE, K = x:shape()[1], hp.n_embd, L.n_expert or hp.n_expert, hp.n_used
 	local r_in = h
 	if hp.gemma then
 		r_in = g:scale(g:rms_norm(x, hp.eps), 1 / math.sqrt(E))

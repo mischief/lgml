@@ -359,6 +359,8 @@ function M.load_mtp(m, w)
 		L[f] = assert(w:get(p .. f .. ".weight"), p .. f)
 	end
 	L.cpu = L.hc_attn_norm:backend() ~= m.be or nil
+	-- An MTP gguf of the base model can hold more experts than a pruned trunk.
+	L.n_expert = L.gate_inp:shape()[1]
 	m.mtp = { L = L, il = il }
 end
 
