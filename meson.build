@@ -92,7 +92,9 @@ lgml = shared_module('lgml',
   'src/sha256.c',
   'src/vocab.c',
   'src/mem.c',
-  dependencies : [ggml, lua, m, png, jpeg, utf8proc],
+  'src/ngram.c',
+  'src/lngram.c',
+  dependencies : [ggml, lua, m, threads, png, jpeg, utf8proc],
   name_prefix : '',
   install : true,
   install_dir : lua_cdir,
@@ -211,6 +213,9 @@ if lua_bin.found()
   test('image', lua_bin, args : [files('test/test_image.lua')],
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
     timeout : 120)
+  test('ngram_lua', lua_bin, args : [files('test/test_ngram.lua')],
+    env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
+    timeout : 60)
   test('vision', lua_bin, args : [files('test/test_vision.lua')],
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
     timeout : 120)

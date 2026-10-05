@@ -3658,5 +3658,6 @@ luaopen_lgml(lua_State *L)
 	lgml_open_ops_nn(L);
 	lgml_open_train(L);
 	lgml_open_mem(L);
+	lgml_open_ngram(L);
 	return 1;
 }
