@@ -50,7 +50,8 @@ local function vocab_kv()
 end
 
 -- The kv and tensors of the model. opts.top_k sets the indexer budget
--- (default M.TOP_K); opts.n_ctx the context length (default 4096).
+-- (default M.TOP_K); opts.n_ctx the context length (default 4096);
+-- opts.mtp false leaves out the MTP layer.
 function M.build(opts)
 	opts = opts or {}
 	local r = tiny.rng(4242)
@@ -98,7 +99,11 @@ function M.build(opts)
 	end
 	kv[#kv + 1] = { "general.architecture", gguf.STRING, "qwen4exp" }
 	kv[#kv + 1] = { "general.name", gguf.STRING, "tiny qwen4exp" }
-	key("block_count", gguf.UINT32, M.NL)
+	local mtp = opts.mtp ~= false
+	key("block_count", gguf.UINT32, M.NL + (mtp and 1 or 0))
+	if mtp then
+		key("nextn_predict_layers", gguf.UINT32, 1)
+	end
 	key("context_length", gguf.UINT32, opts.n_ctx or 4096)
 	key("embedding_length", gguf.UINT32, E)
 	key("feed_forward_length", gguf.UINT32, 2 * E)
@@ -126,8 +131,11 @@ function M.build(opts)
 	key("attention.indexer.key_length", gguf.UINT32, M.ID)
 	key("attention.indexer.top_k", gguf.UINT32, opts.top_k or M.TOP_K)
 	local ratios = {}
-	for i = 1, M.NL do
+	for i = 1, M.NL + (mtp and 1 or 0) do
 		ratios[i] = i % 2 == 0 and M.RATIO or 0
+	end
+	if mtp then
+		ratios[M.NL + 1] = M.RATIO
 	end
 	key("attention.compress_ratios", { gguf.ARRAY, gguf.INT32 }, ratios)
 	-- The n-gram embedding: bigram and trigram heads, two of each.
@@ -199,6 +207,34 @@ function M.build(opts)
 		w(p .. "ffn_gate_shexp.weight", { M.FS, E })
 		w(p .. "ffn_up_shexp.weight", { M.FS, E })
 		w(p .. "ffn_down_shexp.weight", { E, M.FS })
+	end
+	-- The MTP layer: a QSA layer with the nextn weights.
+	if mtp then
+		local p = "blk." .. M.NL .. "."
+		hc(p .. "hc_attn", true)
+		hc(p .. "hc_ffn", true)
+		w(p .. "attn_q.weight", { 2 * M.H * M.D, E })
+		w(p .. "attn_k.weight", { M.HKV * M.D, E })
+		w(p .. "attn_v.weight", { M.HKV * M.D, E })
+		w(p .. "attn_output.weight", { E, M.H * M.D })
+		norm(p .. "attn_q_norm.weight", M.D)
+		norm(p .. "attn_k_norm.weight", M.D)
+		w(p .. "indexer.q_proj.weight", { M.IH * M.ID, E }, 2)
+		w(p .. "indexer.k_proj.weight", { M.ID, E }, 2)
+		norm(p .. "indexer.q_norm.weight", M.ID)
+		norm(p .. "indexer.k_norm.weight", M.ID)
+		w(p .. "ffn_gate_inp.weight", { M.X, E }, 3)
+		w(p .. "ffn_gate_exps.weight", { M.X, M.F, E })
+		w(p .. "ffn_up_exps.weight", { M.X, M.F, E })
+		w(p .. "ffn_down_exps.weight", { M.X, E, M.F })
+		w(p .. "ffn_gate_inp_shexp.weight", { E })
+		w(p .. "ffn_gate_shexp.weight", { M.FS, E })
+		w(p .. "ffn_up_shexp.weight", { M.FS, E })
+		w(p .. "ffn_down_shexp.weight", { E, M.FS })
+		w(p .. "nextn.eh_proj.weight", { E, 2 * E })
+		norm(p .. "nextn.enorm.weight", E)
+		norm(p .. "nextn.hnorm.weight", CE)
+		hc(p .. "nextn.hc_head", false)
 	end
 	return kv, ts
 end
