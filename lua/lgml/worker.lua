@@ -112,6 +112,11 @@ local function stats(engine)
 		end
 		r.store_bytes, r.store_items = pc.bytes, n
 	end
+	local xc = engine.model and engine.model.xcache
+	if xc then
+		r.moe_cache_hits, r.moe_cache_misses = xc:stats()
+		r.moe_cache_moved = xc.moved
+	end
 	return r
 end
 

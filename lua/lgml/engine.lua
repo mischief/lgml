@@ -36,6 +36,7 @@ local lora = require("lgml.lora")
 local media = require("lgml.chat.media")
 local output = require("lgml.chat.output")
 local placement = require("lgml.placement")
+local xcache = require("lgml.xcache")
 local log = require("lgml.log")
 local spec = require("lgml.spec")
 
@@ -72,6 +73,67 @@ local EMBD_KEEP = 8
 -- Device memory kept free for compute buffers when the engine sizes the
 -- context to fit.
 local RESERVE = 1536 << 20
+
+-- Device memory that an automatic expert cache leaves free, past the
+-- memory guard margin and the planned growth of the engine.
+local XCACHE_SLACK = 256 << 20
+
+-- The expert cache options of the engine options, or nil without
+-- moe_cache. Sizes in MiB become bytes; bytes is nil for "auto".
+local function xcache_opts(opts)
+	local v = opts.moe_cache
+	if v == nil or v == false then
+		return nil
+	end
+	local function mib(x, key)
+		local n = tonumber(x)
+		if not n or n < 0 then
+			error(("engine: %s must be MiB, not %s"):format(key, tostring(x)), 0)
+		end
+		return math.floor(n * 1048576)
+	end
+	local x = {
+		profile = opts.moe_cache_profile,
+		halflife = opts.moe_cache_halflife,
+		swap = opts.moe_cache_swap and mib(opts.moe_cache_swap, "moe_cache_swap"),
+		max = opts.moe_cache_max and mib(opts.moe_cache_max, "moe_cache_max"),
+	}
+	if v ~= true and v ~= "auto" then
+		x.bytes = mib(v, "moe_cache")
+	end
+	local f = x.profile and io.open(x.profile, "r")
+	if f then
+		f:close()
+	elseif x.profile then
+		L:warn("expert profile not found; the cache starts empty", "path", x.profile)
+		x.profile = nil
+	end
+	return x
+end
+
+-- The placement options with the routed experts of every layer on the
+-- CPU, for an expert cache.
+local function cache_placement(opts)
+	local o = {}
+	for k, v in pairs(opts) do
+		o[k] = v
+	end
+	if opts.n_cpu_moe ~= nil then
+		L:warn("moe_cache keeps every expert in host memory; n_cpu_moe ignored")
+	end
+	o.cpu_moe, o.n_cpu_moe = true, nil
+	return o
+end
+
+-- Make the expert cache of x (see `xcache_opts`) on model.
+local function new_xcache(model, x)
+	local xc = xcache.new(model, {
+		slots = x.slots, bytes = x.bytes, swap = x.swap, halflife = x.halflife,
+		profile = x.profile,
+	})
+	L:info("expert cache", "slots", xc.n, "experts", xc.ne, "device_mib", xc.bytes // 1048576)
+	return xc
+end
 
 -- The cancel test of a reply sink, as a plain function.
 local function cancel_of(sink)
@@ -272,6 +334,15 @@ end
 --   `ngram_min`, `ngram_max` for the prompt lookup drafter (see
 --   `lgml.spec.lookup`). `drafter`, a function of the request that
 --   returns a drafter, replaces prompt lookup (see `lgml.spec`).
+-- - `moe_cache`: an adaptive expert cache (see `lgml.xcache`): every
+--   routed expert stays in host memory, and device slots hold the most
+--   used ones. A number is the MiB of the slots; `"auto"` or true fills
+--   the device memory that is free after the KV cache of `n_ctx` and the
+--   compute buffers, at most `moe_cache_max` MiB. `moe_cache_profile`
+--   names a profile file for the first scores (see `XCache:save`);
+--   `moe_cache_swap` is the most MiB moved into slots per pass;
+--   `moe_cache_halflife` is the half-life of a pick in tokens. It
+--   applies only on a GPU backend, and replaces `cpu_moe`/`n_cpu_moe`.
 -- @treturn Engine the engine
 -- @raise when the backend, the model or its tokenizer does not load,
 -- when no chat template fits the model, an adapter does not fit it, the
@@ -280,11 +351,12 @@ function M.new(opts)
 	local info = assert(lgml.gguf(opts.model))
 	local family, family_name = chat.load(info.meta)
 	local arch = info.meta["general.architecture"]
-	local rules = placement.rules(opts)
+	local xopts = xcache_opts(opts)
+	local rules = placement.rules(xopts and cache_placement(opts) or opts)
 	if rules and (on_cpu(opts.backend) or not transformer.supports(arch)) then
 		L:warn("weight placement needs a GPU backend and a transformer model; ignored",
 		    "backend", opts.backend or "best", "arch", arch)
-		rules = nil
+		rules, xopts = nil, nil
 	end
 	local be = assert(lgml.backend(opts.backend, { threads = opts.threads, cpu = rules ~= nil }))
 	local n_slots = slot_count(info, opts)
@@ -302,6 +374,17 @@ function M.new(opts)
 		local dev, host = model.w:size()
 		L:info("weights placed", "device_mib", dev // 1048576, "cpu_mib", host // 1048576,
 		    "n_cpu_moe", rules.n_cpu_moe, "n_gpu_layers", rules.n_gpu_layers)
+	end
+	if xopts and not model.hp.n_expert then
+		L:warn("moe_cache needs a model with routed experts; ignored")
+		xopts = nil
+	end
+	-- A cache of a fixed size comes before the KV cache; "auto" after it.
+	if xopts then
+		if not xopts.bytes then
+			xopts.slots = 1
+		end
+		new_xcache(model, xopts)
 	end
 	local fa = opts.flash_attn ~= false
 	local copts = { type_k = opts.cache_type_k or "f16", type_v = opts.cache_type_v or "f16" }
@@ -387,6 +470,9 @@ function M.new(opts)
 	if e.ubatch_auto then
 		e:reserve()
 	end
+	if xopts and not xopts.bytes then
+		e:fit_xcache(xopts)
+	end
 	if model.snapshot then
 		local ram = opts.cache_ram or 8192
 		e.pc = prompt_cache.new(model, cache, {
@@ -407,6 +493,33 @@ end
 
 --- A chat engine. It implements `lgml.server.engine.Engine`.
 -- @type Engine
+
+-- Size the expert cache to the free device memory after the planned
+-- growth: the KV cache at n_ctx, the compute buffers and the margin.
+-- The plans run with a cache of one slot, so they hold its graph.
+function E:fit_xcache(x)
+	local r = budget_mod.report(self)
+	local free = budget_mod.free(self.be:name()) or 0
+	local margin = lgml.memory_guard().margin
+	local bytes = free - margin - math.max(0, r.used - r.now) - XCACHE_SLACK
+	if x.max then
+		bytes = math.min(bytes, x.max)
+	end
+	self.model.xcache:close()
+	collectgarbage()
+	collectgarbage()
+	-- Under a memory limit the slots may not fit; then take fewer.
+	x.slots, x.bytes = nil, math.max(0, bytes)
+	while true do
+		local ok, err = pcall(new_xcache, self.model, x)
+		if ok then
+			return
+		elseif not budget_mod.is_budget(err) or x.bytes == 0 then
+			error(err, 0)
+		end
+		x.bytes = x.bytes * 3 // 4 >> 20 << 20
+	end
+end
 
 -- Load the vision encoder of opts.mmproj on the model's backend.
 function E:load_vision(opts)

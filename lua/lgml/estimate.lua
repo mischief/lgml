@@ -163,7 +163,17 @@ end
 -- r.extra.cpu, and returns the set of layers whose cache is on the CPU.
 local function place(r, spec, meta, budget)
 	local placement = require("lgml.placement")
-	local rules = placement.rules(spec)
+	local pspec = spec
+	if spec.moe_cache then
+		-- An expert cache keeps every routed expert in host memory.
+		pspec = { cpu_moe = true }
+		for k, v in pairs(spec) do
+			if k ~= "cpu_moe" and k ~= "n_cpu_moe" then
+				pspec[k] = v
+			end
+		end
+	end
+	local rules = placement.rules(pspec)
 	local hp = rules and config(meta)
 	if not hp then
 		return nil
@@ -210,14 +220,19 @@ end
 -- estimate picks the count so the weights and the cache of `ctx`
 -- positions (default: at most `lgml.placement.AUTO_CTX`) fit; the
 -- result gives it as n_cpu_moe.
+-- With `moe_cache`, every routed expert goes to the CPU part, and the
+-- cache slots count on the GPU: `moe_cache` MiB, or for "auto" under a
+-- budget, the rest of the budget, given as moe_cache_max.
 -- @tparam table spec the model spec: `model`, `engine`, `stt`, `mmproj`,
 -- `ctx`, `slots`, `flash_attn`, `cache_type_k`, `cache_type_v`, `backend`,
--- `text_backend`, `cpu_moe`, `n_cpu_moe`, `n_gpu_layers` and `override`
+-- `text_backend`, `cpu_moe`, `n_cpu_moe`, `n_gpu_layers`, `override`,
+-- `moe_cache` and `moe_cache_max`
 -- @tparam[opt] number budget the memory budget in bytes of the kind of
 -- `backend`
 -- @tparam[opt] boolean gpu false when the machine has no GPU (see `kind`)
 -- @treturn table `{ bytes, files, kv, margin, n_ctx, slots, kind, extra,
--- n_cpu_moe }`; bytes is the part on the kind of `backend`; n_ctx is the
+-- n_cpu_moe, moe_cache, moe_cache_max }`; moe_cache is the bytes of the
+-- expert cache, and moe_cache_max its cap in bytes for "auto"; bytes is the part on the kind of `backend`; n_ctx is the
 -- context for the worker, or nil when the estimate does not know it;
 -- slots is the slot count of a chat model;
 -- extra is `{ [kind] = bytes }` for the parts on other kinds
@@ -254,7 +269,20 @@ function M.model(spec, budget, gpu)
 			end
 		end
 	end
-	r.bytes = r.files + r.kv + r.margin
+	if spec.moe_cache and kind == "gpu" and r.extra.cpu then
+		local mib = tonumber(spec.moe_cache)
+		local bytes = mib and math.floor(mib * 1048576)
+		if not bytes and budget and budget < math.huge then
+			bytes = math.max(0, budget - r.files - r.kv - r.margin)
+			local max = tonumber(spec.moe_cache_max)
+			if max then
+				bytes = math.min(bytes, math.floor(max * 1048576))
+			end
+			r.moe_cache_max = bytes
+		end
+		r.moe_cache = bytes or 0
+	end
+	r.bytes = r.files + r.kv + r.margin + (r.moe_cache or 0)
 	return r
 end
 

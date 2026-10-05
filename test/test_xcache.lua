@@ -224,5 +224,68 @@ do
 	os.remove(path)
 end
 
+-- The estimate of a server: experts on the CPU part, slots on the GPU.
+do
+	local estimate = require("lgml.estimate")
+	local path = tiny.tmp(".gguf")
+	tiny.write(path, "qwen3moe", { n_ctx = 512, moe = { n = NE, used = 4, ff = 32 } })
+	local plain = estimate.model({ model = path, backend = "Vulkan0", ctx = 256 }, math.huge, true)
+	local r = estimate.model({ model = path, backend = "Vulkan0", ctx = 256, moe_cache = 0.5 },
+	    math.huge, true)
+	ok(r.moe_cache == 524288 and r.extra.cpu > 0 and r.files < plain.files and
+	    r.bytes == r.files + r.kv + r.margin + r.moe_cache,
+	    "estimate: experts on the CPU, the slots on the GPU")
+	local budget = plain.bytes + (1 << 20)
+	r = estimate.model({ model = path, backend = "Vulkan0", ctx = 256, moe_cache = "auto",
+	    moe_cache_max = 0.75 }, budget, true)
+	ok(r.moe_cache_max == 786432 and r.bytes <= budget,
+	    "estimate: auto takes the rest of the budget, at most the max")
+	r = estimate.model({ model = path, backend = "Vulkan0", ctx = 256, moe_cache = "auto" },
+	    r.files + r.kv + r.margin + 4096, true)
+	ok(r.moe_cache_max == 4096, "estimate: auto under a budget gives its cap")
+	os.remove(path)
+end
+
+-- The engine on a GPU: a cache of a fixed size, and one that fills the
+-- free device memory up to moe_cache_max.
+if DEV ~= "CPU" then
+	local uv = require("luv")
+	local engine = require("lgml.engine")
+	local budget = require("lgml.budget")
+	local path = tiny.tmp(".gguf")
+	tiny.write(path, "qwen3moe", { n_ctx = 512, moe = { n = NE, used = 4, ff = 32 } })
+	for _, v in ipairs({ 0.5, "auto" }) do
+		local tag = ("engine, moe_cache %s: "):format(v)
+		local e = engine.new({ model = path, backend = DEV, n_ctx = 256, slots = 1,
+		    moe_cache = v, moe_cache_max = 0.25 })
+		local xc = e.model.xcache
+		ok(xc and xc.n > 0 and e.model.layers[1].down_exps:backend() == e.be:cpu(),
+		    tag .. "experts in host memory, slots on the device")
+		ok(xc and xc.bytes <= (v == "auto" and 0.25 or v) * 1048576,
+		    tag .. ("the slots fit the size (%d bytes)"):format(xc and xc.bytes or -1))
+		local r = budget.report(e)
+		ok(r.weights >= xc.bytes, tag .. "the report counts the slots as weights")
+		local res, done = nil, false
+		local sink = {
+			content = function() return true end,
+			finish = function(_, _, usage) res = usage end,
+			cancelled = function() return false end,
+		}
+		sink.reasoning, sink.tool_arguments = sink.content, sink.content
+		coroutine.wrap(function()
+			e:chat({ messages = { { role = "user", content = "hello there" } }, max_tokens = 8,
+			    top_k = 1 }, sink)
+			done = true
+		end)()
+		while not done do
+			uv.run("once")
+		end
+		local h, mi = xc:stats()
+		ok(res and res.completion_tokens >= 1 and h + mi > 0,
+		    tag .. ("a chat runs through the cache (%d of %d picks held)"):format(h, h + mi))
+	end
+	os.remove(path)
+end
+
 print("1.." .. n)
 os.exit(failed == 0 and 0 or 1)

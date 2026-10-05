@@ -34,7 +34,8 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                    [--lora file[:scale]]... [--mmproj file] [--image-min-tokens n]
                    [--image-max-tokens n] [--inproc] [--stt] [--engine module]
                    [--text-backend name] [--cpu-moe] [--n-cpu-moe n|auto]
-                   [-ngl n] [-ot pattern=backend]... [--cors origin] [--vram MiB]
+                   [-ngl n] [-ot pattern=backend]... [--moe-cache MiB|auto]
+                   [--moe-cache-profile file] [--cors origin] [--vram MiB]
                    [--idle seconds]
                    [-v]... [--log-level name] [--log-file path] [--dump-prompts dir]
                    [--state-dir dir] [--unknown-fields rule]
@@ -80,6 +81,10 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       the flags below; override is a list of
                       "pattern=backend"; that part counts against ram,
                       and n_cpu_moe = "auto" fits the rest in vram,
+                      moe_cache = MiB or "auto", moe_cache_max = MiB,
+                      moe_cache_profile = file, moe_cache_swap = MiB,
+                      moe_cache_halflife = tokens: an adaptive cache of
+                      the most used experts in vram (see --moe-cache),
                       engine = Lua module with new(opts), such as a TTS engine,
                       modes = list of completion, multimodal, decide,
                       transcription, speech, image_generation, embedding
@@ -167,6 +172,15 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
       --n-cpu-moe n   the same for the experts of the first n layers; auto
                       picks the fewest layers so the rest fits in free GPU
                       memory, or in vram with -C
+      --moe-cache MiB|auto
+                      keep every routed expert in host memory, and the
+                      most used ones in a GPU cache of MiB that adapts
+                      as the model runs; the GPU runs the experts in the
+                      cache and the CPU the rest; auto fills the free GPU
+                      memory after the KV cache and compute buffers
+      --moe-cache-profile file
+                      the first expert scores of --moe-cache, from a
+                      profile file (see scripts/expert_profile.lua)
       -ngl, --n-gpu-layers n
                       keep the last n layers on the GPU, and the others,
                       the token embeddings and, when n is at most the
@@ -322,8 +336,8 @@ local function model_engine(spec, managed)
 	local okp, rules = pcall(require("lgml.placement").rules, spec)
 	if not okp then
 		die(rules)
-	elseif rules and (stt or embed or spec.engine) then
-		die("cpu_moe, n_cpu_moe, n_gpu_layers and override need a chat model")
+	elseif (rules or spec.moe_cache) and (stt or embed or spec.engine) then
+		die("cpu_moe, n_cpu_moe, n_gpu_layers, override and moe_cache need a chat model")
 	end
 	if spec.inproc and spec.engine then
 		return require(spec.engine).new({
@@ -351,7 +365,9 @@ local function model_engine(spec, managed)
 			speculative = sp and sp > 0 and { max = sp } or nil,
 			mmproj = spec.mmproj, image_min_tokens = imin, image_max_tokens = imax,
 			cpu_moe = spec.cpu_moe, n_cpu_moe = spec.n_cpu_moe, n_gpu_layers = spec.n_gpu_layers,
-			override = spec.override,
+			override = spec.override, moe_cache = spec.moe_cache,
+			moe_cache_max = spec.moe_cache_max, moe_cache_profile = spec.moe_cache_profile,
+			moe_cache_swap = spec.moe_cache_swap, moe_cache_halflife = spec.moe_cache_halflife,
 		})
 	end
 	local wargs = { "-m", spec.model }
@@ -366,6 +382,9 @@ local function model_engine(spec, managed)
 		["--spec"] = sp and sp > 0 and sp or nil,
 		["--image-min-tokens"] = imin, ["--image-max-tokens"] = imax,
 		["--image-max-side"] = side, ["--mem-margin"] = spec.mem_margin,
+		["--moe-cache-max"] = spec.moe_cache_max, ["--moe-cache-profile"] = spec.moe_cache_profile,
+		["--moe-cache-swap"] = spec.moe_cache_swap,
+		["--moe-cache-halflife"] = spec.moe_cache_halflife,
 	}) do
 		table.move({ flag, tostring(v) }, 1, 2, #wargs + 1, wargs)
 	end
@@ -388,6 +407,10 @@ local function model_engine(spec, managed)
 		if rules.n_gpu_layers then
 			table.move({ "--n-gpu-layers", tostring(rules.n_gpu_layers) }, 1, 2, #wargs + 1, wargs)
 		end
+	end
+	if spec.moe_cache then
+		local v = spec.moe_cache == true and "auto" or tostring(spec.moe_cache)
+		table.move({ "--moe-cache", v }, 1, 2, #wargs + 1, wargs)
 	end
 	if stt then
 		wargs[#wargs + 1] = "--stt"
@@ -510,6 +533,9 @@ local function managed_engines(path, cfg, opts)
 		if est.n_cpu_moe then
 			spec.n_cpu_moe = est.n_cpu_moe
 		end
+		if est.moe_cache_max then
+			spec.moe_cache_max = est.moe_cache_max / MiB
+		end
 		-- Under a budget, the worker gets the context of the estimate, not
 		-- one that fits the free memory at its load.
 		if not spec.ctx and est.n_ctx and budget[kind] < math.huge then
@@ -591,6 +617,7 @@ local function make_engine(opts, cfg)
 			image_max_tokens = opts["image-max-tokens"],
 			cpu_moe = opts["cpu-moe"], n_cpu_moe = opts["n-cpu-moe"],
 			n_gpu_layers = opts["n-gpu-layers"], override = opts["override-tensor"],
+			moe_cache = opts["moe-cache"], moe_cache_profile = opts["moe-cache-profile"],
 		})
 	end
 	die("no engine: give -m model, -C config or --fake")
@@ -672,7 +699,7 @@ local function main(args)
 		["mmproj="] = false, ["image-min-tokens="] = false, ["image-max-tokens="] = false,
 		["text-backend="] = false, ["state-dir="] = false, ["unknown-fields="] = false,
 		["cpu-moe"] = false, ["n-cpu-moe="] = false, ["n-gpu-layers="] = false,
-		["override-tensor="] = false,
+		["override-tensor="] = false, ["moe-cache="] = false, ["moe-cache-profile="] = false,
 	}, { lora = true, v = true, ["override-tensor"] = true })
 	if not opts then
 		io.stderr:write("lgml-server: ", rest, "\n", USAGE)

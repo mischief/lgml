@@ -180,6 +180,9 @@ local STATS = {
 	{ "swap", "worker_swap_bytes", "swapped bytes of the worker process" },
 	{ "store_bytes", "prompt_store_bytes", "bytes in the prompt cache RAM store" },
 	{ "store_items", "prompt_store_items", "entries in the prompt cache RAM store" },
+	{ "moe_cache_hits", "moe_cache_hits", "expert picks that the device cache held" },
+	{ "moe_cache_misses", "moe_cache_misses", "expert picks that the CPU computed" },
+	{ "moe_cache_moved", "moe_cache_moved_bytes", "bytes moved into the expert cache" },
 }
 
 function R:note_stats(s)
