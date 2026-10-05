@@ -405,6 +405,8 @@ end
 --   `moe_cache_swap` is the most MiB moved into slots per pass;
 --   `moe_cache_halflife` is the half-life of a pick in tokens. It
 --   applies only on a GPU backend, and replaces `cpu_moe`/`n_cpu_moe`.
+--   `moe_cache_zerocopy` keeps the slots fixed and lets the device read
+--   the other experts from pinned host memory (see `XCache:zerocopy`).
 -- @treturn Engine the engine
 -- @raise when the backend, the model or its tokenizer does not load,
 -- when no chat template fits the model, an adapter does not fit it, the

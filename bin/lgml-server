@@ -86,6 +86,9 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       moe_cache_profile = file, moe_cache_swap = MiB,
                       moe_cache_halflife = tokens: an adaptive cache of
                       the most used experts in vram (see --moe-cache),
+                      moe_cache_zerocopy = true: fixed slots, and the
+                      device reads the other experts from pinned host
+                      memory over PCIe (needs the lgml ggml patch),
                       engine = Lua module with new(opts), such as a TTS engine,
                       modes = list of completion, multimodal, decide,
                       transcription, speech, image_generation, embedding
@@ -372,6 +375,7 @@ local function model_engine(spec, managed)
 			override = spec.override, moe_cache = spec.moe_cache,
 			moe_cache_max = spec.moe_cache_max, moe_cache_profile = spec.moe_cache_profile,
 			moe_cache_swap = spec.moe_cache_swap, moe_cache_halflife = spec.moe_cache_halflife,
+			moe_cache_zerocopy = spec.moe_cache_zerocopy,
 		})
 	end
 	local wargs = { "-m", spec.model }
@@ -416,6 +420,9 @@ local function model_engine(spec, managed)
 	if spec.moe_cache then
 		local v = spec.moe_cache == true and "auto" or tostring(spec.moe_cache)
 		table.move({ "--moe-cache", v }, 1, 2, #wargs + 1, wargs)
+		if spec.moe_cache_zerocopy then
+			wargs[#wargs + 1] = "--moe-cache-zerocopy"
+		end
 	end
 	if stt then
 		wargs[#wargs + 1] = "--stt"

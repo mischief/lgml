@@ -24,7 +24,7 @@ local USAGE = "usage: lgml-worker --fd n (-m model | --fake) [-b backend] [-t th
     "                   [--override-tensor pattern=backend]...\n" ..
     "                   [--moe-cache MiB|auto] [--moe-cache-max MiB]\n" ..
     "                   [--moe-cache-profile file] [--moe-cache-swap MiB]\n" ..
-    "                   [--moe-cache-halflife tokens]\n" ..
+    "                   [--moe-cache-halflife tokens] [--moe-cache-zerocopy]\n" ..
     "                   [--log-level name] [--log-file path] [--dump-prompts dir]\n" ..
     "                   [--mem-margin MiB] [--mem-limit MiB]\n" ..
     "                   [--fake-size MiB] [--fake-delta MiB] [--fake-load-ms n]\n" ..
@@ -47,7 +47,7 @@ local opts, rest = getopt.parse(arg, "m:b:t:c:", {
 	["dump-prompts="] = false, ["cpu-moe"] = false, ["n-cpu-moe="] = false,
 	["n-gpu-layers="] = false, ["override-tensor="] = false,
 	["moe-cache="] = false, ["moe-cache-max="] = false, ["moe-cache-profile="] = false,
-	["moe-cache-swap="] = false, ["moe-cache-halflife="] = false,
+	["moe-cache-swap="] = false, ["moe-cache-halflife="] = false, ["moe-cache-zerocopy"] = false,
 }, { lora = true, ["override-tensor"] = true })
 -- --devices prints the ggml devices as JSON, for the memory budget of
 -- the front.
@@ -155,6 +155,7 @@ local function load()
 		moe_cache = opts["moe-cache"], moe_cache_max = opts["moe-cache-max"],
 		moe_cache_profile = opts["moe-cache-profile"], moe_cache_swap = opts["moe-cache-swap"],
 		moe_cache_halflife = tonumber(opts["moe-cache-halflife"]),
+		moe_cache_zerocopy = opts["moe-cache-zerocopy"] or nil,
 	})
 end
 
