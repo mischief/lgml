@@ -376,6 +376,23 @@ function Model:models()
 	} }
 end
 
+--- Tells what the slots of the model do (see
+-- `lgml.server.engine.Engine.status`). It does not load the model.
+-- @treturn {table,...} one entry: the status of the worker when loaded,
+-- else `{ id, status, slots = {}, queued }` with the requests that wait
+-- for the load
+function Model:status()
+	local eng = self.state == "loaded" and self.engine
+	if eng and eng.status and eng.hello then
+		local list = eng:status()
+		for _, e in ipairs(list) do
+			e.id = self.id
+		end
+		return list
+	end
+	return { { id = self.id, status = self:models()[1].status, slots = {}, queued = self.inflight } }
+end
+
 --- Lists the modes of the model.
 -- @treturn {string,...} the mode names
 function Model:modes()

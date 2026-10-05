@@ -958,7 +958,7 @@ local function stream_handler(r, w)
 		return send("")
 	end
 	function h.keepalive()
-		return send(": keepalive\n\n")
+		return send(": keep-alive\n\n")
 	end
 	function h.open(_, b)
 		return send(function()

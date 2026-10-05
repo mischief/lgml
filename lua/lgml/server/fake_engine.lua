@@ -33,7 +33,7 @@ function M.new(opts)
 	return setmetatable({
 		delay = opts.delay or 5, model = opts.model or "fake",
 		n_ctx = opts.n_ctx or 4096, total_slots = opts.total_slots or 2,
-		calls = 0, cancels = 0, on_cancel = opts.on_cancel,
+		calls = 0, cancels = 0, on_cancel = opts.on_cancel, acts = {},
 	}, F)
 end
 
@@ -165,6 +165,49 @@ local function fake_logprob(text, k)
 	return e
 end
 
+--- Tells what the slots do (see `lgml.server.engine.Engine.status`).
+-- A running chat takes the first free slot; more wait.
+-- @treturn {table,...} one entry: `{ id, status, slots, queued }`
+function F:status()
+	local e = { id = self.model, status = "loaded", slots = {}, queued = 0 }
+	for i = 1, self.total_slots do
+		e.slots[i] = { id = i - 1, state = "idle" }
+	end
+	for _, a in pairs(self.acts) do
+		if a.slot then
+			e.slots[a.slot] = require("lgml.server.engine").slot_status(a)
+		else
+			e.queued = e.queued + 1
+		end
+	end
+	return { e }
+end
+
+-- The record of a new chat in the first free slot, or with no slot.
+function F:begin(sink, n)
+	local used = {}
+	for _, a in pairs(self.acts) do
+		used[a.slot or 0] = true
+	end
+	local a = { request_id = log.request_id(), state = "prompt", prompt_tokens = n, prompt_done = 0,
+		cached_tokens = 0 }
+	for i = 1, self.total_slots do
+		if not used[i] then
+			a.slot = i
+			break
+		end
+	end
+	self.acts[sink] = a
+	return a
+end
+
+-- Tell the sink the progress of record a, when it takes it.
+local function progress(sink, a)
+	if sink.progress and a.slot then
+		sink:progress(a)
+	end
+end
+
 --- Counts a cancel and calls `on_cancel`.
 -- @treturn nil
 -- @treturn string `"cancelled"`
@@ -184,8 +227,10 @@ end
 -- It calls `sink:prompt` before the first piece. `count_only` finishes
 -- at once with the prompt size.
 -- The last user message `"fail"` makes the call fail before any output,
--- `"crash"` ends the process with code 3, as a crashed worker, and
--- `"hang"` blocks the process for 30 s, as a hung worker.
+-- `"crash"` ends the process with code 3, as a crashed worker,
+-- `"hang"` blocks the process for 30 s, as a hung worker, and `"slow"`
+-- reads the prompt in 20 steps of one delay each, with progress.
+-- `status` shows each running chat.
 -- The prompt counts a quarter token per byte of text, 4 per message and
 -- 16 per image part. The reply counts one token per piece and stops at
 -- `max_tokens`. `stop`
@@ -202,6 +247,13 @@ end
 -- @treturn[2] string an error message
 -- @treturn[2] int an HTTP status
 function F:chat(req, sink)
+	local a = self:begin(sink, prompt_tokens(req))
+	local ok, msg, status = self:run(req, sink, a)
+	self.acts[sink] = nil
+	return ok, msg, status
+end
+
+function F:run(req, sink, a)
 	self.calls = self.calls + 1
 	if last_user(req) == "fail" then
 		return nil, "fake failure", 500
@@ -223,12 +275,26 @@ function F:chat(req, sink)
 	if sink.prompt and not sink:prompt(usage.prompt_tokens, 0) then
 		return self:cancel()
 	end
+	progress(sink, a)
+	if last_user(req) == "slow" then
+		for k = 1, 20 do
+			sleep(self.delay)
+			if sink:cancelled() then
+				return self:cancel()
+			end
+			a.prompt_done = usage.prompt_tokens * k // 20
+			progress(sink, a)
+		end
+	end
+	a.state, a.tokens = "answer", 0
+	progress(sink, a)
 	local out = output.new(sink, nil, { stop = req.stop })
 	for _, piece in ipairs(plan(req)) do
 		sleep(self.delay)
 		if sink:cancelled() then
 			return self:cancel()
 		end
+		a.tokens = usage.completion_tokens
 		if max and usage.completion_tokens >= max then
 			sink:finish("length", usage)
 			return true

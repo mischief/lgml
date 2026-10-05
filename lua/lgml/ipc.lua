@@ -36,7 +36,9 @@ M.CANCEL = 3
 -- Payload: `{ k, text, name, index, id }`. k is `"reasoning"` or
 -- `"content"` with text, `"tool_call"` with name, index and an
 -- optional id, or `"tool_args"` with index and text. Tool call indexes
--- start at 0 in each job.
+-- start at 0 in each job. k `"prompt"` has n and cached, the prompt
+-- size; k `"progress"` has p, the record of `Sink:progress` (see
+-- `lgml.server.engine`). The engine sends progress about once a second.
 M.DELTA = 4
 --- Worker to front: the job ended.
 -- Payload: `{ ok, msg, status, finish, result }`. ok is true on

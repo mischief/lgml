@@ -8,7 +8,6 @@
 local uv = require("luv")
 local json = require("lgml.json")
 local http = require("lgml.server.http")
-local sse = require("lgml.server.sse")
 local engine_api = require("lgml.server.engine")
 local multipart = require("lgml.server.multipart")
 local metrics = require("lgml.server.metrics")
@@ -73,9 +72,14 @@ local function new_reply(res, body, model)
 		include_usage = so and so.include_usage == true,
 		logprobs = body.logprobs == true,
 		id = rand_id("chatcmpl-", 24), created = os.time(), model = model,
-		choices = {}, writer = nil, broken = false,
+		choices = {}, writer = body.stream == true and translate.writer(res) or nil, broken = false,
 	}, Reply)
 end
+
+--- Milliseconds without bytes out before a `: keep-alive` comment in a
+-- chat stream. The comment also starts the stream, so a client that
+-- waits for a long prompt sees bytes.
+M.KEEPALIVE_MS = 10000
 
 function Reply:cancelled()
 	return self.broken or self.s:gone()
@@ -97,8 +101,9 @@ local function chunk(r, choices, extra)
 	return c
 end
 
+-- Sends one event; the first write starts the stream.
 local function send(r, value)
-	local ok = r.writer:send(value)
+	local ok = r.writer:send("data: " .. assert(json.encode(value)) .. "\n\n")
 	if not ok then
 		r.broken = true
 		return nil, "cancelled"
@@ -106,18 +111,9 @@ local function send(r, value)
 	return true
 end
 
--- Starts the event stream.
-local function start(r)
-	if r.writer then
-		return true
-	end
-	local w = sse.start(r.res)
-	if not w then
-		r.broken = true
-		return nil, "cancelled"
-	end
-	r.writer = w
-	return true
+-- Sends [DONE] and ends the body.
+local function done(r)
+	return r.writer:send("data: [DONE]\n\n") and r.writer:finish()
 end
 
 local Sink = {}
@@ -150,12 +146,11 @@ local function choice(self, delta, reason, lp)
 	}
 end
 
--- Starts the stream and sends the role chunk of the choice.
+-- Sends the role chunk of the choice.
 local function open(self)
 	local r = self.reply
-	local ok, err = start(r)
-	if not ok or self.started then
-		return ok, err
+	if self.started then
+		return alive(self)
 	end
 	self.started = true
 	return send(r, chunk(r, {
@@ -342,11 +337,11 @@ end
 -- Ends the stream with an error event, or sends an error response.
 local function fail(r, status, msg)
 	r.res.err = msg
-	if not r.writer then
+	if not (r.writer and r.writer.started) then
 		return r.res:error(status or 500, msg)
 	end
 	if send(r, http.error_object(status or 500, msg)) then
-		r.writer:done()
+		done(r)
 	end
 end
 
@@ -407,6 +402,11 @@ end
 local function run_chat(eng, res, body, model)
 	local r = new_reply(res, body, model)
 	log.note("model", model)
+	if r.writer then
+		r.writer:keepalive(function()
+			r.writer:send(": keep-alive\n\n")
+		end, M.KEEPALIVE_MS)
+	end
 	local ok, msg, status = true, nil, nil
 	for i = 1, body.n or 1 do
 		local sink = new_sink(r, i - 1)
@@ -424,6 +424,9 @@ local function run_chat(eng, res, body, model)
 	end
 	metrics.request(model, "chat", ok == true)
 	log_chat(r)
+	if r.writer then
+		r.writer:stop()
+	end
 	if r:cancelled() then
 		res.close = true
 		return
@@ -438,7 +441,7 @@ local function run_chat(eng, res, body, model)
 		res.close = true
 		return
 	end
-	if r:cancelled() or not r.writer:done() then
+	if r:cancelled() or not done(r) then
 		res.close = true
 	end
 end
@@ -507,6 +510,20 @@ local function set_adapters(eng, req, res)
 		return res:error(status or 400, msg or "lora-adapters failed")
 	end
 	return res:json(200, { success = true })
+end
+
+-- GET /status: what the slots of each model do.
+local function status(eng, res)
+	local list = eng.status and eng:status() or engine_api.plain_status(eng)
+	local models = json.array()
+	for i, m in ipairs(list) do
+		local slots = json.array()
+		for j, s in ipairs(m.slots or {}) do
+			slots[j] = s
+		end
+		models[i] = { id = m.id, status = m.status, slots = slots, queued = m.queued or 0 }
+	end
+	return res:json(200, { models = models })
 end
 
 local function props(eng, res)
@@ -1012,6 +1029,8 @@ end
 --
 -- - `/health`, `/models`, `/props` and `/openapi.json` (see
 --   `lgml.server.openapi`)
+-- - `/status`: what the slots of each model do, from
+--   `Engine:status` (see `lgml.server.engine`)
 -- - `/lora-adapters`: GET lists the adapters from the `lora` field of
 --   the engine props, as llama-server lists them. POST takes a list of
 --   `{ id, scale }` and calls `Engine:lora_adapters`.
@@ -1094,6 +1113,11 @@ function M.install(srv, eng, opts)
 	end
 	srv:route("GET", "/props", get_props)
 	srv:route("GET", "/v1/props", get_props)
+	local function get_status(_, res)
+		return status(eng, res)
+	end
+	srv:route("GET", "/status", get_status)
+	srv:route("GET", "/v1/status", get_status)
 	local function adapters(_, res)
 		local lora = eng:props().lora or {}
 		return res:json(200, #lora > 0 and lora or json.array())

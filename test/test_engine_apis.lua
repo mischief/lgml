@@ -257,7 +257,36 @@ local function test_repeat()
 	e.repeat_stop = 256
 end
 
+-- The engine reports the progress of a request to a sink with
+-- `progress`, and status shows the slot.
+local function test_progress()
+	local translate = require("lgml.server.translate")
+	local sink = translate.blocks({ s = { gone = function() return false end } })
+	local seen, views = {}, {}
+	function sink.progress(_, p)
+		seen[#seen + 1] = { state = p.state, done = p.prompt_done, total = p.prompt_tokens, tokens = p.tokens }
+		views[#views + 1] = e:status()[1].slots[p.slot]
+	end
+	local done
+	coroutine.wrap(function()
+		require("lgml.log").bind("0000cafe")
+		e:chat({ messages = { { role = "user", content = ("ab "):rep(200) } }, max_tokens = 3,
+			temperature = 0, reasoning_effort = "none" }, sink)
+		done = true
+	end)()
+	while not done do
+		require("luv").run("once")
+	end
+	local p, a = seen[1], seen[#seen]
+	ok(p and p.state == "prompt" and p.total > 300 and p.done < p.total and views[1].request_id == "0000cafe" and
+	    views[1].state == "prompt" and a.state == "answer" and a.tokens >= 1,
+	    ("progress: prompt then answer (%d reports)"):format(#seen))
+	local st = e:status()[1]
+	ok(st.id == "tiny" and st.slots[1].state == "idle" and st.queued == 0, "status: idle after the request")
+end
+
 test_messages()
+test_progress()
 test_budget()
 test_repeat()
 test_responses()

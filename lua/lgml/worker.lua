@@ -55,6 +55,10 @@ local function proxy(ch, id)
 		return delta({ k = "prompt", n = n, cached = cached })
 	end
 
+	function s.progress(_, p)
+		return delta({ k = "progress", p = p })
+	end
+
 	function s.finish(_, reason, usage, timings)
 		s.done = { reason = reason, usage = usage, timings = timings }
 	end

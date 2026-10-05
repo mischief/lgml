@@ -54,6 +54,8 @@ E.__index = E
 local UBATCH = 512
 -- The default count of one token in a row that ends a reply.
 local REPEAT_STOP = 256
+-- The least milliseconds between two progress reports of a request.
+local PROGRESS_MS = 1000
 -- The smallest context that `reserve` cuts to before it gives up.
 local MIN_FIT_CTX = 8192
 
@@ -327,7 +329,7 @@ function M.new(opts)
 		fixed = model.recurrent or (cache.ring ~= nil and cache.ring < n_ctx),
 		id = opts.id or info.meta["general.name"] or "lgml",
 		cache = cache, tokens = {},
-		busy = false, waiting = {}, adapters = adapters,
+		busy = false, waiting = {}, adapters = adapters, acts = {}, queued = 0,
 		repeat_stop = opts.repeat_stop_tokens or REPEAT_STOP,
 		reasoning_budget = opts.reasoning_budget_tokens,
 	}, E)
@@ -1646,6 +1648,7 @@ function E:prefill_batched(st, req, slot, prompt, from, stops, sink)
 	end
 	local logits
 	local i, c = from, 1
+	self:note(sink, slot, "prompt", from - 1, #prompt)
 	while i <= #prompt do
 		local j = math.min(#prompt, i + UBATCH - 1)
 		if stops[c] and stops[c] <= j then
@@ -1663,6 +1666,7 @@ function E:prefill_batched(st, req, slot, prompt, from, stops, sink)
 		logits = lg
 		table.move(prompt, i, j, #slot.tokens + 1, slot.tokens)
 		self:publish(slot.cache, slot.tokens)
+		self:note(sink, slot, "prompt", j, #prompt)
 		if j == stops[c] then
 			self:acquire()
 			local good, err = pcall(self.checkpoint_slot, self, slot)
@@ -1706,6 +1710,7 @@ function E:prefill(prompt, from, sink, extra)
 	if self.pc then
 		self:share_state(self.cache, self.tokens, self.pc.ckpts)
 	end
+	self:note(sink, self.slot, "prompt", from - 1, #prompt)
 	while i <= #prompt do
 		local j = math.min(#prompt, i + UBATCH - 1)
 		if stops[c] and stops[c] <= j then
@@ -1737,6 +1742,7 @@ function E:prefill(prompt, from, sink, extra)
 		logits = self:eval(ids, "last", embd)
 		table.move(prompt, i, j, #self.tokens + 1, self.tokens)
 		self:publish(self.cache, self.tokens)
+		self:note(sink, self.slot, "prompt", j, #prompt)
 		if j == stops[c] then
 			self.pc:checkpoint()
 			self:share_state(self.cache, self.tokens, self.pc.ckpts)
@@ -1784,15 +1790,18 @@ function E:chat(req, sink)
 	end
 	local st = { lock = true }
 	local got
+	self.queued = self.queued + 1
 	if self.concurrent then
 		local scales, key = self:lora_for(req.lora)
 		if not scales then
+			self.queued = self.queued - 1
 			return nil, key, 400
 		end
 		got = self:acquire_slot(key, cancel_of(sink))
 	else
 		got = self:acquire(cancel_of(sink))
 	end
+	self.queued = self.queued - 1
 	if not got then
 		return true
 	end
@@ -2069,9 +2078,52 @@ local function first_lines(text, n)
 	return table.concat(out, "\n")
 end
 
+--- The work of each slot, for `GET /status`.
+-- See `lgml.server.engine.Engine.status`.
+-- @treturn {table,...} one entry: `{ id, status, slots, queued }`
+function E:status()
+	local slots = {}
+	for i = 1, #self.slots do
+		slots[i] = { id = i - 1, state = "idle" }
+	end
+	for _, a in pairs(self.acts) do
+		if a.slot and slots[a.slot] then
+			slots[a.slot] = engine_api.slot_status(a)
+		end
+	end
+	return { { id = self.id, status = "loaded", slots = slots, queued = self.queued } }
+end
+
+-- Note the progress of the request of sink on slot: state "prompt" with
+-- done of total prompt tokens, or "answer" with done tokens made. A
+-- sink with `progress` gets the record at each change of state or slot,
+-- and at most once in PROGRESS_MS else.
+function E:note(sink, slot, state, done, total)
+	local a = self.acts[sink]
+	if not a then
+		return
+	end
+	local i = self:slot_index(slot)
+	local changed = a.state ~= state or a.slot ~= i
+	a.slot, a.state = i, state
+	if state == "prompt" then
+		a.prompt_done, a.prompt_tokens = done, total
+		a.cached_tokens = a.cached_tokens or done
+	else
+		a.tokens = done
+	end
+	local now = uv.now()
+	if sink.progress and (changed or now - a.sent >= PROGRESS_MS) then
+		a.sent = now
+		sink:progress(a)
+	end
+end
+
 function E:run(req, sink, st)
 	self.image_ms = 0
+	self.acts[sink] = { request_id = log.request_id(), state = "wait", sent = 0 }
 	local ok, a, b, c = pcall(self.run_prompt, self, req, sink, st)
+	self.acts[sink] = nil
 	self:drop_images()
 	if not ok then
 		error(a, 0)
@@ -2221,6 +2273,7 @@ function E:run_prompt(req, sink, st)
 		elseif not r then
 			return true
 		end
+		self:note(sink, slot or self.slot, "answer", n)
 		if budget and not forced and out:in_reasoning() and out.reasoning_tokens >= budget then
 			forced = self.tk:encode(WRAP_UP .. THINK_END[self.family_name])
 			L:debug("reasoning budget", "tokens", out.reasoning_tokens)

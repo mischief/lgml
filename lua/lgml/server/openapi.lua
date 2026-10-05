@@ -558,6 +558,19 @@ local function misc_schemas(c)
 	c.LoadRequest = obj({ model = str() }, { "model" })
 	c.Success = obj({ success = { const = true } })
 	c.Health = obj({ status = { const = "ok" } })
+	local slot = obj({
+		id = int("From 0."),
+		state = { type = "string", enum = json.array({ "idle", "prompt", "answer" }) },
+		request_id = str("The x-lgml-request-id of the request."),
+		prompt_tokens = int(), prompt_done = int("Prompt tokens read so far, the cached ones too."),
+		cached_tokens = int(), tokens = int("Tokens made so far."),
+	}, { "id", "state" })
+	c.Status = obj({
+		models = arr(obj({
+			id = str(), status = str("Load state, as in /v1/models."), slots = arr(slot),
+			queued = int("Requests that wait for a slot or for the load."),
+		}, { "id", "status", "slots", "queued" })),
+	}, { "models" })
 end
 
 -- operations
@@ -803,6 +816,10 @@ local function operations()
 				responses = with({ ["200"] = reply("Set.", "application/json", ref("Success")) }, { 400 }),
 			},
 		},
+		["/status"] = { GET = {
+			tag = "lgml", summary = "What the slots of each model do",
+			responses = { ["200"] = reply("Slots.", "application/json", ref("Status")) },
+		} },
 		["/health"] = { GET = {
 			tag = "llama.cpp", summary = "Health",
 			responses = { ["200"] = reply("Up.", "application/json", ref("Health")) },

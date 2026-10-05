@@ -177,6 +177,7 @@ if lua_bin.found()
   test('systemone', lua_bin, args : [files('test/test_systemone.lua')], timeout : 600)
   test('worker', lua_bin, args : [files('test/test_worker.lua')], timeout : 60)
   test('stream', lua_bin, args : [files('test/test_stream.lua')], timeout : 30)
+  test('status', lua_bin, args : [files('test/test_status.lua')], timeout : 60)
   test('pool', lua_bin, args : [files('test/test_pool.lua')], timeout : 120)
   test('budget', lua_bin, args : [files('test/test_budget.lua')], timeout : 120)
   test('placement', lua_bin, args : [files('test/test_placement.lua')],

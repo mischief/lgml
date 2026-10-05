@@ -34,6 +34,7 @@ Labels in this file:
 - [Load and unload](#load-and-unload)
 - [Server properties and adapters](#server-properties-and-adapters)
 - [Health](#health)
+- [Status](#status)
 - [Metrics](#metrics)
 - [CORS](#cors)
 - [OpenAPI document](#openapi-document)
@@ -67,6 +68,7 @@ for one handler.
 | GET | `/lora-adapters`, `/v1/lora-adapters` | llama.cpp | [Server properties and adapters](#server-properties-and-adapters) |
 | POST | `/lora-adapters`, `/v1/lora-adapters` | llama.cpp | [Server properties and adapters](#server-properties-and-adapters) |
 | GET | `/health`, `/v1/health` | llama.cpp | [Health](#health) |
+| GET | `/status`, `/v1/status` | lgml | [Status](#status) |
 | GET | `/metrics` | lgml | [Metrics](#metrics) |
 | GET | `/openapi.json`, `/v1/openapi.json` | lgml | [OpenAPI document](#openapi-document) |
 
@@ -555,6 +557,13 @@ one `data:` line with a `chat.completion.chunk` object:
    `usage`. The other chunks then have `usage: null`, as OpenAI sends.
 6. `data: [DONE]`.
 
+While no bytes go out for 10 seconds, such as while a long prompt
+reads, the server sends an SSE comment line, `: keep-alive`. Clients
+skip it; it keeps proxies and clients with a read timeout from closing
+the stream. The first comment also starts the stream (status 200 and
+the headers). `GET /status` shows how far the prompt is; see
+[Status](#status).
+
 When the engine fails before the first event, the reply is a plain
 JSON error with its status. When it fails later, the stream sends
 `data: {"error": {...}}` and then `data: [DONE]`.
@@ -792,7 +801,8 @@ out for 10 seconds (a long prefill, a model load, long reasoning with
 "ping"}`); Claude Code aborts a stream after 300 silent seconds. When a
 ping starts the stream before the engine knows the prompt size,
 `message_start` has 0 input tokens and `message_delta` has the real
-counts.
+counts. The Messages stream uses `ping` events, not comment lines, as
+the Anthropic API does.
 
 An error before the stream starts is a plain JSON error with its
 status. An error after it is an `error` event with the error object,
@@ -1021,7 +1031,8 @@ the final reasoning item has the text in `content` too.
 
 The stream starts when the engine knows the prompt size, before the
 prefill. While no bytes go out for 10 seconds, the server sends an SSE
-comment line (`: keepalive`), which clients skip.
+comment line (`: keep-alive`), which clients skip. `GET /status` shows
+how far the prompt is; see [Status](#status).
 
 An error before the stream starts is a plain JSON error. An error
 after it is an `error` event, in both the flat openai-python form and
@@ -1565,6 +1576,39 @@ curl -s localhost:8080/lora-adapters -d '[{"id": 0, "scale": 0.5}]'
 `GET /health` (alias `/v1/health`). llama.cpp. It gives
 `{"status": "ok"}` when the server listens. It does not check the
 models.
+
+## Status
+
+`GET /status` (alias `/v1/status`). lgml. It tells what each slot of
+each model does now. A slot is one sequence of the KV pool of a model
+(see `-np`); a request takes one slot while it runs.
+
+```json
+{"models": [
+  {"id": "qwen3-14b", "status": "loaded", "queued": 1, "slots": [
+    {"id": 0, "state": "prompt", "request_id": "3fa9c2d1", "prompt_tokens": 30210,
+     "prompt_done": 12800, "cached_tokens": 2048},
+    {"id": 1, "state": "answer", "request_id": "a07b11e4", "prompt_tokens": 812,
+     "prompt_done": 812, "cached_tokens": 790, "tokens": 57},
+    {"id": 2, "state": "idle"}]},
+  {"id": "whisper", "status": "unloaded", "queued": 0, "slots": []}]}
+```
+
+- `status`: the load state, as in [Models](#models). A model that is
+  not loaded has no slots.
+- `queued`: chat requests that wait for a slot or for the load.
+- `state`: `idle`, `prompt` (the model reads the prompt) or `answer`
+  (it makes tokens).
+- `request_id`: the `x-lgml-request-id` of the request in the slot.
+- `prompt_tokens`, `prompt_done`: the prompt size and the tokens read so
+  far, with the cached ones. `cached_tokens`: the tokens reused from
+  the cache.
+- `tokens`: the tokens made so far, reasoning too.
+
+A model in a worker sends its progress to the server about once a
+second, and at each change of state, so the numbers can lag by a
+second. Only chat requests show in the slots; a model without slots
+(speech, images) has none.
 
 ## Metrics
 

@@ -422,6 +422,18 @@ function R:unload(id)
 	return e:unload()
 end
 
+--- Tells what the slots of each model do, in engine order (see
+-- `lgml.server.engine.Engine.status`).
+-- @treturn {table,...} one entry per model
+function R:status()
+	local out = {}
+	for _, e in ipairs(self.engines) do
+		local list = e.status and e:status() or engine_api.plain_status(e)
+		table.move(list, 1, #list, #out + 1, out)
+	end
+	return out
+end
+
 --- Stops each engine that has a `stop` method.
 function R:stop()
 	for _, e in ipairs(self.engines) do

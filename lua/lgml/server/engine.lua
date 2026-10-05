@@ -83,6 +83,30 @@ function M.with_lora(req, scales)
 	return t
 end
 
+--- The `/status` entry of a busy slot from a progress record.
+-- @tparam table p the record that `Sink:progress` gets
+-- @treturn table `{ id, state, request_id, prompt_tokens, prompt_done,
+-- cached_tokens, tokens }`; id counts from 0
+function M.slot_status(p)
+	return {
+		id = p.slot - 1, state = p.state, request_id = p.request_id,
+		prompt_tokens = p.prompt_tokens, prompt_done = p.prompt_done,
+		cached_tokens = p.cached_tokens, tokens = p.tokens,
+	}
+end
+
+--- The `/status` entries of an engine without a `status` method: each
+-- model of `Engine:models` with its load state and no slots.
+-- @tparam Engine e the engine
+-- @treturn {table,...} the entries
+function M.plain_status(e)
+	local out = {}
+	for i, m in ipairs(e:models()) do
+		out[i] = { id = m.id, status = m.status or "loaded", slots = {}, queued = 0 }
+	end
+	return out
+end
+
 --- Checks that e has the methods of the interface.
 -- @tparam Engine e the engine to check
 -- @treturn Engine e
@@ -269,6 +293,16 @@ end
 -- @treturn ?string the model id
 -- @function model_for
 
+--- Tells what the slots of each model do, for `GET /status`.
+-- This method is optional; without it, the server uses `plain_status`.
+-- Each slot is `{ id, state }`, with id from 0 and state `"idle"`,
+-- `"prompt"` (it reads the prompt) or `"answer"` (it makes tokens). A
+-- busy slot also has the fields of `slot_status`.
+-- @treturn {table,...} one entry per model: `{ id, status, slots,
+-- queued }`; status is the load state as in `models`, and queued counts
+-- the requests that wait for a slot
+-- @function status
+
 --- Stops the engine and its worker processes. This method is optional.
 -- `lgml-server` calls it at exit.
 -- @function stop
@@ -328,6 +362,15 @@ end
 -- @treturn[2] nil
 -- @treturn[2] string `"cancelled"`
 -- @function prompt
+
+--- Tells how far the request is. This method is optional for a sink;
+-- an engine calls it when the sink has it, at most about once a second
+-- and at each change of state. The worker sends it to the front, which
+-- shows it in `GET /status`.
+-- @tparam table p `{ slot, state, request_id, prompt_tokens,
+-- prompt_done, cached_tokens, tokens }`: slot counts from 1; state is
+-- `"prompt"` or `"answer"`; tokens counts the tokens made
+-- @function progress
 
 --- Ends the reply. Call it once.
 -- The server changes reason `stop` to `tool_calls` when the reply has

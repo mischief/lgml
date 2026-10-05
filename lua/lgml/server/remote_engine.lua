@@ -205,7 +205,11 @@ function R:message(t, id, v)
 	end
 	local job = self.jobs[id]
 	if job then
-		if t == ipc.DONE then
+		-- Progress is for status only; the job does not wake.
+		if t == ipc.DELTA and type(v) == "table" and v.k == "progress" then
+			job.progress = v.p
+			return
+		elseif t == ipc.DONE then
 			self.jobs[id] = nil
 			self:note_stats(v and v.stats)
 		end
@@ -296,6 +300,28 @@ function R:lora_adapters(list)
 	end
 	self.lora = scales
 	return true
+end
+
+--- Tells what the slots of the worker engine do, from the progress
+-- that its chat jobs send (see `lgml.server.engine.Engine.status`). A
+-- chat job with no progress yet waits for a slot.
+-- @treturn {table,...} one entry: `{ id, status, slots, queued }`
+function R:status()
+	local h = self.hello
+	local m = h and h.models and h.models[1]
+	local e = { id = m and m.id or self.opts.id, status = h and "loaded" or "loading", slots = {}, queued = 0 }
+	for i = 1, h and h.props and h.props.total_slots or 0 do
+		e.slots[i] = { id = i - 1, state = "idle" }
+	end
+	for _, job in pairs(self.jobs) do
+		local p = job.progress
+		if p and type(p.slot) == "number" and e.slots[p.slot] then
+			e.slots[p.slot] = engine_api.slot_status(p)
+		elseif job.chat then
+			e.queued = e.queued + 1
+		end
+	end
+	return { e }
 end
 
 --- Sends SIGTERM to the worker. No new worker starts.
@@ -420,7 +446,7 @@ function R:chat(req, sink)
 	end
 	local id = self.next_id
 	self.next_id = id + 1
-	local job = setmetatable({ q = {} }, Job)
+	local job = setmetatable({ q = {}, chat = true }, Job)
 	self.jobs[id] = job
 	self.ch:send(ipc.JOB, id, tagged(engine_api.with_lora(req, self.lora)))
 	local map, cancelled = {}, false
