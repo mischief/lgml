@@ -275,8 +275,10 @@ function M.state_copy(model)
 	local function build(cache)
 		close_graphs()
 		local by = {}
-		for _, part in ipairs({ "conv", "ssm" }) do
-			for il, t in pairs(cache[part]) do
+		-- The PLE conv state of qwen4exp is recurrent too.
+		local parts = { conv = cache.conv, ssm = cache.ssm, pconv = cache.pconv or {} }
+		for _, part in ipairs({ "conv", "ssm", "pconv" }) do
+			for il, t in pairs(parts[part]) do
 				local key = part .. il
 				local be = t:backend()
 				local s = sc.spare[key]
