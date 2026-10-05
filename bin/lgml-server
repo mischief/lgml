@@ -742,6 +742,10 @@ local function main(args)
 		die("listen: " .. tostring(err))
 	end
 	L:info("listening", "addr", ("%s:%d"):format(srv.host, bound), "log_level", log.level_name())
+	local has_lgml, lgml = pcall(require, "lgml")
+	if has_lgml and lgml.set_proc_title then
+		lgml.set_proc_title(("lgml-server %s:%d"):format(srv.host, bound), "lgml-server")
+	end
 	local sigs
 	local function stop()
 		if engine.stop then

@@ -76,7 +76,13 @@ if opts["log-file"] then
 	end
 end
 log.set_dump_dir(opts["dump-prompts"])
-log.set_prefix("worker:" .. (opts.alias or (opts.m and opts.m:match("([^/]+)/*$")) or "fake"))
+local name = opts.alias or (opts.m and opts.m:match("([^/]+)/*$")) or "fake"
+log.set_prefix("worker:" .. name)
+-- ps and top show the model, not the interpreter.
+local has_lgml, lgml = pcall(require, "lgml")
+if has_lgml and lgml.set_proc_title then
+	lgml.set_proc_title("lgml-worker " .. name, "lgml:" .. name)
+end
 local L = log.new("worker")
 local fd = math.tointeger(tonumber(opts.fd))
 local threads = opts.t and math.tointeger(tonumber(opts.t))
