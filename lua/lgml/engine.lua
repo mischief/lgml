@@ -522,7 +522,8 @@ function M.new(opts)
 	    drafter = so.drafter, adaptive = so.adaptive }
 	if not so.drafter and model.mtp then
 		e.spec_opts.drafter = function()
-			return spec.mtp(model, { ngram_min = so.ngram_min, ngram_max = so.ngram_max, flash_attn = fa })
+			return spec.mtp(model, { ngram_min = so.ngram_min, ngram_max = so.ngram_max, flash_attn = fa,
+				max = so.max, min_p = so.min_p })
 		end
 	end
 	e.spec_costs = spec.costs()

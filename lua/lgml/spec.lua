@@ -102,11 +102,12 @@ Mtp.__index = Mtp
 -- verify path.
 -- @param model the model, with mtp
 -- @tparam[opt] table opts `max` (the most guesses of the head, default
--- 3), `flash_attn`, and the options of `lookup`
+-- 3), `min_p` (a guess whose probability is below it ends the draft;
+-- default 0), `flash_attn`, and the options of `lookup`
 -- @treturn table the drafter
 function M.mtp(model, opts)
 	opts = opts or {}
-	return setmetatable({ model = model, max = opts.max or 3, flash = opts.flash_attn,
+	return setmetatable({ model = model, max = opts.max or 3, min_p = opts.min_p, flash = opts.flash_attn,
 		lookup = M.lookup(opts), hidden = true, drafted = 0, used = 0 }, Mtp)
 end
 
@@ -138,7 +139,7 @@ function Mtp:draft(ctx, k)
 	local out = {}
 	if ok and cache.mtp_h then
 		out = require("lgml.qwen4exp").mtp_draft(self.model, cache, pend, h_rest, math.min(k, self.max),
-		    self.flash)
+		    self.flash, nil, self.min_p)
 		self.used = self.used + 1
 	end
 	if h_rest then

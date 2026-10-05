@@ -1080,7 +1080,7 @@ end
 -- @tparam[opt] boolean flash true for flash attention
 -- @tparam[opt] table rows gets the logits of each step, as lists
 -- @treturn {integer,...} the guesses
-function M.mtp_draft(self, cache, pend, h_rest, k, flash, rows)
+function M.mtp_draft(self, cache, pend, h_rest, k, flash, rows, min_p)
 	local hp = self.hp
 	if not self.mtp_hbuf then
 		self.mtp_hbuf = self.be:tensor("f32", { 1, hp.hc, hp.n_embd })
@@ -1091,8 +1091,12 @@ function M.mtp_draft(self, cache, pend, h_rest, k, flash, rows)
 	self:grow(cache, math.min(cache.n_ctx, cache.n_past + #pend + k))
 	px.n_past = cache.n_past
 	local out, ids = {}, pend
+	-- The best token and its probability, for the min_p gate.
 	local function argmax(g, logits, taps)
-		return g:argmax(logits), taps.h, logits
+		local best = g:argmax(logits)
+		local n = logits:shape()[2]
+		local p = g:get_rows(g:reshape(g:soft_max(logits), { n, 1 }), best)
+		return best, taps.h, logits, p
 	end
 	for j = 1, k do
 		if px.n_past + #ids > cache.n_ctx then
@@ -1100,7 +1104,11 @@ function M.mtp_draft(self, cache, pend, h_rest, k, flash, rows)
 		end
 		local o = { logits = "last", flash_attn = flash, first = j == 1, h_rest = j == 1 and h_rest or nil,
 			tag = "mtp" }
-		local best, _, logits = replay.run(head, px, ids, o, argmax)
+		local best, _, logits, p = replay.run(head, px, ids, o, argmax)
+		-- An unsure guess ends the draft: it would likely be rejected.
+		if min_p and min_p > 0 and p:get()[1] < min_p then
+			break
+		end
 		out[j] = best:get()[1]
 		if rows then
 			rows[j] = logits:get()
