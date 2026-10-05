@@ -113,6 +113,7 @@ end
 --   GPU model; the measure of the worker does not change them
 -- - `fixed`: true to keep `size` and not use the measure of the worker
 -- - `context_length`: the context size, when known before the load
+-- - `n_ctx_train`: the context the model was trained for, when known
 -- - `props`: the props to give while the model is not loaded
 -- - `idle`: seconds without requests before it unloads (default: the
 --   pool's; 0 turns it off)
@@ -124,7 +125,8 @@ function P:add(o)
 		pool = self, id = o.id, mode_list = o.modes, kind = o.kind or "gpu",
 		estimate = o.size or 0, size = o.size or 0, files = o.files or 0,
 		margin = o.margin or 0, extra = o.extra or {}, fixed = o.fixed,
-		context_length = o.context_length, static_props = o.props, idle = o.idle,
+		context_length = o.context_length, n_ctx_train = o.n_ctx_train, static_props = o.props,
+		idle = o.idle,
 		start = o.start,
 		state = "unloaded", inflight = 0, wanted = 0, last = 0, waiters = {}, counted = false,
 	}, Model)
@@ -352,8 +354,8 @@ end
 
 --- Lists the one model with its load state.
 -- It does not load the model.
--- @treturn {table,...} `{ { id, context_length, capabilities, status,
--- bytes, memory, vision } }`; status is the state, bytes the size counted
+-- @treturn {table,...} `{ { id, context_length, n_ctx_train, capabilities,
+-- status, bytes, memory, vision } }`; status is the state, bytes the size counted
 -- against the budget, and memory the parts that the worker measured:
 -- `{ weights, cache, compute, overhead }` in bytes, while loaded
 function Model:models()
@@ -368,7 +370,7 @@ function Model:models()
 		ctx = h.models[1].context_length or ctx
 	end
 	return { {
-		id = self.id, context_length = ctx, capabilities = self.mode_list,
+		id = self.id, context_length = ctx, n_ctx_train = self.n_ctx_train, capabilities = self.mode_list,
 		status = self.failed and self.state == "unloaded" and "failed" or self.state,
 		bytes = self.size, vision = vision,
 		memory = self.state == "loaded" and p and { weights = p.weights, cache = p.cache,

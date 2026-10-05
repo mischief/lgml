@@ -230,10 +230,11 @@ end
 -- @tparam[opt] number budget the memory budget in bytes of the kind of
 -- `backend`
 -- @tparam[opt] boolean gpu false when the machine has no GPU (see `kind`)
--- @treturn table `{ bytes, files, kv, margin, n_ctx, slots, kind, extra,
--- n_cpu_moe, moe_cache, moe_cache_max }`; moe_cache is the bytes of the
+-- @treturn table `{ bytes, files, kv, margin, n_ctx, n_ctx_train, slots,
+-- kind, extra, n_cpu_moe, moe_cache, moe_cache_max }`; moe_cache is the bytes of the
 -- expert cache, and moe_cache_max its cap in bytes for "auto"; bytes is the part on the kind of `backend`; n_ctx is the
 -- context for the worker, or nil when the estimate does not know it;
+-- n_ctx_train is the context the model was trained for;
 -- slots is the slot count of a chat model;
 -- extra is `{ [kind] = bytes }` for the parts on other kinds
 -- @raise on bad placement keys
@@ -262,6 +263,7 @@ function M.model(spec, budget, gpu)
 				n = math.min(n, math.max(math.tointeger(fit) or 256, 256))
 			end
 			r.n_ctx = n
+			r.n_ctx_train = n_train
 			r.slots = slots
 			r.kv = per * n + fixed * slots
 			if cpu then

@@ -465,7 +465,7 @@ local function models(eng, req, res)
 			id = m.id, object = "model", created = m.created or 0,
 			owned_by = m.owned_by or "lgml",
 			context_length = m.context_length,
-			meta = { n_ctx_train = m.context_length },
+			meta = { n_ctx_train = m.n_ctx_train or m.context_length },
 			capabilities = caps,
 			status = { value = m.status or "loaded" },
 			lgml = { status = m.status or "loaded", bytes = m.bytes, memory = m.memory },

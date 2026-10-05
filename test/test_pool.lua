@@ -484,6 +484,7 @@ local function test_estimate()
 	per = model:cache_size({ type_k = "f32", type_v = "f16" })
 	e = estimate.model({ model = path, ctx = 128, cache_type_k = "f32" })
 	ok(e.n_ctx == 128 and e.kv == per * 128, "estimate: ctx and cache types")
+	ok(e.n_ctx_train == 256, "estimate: n_ctx_train is the trained context, not ctx")
 	e = estimate.model({ model = path }, size + estimate.MARGIN + 130 * model:cache_size({ type = "f16" }))
 	ok(e.n_ctx == 256, "estimate: the context shrinks to fit the budget, to at least 256")
 	ok(estimate.id({ model = path }) == "tiny qwen3" and estimate.id({ model = "/m/x.gguf", id = "y" }) == "y" and

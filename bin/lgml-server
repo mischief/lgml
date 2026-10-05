@@ -514,7 +514,7 @@ local function managed_engines(path, cfg, opts)
 			id = spec.id, modes = modes, kind = kind,
 			size = mem and mem * MiB or est.bytes, fixed = mem ~= nil,
 			files = est.files, margin = est.margin, extra = est.extra,
-			context_length = est.n_ctx,
+			context_length = est.n_ctx, n_ctx_train = est.n_ctx_train,
 			idle = number_key(spec, "idle"),
 			props = { n_ctx = est.n_ctx or 0, total_slots = 1, lora = list,
 			    modalities = { vision = spec.mmproj ~= nil } },
