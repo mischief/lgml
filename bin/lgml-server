@@ -65,7 +65,8 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       flash_attn, stt, cache_type_k, cache_type_v, recipe,
                       cache_ram, ctx_checkpoints, kv_initial, slots,
                       ubatch, repeat_stop_tokens, reasoning_budget_tokens
-                      (--reasoning-budget), lora = "file[:scale]" or a
+                      (--reasoning-budget), speculative = true, false or
+                      the most draft tokens (--spec), lora = "file[:scale]" or a
                       list of them or of { path, scale }, mmproj,
                       image_min_tokens, image_max_tokens,
                       text_backend = backend of the text encoder of
@@ -116,6 +117,9 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
       --kv-initial n  KV pool cells at load (default 4096); the pool
                       grows as prompts need, up to -c; 0 allocates all
                       -c cells at load
+      --spec n        speculative decoding with prompt lookup drafts of
+                      at most n tokens (default 0: off); a request can
+                      turn it on or off with "speculative"
   -np, --parallel n   slots: the most sequences kept (default 4, or
                       fewer when their recurrent states and rings would
                       take more than a quarter of the pool); all
@@ -253,6 +257,16 @@ local function model_engine(spec, managed)
 	if spec.kv_initial and not (kvi and kvi >= 0) then
 		die("bad KV initial size " .. tostring(spec.kv_initial))
 	end
+	local sp = spec.speculative
+	if type(sp) ~= "boolean" and sp ~= nil then
+		sp = math.tointeger(tonumber(sp))
+		if not (sp and sp >= 0 and sp <= 64) then
+			die("bad speculative setting " .. tostring(spec.speculative))
+		end
+	end
+	if sp == true then
+		sp = 16
+	end
 	local nslots = spec.slots and math.tointeger(tonumber(spec.slots))
 	if spec.slots and not (nslots and nslots >= 1 and nslots <= 64) then
 		die("bad slot count " .. tostring(spec.slots))
@@ -334,6 +348,7 @@ local function model_engine(spec, managed)
 			recipe = spec.recipe, cache_ram = ram, ctx_checkpoints = ckpt, lora = lora,
 			kv_initial = kvi, slots = nslots, repeat_stop_tokens = rst,
 			reasoning_budget_tokens = rbt, ubatch = ub,
+			speculative = sp and sp > 0 and { max = sp } or nil,
 			mmproj = spec.mmproj, image_min_tokens = imin, image_max_tokens = imax,
 			cpu_moe = spec.cpu_moe, n_cpu_moe = spec.n_cpu_moe, n_gpu_layers = spec.n_gpu_layers,
 			override = spec.override,
@@ -348,6 +363,7 @@ local function model_engine(spec, managed)
 		["--ctx-checkpoints"] = spec.ctx_checkpoints, ["--mmproj"] = spec.mmproj,
 		["--kv-initial"] = kvi, ["--slots"] = nslots, ["--repeat-stop"] = rst,
 		["--reasoning-budget"] = rbt, ["--ubatch"] = ub,
+		["--spec"] = sp and sp > 0 and sp or nil,
 		["--image-min-tokens"] = imin, ["--image-max-tokens"] = imax,
 		["--image-max-side"] = side, ["--mem-margin"] = spec.mem_margin,
 	}) do
@@ -569,6 +585,7 @@ local function make_engine(opts, cfg)
 			kv_initial = opts["kv-initial"], slots = opts.parallel,
 			repeat_stop_tokens = opts["repeat-stop"], reasoning_budget_tokens = opts["reasoning-budget"],
 			ubatch = opts.ubatch,
+			speculative = opts.spec,
 			engine = opts.engine, lora = opts.lora, mmproj = opts.mmproj,
 			image_min_tokens = opts["image-min-tokens"],
 			image_max_tokens = opts["image-max-tokens"],
@@ -650,6 +667,7 @@ local function main(args)
 		["recipe="] = false, ["cache-ram="] = false, ["ctx-checkpoints="] = false,
 		["kv-initial="] = false, ["parallel="] = false, ["repeat-stop="] = false,
 		["reasoning-budget="] = false, ["ubatch="] = false,
+		["spec="] = false,
 		["lora="] = false, ["cors="] = false, ["vram="] = false, ["idle="] = false,
 		["mmproj="] = false, ["image-min-tokens="] = false, ["image-max-tokens="] = false,
 		["text-backend="] = false, ["state-dir="] = false, ["unknown-fields="] = false,

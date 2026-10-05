@@ -62,6 +62,10 @@ function M.chat(model, t)
 	M.add("cache_tokens_total", "prompt tokens reused from the cache", model, t.cache_n)
 	M.add("restored_tokens_total", "prompt tokens restored from host memory", model, t.restored_n)
 	M.add("repeat_stops_total", "replies that ended on one token repeated", model, t.repeat_stop)
+	if t.draft_n then
+		M.add("draft_tokens_total", "speculative draft tokens verified", model, t.draft_n)
+		M.add("draft_accepted_tokens_total", "speculative draft tokens kept", model, t.draft_accepted)
+	end
 end
 
 -- Header value: integers as they are, other numbers with 3 decimals.

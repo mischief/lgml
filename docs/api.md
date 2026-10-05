@@ -175,7 +175,7 @@ lgml extensions.
 
 | Route | Headers |
 | --- | --- |
-| chat, not streamed | the llama.cpp timings of the reply: `x-lgml-cache-n` (prompt tokens reused from the KV cache), `x-lgml-restored-n` (prompt tokens restored from the host prompt store), `x-lgml-prompt-n` (prompt tokens computed), `x-lgml-prompt-ms`, `x-lgml-prompt-per-token-ms`, `x-lgml-prompt-per-second`, `x-lgml-predicted-n` (tokens made), `x-lgml-predicted-ms`, `x-lgml-predicted-per-token-ms`, `x-lgml-predicted-per-second`. An engine can give fewer. |
+| chat, not streamed | the llama.cpp timings of the reply: `x-lgml-cache-n` (prompt tokens reused from the KV cache), `x-lgml-restored-n` (prompt tokens restored from the host prompt store), `x-lgml-prompt-n` (prompt tokens computed), `x-lgml-prompt-ms`, `x-lgml-prompt-per-token-ms`, `x-lgml-prompt-per-second`, `x-lgml-predicted-n` (tokens made), `x-lgml-predicted-ms`, `x-lgml-predicted-per-token-ms`, `x-lgml-predicted-per-second`, and with speculative decoding `x-lgml-draft-n` and `x-lgml-draft-accepted`. An engine can give fewer. |
 | images | `x-lgml-elapsed-ms` (wall time), `x-lgml-images` (count), `x-lgml-steps` (sampling steps of all images), `x-lgml-seed` (seed of the first image), `x-lgml-sample-ms` (sampling time), `x-lgml-ms-per-step` |
 | speech | `x-lgml-elapsed-ms`, `x-lgml-audio-seconds` (length of the audio), `x-lgml-rtf` (wall time over audio time), `x-lgml-sample-rate` (samples per second), `x-lgml-channels` (1) |
 | transcriptions | `x-lgml-elapsed-ms`, `x-lgml-audio-seconds` (length of the input), `x-lgml-rtf` |
@@ -275,6 +275,7 @@ usage, the event stream framing and the tool call fragments.
 | `chat_template_kwargs` | llama.cpp | supported | `enable_thinking`, `reasoning_effort` (a string for the template), `preserve_thinking` (false drops old reasoning). |
 | `lora` | llama.cpp | supported | Adapter scales for this request: `[{"id": 0, "scale": 0.5}]`. Adapters that the list does not name get scale 0. Without `lora`, the global scales apply; see [Server properties and adapters](#server-properties-and-adapters). |
 | `reasoning_budget_tokens` | lgml | supported | A positive integer: the most reasoning tokens before the engine ends the reasoning block. See [Reasoning budget](#reasoning-budget). |
+| `speculative` | lgml | supported | `true` or `false` turns speculative decoding on or off for this request. Default: the model's `speculative` setting. See [Speculative decoding](#speculative-decoding). |
 
 ### Reply fields
 
@@ -538,6 +539,51 @@ arithmetic, not by the passes; the gain is on GPUs.
   `predicted_per_second`. See [Response headers](#response-headers).
   A reply that the [repeat guard](#repeat-guard) ended also has
   `repeat_stop: 1`.
+  With speculative decoding on, timings also have `draft_n` (draft
+  tokens verified) and `draft_accepted` (draft tokens kept).
+
+### Speculative decoding
+
+lgml. With speculative decoding on, a drafter guesses the next tokens.
+One pass of the model then checks the last sampled token and the
+guesses, with logits for each row. The sampler takes the rows in
+order, as for decode steps; a guess stays while it equals the sampled
+token, and the first other token ends the pass. A pass that keeps k
+guesses gives k + 1 tokens.
+
+- The reply does not change. Greedy replies are the same tokens.
+  Sampled replies keep their distribution, and with `seed`, the same
+  seed gives the same reply. Penalties, `logit_bias`, grammars and JSON
+  schemas, `logprobs` and stop strings apply to each token as without
+  speculation. One limit: with flash attention, the kernels of some
+  backends give slightly other logits for a pass of several rows than
+  for one row, so a near tie can go the other way.
+- The drafter is prompt lookup: it finds the last 3 (or 2) tokens at an
+  earlier place in the prompt or the reply and guesses the tokens that
+  followed there. It gains most when the reply repeats the prompt, as
+  in code edits.
+- The engine drafts only when it pays. It measures the time of passes
+  of each size, and for each request, the part of the guesses that
+  stays. It drafts the length (1, 2, 4, 8 or 16 tokens) that gives the
+  most tokens per second, or decodes plainly. When drafts do not pay,
+  it tries one guess now and then.
+- Rejected guesses leave the KV cache. Hybrid models (Qwen3-Next,
+  Qwen3.5) copy their recurrent state on the device before a pass with
+  guesses; after a rejection, the state goes back and the next pass
+  runs the kept tokens again. Sliding window rings (Gemma 4) keep the
+  rows they need.
+- A request speculates only while it is the only running request. With
+  other requests, it decodes in the shared batched passes.
+- `usage.completion_tokens` counts the reply tokens, as without
+  speculation. The [repeat guard](#repeat-guard) counts each reply
+  token, kept guesses too. Guesses stop before the
+  [reasoning budget](#reasoning-budget); the wrap-up text at the budget
+  runs as plain decode steps.
+
+The model setting `speculative` (config key, or `--spec` for one
+model) turns it on by default: `true`, or a table with `max` (the most
+draft tokens, default 16). A request field `speculative` overrides it.
+The diffusion engine ignores the field.
 
 ### Log probabilities
 
@@ -1649,6 +1695,8 @@ its first event.
 | `lgml_cache_tokens_total` | counter | Prompt tokens reused from the KV cache. |
 | `lgml_restored_tokens_total` | counter | Prompt tokens restored from host memory. |
 | `lgml_repeat_stops_total` | counter | Chat replies that the [repeat guard](#repeat-guard) ended. |
+| `lgml_draft_tokens_total` | counter | Speculative draft tokens verified. |
+| `lgml_draft_accepted_tokens_total` | counter | Speculative draft tokens kept. |
 | `lgml_transcribed_seconds_total` | counter | Audio seconds transcribed. |
 | `lgml_spoken_seconds_total` | counter | Audio seconds of speech made. |
 | `lgml_embedding_tokens_total` | counter | Tokens of embedding inputs. |

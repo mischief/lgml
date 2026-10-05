@@ -499,6 +499,7 @@ M.FIELDS = {
 	{ "lora", "table", is_list, "an array of { id, scale }", status = "supported", label = "llama.cpp" },
 	{ "reasoning_budget_tokens", "number", int_in(1), "a positive integer", status = "supported",
 	    label = "lgml" },
+	{ "speculative", "boolean", status = "supported", label = "lgml" },
 }
 
 -- Checks the type and the value of field c in b.
