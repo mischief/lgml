@@ -634,7 +634,12 @@ static int tensor_set(lua_State *L);
  * The tensor frees its storage when it closes.
  * @tparam string type ggml type name, such as "f32" or `"q8_0"`
  * @tparam {int,...} shape 1 to 4 positive sizes
+ * With `opts.weights`, the storage counts as weights. A graph through
+ * the scheduler then runs the ops that use the tensor on this backend.
+ * @tparam string type ggml type name, such as "f32" or `"q8_0"`
+ * @tparam {int,...} shape 1 to 4 positive sizes
  * @tparam[opt] string|table data initial contents, as for `tensor:set`
+ * @tparam[opt] table opts `weights`: true to mark the storage as weights
  * @treturn tensor the leaf
  * @raise if the type is unknown, the innermost size is not a multiple of
  * the type block size, or the device is out of memory
@@ -652,9 +657,15 @@ backend_tensor(lua_State *L)
 	ggml_backend_buffer_type_t bt;
 	ggml_backend_buffer_t buf;
 	struct store *s;
-	int rank, hasdata = !lua_isnoneornil(L, 4);
+	int rank, hasdata = !lua_isnoneornil(L, 4), weights = 0;
 
 	rank = check_shape(L, 3, ne);
+	if (!lua_isnoneornil(L, 5)) {
+		luaL_checktype(L, 5, LUA_TTABLE);
+		lua_getfield(L, 5, "weights");
+		weights = lua_toboolean(L, -1);
+		lua_pop(L, 1);
+	}
 	if (ne[0] % ggml_blck_size(type) != 0)
 		return luaL_error(L, "inner dimension not a multiple of %s block size",
 		    ggml_type_name(type));
@@ -677,7 +688,11 @@ backend_tensor(lua_State *L)
 		ggml_free(ctx);
 		return luaL_error(L, "out of device memory");
 	}
+	if (weights)
+		ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 	s = push_store(L, 1, ctx, buf);
+	if (weights)
+		lgml_store_account(s, MEM_WEIGHTS);
 	s->closed = 1;
 	push_leaf(L, lua_gettop(L), gt, rank);
 	lua_remove(L, -2);
