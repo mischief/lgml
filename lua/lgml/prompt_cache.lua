@@ -132,12 +132,13 @@ local function before(a, b)
 end
 
 -- Drop the store, state index or block entry of the lowest priority,
--- the least recently used one first.
-function P:evict()
+-- the least recently used one first, but not keep. False when there is
+-- no such entry.
+function P:evict(keep)
 	local lru, list
 	for _, l in ipairs({ self.store, self.states }) do
 		for _, e in ipairs(l) do
-			if not lru or before(e, lru) then
+			if e ~= keep and (not lru or before(e, lru)) then
 				lru, list = e, l
 			end
 		end
@@ -147,31 +148,38 @@ function P:evict()
 			lru, list = e, self.blocks
 		end
 	end
+	if not lru then
+		return false
+	end
 	self.bytes = self.bytes - lru.bytes
 	if list == self.blocks then
 		self.blocks[lru.key] = nil
 		lru.buf:close()
-		return
+		return true
 	end
 	remove(list, lru)
 	if list == self.states then
 		release(lru.ck)
-		return
+		return true
 	end
 	release(lru.snap)
 	for _, ck in ipairs(lru.ckpts) do
 		release(ck)
 	end
 	self.stats.evicted = self.stats.evicted + 1
+	return true
 end
 
--- Make room for bytes under the budget. False when they do not fit.
-function P:room(bytes)
+-- Make room for bytes under the budget, without evicting keep. False
+-- when they do not fit.
+function P:room(bytes, keep)
 	if bytes > self.ram then
 		return false
 	end
-	while self.bytes + bytes > self.ram and (#self.store > 0 or #self.states > 0 or next(self.blocks)) do
-		self:evict()
+	while self.bytes + bytes > self.ram do
+		if not self:evict(keep) then
+			return false
+		end
 	end
 	return true
 end
@@ -286,8 +294,9 @@ function P:adopt(s)
 end
 
 -- Save the slot to the store, unless it is short, too big or already there.
--- The entry has the priority eng.prio, or that of eng.slot.
-function P:save(eng)
+-- The entry has the priority eng.prio, or that of eng.slot. The save does
+-- not evict keep, a store or state index entry.
+function P:save(eng, keep)
 	local toks = eng.tokens
 	if self.ram <= 0 or #toks < MIN_SAVE then
 		return
@@ -303,7 +312,7 @@ function P:save(eng)
 	for _, ck in ipairs(self.ckpts) do
 		bytes = bytes + ck.bytes
 	end
-	if not self:room(bytes) then
+	if not self:room(bytes, keep) then
 		return
 	end
 	local ckpts = {}

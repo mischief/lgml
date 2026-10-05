@@ -204,6 +204,7 @@ if lua_bin.found()
   test('ubatch', lua_bin, args : [files('test/test_ubatch.lua')], timeout : 120)
   test('pool', lua_bin, args : [files('test/test_pool.lua')], timeout : 120)
   test('budget', lua_bin, args : [files('test/test_budget.lua')], timeout : 120)
+  test('prompt_cache', lua_bin, args : [files('test/test_prompt_cache.lua')], timeout : 30)
   test('placement', lua_bin, args : [files('test/test_placement.lua')],
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
     timeout : 60)

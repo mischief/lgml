@@ -1772,7 +1772,7 @@ function E:attach_edge(prompt, keep, save, blocks, keys)
 			end
 			if got >= part then
 				if save then
-					pc:save(self)
+					pc:save(self, s)
 				end
 				self.model:truncate(cache, 0)
 				self.model:share(cache, table.move(blocks, 1, j, 1, {}), table.move(keys, 1, j, 1, {}))
