@@ -588,6 +588,11 @@ function M.recipe(base, over)
 			end
 			for p, x in pairs(v) do
 				r[name][p] = x
+				-- A temperature set here wins over one in the model file.
+				if name == "temperature" or name == "temp_k_slope" then
+					r.set = r.set or {}
+					r.set[p] = true
+				end
 			end
 		end
 	end
@@ -617,7 +622,35 @@ function M.load_recipe(path)
 	return r
 end
 
+--- Reads the fitted temperatures of a decision model from its gguf
+-- metadata: the keys `<arch>.decision.temperature.<name>`, where name
+-- is a question type, or a type and an option count bucket such as
+-- `choice.3_5`.
+-- @tparam table meta the gguf metadata
+-- @treturn ?table the temperatures by name, or nil when there are none
+function M.model_temperatures(meta)
+	local prefix = tostring(meta["general.architecture"]) .. ".decision.temperature."
+	local out
+	for k, v in pairs(meta) do
+		if type(k) == "string" and k:sub(1, #prefix) == prefix and tonumber(v) and tonumber(v) > 0 then
+			out = out or {}
+			out[k:sub(#prefix + 1)] = tonumber(v)
+		end
+	end
+	return out
+end
+
+-- The option count bucket of a fitted temperature, as llama.cpp names it.
+local function bucket(k)
+	return k <= 2 and "2" or k <= 5 and "3_5" or k <= 10 and "6_10" or "11"
+end
+
 local function temp_for(r, prim, k)
+	local fit = r.fitted and not (r.set and r.set[prim]) and
+	    (r.fitted[prim .. "." .. bucket(k)] or r.fitted[prim])
+	if fit then
+		return fit
+	end
 	local t = r.temperature[prim] or 1.0
 	local slope = r.temp_k_slope[prim] or 0.0
 	if slope ~= 0 and k > 2 then
@@ -1001,6 +1034,12 @@ function M.run(e, req, ctl)
 	local recipe, err = M.recipe(e.recipe or M.default_recipe(), req.recipe)
 	if not recipe then
 		return nil, err, 422
+	end
+	if e.model and e.model.meta then
+		if e.decide_temps == nil then
+			e.decide_temps = M.model_temperatures(e.model.meta) or false
+		end
+		recipe.fitted = e.decide_temps or nil
 	end
 	local images = req.images or {}
 	local keys, markers

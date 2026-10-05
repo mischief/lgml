@@ -489,46 +489,98 @@ local function attachment_url(v, loc)
 	bad(loc, "must be a data URL string or an image_url part")
 end
 
-local function check_attachments(list)
-	local loc = { "body", "attachments" }
+-- The image of one attachment item: `{ bytes, mime }`. here is the
+-- location for errors.
+local function check_image(v, here)
+	local url = attachment_url(v, here)
+	local scheme = (url:match("^(%a[%w+.-]*):") or ""):lower()
+	if scheme == "http" or scheme == "https" then
+		error(setmetatable({ loc = here,
+			msg = "image url must be a data URL; http and https URLs are not supported" },
+		    Unsupported), 0)
+	end
+	local head = url:match("^[^,]*")
+	if #url - #head > M.MAX_ATTACHMENT_BYTES // 3 * 4 + 8 then
+		bad(here, ("image larger than %d bytes"):format(M.MAX_ATTACHMENT_BYTES))
+	end
+	local bytes, mime = media.data_url(url)
+	if not bytes then
+		bad(here, mime)
+	end
+	local png, jpeg = bytes:sub(1, 8) == PNG_SIG, bytes:sub(1, 3) == "\255\216\255"
+	if not (mime == "image/png" or mime == "image/jpeg" or mime == "image/jpg") then
+		bad(here, "image must be image/png or image/jpeg, got " .. mime)
+	elseif not (png or jpeg) then
+		bad(here, "data is not a PNG or JPEG file")
+	elseif #bytes > M.MAX_ATTACHMENT_BYTES then
+		bad(here, ("image larger than %d bytes"):format(M.MAX_ATTACHMENT_BYTES))
+	end
+	return { bytes = bytes, mime = png and "image/png" or "image/jpeg" }
+end
+
+-- Adds the images of the array field name of b to out.
+local function check_image_list(b, name, out)
+	local list = b[name]
+	if list == nil or list == json.null then
+		return
+	end
+	local loc = { "body", name }
 	if not is_array(list) then
 		bad(loc, "must be an array of images")
-	elseif #list > M.MAX_ATTACHMENTS then
-		bad(loc, ("at most %d images, got %d"):format(M.MAX_ATTACHMENTS, #list))
 	end
-	local out = {}
 	for i, v in ipairs(list) do
-		local here = at(loc, i - 1)
-		local url = attachment_url(v, here)
-		local scheme = (url:match("^(%a[%w+.-]*):") or ""):lower()
-		if scheme == "http" or scheme == "https" then
-			error(setmetatable({ loc = here,
-				msg = "image url must be a data URL; http and https URLs are not supported" },
-			    Unsupported), 0)
-		end
-		local head = url:match("^[^,]*")
-		if #url - #head > M.MAX_ATTACHMENT_BYTES // 3 * 4 + 8 then
-			bad(here, ("image larger than %d bytes"):format(M.MAX_ATTACHMENT_BYTES))
-		end
-		local bytes, mime = media.data_url(url)
-		if not bytes then
-			bad(here, mime)
-		end
-		local png, jpeg = bytes:sub(1, 8) == PNG_SIG, bytes:sub(1, 3) == "\255\216\255"
-		if not (mime == "image/png" or mime == "image/jpeg" or mime == "image/jpg") then
-			bad(here, "image must be image/png or image/jpeg, got " .. mime)
-		elseif not (png or jpeg) then
-			bad(here, "data is not a PNG or JPEG file")
-		elseif #bytes > M.MAX_ATTACHMENT_BYTES then
-			bad(here, ("image larger than %d bytes"):format(M.MAX_ATTACHMENT_BYTES))
-		end
-		out[i] = { bytes = bytes, mime = png and "image/png" or "image/jpeg" }
+		out[#out + 1] = check_image(v, at(loc, i - 1))
 	end
-	return out
+end
+
+-- A copy of an object that keeps its key order.
+local function ocopy(t)
+	local keys = table.move(getmetatable(t).__order, 1, #getmetatable(t).__order, 1, {})
+	local c = setmetatable({}, { __jsontype = "object", __order = keys })
+	for _, k in ipairs(keys) do
+		c[k] = t[k]
+	end
+	return c
+end
+
+-- A state of chat messages (an array, or an object with a messages
+-- array), as OpenJev sends it: the image_url parts of the contents go
+-- to out, and the state comes back without them. Other states come
+-- back as they are.
+local function state_images(state, out)
+	local wrapped = is_object(state) and is_array(state.messages)
+	local msgs = wrapped and state.messages or state
+	if not is_array(msgs) then
+		return state
+	end
+	local loc = wrapped and { "body", "state", "messages" } or { "body", "state" }
+	local new = json.array()
+	for i, m in ipairs(msgs) do
+		if is_object(m) and is_array(m.content) then
+			local copy, content = ocopy(m), json.array()
+			for j, part in ipairs(m.content) do
+				if is_object(part) and part.type == "image_url" and part.image_url ~= nil then
+					out[#out + 1] = check_image(part, at(loc, i - 1, "content", j - 1))
+				else
+					content[#content + 1] = part
+				end
+			end
+			copy.content = content
+			new[i] = copy
+		else
+			new[i] = m
+		end
+	end
+	if not wrapped then
+		return new
+	end
+	local s = ocopy(state)
+	s.messages = new
+	return s
 end
 
 local TOP = { state = true, model = true, questions = true, lgml = true, attachments = true,
-	keep_alive = true }
+	images = true, keep_alive = true }
 
 local function check_body(b)
 	if not is_object(b) then
@@ -559,23 +611,28 @@ local function check_body(b)
 	if ka ~= nil and ka ~= json.null and type(ka) ~= "string" and type(ka) ~= "number" then
 		bad({ "body", "keep_alive" }, "must be a duration string or a number of seconds")
 	end
+	-- Images: attachments, then images, then the parts of a chat state.
+	local images = {}
+	check_image_list(b, "attachments", images)
+	check_image_list(b, "images", images)
+	local state = state_images(b.state, images)
+	if #images > M.MAX_ATTACHMENTS then
+		bad({ "body", "attachments" }, ("at most %d images, got %d"):format(M.MAX_ATTACHMENTS, #images))
+	end
 	local req = {
 		model = b.model,
-		state = type(b.state) == "string" and b.state or M.dumps(b.state, 2),
+		state = type(state) == "string" and state or M.dumps(state, 2),
 		questions = json.array(),
+		images = #images > 0 and images or nil,
 	}
-	if type(b.state) == "table" then
-		req.state_compact = M.compact(b.state)
+	if type(state) == "table" then
+		req.state_compact = M.compact(state)
 	end
 	for i, id in ipairs(mt.__order) do
 		req.questions[i] = check_question(id, qs[id])
 	end
 	if b.lgml ~= nil then
 		check_lgml(b.lgml, req)
-	end
-	if b.attachments ~= nil and b.attachments ~= json.null then
-		local images = check_attachments(b.attachments)
-		req.images = #images > 0 and images or nil
 	end
 	return req
 end
@@ -725,9 +782,10 @@ function M.score_expectation(p)
 	return s
 end
 
---- Returns the score confidence `1 - std / std_max`.
--- Jev's own rule is unknown; this is Jevify's. std is the standard
--- deviation of the level index and std_max is `(K - 1) / 2`.
+--- Returns the score confidence, as TypeSafe publishes it for Jev.
+-- It is `1 - d / d_uniform`: d is the mean distance of the level index
+-- to the mode, and d_uniform that of a uniform distribution to the
+-- center of the scale.
 -- @tparam {number,...} p the level probabilities, lowest first
 -- @treturn number the confidence, from 0 to 1
 function M.score_confidence(p)
@@ -735,11 +793,18 @@ function M.score_confidence(p)
 	if k < 2 then
 		return 1.0
 	end
-	local mu, var = M.score_expectation(p), 0.0
-	for i, v in ipairs(p) do
-		var = var + v * (i - 1 - mu) ^ 2
+	local mode = 1
+	for i = 2, k do
+		if p[i] > p[mode] then
+			mode = i
+		end
 	end
-	return clip01(1 - math.sqrt(math.max(var, 0)) / ((k - 1) / 2))
+	local d, du = 0.0, 0.0
+	for i, v in ipairs(p) do
+		d = d + v * math.abs(i - mode)
+		du = du + math.abs(i - 1 - (k - 1) / 2) / k
+	end
+	return clip01(1 - d / du)
 end
 
 -- Python round(x, n) for the fields that Jevify rounds to 4 places.

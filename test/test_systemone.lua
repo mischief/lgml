@@ -176,6 +176,26 @@ local function test_attachments()
 	    e.detail[1].msg:find("data URL", 1, true), "an https URL gives 400")
 	_, e, status = so.check(with_images(('[{"type": "image_url", "image_url": {"url": "http://x/y.png"}}]')))
 	ok(status == 400, "an http URL in a part gives 400")
+	-- OpenJev forms: an images field, and image_url parts in a state of
+	-- chat messages. Order: attachments, images, then the state.
+	r = assert(so.check(('{"state": "s", "questions": {"q": %s}, "images": [%q]}'):format(NOUL, JPEG_URL)))
+	ok(#r.images == 1 and r.images[1].mime == "image/jpeg", "the images field")
+	r = assert(so.check(('{"state": {"messages": [{"role": "user", "content": [' ..
+	    '{"type": "text", "text": "look"}, {"type": "image_url", "image_url": {"url": %q}}]}]}, ' ..
+	    '"questions": {"q": %s}, "attachments": [%q], "images": [%q]}'):format(PNG_URL, NOUL, JPEG_URL, JPEG_URL)))
+	ok(#r.images == 3 and r.images[1].mime == "image/jpeg" and r.images[3].mime == "image/png" and
+	    r.state:find('"look"', 1, true) and not r.state:find("image_url", 1, true) and
+	    r.state_compact == '{"messages":[{"role":"user","content":[{"type":"text","text":"look"}]}]}',
+	    "image parts of a chat state go to the images, last")
+	r = assert(so.check(('{"state": [{"role": "user", "content": [{"type": "image_url", "image_url": %q}]}], ' ..
+	    '"questions": {"q": %s}}'):format(PNG_URL, NOUL)))
+	ok(#r.images == 1 and r.state_compact == '[{"role":"user","content":[]}]', "a state that is an array of messages")
+	local many = {}
+	for i = 1, so.MAX_ATTACHMENTS do
+		many[i] = ("%q"):format(PNG_URL)
+	end
+	check_fails(('{"state": "s", "questions": {"q": %s}, "attachments": [%s], "images": [%q]}'):format(
+	    NOUL, table.concat(many, ","), PNG_URL), "body.attachments", "the image limit counts every source")
 	check_fails(with_images("{}"), "body.attachments", "attachments must be an array")
 	check_fails(with_images("[5]"), "body.attachments.0", "a number is not an attachment")
 	check_fails(with_images('[{"type": "text", "text": "x"}]'), "body.attachments.0.type", "a text part")
@@ -210,6 +230,8 @@ local function test_stats()
 	ok(so.choice_confidence({ 0.25, 0.25, 0.25, 0.25 }) == 0, "uniform choice confidence 0")
 	ok(so.score_confidence({ 0, 1, 0 }) == 1 and near(so.score_confidence({ 0.5, 0, 0.5 }), 0),
 	    "score confidence")
+	-- TypeSafe's rule: mean distance to the mode 0.3, uniform 2/3.
+	ok(near(so.score_confidence({ 0.1, 0.7, 0.2 }), 0.55, 1e-12), "score confidence by distance to the mode")
 	ok(near(so.score_expectation({ 0.1, 0.2, 0.7 }), 1.6), "score expectation")
 end
 
@@ -361,6 +383,23 @@ local function test_finalize()
 	ok(near(decide.finalize(nq, nr, prior, rc).yes, 0.25), "prior correction")
 	ok(decide.recipe(rc, { temperature = { choice = 0 } }) == nil and
 	    decide.recipe(rc, { mode = "label" }) == nil, "bad recipes fail")
+
+	-- Fitted temperatures from the gguf: by type and option count
+	-- bucket; a temperature in the recipe wins.
+	local fit = decide.model_temperatures({ ["general.architecture"] = "x",
+		["x.decision.temperature.choice.2"] = 2.0, ["x.decision.temperature.choice"] = 4.0,
+		["x.decision.temperature.noul"] = "0.5", ["x.other"] = 9 })
+	ok(fit and fit["choice.2"] == 2 and fit.choice == 4 and fit.noul == 0.5, "model temperatures")
+	rc = assert(decide.recipe(decide.default_recipe(), { permutations = { choice = 1 } }))
+	rc.fitted = fit
+	ok(near(decide.finalize(q, runs, nil, rc).probabilities[1], 2 / 3), "fitted temperature of the bucket")
+	local q3 = { type = "choice", options = { { key = "a" }, { key = "b" }, { key = "c" } } }
+	local r3 = { { keys = { "a", "b", "c" }, logscores = { math.log(0.8), math.log(0.1), math.log(0.1) } } }
+	local p = decide.finalize(q3, r3, nil, rc).probabilities
+	ok(near(p[1], 0.8 ^ 0.25 / (0.8 ^ 0.25 + 2 * 0.1 ^ 0.25)), "fitted temperature of the type")
+	rc = assert(decide.recipe(rc, { temperature = { choice = 1 } }))
+	rc.fitted = fit
+	ok(near(decide.finalize(q, runs, nil, rc).probabilities[1], 0.8), "a recipe temperature wins")
 end
 
 -- HTTP

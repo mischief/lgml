@@ -1246,6 +1246,13 @@ Top-level fields. Any other field gives 422.
   `{"type": "image_url", "image_url": {"url": "data:..."}}`. The images
   are PNG or JPEG. A request with attachments goes to a model with
   capability `multimodal`.
+- `images` (OpenJev, as llama.cpp takes it): an array of images, as
+  `attachments`.
+- A `state` of chat messages (an array of messages, or an object with
+  a `messages` array) also gives images: each `image_url` part of a
+  message `content` goes to the images, and the state keeps the other
+  parts. The images come in this order: `attachments`, `images`, then
+  the state. At most 16 images in all.
 
 Question fields. Any other field gives 422.
 
@@ -1274,7 +1281,11 @@ JSON.
   (`choice`, `score`, `noul`):
   - `permutations`: option orders to average, an integer from 1 to 8.
     Default: 2 for choice, 1 for the others.
-  - `temperature`: above 0. Default 1.
+  - `temperature`: above 0. Default 1. A decision model gguf can hold
+    fitted temperatures: `<arch>.decision.temperature.<type>` or
+    `<type>.<bucket>`, with the option count buckets `2`, `3_5`,
+    `6_10` and `11`, as llama.cpp reads them. They apply when no
+    recipe sets the temperature of that question type.
   - `prior_weight`: at least 0. Default 0 (no prior correction).
   - `bias`: log-odds added to the noul answer. Default 0.
   - `temp_k_slope`: for K > 2 options, the temperature grows by
@@ -1292,7 +1303,7 @@ JSON.
   "flee": {"type": "noul", "noul": 0.27},
   "act": {"type": "choice", "choice": "attack", "confidence": 0.4,
     "probabilities": {"attack": 0.7, "run": 0.3}},
-  "mood": {"type": "score", "score": 0.99, "confidence": 0.1815,
+  "mood": {"type": "score", "score": 0.99, "confidence": 0.0,
     "legend": {"0": "calm", "1": "tense", "2": "panic"},
     "probabilities": {"0": 0.34, "1": 0.33, "2": 0.33}}},
  "usage": {"input_tokens": 51, "output_tokens": 7}}
@@ -1302,7 +1313,10 @@ JSON.
 - choice: `choice` is the option with the highest probability.
   `confidence` is `(p_max - 1/K) / (1 - 1/K)` for K options.
 - score: `score` is the expected level index, from 0. `confidence` is
-  `1 - std / ((K - 1) / 2)`. `legend` maps each index to its level.
+  TypeSafe's rule: `1 - d / d_uniform`, with d the mean distance of the
+  level index to the most likely level, and d_uniform that of a uniform
+  distribution to the center of the scale, at least 0. `legend` maps
+  each index to its level.
 - `probabilities` sum to exactly 1, with 0.01 steps (largest remainder
   rounding). `score` and `confidence` have 4 decimal places.
 - `model` is the id of the model that answered.
