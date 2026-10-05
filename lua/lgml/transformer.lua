@@ -1,7 +1,8 @@
 --- Config-driven decoder for the gguf text models.
 -- One module builds llama, qwen3, qwen3moe, qwen3next, qwen35,
--- qwen35moe and gemma4 graphs. `config` reads the gguf metadata into a
--- table; the blocks read that table and the weights that exist.
+-- qwen35moe, qwen4exp (see `lgml.qwen4exp`) and gemma4 graphs.
+-- `config` reads the gguf metadata into a table; the blocks read that
+-- table and the weights that exist.
 -- A layer is gated delta net or attention, then a dense FFN, routed
 -- experts, or both. Shapes are in torch order.
 -- @module lgml.transformer
@@ -12,6 +13,7 @@ local placement = require("lgml.placement")
 local replay = require("lgml.replay")
 local budget = require("lgml.budget")
 local log = require("lgml.log")
+local q4 = require("lgml.qwen4exp")
 
 local LOG = log.new("kv")
 
@@ -63,6 +65,7 @@ local family = {
 	qwen3next = { qk_norm = true, rope_ctx = true, hybrid = true, ssm_tile = true },
 	qwen35 = { qk_norm = true, rope_ctx = true, hybrid = true },
 	qwen35moe = { qk_norm = true, rope_ctx = true, hybrid = true },
+	qwen4exp = { qk_norm = true, rope_ctx = true, hybrid = true, hc = true },
 	gemma4 = { qk_norm = true, gemma = true },
 	["diffusion-gemma"] = { qk_norm = true, gemma = true },
 }
@@ -85,7 +88,7 @@ end
 --- Tell if the transformer handles a gguf architecture.
 -- @tparam string arch the `general.architecture` value
 -- @treturn boolean true for llama, qwen3, qwen3moe, qwen3next, qwen35,
--- qwen35moe and gemma4
+-- qwen35moe, qwen4exp and gemma4
 function M.supports(arch)
 	return family[arch] ~= nil
 end
@@ -214,6 +217,9 @@ function M.config(meta)
 		end
 		hp.layers[i] = d
 	end
+	if fam.hc then
+		q4.config(hp, k)
+	end
 	return hp
 end
 
@@ -339,6 +345,9 @@ function M.load(be, path, opts)
 	opts = opts or {}
 	local info = assert(lgml.gguf(path))
 	local hp = M.config(info.meta)
+	if hp.hc then
+		return q4.load(be, path, opts, info, hp)
+	end
 	local cpu = opts.placement and placement.plan(opts.placement, info.tensors, hp.n_layer)
 	if cpu and not be:cpu() then
 		error(path .. ": the placement moves weights to the CPU; open the backend with cpu = true")
@@ -491,6 +500,9 @@ local function add_layers(self, c, opts, global)
 			c.v[il]:zero()
 		end
 	end
+	if hp.hc then
+		q4.add_cache(self, c, c.cap, global)
+	end
 end
 
 --- Make a cache for one sequence.
@@ -559,6 +571,9 @@ function M:pool(n_cells, opts)
 			p.k[il]:zero()
 			p.v[il]:zero()
 		end
+	end
+	if self.hp.hc then
+		q4.add_cache(self, p, cap, true)
 	end
 	return p
 end
@@ -638,7 +653,7 @@ function M:free_seq(c)
 			end
 		end
 	end
-	for _, part in ipairs({ c.k, c.v, c.conv or {}, c.ssm or {} }) do
+	for _, part in ipairs({ c.k, c.v, c.conv or {}, c.ssm or {}, c.pconv or {} }) do
 		for il, t in pairs(part) do
 			t:close()
 			part[il] = nil
@@ -673,7 +688,7 @@ end
 local function pool_grow(self, p, cap)
 	cap = cap or math.min(p.n_ctx, p.cap * 2)
 	local list = {}
-	for _, part in ipairs({ p.k, p.v }) do
+	for _, part in ipairs({ p.k, p.v, p.x or {} }) do
 		for _, t in pairs(part) do
 			list[#list + 1] = t
 		end
@@ -684,7 +699,7 @@ local function pool_grow(self, p, cap)
 	drop_pool_graphs(self, p)
 	local empty = p.alloc.used == 0 and p.alloc.cached == 0
 	local buf
-	for _, part in ipairs({ p.k, p.v }) do
+	for _, part in ipairs({ p.k, p.v, p.x or {} }) do
 		for il, old in pairs(part) do
 			local bytes = math.min(old:nbytes(), cap * (old:nbytes() // old:shape()[1]))
 			local new = old:backend():tensor(old:type(), { cap, old:shape()[2] })
@@ -793,7 +808,7 @@ end
 -- @tparam integer n the cell count, at most the block size
 function M.copy_block(pool, src, dst, n)
 	local buf
-	for _, part in ipairs({ pool.k, pool.v }) do
+	for _, part in ipairs({ pool.k, pool.v, pool.x or {} }) do
 		for _, t in pairs(part) do
 			local row = t:nbytes() // t:shape()[1]
 			if not buf or #buf < n * row then
@@ -822,6 +837,14 @@ local function pool_tensors(pool)
 	for _, il in ipairs(list) do
 		out[#out + 1] = pool.k[il]
 		out[#out + 1] = pool.v[il]
+	end
+	local xs = {}
+	for il in pairs(pool.x or {}) do
+		xs[#xs + 1] = il
+	end
+	table.sort(xs)
+	for _, il in ipairs(xs) do
+		out[#out + 1] = pool.x[il]
 	end
 	return out
 end
@@ -929,6 +952,23 @@ local function seq_cells(c, from, n)
 	return r
 end
 
+--- The cells of positions [from, from + n) of a cache: pool cells
+-- for a pool sequence, else the positions.
+-- @tparam table c the cache
+-- @tparam integer from the first position
+-- @tparam integer n the count
+-- @treturn {integer,...} the cells
+function M.cells(c, from, n)
+	if c.pool then
+		return seq_cells(c, from, n)
+	end
+	local r = {}
+	for i = 1, n do
+		r[i] = from + i - 1
+	end
+	return r
+end
+
 -- The pool window that holds positions [0, n_kv) of a pool sequence:
 -- the first cell and the width, both in PAD steps.
 local function seq_window(c, n_kv)
@@ -976,14 +1016,24 @@ function M:cache_size(opts)
 		local p = L.cpu and s.cpu or s.dev
 		if L.recr then
 			p[2] = p[2] + 4 * (conv_dim(hp) * (hp.d_conv - 1) + hp.n_v_heads * hp.head_v * hp.head_v)
+			if L.ple then
+				p[2] = p[2] + 4 * hp.hc * hp.n_embd * hp.ple.hist
+			end
 		elseif not L.kv_src then
 			local row = lgml.row_size(tk, L.Hkv * L.D) + lgml.row_size(tv, L.Hkv * L.D)
+			if L.idx then
+				row = row + lgml.row_size("f16", L.idx)
+			end
 			if L.swa then
 				p[2] = p[2] + ring * row
 			else
 				p[1] = p[1] + row
 			end
 		end
+	end
+	-- Token ids of the cells, for the n-gram input.
+	if hp.ple then
+		s.cpu[1] = s.cpu[1] + 4
 	end
 	return s.dev[1], s.dev[2], s.cpu[1], s.cpu[2]
 end
@@ -1007,35 +1057,38 @@ function M:grow(cache, rows)
 	end
 	assert(rows <= cache.n_ctx, "grow: past n_ctx")
 	local cap = math.min(cache.n_ctx, math.max(cache.cap * 2, (rows + PAD - 1) // PAD * PAD))
-	local list = {}
+	-- The tensors that grow, as { table, key } pairs.
+	local slots, list = {}, {}
 	for il, L in ipairs(self.layers) do
 		if cache.k[il] and not L.swa then
-			list[#list + 1] = cache.k[il]
-			list[#list + 1] = cache.v[il]
+			slots[#slots + 1] = { cache.k, il }
+			slots[#slots + 1] = { cache.v, il }
 		end
+	end
+	for il in pairs(cache.x or {}) do
+		slots[#slots + 1] = { cache.x, il }
+	end
+	for i, sl in ipairs(slots) do
+		list[i] = sl[1][sl[2]]
 	end
 	check_grow(list, cap, ("the KV cache from %d to %d rows"):format(cache.cap, cap))
 	replay.drop(cache)
 	local keep = math.min(cache.n_past, cache.cap)
 	local buf
-	for il, L in ipairs(self.layers) do
-		if cache.k[il] and not L.swa then
-			for _, name in ipairs({ "k", "v" }) do
-				local old = cache[name][il]
-				local bytes = keep * (old:nbytes() // old:shape()[1])
-				local new = old:backend():tensor(old:type(), { cap, old:shape()[2] })
-				new:zero()
-				if bytes > 0 then
-					if not buf or #buf < bytes then
-						buf = lgml.hostbuf(bytes)
-					end
-					old:to_host(buf, 0, 0, bytes)
-					new:from_host(buf, 0, 0, bytes)
-				end
-				old:close()
-				cache[name][il] = new
+	for _, sl in ipairs(slots) do
+		local old = sl[1][sl[2]]
+		local bytes = keep * (old:nbytes() // old:shape()[1])
+		local new = old:backend():tensor(old:type(), { cap, old:shape()[2] })
+		new:zero()
+		if bytes > 0 then
+			if not buf or #buf < bytes then
+				buf = lgml.hostbuf(bytes)
 			end
+			old:to_host(buf, 0, 0, bytes)
+			new:from_host(buf, 0, 0, bytes)
 		end
+		old:close()
+		sl[1][sl[2]] = new
 	end
 	if buf then
 		buf:close()
@@ -1051,7 +1104,7 @@ end
 -- @treturn integer bytes of the K, V, ring and recurrent tensors
 function M.cache_bytes(cache)
 	local n = 0
-	for _, part in ipairs({ cache.k, cache.v, cache.conv or {}, cache.ssm or {} }) do
+	for _, part in ipairs({ cache.k, cache.v, cache.conv or {}, cache.ssm or {}, cache.x or {}, cache.pconv or {} }) do
 		for _, t in pairs(part) do
 			n = n + t:nbytes()
 		end
@@ -1117,6 +1170,9 @@ local function snap_parts(self, cache, rows, state, hi)
 			if state then
 				add(cache.conv[il], cache.conv[il]:nbytes())
 				add(cache.ssm[il], cache.ssm[il]:nbytes())
+				if L.ple then
+					add(cache.pconv[il], cache.pconv[il]:nbytes())
+				end
 			end
 		elseif L.swa then
 			if state and cache.k[il] then
@@ -1126,11 +1182,16 @@ local function snap_parts(self, cache, rows, state, hi)
 			end
 		elseif rows and not L.kv_src then
 			local src = cache.pool or cache
-			for _, t in ipairs({ src.k[il], src.v[il] }) do
+			for _, t in ipairs({ src.k[il], src.v[il], src.x and src.x[il] }) do
 				local row = t:nbytes() // t:shape()[1]
 				add(t, rows * row, row)
 			end
 		end
+	end
+	local tok = rows and (cache.pool or cache).x
+	tok = tok and tok[0]
+	if tok then
+		add(tok, rows * (tok:nbytes() // tok:shape()[1]), tok:nbytes() // tok:shape()[1])
 	end
 	return parts
 end
@@ -1277,6 +1338,9 @@ local function check_pass(self, cache, n)
 				cache.conv[i]:zero()
 				cache.ssm[i]:zero()
 			end
+			for _, t in pairs(cache.pconv or {}) do
+				t:zero()
+			end
 		elseif cache.n_past ~= cache.rs_pos then
 			error(("recurrent state is at %d, not %d"):format(cache.rs_pos, cache.n_past))
 		end
@@ -1389,7 +1453,14 @@ function M:inputs(ids, cache, opts)
 			inp.rows_swa = be:tensor("i64", { n })
 		end
 	end
+	if hp.hc then
+		q4.leaves(self, inp, n)
+		q4.seq_leaves(self, inp, n_attn)
+	end
 	fill(hp, inp, cache, nil, opts)
+	if hp.hc then
+		q4.pass(self, inp, cache, ids)
+	end
 	return inp
 end
 
@@ -1425,6 +1496,9 @@ end
 function M:refill(inp, ids, cache, opts)
 	check_pass(self, cache, #ids)
 	fill(self.hp, inp, cache, ids, opts)
+	if self.hp.hc then
+		q4.pass(self, inp, cache, ids)
+	end
 end
 
 --- Build the normed, projected and roped queries, keys and values.
@@ -1443,7 +1517,7 @@ end
 function M.qkv(g, hp, L, x, pos)
 	local eps, n, H, D = hp.eps, x:shape()[1], hp.n_head, L.D
 	local rope = { mode = hp.rope_mode, base = L.base, n_dims = L.n_rot, n_ctx_orig = hp.rope_ctx }
-	local cur = g:mul(g:rms_norm(x, eps), L.attn_norm)
+	local cur = L.attn_norm and g:mul(g:rms_norm(x, eps), L.attn_norm) or x
 	local q, gate, k, v
 	if hp.attn_gate then
 		-- q_proj gives [q | gate] per head.
@@ -1530,6 +1604,7 @@ local function attention(hp, g, inp, il, L, q, k, v, shared)
 	local mask = L.swa and inp.mask_swa or inp.mask
 	return M.attend(g, q, k, v, mask, hp.attn_scale or 1 / math.sqrt(D), inp.flash_attn, rv)
 end
+M.attention = attention
 
 --- Build the output projection, post norm and residual of attention.
 -- This is a plain function.
@@ -1773,9 +1848,11 @@ local function linear_attention(hp, g, inp, L, il, x, taps, sfx)
 	taps["attn_output" .. sfx] = o
 
 	z = g:reshape(z, { 1, n, nv, hv })
-	o = g:mul(g:mul(g:rms_norm(o, hp.eps), L.ssm_norm), g:silu(z))
+	z = hp.gdn_gate == "sigmoid" and g:sigmoid(z) or g:silu(z)
+	o = g:mul(g:mul(g:rms_norm(o, hp.eps), L.ssm_norm), z)
 	return mm(g, L, "ssm_out", g:reshape(o, { n, vd }))
 end
+M.linear_attention = linear_attention
 
 -- Per-layer inputs (n_layer, n, n_embd_per_layer) from the token ids
 -- and the scaled embedding x.
@@ -1804,6 +1881,9 @@ end
 -- @treturn table named nodes for comparison, such as "embd",
 -- "ffn_out-0", "l_out-0" and "result_norm"
 function M:forward(g, inp)
+	if self.hp.hc then
+		return q4.forward(self, g, inp)
+	end
 	local hp, n = self.hp, inp.n
 	local taps, shared = {}, {}
 	local x
@@ -1948,6 +2028,9 @@ local function fill_batch(hp, inp, ids)
 				c.conv[l]:zero()
 				c.ssm[l]:zero()
 			end
+			for _, t in pairs(c.pconv or {}) do
+				t:zero()
+			end
 		end
 		if b.mask then
 			b.mask:fill_blocks({ n_past = n_past, block = c.pool.block, blocks = c.blocks, lo = b.lo })
@@ -2016,6 +2099,9 @@ function M:batch_inputs(caches, ids, opts)
 			if c.ring then
 				b.rows_swa = be:tensor("i64", { n })
 			end
+			if hp.hc then
+				q4.seq_leaves(self, b, n_attn)
+			end
 		end
 		inp.batch[i] = b
 		N = N + n
@@ -2023,6 +2109,9 @@ function M:batch_inputs(caches, ids, opts)
 	inp.n = N
 	inp.ids = be:tensor("i32", { N })
 	inp.pos = be:tensor("i32", { N })
+	if hp.hc then
+		q4.leaves(self, inp, N)
+	end
 	-- Only the last token of each sequence needs logits.
 	local last = {}
 	for i, b in ipairs(inp.batch) do
@@ -2030,6 +2119,9 @@ function M:batch_inputs(caches, ids, opts)
 	end
 	inp.logit_rows = be:tensor("i32", { #last }, last)
 	fill_batch(hp, inp, ids)
+	if hp.hc then
+		q4.batch(self, inp, ids)
+	end
 	return inp
 end
 
@@ -2074,6 +2166,9 @@ function M:run_batch(caches, ids, opts)
 			check_pass(self, b.cache, b.n)
 		end
 		fill_batch(self.hp, r.inp, ids)
+		if self.hp.hc then
+			q4.batch(self, r.inp, ids)
+		end
 	else
 		if r then
 			drop_batch(self)
