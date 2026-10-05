@@ -163,8 +163,11 @@ do
 end
 
 -- A prompt whose KV growth passes the guard fails with 507; the engine
--- then serves a short prompt.
+-- then serves a short prompt. The limit must not count the tensors of
+-- earlier engines that the collector has not freed yet.
 do
+	collectgarbage()
+	collectgarbage()
 	local e = engine.new({ model = path, backend = "CPU", n_ctx = 4096, slots = 1, kv_initial = 256,
 		cache_ram = 0 })
 	local grow = transformer.block_bytes(e.pool) // e.pool.block * 256
