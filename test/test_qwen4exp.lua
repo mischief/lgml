@@ -212,6 +212,31 @@ local function dense_check(m, path)
 	d:close()
 end
 
+-- A pass within the budget stores its indexer keys: a prompt in two
+-- passes, the second past the budget, gives the keys and logits of one
+-- pass. A large budget puts the first pass within it.
+local function split_check(m)
+	local one = m:cache(256)
+	local all = eval(m, one, batches[1])
+	local c = m:cache(256)
+	local top_k = m.hp.idx.top_k
+	m.hp.idx.top_k = 1 << 20
+	eval(m, c, table.move(batches[1], 1, 11, 1, {}))
+	m.hp.idx.top_k = top_k
+	local rest = eval(m, c, table.move(batches[1], 12, #batches[1], 1, {}))
+	local e = 0
+	for i = 1, #rest do
+		e = math.max(e, maxdiff(rest[i], all[11 + i]))
+	end
+	local ek = 0
+	for il, x in pairs(one.x) do
+		if il > 0 then
+			ek = math.max(ek, maxdiff(c.x[il]:get(), x:get()))
+		end
+	end
+	ok(e < TOL and ek < TOL, ("qsa: a pass within the budget keeps its keys (max error %.3g, keys %.3g)"):format(e, ek))
+end
+
 -- The n-gram rows of the Lua hash for a context with an EOS and a
 -- sequence start, against the formula by hand.
 local function hash_check(m)
@@ -620,6 +645,7 @@ reader_check(m, path)
 placement_check(path)
 xcache_check(m, path)
 dense_check(m, path)
+split_check(m)
 
 local long = {}
 for i = 1, 250 do

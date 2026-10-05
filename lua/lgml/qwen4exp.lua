@@ -747,6 +747,9 @@ end
 local function qsa_mask(g, hp, L, cur, pos, ikw, lo, span, mask, qpos, qw)
 	local I = hp.idx
 	local R, P, K = I.ratio, span // I.ratio, I.top_k // I.ratio
+	-- The dense mask does not read the keys. Expand the write, or later
+	-- passes find no keys for these cells.
+	g:expand(ikw)
 	if not qpos or P <= K then
 		return mask
 	end
