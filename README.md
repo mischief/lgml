@@ -13,12 +13,13 @@ a memory budget.
 
 ## Build
 
-You need Lua 5.4, a C compiler, meson, ggml, libpng, libjpeg, zlib
-and utf8proc. Meson uses the system ggml when it finds one, else it
-builds ggml from `subprojects/ggml.wrap` (this needs cmake and the
-Vulkan headers and glslc). `-Dggml=system` or `-Dggml=subproject`
-forces one. It builds the other four from the wraps in `subprojects`
-when the system lacks them. The default build type is debugoptimized.
+You need Lua 5.4, a C compiler, meson, cmake, the Vulkan headers,
+glslc, libpng, libjpeg, zlib and utf8proc. Meson builds ggml from
+`subprojects/ggml.wrap` into `lgml.so`, static, with the lgml patch:
+fused ops and zero-copy experts need it. `-Dggml=system` links the
+system ggml in place; lgml then runs without those two. It builds the
+other four from the wraps in `subprojects` when the system lacks them.
+The default build type is debugoptimized.
 
 ### Packages
 
