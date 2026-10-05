@@ -236,6 +236,7 @@ test_modes(const char *path)
 	int64_t rows[sizeof(ids) / sizeof(ids[0]) * T_HEADS], all[] = { 0, T_ROWS - 1, 100, 99,
 		101, 100 };
 	float *out[3], want[T_DIM], got[6 * T_DIM];
+	static float got2[sizeof(ids) / sizeof(ids[0]) * T_HEADS * T_DIM];
 	struct ngram *r;
 	char err[256], name[300];
 	int m, good;
@@ -292,6 +293,13 @@ test_modes(const char *path)
 	ok(ngram_read(r, rows, 6, got) == 0, "read after fallback");
 	ok(memcmp(got, out[0], 6 * T_DIM * sizeof(float)) == 0, "fallback gives the same rows");
 	ngram_close(r);
+	r = ngram_open(path, NULL, "per_layer_token_embd.weight", NGRAM_DIRECT, 0, 2, err,
+	    sizeof(err));
+	ok(r != NULL && (r->align == 512 || r->align == 4096), "open direct with a found unit");
+	printf("# found unit %d, mode %d\n", (int)r->align, (int)r->mode);
+	ok(ngram_read(r, rows, nr, got2) == 0 &&
+	    memcmp(got2, out[0], nr * T_DIM * sizeof(float)) == 0, "found unit gives the same rows");
+	ngram_close(r);
 	ok(ngram_open(path, NULL, "nope", NGRAM_PREAD, 4096, 1, err, sizeof(err)) == NULL &&
 	    strstr(err, "no tensor") != NULL, "missing tensor");
 	ok(ngram_open(path, NULL, "per_layer_token_embd.weight", NGRAM_PREAD, 3000, 1, err,
@@ -320,7 +328,7 @@ test_real(const char *path, const char *meta)
 	int fd, m;
 
 	for (m = 0; m < 3; m++) {
-		r = ngram_open(path, meta, "per_layer_token_embd.weight", (enum ngram_mode)m, 4096,
+		r = ngram_open(path, meta, "per_layer_token_embd.weight", (enum ngram_mode)m, 0,
 		    8, err, sizeof(err));
 		ok(r != NULL, r != NULL ? "real: open" : err);
 		nr = n * (size_t)r->p.n_heads;

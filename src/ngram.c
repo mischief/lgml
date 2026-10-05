@@ -314,22 +314,42 @@ grow_buf(struct ngram *r, size_t n)
 
 /* Read one aligned block of the table, to see that direct reads work. */
 static int
-probe_direct(struct ngram *r)
+probe_direct(struct ngram *r, size_t align)
 {
-	off_t off = r->base - r->base % (off_t)r->align;
+	off_t off = r->base - r->base % (off_t)align;
 	ssize_t k;
 
-	if (grow_buf(r, r->align) != 0)
+	if (grow_buf(r, align) != 0)
 		return -1;
-	k = pread(r->dfd, r->buf, r->align, off);
+	k = pread(r->dfd, r->buf, align, off);
 	return k > 0 ? 0 : -1;
+}
+
+/* Find a unit that direct reads accept: align, or 512 then 4096 for 0. */
+static int
+pick_align(struct ngram *r, size_t align)
+{
+	static const size_t units[] = { 512, 4096 };
+	size_t i;
+
+	if (align != 0) {
+		r->align = align != 0 ? align : 4096;
+		return probe_direct(r, align);
+	}
+	for (i = 0; i < sizeof(units) / sizeof(units[0]); i++)
+		if (probe_direct(r, units[i]) == 0) {
+			r->align = units[i];
+			return 0;
+		}
+	r->align = 4096;
+	return -1;
 }
 
 /*
  * Open the table tensor of the gguf file path. meta is the gguf file
  * with the <arch>.ple.* keys, or NULL for path. align is the direct I/O
- * unit, a power of two. Direct mode falls back to pread when the file
- * system refuses it. On failure, returns NULL with a message in err.
+ * unit, a power of two, or 0 to find one. Direct mode falls back to
+ * pread when the file system refuses it. On failure, returns NULL with a message in err.
  */
 struct ngram *
 ngram_open(const char *path, const char *meta, const char *tensor, enum ngram_mode mode,
@@ -344,8 +364,8 @@ ngram_open(const char *path, const char *meta, const char *tensor, enum ngram_mo
 	int64_t id;
 	int h;
 
-	if (align == 0 || (align & (align - 1)) != 0) {
-		seterr(err, errlen, "align must be a power of two");
+	if ((align & (align - 1)) != 0) {
+		seterr(err, errlen, "align must be 0 or a power of two");
 		return NULL;
 	}
 	if ((r = calloc(1, sizeof(*r))) == NULL) {
@@ -407,7 +427,7 @@ ngram_open(const char *path, const char *meta, const char *tensor, enum ngram_mo
 #endif
 	if (mode == NGRAM_DIRECT) {
 		r->dfd = open_direct(path);
-		if (r->dfd == -1 || probe_direct(r) != 0) {
+		if (r->dfd == -1 || pick_align(r, align) != 0) {
 			if (r->dfd != -1)
 				close(r->dfd);
 			r->dfd = -1;

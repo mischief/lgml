@@ -155,7 +155,8 @@ read_out(lua_State *L, struct ngram *r, const int64_t *rows, size_t n, int idx)
  *   mode falls back to "pread" where the system or file system has no
  *   direct I/O; `reader:info().mode` tells which one is in use.
  * - `threads`: parallel reads (default 8)
- * - `align`: direct I/O unit in bytes, a power of two (default 4096)
+ * - `align`: direct I/O unit in bytes, a power of two (default: the
+ *   first of 512 and 4096 that the file accepts)
  * @tparam string path gguf file that holds the table
  * @tparam[opt] table opts options
  * @treturn[1] ngram_reader the reader
@@ -170,7 +171,7 @@ l_ngram_open(lua_State *L)
 	const char *path = luaL_checkstring(L, 1), *meta = NULL;
 	const char *tensor = "per_layer_token_embd.weight";
 	struct reader *rd;
-	lua_Integer threads = 8, align = 4096;
+	lua_Integer threads = 8, align = 0;
 	char err[512];
 	int mode = NGRAM_DIRECT;
 
@@ -187,7 +188,7 @@ l_ngram_open(lua_State *L)
 		if (lua_getfield(L, 2, "align") != LUA_TNIL)
 			align = luaL_checkinteger(L, -1);
 		luaL_argcheck(L, threads >= 1 && threads <= 64, 2, "threads must be 1 to 64");
-		luaL_argcheck(L, align >= 1 && align <= 1 << 20, 2, "align out of range");
+		luaL_argcheck(L, align >= 0 && align <= 1 << 20, 2, "align out of range");
 	}
 	rd = lua_newuserdatauv(L, sizeof(*rd), 0);
 	rd->r = NULL;
