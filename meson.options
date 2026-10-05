@@ -20,3 +20,7 @@ option('lua_dir', type : 'string', value : '',
   description : 'install directory of the Lua modules; empty: <prefix>/share/lua/5.4')
 option('lua_cdir', type : 'string', value : '',
   description : 'install directory of the C module; empty: <prefix>/lib/lua/5.4')
+option('ngram', type : 'string', value : '',
+  description : 'gguf file with a PLE n-gram table (per_layer_token_embd.weight) for the ngram test; empty skips that check')
+option('ngram_meta', type : 'string', value : '',
+  description : 'gguf file with the ple keys of the ngram table, when another file holds them')

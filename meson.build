@@ -12,6 +12,7 @@ project('lgml',
 
 cc = meson.get_compiler('c')
 m = cc.find_library('m', required : false)
+threads = dependency('threads')
 
 add_project_arguments(cc.get_supported_arguments([
   '-Wvla',
@@ -130,6 +131,18 @@ test_audio = executable('test_audio',
   dependencies : [m],
 )
 test('audio', test_audio, timeout : 60)
+
+# The real table check runs when the ngram option names the gguf file
+# that holds it, and ngram_meta the file with the ple keys.
+test_ngram = executable('test_ngram',
+  'test/test_ngram.c',
+  'src/ngram.c',
+  include_directories : include_directories('src'),
+  dependencies : [ggml, m, threads],
+)
+test('ngram', test_ngram,
+  env : { 'LGML_NGRAM' : get_option('ngram'), 'LGML_NGRAM_META' : get_option('ngram_meta') },
+  timeout : 120)
 
 lua_bin = find_program('lua5.4', 'lua', required : false)
 if lua_bin.found()
