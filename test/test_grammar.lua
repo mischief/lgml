@@ -253,6 +253,101 @@ do
 	ok(lgml.grammar("root ::= <b>", { tokenizer = tk }) ~= nil, "token names with a tokenizer")
 end
 
+-- Lazy grammars: free text until a trigger, then the grammar until its
+-- root can end.
+do
+	--          0     1     2    3    4    5    6      7    8      9       10     11      12
+	local p = { "hi", "<c", ">", "f", "g", "z", "</c>", " ", "<t>", "</t>", "<c>z", "</s>", "<C>" }
+	local tk = vocab(p, { 11 })
+	local text = [[root ::= ("<c>" | "<C>") ("f" | "g") "</c>"]]
+	local function lazy(extra)
+		local o = { grammar = text, tokenizer = tk, temperature = 0, triggers = { "<c>" } }
+		for k, v in pairs(extra or {}) do
+			o[k] = v
+		end
+		return lgml.sampler(o)
+	end
+	-- z has the top logit, then g; </s> is next.
+	local x <close> = be:tensor("f32", { 1, #p }, { 0, 0, 0, 1, 2, 9, 0, 0, 0, 0, 0, 5, 0 })
+	local s = lazy()
+	ok(not s:active() and s:can_end() and #s:allowed() == #p, "lazy: off at the start")
+	ok(s:sample(x) == 5, "lazy: free text before a trigger")
+	s:accept(0)
+	s:accept(1)
+	ok(not s:active(), "lazy: a partial trigger does nothing")
+	s:accept(2)
+	ok(s:active() and set(s:allowed()) == "3,4", "lazy: a trigger over two tokens starts the grammar")
+	ok(not s:can_end(), "lazy: no end of generation in a call")
+	ok(s:sample(x) == 4, "lazy: the grammar masks the top logit")
+	s:accept(4)
+	ok(set(s:allowed()) == "6", "lazy: then the close")
+	s:accept(6)
+	ok(not s:active() and s:sample(x) == 5, "lazy: off when the root ends")
+	s:accept(7)
+	s:accept(1)
+	s:accept(2)
+	ok(s:active() and set(s:allowed()) == "3,4", "lazy: a second trigger starts it again")
+	s:accept(3)
+	s:accept(6)
+	ok(not s:active(), "lazy: the second call ends")
+	s:accept(10)
+	ok(not s:active() and s:sample(x) == 5, "lazy: a trigger with text that does not fit stays free")
+
+	s = lazy({ free_block = { "<t>", "</t>" } })
+	s:accept(8)
+	s:accept(1)
+	s:accept(2)
+	ok(not s:active(), "lazy: a trigger in the free block does nothing")
+	s:accept(9)
+	s:accept(1)
+	s:accept(2)
+	ok(s:active(), "lazy: a trigger after the free block starts the grammar")
+	s = lazy({ free_block = { "<t>", "</t>", inside = true } })
+	s:accept(1)
+	s:accept(2)
+	ok(not s:active(), "lazy: inside the free block at the start")
+	s:accept(9)
+	s:accept(1)
+	s:accept(2)
+	ok(s:active(), "lazy: free from the block end")
+
+	s = lazy({ triggers = {}, trigger_tokens = { 12 } })
+	s:accept(1)
+	s:accept(2)
+	ok(not s:active(), "lazy: text is no trigger with trigger_tokens only")
+	s:accept(12)
+	ok(s:active() and set(s:allowed()) == "3,4", "lazy: a trigger token starts the grammar")
+	ok(not pcall(lazy, { triggers = { "" } }), "lazy: an empty trigger raises")
+	ok(not pcall(lazy, { trigger_tokens = { "a" } }), "lazy: a bad trigger token raises")
+
+	-- The sampler accepts only sampled tokens, so a speculative verify
+	-- pass (sample, then accept, per row) matches plain decoding.
+	local rows <close> = be:tensor("f32", { 4, #p }, {
+		0, 9, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+		0, 0, 9, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+		0, 0, 0, 1, 2, 9, 0, 0, 0, 0, 0, 5, 0,
+		0, 0, 0, 1, 2, 9, 0, 0, 0, 0, 0, 5, 0,
+	})
+	local a, b = lazy(), lazy()
+	local seq_a, seq_b = {}, {}
+	for r = 1, 4 do
+		local id = a:sample(rows, r)
+		a:accept(id)
+		seq_a[r] = id
+	end
+	-- A draft that guesses z for row 3 is rejected: row 3 samples g.
+	local drafts = { 1, 2, 5, 6 }
+	for r = 1, 4 do
+		local id = b:sample(rows, r)
+		b:accept(id)
+		seq_b[r] = id
+		if id ~= drafts[r] then
+			break
+		end
+	end
+	ok(set(seq_a) == "1,2,4,6" and set(seq_b) == "1,2,4", "lazy: verify rows sample as plain decoding")
+end
+
 -- The vocab table is built once per tokenizer.
 do
 	local calls = 0

@@ -37,6 +37,8 @@ struct grammar	*grammar_new(const char *, size_t, const char *,
 void		 grammar_free(struct grammar *);
 const char	*grammar_error(const struct grammar *);
 int		 grammar_can_end(const struct grammar *);
+/* Go back to the start state. 0 on success, -1 on error. */
+int		 grammar_reset(struct grammar *);
 size_t		 grammar_nstacks(const struct grammar *);
 
 /* 0 on success, -1 when the input does not fit or on error. */

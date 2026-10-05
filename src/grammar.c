@@ -95,6 +95,7 @@ struct grammar {
 	uint32_t	 nrules;
 
 	struct sset	 cur;
+	struct sset	 start;	/* cur after grammar_new */
 	struct sset	 nxt;
 	struct sset	 a;
 	struct sset	 b;
@@ -315,6 +316,23 @@ ss_add(struct grammar *g, struct sset *s, const uint32_t *e, uint32_t len,
 nomem:
 	set_err(g->err, sizeof(g->err), "out of memory");
 	return -1;
+}
+
+/* Make dst a copy of src. */
+static int
+copy_set(struct grammar *g, struct sset *dst, const struct sset *src)
+{
+	const uint32_t *stk;
+	uint32_t len;
+	size_t i;
+
+	ss_clear(dst);
+	for (i = 0; i < src->n; i++) {
+		stk = ss_get(src, i, &len);
+		if (ss_add(g, dst, stk, len, MAX_STACKS) == -1)
+			return -1;
+	}
+	return 0;
 }
 
 /* Parser */
@@ -1384,6 +1402,15 @@ reject_all(struct grammar *g, unsigned depth, struct sset *s,
 }
 
 int
+grammar_reset(struct grammar *g)
+{
+	g->budget = MAX_WORK;
+	g->pv = 0;
+	g->nr = 0;
+	return copy_set(g, &g->cur, &g->start);
+}
+
+int
 grammar_can_end(const struct grammar *g)
 {
 	size_t i;
@@ -1598,6 +1625,7 @@ grammar_free(struct grammar *g)
 	free(g->el);
 	free(g->roff);
 	ss_free(&g->cur);
+	ss_free(&g->start);
 	ss_free(&g->nxt);
 	ss_free(&g->a);
 	ss_free(&g->b);
@@ -1709,6 +1737,10 @@ grammar_new(const char *src, size_t len, const char *root,
 		if (g->el[pos].type != G_ALT)
 			break;
 		pos++;
+	}
+	if (copy_set(g, &g->start, &g->cur) == -1) {
+		set_err(p.err, sizeof(p.err), "%s", g->err);
+		goto bad;
 	}
 	parse_free(&p);
 	return g;

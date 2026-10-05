@@ -24,6 +24,11 @@
 #define TOP_P_START	256	/* first partial sort size for top_p */
 #define MASK_TOP	512	/* tokens checked first against a grammar */
 
+struct lazypat {
+	char		*s;
+	size_t		 len;
+};
+
 struct cand {
 	float		 logit;
 	int32_t		 id;
@@ -63,6 +68,24 @@ struct sampler {
 	struct grammar	*g;
 	struct gvocab	*gv;
 	uint8_t		*mask;
+
+	/*
+	 * A lazy grammar is off until a trigger shows in the accepted
+	 * text, then on until its root can end. A free block, such as a
+	 * reasoning block, hides triggers.
+	 */
+	int		 lazy;
+	int		 active;	/* the grammar applies to tokens */
+	struct lazypat	*pat;		/* triggers, then the block tags */
+	int		 ntrig;
+	int		 npat;
+	int32_t		*trig_tok;
+	int		 ntrig_tok;
+	int		 in_block;
+	char		*tbuf;		/* text since the last match */
+	size_t		 tlen;
+	size_t		 tcap;
+	size_t		 tkeep;		/* longest pattern less one byte */
 
 	int		 closed;
 };
@@ -232,6 +255,219 @@ read_bias(lua_State *L, struct sampler *s)
 	lua_pop(L, 1);
 }
 
+/* Room for n more bytes of trigger text. */
+static int
+grow_text(struct sampler *s, size_t n)
+{
+	char *p;
+	size_t cap;
+
+	if (s->tlen + n <= s->tcap)
+		return 0;
+	cap = (s->tlen + n) * 2;
+	if ((p = realloc(s->tbuf, cap)) == NULL)
+		return -1;
+	s->tbuf = p;
+	s->tcap = cap;
+	return 0;
+}
+
+/* Offset of the first p in s[0..n), or n when there is none. */
+static size_t
+find_text(const char *s, size_t n, const char *p, size_t m)
+{
+	size_t i;
+
+	if (m == 0 || m > n)
+		return n;
+	for (i = 0; i + m <= n; i++)
+		if (s[i] == p[0] && memcmp(s + i, p, m) == 0)
+			return i;
+	return n;
+}
+
+/* The pattern of p[0..n) that starts first in s, or -1; ties go low. */
+static int
+first_match(const struct lazypat *p, int n, const char *s, size_t len,
+    size_t *at)
+{
+	size_t best = len, o;
+	int i, k = -1;
+
+	for (i = 0; i < n; i++) {
+		o = find_text(s, len, p[i].s, p[i].len);
+		if (o < best) {
+			best = o;
+			k = i;
+		}
+	}
+	*at = best;
+	return k;
+}
+
+/* Drop the first n bytes of the trigger text. */
+static void
+lazy_drop(struct sampler *s, size_t n)
+{
+	memmove(s->tbuf, s->tbuf + n, s->tlen - n);
+	s->tlen -= n;
+}
+
+/* Turn the grammar on when it takes text from its start. */
+static void
+lazy_start(lua_State *L, struct sampler *s, const char *text, size_t n,
+    int32_t id)
+{
+	int r;
+
+	if (grammar_reset(s->g) == -1)
+		luaL_error(L, "grammar: %s", grammar_error(s->g));
+	if (id >= 0)
+		r = grammar_accept_token(s->g, s->gv, id);
+	else
+		r = grammar_accept_bytes(s->g, text, n);
+	/* Text that does not fit stays free. */
+	s->active = r == 0 && !grammar_can_end(s->g);
+	s->tlen = 0;
+}
+
+/*
+ * Look for a trigger in the text of an accepted token while the lazy
+ * grammar is off. A trigger starts the grammar at its first byte; the
+ * grammar then also takes the rest of the token.
+ */
+static void
+lazy_scan(lua_State *L, struct sampler *s, int32_t id)
+{
+	const struct gvocab *v = s->gv;
+	const struct lazypat *close = &s->pat[s->ntrig + 1];
+	size_t n, at;
+	int i, k;
+
+	if (id >= v->n || (v->flag[id] & (GV_EOG | GV_BAD)))
+		return;
+	for (i = 0; i < s->ntrig_tok && !s->in_block; i++) {
+		if (s->trig_tok[i] == id) {
+			lazy_start(L, s, NULL, 0, id);
+			return;
+		}
+	}
+	n = v->off[id + 1] - v->off[id];
+	if (grow_text(s, n) == -1)
+		luaL_error(L, "out of memory");
+	memcpy(s->tbuf + s->tlen, v->bytes + v->off[id], n);
+	s->tlen += n;
+	for (;;) {
+		if (s->in_block) {
+			if (first_match(close, 1, s->tbuf, s->tlen, &at) < 0)
+				break;
+			lazy_drop(s, at + close->len);
+			s->in_block = 0;
+			continue;
+		}
+		k = first_match(s->pat, s->npat > s->ntrig ? s->ntrig + 1 :
+		    s->ntrig, s->tbuf, s->tlen, &at);
+		if (k < 0)
+			break;
+		if (k < s->ntrig) {
+			lazy_start(L, s, s->tbuf + at, s->tlen - at, -1);
+			return;
+		}
+		lazy_drop(s, at + s->pat[k].len);
+		s->in_block = 1;
+	}
+	if (s->tlen > s->tkeep)
+		lazy_drop(s, s->tlen - s->tkeep);
+}
+
+/* Copy the string at the top of the stack into p. */
+static void
+read_pat(lua_State *L, struct lazypat *p, const char *what)
+{
+	const char *t;
+	size_t n;
+
+	if ((t = lua_tolstring(L, -1, &n)) == NULL || n == 0)
+		luaL_error(L, "%s must be a non-empty string", what);
+	if ((p->s = malloc(n)) == NULL)
+		luaL_error(L, "out of memory");
+	memcpy(p->s, t, n);
+	p->len = n;
+	lua_pop(L, 1);
+}
+
+/* Read opts.triggers, opts.trigger_tokens and opts.free_block. */
+static void
+read_lazy(lua_State *L, struct sampler *s)
+{
+	lua_Integer id;
+	int i, nt, nk, isint, inside = 0;
+
+	nt = lua_getfield(L, 1, "triggers") == LUA_TNIL ? -1 :
+	    (luaL_checktype(L, -1, LUA_TTABLE), (int)luaL_len(L, -1));
+	nk = lua_getfield(L, 1, "trigger_tokens") == LUA_TNIL ? -1 :
+	    (luaL_checktype(L, -1, LUA_TTABLE), (int)luaL_len(L, -1));
+	lua_getfield(L, 1, "free_block");
+	if (nt < 0 && nk < 0) {
+		s->active = 1;
+		lua_pop(L, 3);
+		return;
+	}
+	s->lazy = 1;
+	nt = nt < 0 ? 0 : nt;
+	nk = nk < 0 ? 0 : nk;
+	if ((s->pat = calloc((size_t)nt + 2, sizeof(*s->pat))) == NULL ||
+	    (nk > 0 && (s->trig_tok = malloc((size_t)nk *
+	    sizeof(*s->trig_tok))) == NULL))
+		luaL_error(L, "out of memory");
+	for (i = 0; i < nt; i++) {
+		lua_geti(L, -3, i + 1);
+		read_pat(L, &s->pat[i], "a trigger");
+		s->ntrig = s->npat = i + 1;
+	}
+	for (i = 0; i < nk; i++) {
+		lua_geti(L, -2, i + 1);
+		id = lua_tointegerx(L, -1, &isint);
+		if (!isint || id < 0 || id > INT32_MAX)
+			luaL_error(L, "trigger_tokens: need token ids");
+		s->trig_tok[s->ntrig_tok++] = (int32_t)id;
+		lua_pop(L, 1);
+	}
+	if (!lua_isnil(L, -1)) {
+		luaL_checktype(L, -1, LUA_TTABLE);
+		lua_geti(L, -1, 1);
+		read_pat(L, &s->pat[nt], "free_block[1]");
+		lua_geti(L, -1, 2);
+		read_pat(L, &s->pat[nt + 1], "free_block[2]");
+		s->npat = nt + 2;
+		lua_getfield(L, -1, "inside");
+		inside = lua_toboolean(L, -1);
+		lua_pop(L, 1);
+	}
+	lua_pop(L, 3);
+	s->in_block = inside;
+	for (i = 0; i < s->npat; i++)
+		if (s->pat[i].len > s->tkeep + 1)
+			s->tkeep = s->pat[i].len - 1;
+}
+
+static void
+free_lazy(struct sampler *s)
+{
+	int i;
+
+	for (i = 0; s->pat != NULL && i < s->ntrig + 2; i++)
+		free(s->pat[i].s);
+	free(s->pat);
+	free(s->trig_tok);
+	free(s->tbuf);
+	s->pat = NULL;
+	s->trig_tok = NULL;
+	s->tbuf = NULL;
+	s->npat = s->ntrig = s->ntrig_tok = 0;
+	s->tlen = s->tcap = 0;
+}
+
 /*** Make a token sampler.
  * The chain follows llama.cpp: penalties, `top_k`, `top_p`, `min_p`,
  * temperature, then a draw. opts fields and defaults: temperature (0.8;
@@ -243,6 +479,11 @@ read_bias(lua_State *L, struct sampler *s)
  * grammar is GBNF text; tokens must then fit it (see `sampler:sample`).
  * It needs tokenizer, an object with `n_vocab`, `token` and `special`
  * methods; `grammar_root` names the start rule (default "root").
+ * With `triggers` (a list of strings) or `trigger_tokens` (a list of
+ * token ids), the grammar is lazy: it applies from the first trigger
+ * in the accepted text until its root can end, then again at the next
+ * trigger. `free_block = { open, close, inside = bool }` hides
+ * triggers between the two tags; inside means the text starts there.
  * @tparam[opt] table opts options
  * @treturn sampler the sampler
  * @raise if an option has the wrong type or range, or the grammar is bad
@@ -312,6 +553,7 @@ l_sampler(lua_State *L)
 	if ((s->g = grammar_new(text, len, root, s->gv, 0, err,
 	    sizeof(err))) == NULL)
 		return luaL_error(L, "grammar: %s", err);
+	read_lazy(L, s);
 	lua_settop(L, 2);
 	return 1;
 }
@@ -344,13 +586,15 @@ sampler_close(lua_State *L)
 	s->g = NULL;
 	free(s->mask);
 	s->mask = NULL;
+	free_lazy(s);
 	s->closed = 1;
 	return 0;
 }
 
 /*** Add a token id to the penalty history.
  * The history keeps the last `repeat_last_n` ids. With a grammar, the
- * token also advances the grammar.
+ * token also advances the grammar. While a lazy grammar is off, the
+ * sampler looks for a trigger in the token text instead.
  * @tparam int id token id, from 0
  * @raise if the id is negative or too large, or does not fit the grammar
  * @function sampler:accept
@@ -364,8 +608,16 @@ sampler_accept(lua_State *L)
 
 	luaL_argcheck(L, v >= 0 && v <= INT32_MAX, 2, "bad token id");
 	id = (int32_t)v;
-	if (s->g != NULL && grammar_accept_token(s->g, s->gv, id) == -1)
-		return luaL_error(L, "grammar: %s", grammar_error(s->g));
+	if (s->g != NULL && s->active) {
+		if (grammar_accept_token(s->g, s->gv, id) == -1)
+			return luaL_error(L, "grammar: %s",
+			    grammar_error(s->g));
+		if (s->lazy && grammar_can_end(s->g)) {
+			s->active = 0;
+			s->tlen = 0;
+		}
+	} else if (s->g != NULL)
+		lazy_scan(L, s, id);
 	if (s->last_n == 0)
 		return 0;
 	if (s->hist_len == s->last_n) {
@@ -782,6 +1034,7 @@ constrain(lua_State *L, struct sampler *s, int32_t id)
  * token does not fit, each token that does not fit is masked and the
  * chain runs again. An end-of-generation token fits only where the
  * grammar can end.
+ * A lazy grammar that is off masks nothing.
  * @tparam tensor logits computed, contiguous f32, f16 or bf16 tensor
  * @tparam[opt] int row row number from 1; the default is the last row
  * @treturn int token id, from 0
@@ -800,7 +1053,7 @@ sampler_sample(lua_State *L)
 			s->logits[s->bias_id[i]] += s->bias[i];
 	apply_penalties(s);
 	id = chain(s);
-	if (s->g != NULL)
+	if (s->g != NULL && s->active)
 		id = constrain(L, s, id);
 	lua_pushinteger(L, id);
 	return 1;
@@ -855,6 +1108,7 @@ sampler_logprobs(lua_State *L)
 }
 
 /*** List the token ids that fit the grammar now.
+ * While a lazy grammar is off, each token fits.
  * @treturn {int,...} token ids, from 0, ascending
  * @raise without a grammar
  * @function sampler:allowed
@@ -871,7 +1125,9 @@ sampler_allowed(lua_State *L)
 	if (s->mask == NULL &&
 	    (s->mask = malloc(s->gv->n > 0 ? (size_t)s->gv->n : 1)) == NULL)
 		return luaL_error(L, "out of memory");
-	if (grammar_mask(s->g, s->gv, s->mask) == -1)
+	if (!s->active)
+		memset(s->mask, 1, (size_t)s->gv->n);
+	else if (grammar_mask(s->g, s->gv, s->mask) == -1)
 		return luaL_error(L, "grammar: %s", grammar_error(s->g));
 	lua_newtable(L);
 	for (i = 0; i < s->gv->n; i++) {
@@ -884,7 +1140,8 @@ sampler_allowed(lua_State *L)
 }
 
 /*** Test whether the grammar can end here.
- * @treturn boolean true without a grammar, or when the grammar can end
+ * @treturn boolean true without a grammar, while a lazy grammar is off,
+ * or when the grammar can end
  * @function sampler:can_end
  */
 static int
@@ -892,7 +1149,21 @@ sampler_can_end(lua_State *L)
 {
 	struct sampler *s = check_sampler(L, 1);
 
-	lua_pushboolean(L, s->g == NULL || grammar_can_end(s->g));
+	lua_pushboolean(L, s->g == NULL || !s->active || grammar_can_end(s->g));
+	return 1;
+}
+
+/*** Test whether the grammar applies now.
+ * @treturn boolean true with a grammar, unless it is a lazy grammar
+ * that waits for a trigger
+ * @function sampler:active
+ */
+static int
+sampler_active(lua_State *L)
+{
+	struct sampler *s = check_sampler(L, 1);
+
+	lua_pushboolean(L, s->g != NULL && s->active);
 	return 1;
 }
 
@@ -973,6 +1244,7 @@ static const luaL_Reg sampler_methods[] = {
 	{ "allowed", sampler_allowed },
 	{ "logprobs", sampler_logprobs },
 	{ "can_end", sampler_can_end },
+	{ "active", sampler_active },
 	{ "close", sampler_close },
 	{ NULL, NULL }
 };
