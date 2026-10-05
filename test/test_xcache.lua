@@ -151,6 +151,18 @@ for _, kind in ipairs({ "split", "fused", "q8_0" }) do
 		ok(xc.layers[1].router_cpu and d < TOL,
 		    ("%s, router on the CPU: logits equal one backend (max error %.3g)"):format(kind, d))
 	end
+	-- Zero-copy: the device reads the misses from pinned host memory where
+	-- the Vulkan backend has the hook; elsewhere the CPU computes them.
+	do
+		local m = transformer.load(be, path, { placement = rules })
+		local xc = xcache.new(m, { slots = 5, zerocopy = true })
+		local zc = xc.layers[1].host ~= nil
+		local d = maxdiff(want, rows(m, ids))
+		local db = maxdiff(want_batch, batch_row(m, ids))
+		ok(d < TOL and db < (DEV == "CPU" and TOL or 1e-2),
+		    ("%s, zero-copy %s: logits equal one backend (max error %.3g, batch %.3g)")
+		    :format(kind, zc and "on" or "off", d, db))
+	end
 	-- Slots that change before every pass, at most one expert each.
 	do
 		local m = transformer.load(be, path, { placement = rules })

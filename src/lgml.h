@@ -121,6 +121,7 @@ void		 lgml_open_ops_vibevoice(lua_State *);
 void		 lgml_open_ops_nn(lua_State *);
 void		 lgml_open_proctitle(lua_State *);
 void		 lgml_open_ops_fused(lua_State *);
+ggml_backend_buffer_type_t lgml_host_read_buft(void);
 void		 lgml_open_xcache(lua_State *);
 void		 lgml_open_train(lua_State *);
 void		 lgml_open_ngram(lua_State *);

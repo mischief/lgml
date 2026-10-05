@@ -1,17 +1,17 @@
-Subject: [PATCH] vulkan: custom op shaders and pinned host reads (lgml)
+Subject: [PATCH] vulkan: custom op shaders and a host read buffer type (lgml)
 
 A caller registers a SPIR-V shader for a ggml custom op function with
 ggml_backend_vk_register_custom; the Vulkan backend then runs such ops on
-the device. ggml_backend_vk_set_host_read(true) lets ops on the device
-read tensors in its pinned host buffer type in place, over PCIe, and the
-scheduler keeps such ops on the device. Both come through the backend
-registry proc address of the same name.
+the device. ggml_backend_vk_host_read_buffer_type is pinned host memory
+that ops on the device read in place, over PCIe; the scheduler keeps ops
+on such tensors on the device. Both come through the backend registry
+proc address of the same name.
 
 diff --git a/include/ggml-vulkan.h b/include/ggml-vulkan.h
-index ed5ea5f..2090c85 100644
+index ed5ea5f..a285c36 100644
 --- a/include/ggml-vulkan.h
 +++ b/include/ggml-vulkan.h
-@@ -24,6 +24,28 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type(voi
+@@ -24,6 +24,29 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type(voi
  
  GGML_BACKEND_API ggml_backend_reg_t ggml_backend_vk_reg(void);
  
@@ -33,33 +33,34 @@ index ed5ea5f..2090c85 100644
 +// fun as before. Register before the first graph that holds such an op.
 +GGML_BACKEND_API void ggml_backend_vk_register_custom(ggml_custom_op_t fun, const struct ggml_vk_custom_op * op);
 +
-+// With on, ops on a Vulkan device read tensors in its pinned host buffer type
-+// in place, over PCIe, and the scheduler keeps such ops on the device.
-+GGML_BACKEND_API void ggml_backend_vk_set_host_read(bool on);
++// Pinned host memory that ops on a Vulkan device read in place, over PCIe;
++// the scheduler keeps ops on such tensors on the device. Other pinned host
++// buffers stay CPU memory.
++GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_host_read_buffer_type(void);
 +
  #ifdef  __cplusplus
  }
  #endif
 diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
-index 735ae3b..10d6e91 100644
+index 735ae3b..c9e1cec 100644
 --- a/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -269,9 +269,17 @@ uint64_t vk_tensor_offset(const ggml_tensor * tensor) {
      return (uint8_t *) tensor->data - (uint8_t *) vk_ptr_base;
  }
  
-+// When set, ops on the device read tensors in its pinned host buffer in place,
-+// over PCIe, as on a UMA device. See ggml_backend_vk_set_host_read.
-+static bool vk_host_read = false;
++// Pinned host memory that ops on the device read in place, over PCIe, as on a
++// UMA device. See ggml_backend_vk_host_read_buffer_type.
++static struct ggml_backend_buffer_type vk_host_read_buft;
 +
-+void ggml_backend_vk_set_host_read(bool on) {
-+    vk_host_read = on;
++static bool ggml_vk_is_host_read(const ggml_tensor * t) {
++    return t != nullptr && t->buffer != nullptr && t->buffer->buft == &vk_host_read_buft;
 +}
 +
  size_t ggml_vk_tensor_buffer_offset(const ggml_backend_vk_context * ctx, const ggml_tensor * t) {
      // vk_tensor_offset() is relative to vk_ptr_base, but mapped host tensors need an offset relative to their Vulkan buffer.
 -    if (ctx->device->uma) {
-+    if (ctx->device->uma || vk_host_read) {
++    if (ctx->device->uma || ggml_vk_is_host_read(t)) {
          vk_buffer buf = nullptr;
          size_t off = 0;
          ggml_vk_host_get(ctx->device, t->data, buf, off);
@@ -68,7 +69,7 @@ index 735ae3b..10d6e91 100644
      vk_buffer buffer = nullptr;
      size_t offset = 0;
 -    if (ctx->device->uma) {
-+    if (ctx->device->uma || vk_host_read) {
++    if (ctx->device->uma || ggml_vk_is_host_read(tensor)) {
          ggml_vk_host_get(ctx->device, tensor->data, buffer, offset);
      }
      if (!buffer) {
@@ -77,7 +78,7 @@ index 735ae3b..10d6e91 100644
      bool src1_uma = false;
  
 -    if (ctx->device->uma) {
-+    if (ctx->device->uma || vk_host_read) {
++    if (ctx->device->uma || ggml_vk_is_host_read(src0)) {
          ggml_vk_host_get(ctx->device, src0->data, d_Qx, qx_buf_offset);
          ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
          src0_uma = d_Qx != nullptr;
@@ -86,7 +87,7 @@ index 735ae3b..10d6e91 100644
      bool ids_uma = false;
  
 -    if (ctx->device->uma) {
-+    if (ctx->device->uma || vk_host_read) {
++    if (ctx->device->uma || ggml_vk_is_host_read(src0)) {
          ggml_vk_host_get(ctx->device, src0->data, d_Qx, qx_buf_offset);
          ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
          ggml_vk_host_get(ctx->device, ids->data, d_ids, ids_buf_offset);
@@ -176,7 +177,7 @@ index 735ae3b..10d6e91 100644
              if (unsynced_nodes.size() == 0) {
                  return false;
              }
-+            // tensors in pinned host memory (vk_host_read) are read-only weights
++            // tensors in host read buffers are read-only weights
 +            if (node->buffer->buft->iface.get_name != ggml_backend_vk_buffer_type_name) {
 +                return false;
 +            }
@@ -202,7 +203,29 @@ index 735ae3b..10d6e91 100644
          break;
      case GGML_OP_SCALE:
          if (ctx->fused_hc_post_gate) {
-@@ -15751,6 +15845,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+@@ -13148,6 +13242,21 @@ ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type() {
+     return &ggml_backend_vk_buffer_type_host;
+ }
+ 
++static const char * ggml_backend_vk_host_read_buffer_type_name(ggml_backend_buffer_type_t buft) {
++    return GGML_VK_NAME "_Host_Read";
++
++    UNUSED(buft);
++}
++
++ggml_backend_buffer_type_t ggml_backend_vk_host_read_buffer_type() {
++    static std::once_flag once;
++    std::call_once(once, [] {
++        vk_host_read_buft = *ggml_backend_vk_host_buffer_type();
++        vk_host_read_buft.iface.get_name = ggml_backend_vk_host_read_buffer_type_name;
++    });
++    return &vk_host_read_buft;
++}
++
+ static const char * ggml_backend_vk_name(ggml_backend_t backend) {
+     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+ 
+@@ -15751,6 +15860,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
              return op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16;
          case GGML_OP_SCALE:
              return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
@@ -211,17 +234,17 @@ index 735ae3b..10d6e91 100644
          case GGML_OP_PAD:
          case GGML_OP_PAD_REFLECT_1D:
          case GGML_OP_ROLL:
-@@ -15985,6 +16081,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+@@ -15985,6 +16096,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
  }
  
  static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-+    if (vk_host_read && buft == ggml_backend_vk_host_buffer_type()) {
++    if (buft == &vk_host_read_buft) {
 +        return true;
 +    }
      if (buft->iface.get_name != ggml_backend_vk_buffer_type_name) {
          return false;
      }
-@@ -16158,11 +16257,22 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
+@@ -16158,11 +16272,22 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
      return devices[device];
  }
  
@@ -230,8 +253,8 @@ index 735ae3b..10d6e91 100644
 +    if (strcmp(name, "ggml_backend_vk_register_custom") == 0) {
 +        return (void *) ggml_backend_vk_register_custom;
 +    }
-+    if (strcmp(name, "ggml_backend_vk_set_host_read") == 0) {
-+        return (void *) ggml_backend_vk_set_host_read;
++    if (strcmp(name, "ggml_backend_vk_host_read_buffer_type") == 0) {
++        return (void *) ggml_backend_vk_host_read_buffer_type;
 +    }
 +    return NULL;
 +}

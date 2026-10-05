@@ -13,14 +13,13 @@
 #include <stdint.h>
 #include <string.h>
 
+#include <ggml-backend.h>
 #include <lua.h>
 #include <lauxlib.h>
 
 #include "lgml.h"
 
 #ifdef LGML_HAVE_SPV
-#include <ggml-backend.h>
-
 struct ggml_vk_custom_op {
 	const void	*spv;
 	size_t		 spv_size;
@@ -222,31 +221,22 @@ register_vk(void)
 #endif
 }
 
-/*** Let Vulkan ops read pinned host tensors in place.
- * With it on, an op on a Vulkan device whose weights are in pinned host
- * memory (`backend:tensor` with `pinned`) stays on the device and reads
- * them over PCIe. It holds for the whole process.
- * @tparam boolean on
- * @treturn boolean true when the Vulkan backend has the switch
- * @function vk_host_read
+/*
+ * The Vulkan buffer type of pinned host memory that ops on the device read
+ * in place, over PCIe; NULL when ggml lacks the lgml patch.
  */
-static int
-l_vk_host_read(lua_State *L)
+ggml_backend_buffer_type_t
+lgml_host_read_buft(void)
 {
-#ifdef LGML_HAVE_SPV
 	ggml_backend_reg_t reg = ggml_backend_reg_by_name("Vulkan");
-	void (*fn)(bool);
-	void *addr = reg != NULL ? ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_set_host_read") : NULL;
+	ggml_backend_buffer_type_t (*fn)(void);
+	void *addr = reg != NULL ?
+	    ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_host_read_buffer_type") : NULL;
 
-	if (addr != NULL) {
-		memcpy(&fn, &addr, sizeof(fn));
-		fn(lua_toboolean(L, 1));
-		lua_pushboolean(L, 1);
-		return 1;
-	}
-#endif
-	lua_pushboolean(L, 0);
-	return 1;
+	if (addr == NULL)
+		return NULL;
+	memcpy(&fn, &addr, sizeof(fn));
+	return fn();
 }
 
 void
@@ -254,7 +244,11 @@ lgml_open_ops_fused(lua_State *L)
 {
 	lgml_graph_ops(L, ops);
 	register_vk();
-	lua_pushcfunction(L, l_vk_host_read);
+	/*** True when Vulkan devices can read host memory in place: tensors
+	 * from `backend:tensor` with `host_read`.
+	 * @field vk_host_read
+	 */
+	lua_pushboolean(L, lgml_host_read_buft() != NULL);
 	lua_setfield(L, -2, "vk_host_read");
 	/*** True when the Vulkan backend runs the fused ops on the device.
 	 * Without it a fused op on a GPU graph runs on the CPU.

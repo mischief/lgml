@@ -12,6 +12,9 @@
 -- scores.
 -- @module lgml.xcache
 local lgml = require("lgml")
+local log = require("lgml.log")
+
+local L = log.new("xcache")
 
 local M = {}
 M.__index = M
@@ -200,8 +203,9 @@ function M.new(model, opts)
 		-- Fill every slot now, the experts of most score first.
 		self:apply(self.state:plan(n * #model.layers, self.decay, self.margin))
 	end
-	if opts.zerocopy and n > 0 and n < hp.n_expert then
-		self:zerocopy()
+	if opts.zerocopy and n > 0 and n < hp.n_expert and not self:zerocopy() then
+		L:warn("zero-copy experts need the Vulkan host read hook of the lgml ggml patch; " ..
+		    "the CPU computes the misses")
 	end
 	for il, xc in pairs(self.layers) do
 		model.layers[il].xc = xc
@@ -215,10 +219,13 @@ end
 -- which it reads over PCIe: the misses then run on the device, and a pass
 -- needs no CPU part. The slots stay as they are (no moves). xc.host holds
 -- the experts per field, xc.hmap (f32) the host row of each expert; held
--- experts map to a dummy row, read at weight 0.
+-- experts map to a dummy row, read at weight 0. Returns false, and changes
+-- nothing, when the Vulkan backend lacks the host read hook.
 function M:zerocopy()
-	assert(lgml.vk_host_read and lgml.vk_host_read(true), "zero-copy needs ggml patch 07")
 	local be = self.model.be
+	if be:name():upper():match("^CPU") or not lgml.vk_host_read then
+		return false
+	end
 	for il, xc in pairs(self.layers) do
 		local L = self.model.layers[il]
 		local map, hit = self.state:tables(il)
@@ -245,7 +252,7 @@ function M:zerocopy()
 			if t then
 				local s = t:shape()
 				s[1] = #rows + K
-				local h = be:tensor(t:type(), s, nil, { weights = true, pinned = true })
+				local h = be:tensor(t:type(), s, nil, { weights = true, host_read = true })
 				for i, e in ipairs(rows) do
 					h:set_slice(i - 1, t, e)
 				end
@@ -266,6 +273,7 @@ function M:zerocopy()
 		xc.static = true
 	end
 	self.swap = 0
+	return true
 end
 
 --- An expert cache from `new`.
