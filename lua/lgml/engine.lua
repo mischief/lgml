@@ -217,6 +217,38 @@ local function dev_type(be)
 	end
 end
 
+-- The most host RAM, as a fraction, that pinned weights may take. The
+-- driver maps pinned memory into a GPU address space of limited size
+-- (on amdgpu, GTT: half of RAM). Past it, command submits fail and the
+-- device is lost.
+local PIN_MAX = 0.4
+
+-- True when the weights that rules put on the CPU go to pinned memory:
+-- opts.pinned when set, else on a discrete GPU when they fit PIN_MAX.
+local function pin_host(be, rules, info, opts)
+	if opts.pinned ~= nil then
+		return opts.pinned
+	end
+	if dev_type(be) == "igpu" then
+		-- RAM is shared, so pinned memory gives no speed, and it
+		-- counts against the GPU memory limit.
+		return false
+	end
+	if not rules or not transformer.supports(info.meta["general.architecture"]) then
+		return true
+	end
+	local hp = transformer.config(info.meta)
+	local _, bytes = placement.plan(rules, transformer.weight_tensors(info, hp), hp.n_layer)
+	for _, d in ipairs(lgml.devices()) do
+		if d.type == "cpu" and d.total and bytes > d.total * PIN_MAX then
+			L:info("weights on the CPU too large to pin", "cpu_mib", bytes // 1048576,
+			    "limit_mib", math.floor(d.total * PIN_MAX) // 1048576)
+			return false
+		end
+	end
+	return true
+end
+
 -- The cache options of a model shape: q8_0 with flash attention when
 -- it fits and no type is set, else the types of opts (default f16).
 local function shape_copts(shape, opts)
@@ -399,9 +431,7 @@ function M.new(opts)
 	local model = (transformer.supports(arch) and transformer or require("lgml." .. arch))
 	    .load(be, opts.model, (rules or mtp) and {
 		placement = rules,
-		-- An integrated GPU shares RAM with the CPU, so pinned memory
-		-- gives no speed, and it counts against the GPU memory limit.
-		pinned = dev_type(be) ~= "igpu",
+		pinned = pin_host(be, rules, info, opts),
 		mtp = mtp,
 	    } or nil)
 	if rules then
