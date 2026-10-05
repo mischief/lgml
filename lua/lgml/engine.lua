@@ -329,6 +329,8 @@ end
 --   guard off). The finish timings then have `repeat_stop = 1`.
 -- - `reasoning_budget_tokens`: the reasoning budget of a request
 --   without `reasoning_budget` (default none); see `E:chat`
+-- - `lazy_tool_grammar`: false turns off the grammar that keeps tool
+--   calls to the request tools under tool_choice "auto" (default on)
 -- - `ubatch`: the most prompt tokens per pass (default 512), or
 --   `"auto"`: the largest of 4096, 2048, 1024 and 512 whose compute
 --   buffers fit the memory budget, as `E:reserve` plans them. A model
@@ -450,6 +452,7 @@ function M.new(opts)
 		repeat_stop = opts.repeat_stop_tokens or REPEAT_STOP,
 		ubatch = copts.ubatch, ubatch_auto = auto and pool ~= nil,
 		reasoning_budget = opts.reasoning_budget_tokens,
+		lazy_tool_grammar = opts.lazy_tool_grammar,
 	}, E)
 	if opts.recipe == "nimble" then
 		e.recipe = decide.nimble_recipe()
@@ -2205,9 +2208,14 @@ end
 -- Sampler options for the grammar of req: {} when it has none, or nil
 -- and an error. A forced tool call takes the tool call grammar of the
 -- chat family. With thinking on, the grammar applies after the block.
+-- With tools and tool_choice "auto", and no grammar or response format,
+-- the tool call grammar is lazy: it applies from a call opener to the
+-- end of the call, outside the reasoning block.
 function E:grammar_opts(req, think, prompt)
 	local text, err, root
 	local forced, parallel = forced_tools(req)
+	local tags = THINK[self.family_name]
+	local opened = think and tags and prompt:gsub("%s+$", ""):sub(-#tags[1]) == tags[1]
 	if forced then
 		if not self.family.tool_grammar then
 			return nil, ("tool_choice: the %s chat template cannot force a tool call"):format(self.family_name)
@@ -2218,17 +2226,35 @@ function E:grammar_opts(req, think, prompt)
 		end
 	else
 		text, err = grammar.from_request(req)
-		if not text then
-			return err == nil and {} or nil, err
+		if err then
+			return nil, err
+		elseif not text then
+			return self:lazy_tool_opts(req, think and tags, opened)
 		end
 		root = "root"
 	end
-	local tags = THINK[self.family_name]
 	if think and tags then
-		local opened = prompt:gsub("%s+$", ""):sub(-#tags[1]) == tags[1]
 		text, root = grammar.reasoning(text, tags[1], tags[2], opened, root)
 	end
 	return { grammar = text, grammar_root = root, tokenizer = self.tk }
+end
+
+-- Sampler options for the lazy tool call grammar of req, or {} when it
+-- has none. tags, when set, are the reasoning block tags; opened tells
+-- that the prompt opened the block.
+function E:lazy_tool_opts(req, tags, opened)
+	local tools, tc = req.tools, req.tool_choice
+	if not self.family.tool_grammar or self.lazy_tool_grammar == false or type(tools) ~= "table" or
+	    #tools == 0 or (tc ~= nil and tc ~= "auto") then
+		return {}
+	end
+	local text, root, triggers = self.family.tool_grammar(tools, { lazy = true })
+	if not text then
+		L:warn("no tool call grammar", "error", root)
+		return {}
+	end
+	return { grammar = text, grammar_root = root, triggers = triggers, tokenizer = self.tk,
+	    free_block = tags and { tags[1], tags[2], inside = opened } or nil }
 end
 
 -- Prepare the images of a request, each `{ bytes }`, for the encoder.
@@ -2698,6 +2724,12 @@ function E:run_prompt(req, sink, st)
 	end
 	local want_lp, top_lp = req.logprobs == true, math.tointeger(req.top_logprobs) or 0
 	local good, smp = pcall(sampler_opts, req, think, gopts)
+	if not good and gopts.triggers then
+		-- A tool schema that the grammar cannot take leaves calls free.
+		L:warn("tool call grammar", "error", tostring(smp))
+		gopts = { logit_bias = gopts.logit_bias }
+		good, smp = pcall(sampler_opts, req, think, gopts)
+	end
 	if not good then
 		return nil, tostring(smp):gsub("^.-grammar: ", "grammar: "), 400
 	end
@@ -2706,7 +2738,8 @@ function E:run_prompt(req, sink, st)
 		local preset = think and "qwen3_think" or "qwen3"
 		L:debug("sampling", "preset", preset, "settings", sampler.settings(preset, req),
 		    "seed", req.seed or "random", "max_tokens", max, "thinking", think,
-		    "grammar", gopts.grammar and first_lines(gopts.grammar, 6), "root", gopts.grammar_root)
+		    "grammar", gopts.grammar and first_lines(gopts.grammar, 6), "root", gopts.grammar_root,
+		    "triggers", gopts.triggers and #gopts.triggers)
 	end
 	-- With no tools, as with tool_choice "none", the parser reads no calls.
 	local out = output.new(sink, self.family.new_parser({ tools = req.tools or {}, enable_thinking = think }),

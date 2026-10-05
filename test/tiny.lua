@@ -22,8 +22,8 @@ function M.rng(seed)
 end
 
 -- Byte-level vocab: the 256 GPT-2 byte pieces, one merge, and the
--- chat specials.
-local function vocab_kv()
+-- chat specials, then the extra tokens.
+local function vocab_kv(extra)
 	local tokens, types, k = {}, {}, 0
 	for b = 0, 255 do
 		if (b >= 33 and b <= 126) or (b >= 161 and b <= 172) or b >= 174 then
@@ -38,6 +38,10 @@ local function vocab_kv()
 	    { "<think>", 1 }, { "</think>", 1 } }) do
 		tokens[#tokens + 1] = t[1]
 		types[#types + 1] = t[2]
+	end
+	for _, t in ipairs(extra or {}) do
+		tokens[#tokens + 1] = t
+		types[#types + 1] = 1
 	end
 	return {
 		{ "tokenizer.ggml.model", gguf.STRING, "gpt2" },
@@ -56,12 +60,13 @@ end
 -- gives f32 values by tensor name. opts.moe, such as { n = 16, used =
 -- 4, ff = 32, fused = true }, gives each layer routed experts in place
 -- of the dense FFN (arch "qwen3moe"); fused puts gate and up in one
--- tensor. opts.kv adds { name, type, value } entries. Returns the
+-- tensor. opts.kv adds { name, type, value } entries. opts.tokens
+-- adds normal tokens to the vocab, such as "<tool_call>". Returns the
 -- tensors, { name = { shape, values } }.
 function M.write(path, arch, opts)
 	opts = opts or {}
 	local r = M.rng(#arch * 7919 + (opts.seed or 0))
-	local kv, nv = vocab_kv()
+	local kv, nv = vocab_kv(opts.tokens)
 	local E, H, HKV, D, F = M.E, M.H, M.HKV, M.D, M.F
 	local ts, byname = {}, {}
 	local function key(k, t, v)

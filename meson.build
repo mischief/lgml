@@ -167,6 +167,7 @@ if lua_bin.found()
   test('batch', lua_bin, args : [files('test/test_batch.lua')], timeout : 120)
   test('kvpool', lua_bin, args : [files('test/test_kvpool.lua')], timeout : 120)
   test('engine_apis', lua_bin, args : [files('test/test_engine_apis.lua')], timeout : 120)
+  test('lazy_tools', lua_bin, args : [files('test/test_lazy_tools.lua')], timeout : 120)
   test('tokenize', lua_bin, args : [files('test/test_tokenize.lua')],
     env : { 'LGML_VOCAB_DIR' : get_option('vocab_dir'),
       'LGML_TOK_MODEL' : get_option('model'),
