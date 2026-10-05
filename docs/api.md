@@ -485,6 +485,24 @@ and `lgml_repeat_stops_total` counts the reply (see
 config key `repeat_stop_tokens` (server-wide, or in a model spec), sets
 it; 0 turns the guard off.
 
+### Prompt chunks
+
+The gguf chat engine reads a prompt in passes of at most `ubatch`
+tokens: 512 by default. A larger chunk reads a long prompt faster on a
+GPU, but its compute buffers take more device memory. `-ub n` (or
+`--ubatch n`), or the model spec key `ubatch`, sets the size. `auto`
+takes the largest of 4096, 2048, 1024 and 512 (at most the context)
+whose compute buffers fit the memory budget. The worker plans the
+buffers at load, as it plans them for the 512 default, so a model that
+loads does not later fail a prompt for want of compute memory. When
+512 does not fit either, the worker cuts the context. With
+batched slots, a chunk of each slot can run in one pass, and the plan
+counts them all. The chunk size does not change the reply.
+On the CPU backend the chunk size gives no speed: Qwen3-Embedding-4B
+Q8_0 with 16 threads reads a 4615-token prompt at about 59 tokens/s
+with chunks of 512, 1024, 2048 and 4096. The CPU is bound by the
+arithmetic, not by the passes; the gain is on GPUs.
+
 ### Response
 
 ```json

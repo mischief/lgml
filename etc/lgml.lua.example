@@ -41,8 +41,11 @@ return {
 	models = {
 		-- lora adds LoRA adapters, "file[:scale]", from lgml-finetune or
 		-- llama.cpp; a request can change their scales.
+		-- ubatch is the most prompt tokens per pass (default 512); "auto"
+		-- takes the largest of 4096, 2048, 1024 and 512 whose compute
+		-- buffers fit vram at load. Larger chunks read long prompts faster.
 		{ id = "qwen3-14b", model = "/home/you/models/Qwen3-14B-Q4_K_M.gguf", backend = "Vulkan0",
-			preload = true, ctx = 16384,
+			preload = true, ctx = 16384, ubatch = "auto",
 			-- lora = { "/home/you/adapters/tuned.gguf:1.0" },
 		},
 		-- mmproj adds image input: image_url parts with data URLs. slots

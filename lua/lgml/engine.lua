@@ -52,6 +52,8 @@ local E = {}
 E.__index = E
 
 local UBATCH = 512
+-- The prompt chunk sizes that ubatch "auto" tries, the largest first.
+local AUTO_UBATCH = { 4096, 2048, 1024, 512 }
 -- The default count of one token in a row that ends a reply.
 local REPEAT_STOP = 256
 -- The least milliseconds between two progress reports of a request.
@@ -254,6 +256,10 @@ end
 --   guard off). The finish timings then have `repeat_stop = 1`.
 -- - `reasoning_budget_tokens`: the reasoning budget of a request
 --   without `reasoning_budget` (default none); see `E:chat`
+-- - `ubatch`: the most prompt tokens per pass (default 512), or
+--   `"auto"`: the largest of 4096, 2048, 1024 and 512 whose compute
+--   buffers fit the memory budget, as `E:reserve` plans them. A model
+--   without a KV pool takes 512 for auto.
 -- @treturn Engine the engine
 -- @raise when the backend, the model or its tokenizer does not load,
 -- when no chat template fits the model, an adapter does not fit it, the
@@ -307,10 +313,12 @@ function M.new(opts)
 	if initial > 0 then
 		copts.initial = initial
 	end
+	local auto = opts.ubatch == "auto"
+	copts.ubatch = not auto and opts.ubatch or UBATCH
 	-- The slots are sequences of one KV pool when the model has one.
 	local pool = model.pool and model:pool(n_ctx, copts)
 	local function new_cache()
-		return pool and model:seq(pool, { n_ctx = n_ctx }) or model:cache(n_ctx, copts)
+		return pool and model:seq(pool, { n_ctx = n_ctx, ubatch = copts.ubatch }) or model:cache(n_ctx, copts)
 	end
 	local cache = new_cache()
 	local slots = { { cache = cache, tokens = {}, ckpts = {}, used = 0 } }
@@ -331,6 +339,7 @@ function M.new(opts)
 		cache = cache, tokens = {},
 		busy = false, waiting = {}, adapters = adapters, acts = {}, queued = 0,
 		repeat_stop = opts.repeat_stop_tokens or REPEAT_STOP,
+		ubatch = copts.ubatch, ubatch_auto = auto and pool ~= nil,
 		reasoning_budget = opts.reasoning_budget_tokens,
 	}, E)
 	if opts.recipe == "nimble" then
@@ -354,6 +363,11 @@ function M.new(opts)
 	e:set_lora()
 	if opts.mmproj then
 		e:load_vision(opts)
+	end
+	-- The plans pick the chunk size before the prompt cache takes the
+	-- first slot.
+	if e.ubatch_auto then
+		e:reserve()
 	end
 	if model.snapshot then
 		local ram = opts.cache_ram or 8192
@@ -400,15 +414,16 @@ end
 
 -- The device and CPU compute bytes of a pass of k pool sequences of n
 -- tokens each, with its input leaves. The sequences share span cells
--- block by block, so each one reads a window of all span cells. It
--- plans the graph and runs nothing; the blocks go back to the pool.
-function E:plan_pass(k, n, span)
+-- block by block, so each one reads a window of all span cells. Rings
+-- hold ubatch more rows. It plans the graph and runs nothing; the blocks
+-- go back to the pool.
+function E:plan_pass(k, n, span, ubatch)
 	local model, pool = self.model, self.pool
 	local each = math.max(n, span // k // pool.block * pool.block)
 	local caches, ids = {}, {}
 	local ok, dev, cpu = pcall(function()
 		for i = 1, k do
-			caches[i] = model:seq(pool, { n_ctx = self.n_ctx })
+			caches[i] = model:seq(pool, { n_ctx = self.n_ctx, ubatch = ubatch })
 			ids[i] = {}
 			for j = 1, n do
 				ids[i][j] = 0
@@ -454,11 +469,12 @@ function E:plan_pass(k, n, span)
 end
 
 --- The device bytes of the largest compute buffers of the engine.
--- It plans prompt chunks of `UBATCH` tokens over all n_ctx cells: one
+-- It plans prompt chunks of ubatch tokens over all n_ctx cells: one
 -- alone plus, with batched slots, one per slot, as a dropped graph lives
 -- until the collector takes its outputs. An image of the most tokens
 -- adds its encoder. The pool grows to n_ctx for the plans and shrinks
 -- back, so a full cache that does not fit raises the budget error.
+-- With ubatch "auto", the first call picks the chunk size; see `new`.
 -- @treturn ?integer the bytes, or nil for an engine without a pool
 function E:reserve()
 	local pool = self.pool
@@ -497,25 +513,26 @@ function E:reserve_ctx()
 	local cells = pool.cap
 	local name = self.be:name()
 	local before = budget_mod.free(name)
-	local ok, best = pcall(function()
-		model:pool_resize(pool, pool.n_ctx)
-		local ks, top = { 1 }, pool.n_ctx
-		if self.concurrent then
-			ks[2] = #self.slots
-		end
-		local r = 0
-		for _, k in ipairs(ks) do
-			local n = math.min(UBATCH, top // k // pool.block * pool.block)
-			if n > 0 then
-				r = r + self:plan_pass(k, n, top)
+	local list = { self.ubatch }
+	if self.ubatch_auto then
+		list = {}
+		for _, u in ipairs(AUTO_UBATCH) do
+			if u <= pool.n_ctx or u == UBATCH then
+				list[#list + 1] = u
 			end
 		end
-		-- The full pool is in place: the compute buffers must fit too.
-		local fits, err = lgml.memory_check(self.be, r, "the compute buffers")
-		if not fits then
-			error(err, 0)
+	end
+	local ok, best, pick = pcall(function()
+		model:pool_resize(pool, pool.n_ctx)
+		for i, u in ipairs(list) do
+			local good, r = pcall(self.plan_chunks, self, u)
+			if good or i == #list or not budget_mod.is_budget(r) then
+				if not good then
+					error(r, 0)
+				end
+				return r, u
+			end
 		end
-		return r
 	end)
 	model:pool_resize(pool, cells)
 	-- Later budget checks must see the cells that the shrink freed.
@@ -528,10 +545,66 @@ function E:reserve_ctx()
 	if not ok then
 		error(best, 0)
 	end
+	if self.ubatch_auto then
+		self:set_ubatch(pick)
+	end
 	if self.vision and self.vision.measure then
 		best = best + self.vision:measure()
 	end
 	return best
+end
+
+-- The compute bytes of prompt chunks of u tokens over the full pool,
+-- for `reserve_ctx`. Rings that grow for u count too. It raises the
+-- budget error when they do not fit.
+function E:plan_chunks(u)
+	local pool, model = self.pool, self.model
+	local ks, top = { 1 }, pool.n_ctx
+	if self.concurrent then
+		ks[2] = #self.slots
+	end
+	local r = 0
+	for _, k in ipairs(ks) do
+		local n = math.min(u, top // k // pool.block * pool.block)
+		if n > 0 then
+			r = r + self:plan_pass(k, n, top, u)
+		end
+	end
+	local rings = 0
+	if u ~= self.ubatch and model.hp.n_swa then
+		local o = setmetatable({ ubatch = u }, { __index = self.copts })
+		rings = (select(2, model:cache_size(o)) - select(2, model:cache_size(self.copts))) * #self.slots
+	end
+	-- The full pool is in place: the compute buffers must fit too.
+	local fits, err = lgml.memory_check(self.be, r + rings, "the compute buffers")
+	if not fits then
+		error(err, 0)
+	end
+	return r
+end
+
+-- Take u tokens per prompt pass from now on. With rings, the slots get
+-- new sequences that hold u more rows; they must be empty.
+function E:set_ubatch(u)
+	self.ubatch_auto = false
+	L:info("prompt chunk size", "ubatch", u, "auto", true)
+	if u == self.ubatch then
+		return
+	end
+	self.ubatch, self.copts.ubatch = u, u
+	if not self.model.hp.n_swa then
+		return
+	end
+	for _, s in ipairs(self.slots) do
+		assert(#s.tokens == 0 and s.cache.n_past == 0, "ubatch: a slot is in use")
+		self.model:free_seq(s.cache)
+		s.cache = self.model:seq(self.pool, { n_ctx = self.n_ctx, ubatch = u })
+	end
+	self.cache = self.slot.cache
+	self.fixed = self.model.recurrent or (self.cache.ring ~= nil and self.cache.ring < self.n_ctx)
+	if self.pc then
+		self.pc.cache = self.cache
+	end
 end
 
 --- The memory plan of the engine, for `lgml.budget.report`.
@@ -1629,7 +1702,7 @@ function E:fork_rows(n, prompts, ck, sink)
 end
 
 --- Prefill a prompt on a slot that a request owns, in batched passes.
--- Chunks of at most UBATCH tokens join the decode steps and prompt
+-- Chunks of at most ubatch tokens join the decode steps and prompt
 -- chunks of other requests in one pass. Checkpoints come at the prompt
 -- cache's planned stops, as in `prefill`. When other running requests
 -- hold the pool, the request waits for them; see `preempt`.
@@ -1650,7 +1723,7 @@ function E:prefill_batched(st, req, slot, prompt, from, stops, sink)
 	local i, c = from, 1
 	self:note(sink, slot, "prompt", from - 1, #prompt)
 	while i <= #prompt do
-		local j = math.min(#prompt, i + UBATCH - 1)
+		local j = math.min(#prompt, i + self.ubatch - 1)
 		if stops[c] and stops[c] <= j then
 			j = stops[c]
 		end
@@ -1712,7 +1785,7 @@ function E:prefill(prompt, from, sink, extra)
 	end
 	self:note(sink, self.slot, "prompt", from - 1, #prompt)
 	while i <= #prompt do
-		local j = math.min(#prompt, i + UBATCH - 1)
+		local j = math.min(#prompt, i + self.ubatch - 1)
 		if stops[c] and stops[c] <= j then
 			j = stops[c]
 		end
