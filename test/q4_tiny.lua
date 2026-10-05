@@ -3,6 +3,7 @@
 -- routed and shared experts. Shapes are in torch order.
 local here = debug.getinfo(1, "S").source:match("^@(.*/)") or "./"
 package.path = here .. "?.lua;" .. package.path
+local lgml = require("lgml")
 local gguf = require("gguf")
 local tiny = require("tiny")
 
@@ -145,7 +146,14 @@ function M.build(opts)
 	w("token_embd.weight", { nv, E }, 3)
 	w("output.weight", { nv, E })
 	hc("output_hc", false)
+	-- The n-gram table is f16, as the reader takes no f32 table.
 	w("per_layer_token_embd.weight", { rows + 8, PD }, 3)
+	do
+		local t = ts[#ts]
+		local be <close> = assert(lgml.backend("CPU"))
+		local h <close> = be:tensor("f16", t[2], t[3])
+		t[3], t[4] = h:bytes(), gguf.F16
+	end
 	local kd, vd = M.NK * M.S, M.NV * M.S
 	for i = 0, M.NL - 1 do
 		local p = "blk." .. i .. "."

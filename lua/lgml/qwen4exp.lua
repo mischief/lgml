@@ -203,11 +203,14 @@ local TABLE = "per_layer_token_embd.weight"
 
 --- Load a model of this arch.
 -- It reads every file of a split gguf. The n-gram table stays in its
--- file: a map of it serves `get_rows` on the CPU. Without a CPU for
--- the backend it loads. MTP layers past n_layer do not load.
+-- file: an `lgml.ngram` reader in model.ngram reads the rows that a
+-- pass needs. With opts.ngram false, a map of the table serves
+-- `get_rows` on the CPU instead, or the table loads when the backend
+-- has no CPU. MTP layers past n_layer do not load.
 -- @param be the backend
 -- @tparam string path a gguf file of the model
--- @tparam table opts the options of `lgml.transformer.load`
+-- @tparam table opts the options of `lgml.transformer.load`, and
+-- opts.ngram (false for get_rows on the table)
 -- @tparam table info the gguf info of path
 -- @tparam table hp the config
 -- @treturn Model the model, with the metatable of `lgml.transformer`
@@ -218,8 +221,9 @@ function M.load(be, path, opts, info, hp)
 		error(path .. ": the placement moves weights to the CPU; open the backend with cpu = true")
 	end
 	local w = setmetatable({}, Multi)
-	local mapped = false
-	for _, file in ipairs(shards(path, info.meta)) do
+	local files = shards(path, info.meta)
+	local mapped, reader = false, nil
+	for _, file in ipairs(files) do
 		local finfo = file == path and info or assert(lgml.gguf(file))
 		local skip = {}
 		for _, t in ipairs(finfo.tensors) do
@@ -232,7 +236,14 @@ function M.load(be, path, opts, info, hp)
 		for _, t in ipairs(finfo.tensors) do
 			has_table = has_table or t.name == TABLE
 		end
-		if has_table and hp.ple and opts.map ~= false then
+		if has_table and hp.ple and opts.ngram ~= false then
+			local err
+			reader, err = lgml.ngram.open(file, { meta = files[1] })
+			if not reader then
+				error(err)
+			end
+			skip[TABLE] = true
+		elseif has_table and hp.ple then
 			local ok, s = pcall(be.map, be, file, { TABLE })
 			if ok then
 				w[#w + 1] = s
@@ -252,7 +263,9 @@ function M.load(be, path, opts, info, hp)
 	m.hc_head_down = get("output_hc_down.weight")
 	m.hc_head_up = get("output_hc_up.weight")
 	hp.n_vocab = hp.n_vocab or m.output:shape()[1]
-	if hp.ple then
+	if reader then
+		m.ngram = reader
+	elseif hp.ple then
 		m.ple_table = get(TABLE)
 		m.ple_mapped = mapped
 	end
@@ -364,11 +377,11 @@ end
 --- Make the qwen4exp input leaves of a pass of n tokens.
 -- The n-gram input is ple_rows (i32, n * heads rows of the table) or,
 -- with a reader in model.ngram, ple_embd (f32, n by n_embd). The
--- reader's `embed(ids, prev, buf, off)` writes the f32 table rows of
--- ids to the host buffer buf at byte offset off, one row of n_embd per
--- token; prev lists the tokens before ids[1], oldest first (n - 1 of
--- them, fewer at the start of a sequence); see `lgml.ngram`. qsa_w
--- holds the indexer head weights.
+-- reader's `embed(ids, prev, out, off)` writes the table rows of ids
+-- into out at byte offset off, one row of n_embd per token; prev lists
+-- the tokens before ids[1], oldest first (n - 1 of them, fewer at the
+-- start of a sequence); see `lgml.ngram`. qsa_w holds the indexer head
+-- weights.
 -- @tparam Model self the model
 -- @tparam table inp the inputs
 -- @tparam integer n the tokens of the pass
@@ -462,9 +475,7 @@ function M.fill(self, inp, b, c, ids, n_past, lo, off)
 		end
 		buf:close()
 		if inp.ple_embd then
-			local row = p.heads * lgml.row_size("f32", p.dim)
-			inp.ple_buf = inp.ple_buf or lgml.hostbuf(inp.ple_embd:nbytes())
-			self.ngram:embed(ids, prev, inp.ple_buf, off * row)
+			self.ngram:embed(ids, prev, inp.ple_embd, off * p.heads * lgml.row_size("f32", p.dim))
 		else
 			inp.ple_list = inp.ple_list or {}
 			M.ngram_rows(p, prev, ids, inp.ple_list, off * p.heads)
@@ -494,13 +505,9 @@ function M.fill(self, inp, b, c, ids, n_past, lo, off)
 	end
 end
 
--- Load the n-gram inputs that `fill` gathered into their leaf.
+-- Load the n-gram rows that `fill` gathered into their leaf.
 local function finish(inp)
-	if inp.ple_buf then
-		inp.ple_embd:from_host(inp.ple_buf, 0, 0, inp.ple_embd:nbytes())
-		inp.ple_buf:close()
-		inp.ple_buf = nil
-	elseif inp.ple_list then
+	if inp.ple_list then
 		inp.ple_rows:set(inp.ple_list)
 		inp.ple_list = nil
 	end

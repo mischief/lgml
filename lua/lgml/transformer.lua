@@ -396,6 +396,9 @@ end
 --- Close the weights.
 function M:close()
 	self.w:close()
+	if self.ngram then
+		self.ngram:close()
+	end
 end
 
 --- Apply LoRA adapters to the model, or remove them.
