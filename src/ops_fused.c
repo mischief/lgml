@@ -41,6 +41,8 @@ static const uint32_t hc_mean_spv[] =
 /* True when the Vulkan backend runs the fused ops on the device. */
 static int vk_fused;
 
+static int register_vk(void);
+
 /*
  * hc_add: d (T, HC, E) = r + o (T, E) * 2 * sigmoid(w (T, HC)).
  * Rows of d split across the threads.
@@ -93,6 +95,7 @@ hc_add_setup(const struct ggml_tensor *d, void *push, uint32_t el[3])
 static int
 g_hc_add(lua_State *L)
 {
+	register_vk();
 	struct graph *g = lgml_check_graph(L, 1);
 	struct tensor *r = lgml_operand(L, g, 2);
 	struct tensor *o = lgml_operand(L, g, 3);
@@ -166,6 +169,7 @@ hc_mean_setup(const struct ggml_tensor *d, void *push, uint32_t el[3])
 static int
 g_hc_mean(lua_State *L)
 {
+	register_vk();
 	struct graph *g = lgml_check_graph(L, 1);
 	struct tensor *x = lgml_operand(L, g, 2);
 	struct tensor *gate = lgml_operand(L, g, 3);
@@ -188,21 +192,30 @@ static const luaL_Reg ops[] = {
 	{ NULL, NULL }
 };
 
-/* Give the shaders to the Vulkan backend when it takes them. */
-static void
+/*
+ * Give the shaders to the Vulkan backend when it takes them, once. It
+ * starts Vulkan, so it waits for the first use: a process that only
+ * loads the module (a server, a fake worker) stays fast.
+ */
+static int
 register_vk(void)
 {
 #ifdef LGML_HAVE_SPV
-	ggml_backend_reg_t reg = ggml_backend_reg_by_name("Vulkan");
+	static int done;
+	ggml_backend_reg_t reg;
 	vk_register_fn fn;
 	struct ggml_vk_custom_op op;
 	void *addr;
 
+	if (done)
+		return vk_fused;
+	done = 1;
+	reg = ggml_backend_reg_by_name("Vulkan");
 	if (reg == NULL)
-		return;
+		return 0;
 	addr = ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_register_custom");
 	if (addr == NULL)
-		return;
+		return 0;
 	memcpy(&fn, &addr, sizeof(fn));
 	memset(&op, 0, sizeof(op));
 	op.push_size = 3 * sizeof(uint32_t);
@@ -219,6 +232,7 @@ register_vk(void)
 	fn(hc_mean_op, &op);
 	vk_fused = 1;
 #endif
+	return vk_fused;
 }
 
 /*
@@ -239,21 +253,37 @@ lgml_host_read_buft(void)
 	return fn();
 }
 
+/*** Whether Vulkan devices can read host memory in place: tensors from
+ * `backend:tensor` with `host_read`.
+ * @treturn boolean
+ * @function vk_host_read
+ */
+static int
+l_vk_host_read(lua_State *L)
+{
+	lua_pushboolean(L, lgml_host_read_buft() != NULL);
+	return 1;
+}
+
+/*** Whether the Vulkan backend runs the fused ops on the device; without
+ * it a fused op on a GPU graph runs on the CPU. The first call gives
+ * Vulkan the shaders.
+ * @treturn boolean
+ * @function vk_fused
+ */
+static int
+l_vk_fused(lua_State *L)
+{
+	lua_pushboolean(L, register_vk());
+	return 1;
+}
+
 void
 lgml_open_ops_fused(lua_State *L)
 {
 	lgml_graph_ops(L, ops);
-	register_vk();
-	/*** True when Vulkan devices can read host memory in place: tensors
-	 * from `backend:tensor` with `host_read`.
-	 * @field vk_host_read
-	 */
-	lua_pushboolean(L, lgml_host_read_buft() != NULL);
+	lua_pushcfunction(L, l_vk_host_read);
 	lua_setfield(L, -2, "vk_host_read");
-	/*** True when the Vulkan backend runs the fused ops on the device.
-	 * Without it a fused op on a GPU graph runs on the CPU.
-	 * @field vk_fused
-	 */
-	lua_pushboolean(L, vk_fused);
+	lua_pushcfunction(L, l_vk_fused);
 	lua_setfield(L, -2, "vk_fused");
 }

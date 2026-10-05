@@ -223,7 +223,7 @@ end
 -- nothing, when the Vulkan backend lacks the host read hook.
 function M:zerocopy()
 	local be = self.model.be
-	if be:name():upper():match("^CPU") or not lgml.vk_host_read then
+	if be:name():upper():match("^CPU") or not lgml.vk_host_read() then
 		return false
 	end
 	for il, xc in pairs(self.layers) do

@@ -11,9 +11,16 @@ local lgml = require("lgml")
 
 local M = {}
 
--- Fused ops run on the device (see lgml.vk_fused). LGML_NO_FUSED turns
--- them off, to compare.
-local FUSED = lgml.vk_fused and not os.getenv("LGML_NO_FUSED")
+-- True when fused ops run on the device (see lgml.vk_fused), decided at
+-- the first graph: the check starts Vulkan. LGML_NO_FUSED turns them off,
+-- to compare.
+local fused_on
+local function fused()
+	if fused_on == nil then
+		fused_on = lgml.vk_fused() and not os.getenv("LGML_NO_FUSED")
+	end
+	return fused_on
+end
 
 -- The name of the n-gram table.
 local TABLE = "per_layer_token_embd.weight"
@@ -679,7 +686,7 @@ local function hc_mix(g, hp, x, wn, wd, wu, wi)
 	xn = g:reshape(xn, { n, HC * E })
 	local lo = g:silu(g:mul_mat(wd, xn))
 	local gate = g:mul_mat(wu, lo)
-	if FUSED then
+	if fused() then
 		local x3 = g:reshape(xn, { n, HC, E })
 		return g:hc_mean(x3, g:reshape(gate, { n, HC, E })), wi and g:mul_mat(wi, xn)
 	end
@@ -699,7 +706,7 @@ end
 -- scaled by 2 * sigmoid(inj), with inj the inject weights / hc.
 local function hc_add(g, hp, res, o, inj)
 	local n, E, HC = res:shape()[1], hp.n_embd, hp.hc
-	if FUSED then
+	if fused() then
 		local st = o:strides()
 		if st[2] ~= 4 or st[1] ~= 4 * E then
 			o = g:cont(o)
