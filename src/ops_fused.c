@@ -9,6 +9,7 @@
  */
 
 #include <math.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -221,11 +222,40 @@ register_vk(void)
 #endif
 }
 
+/*** Let Vulkan ops read pinned host tensors in place.
+ * With it on, an op on a Vulkan device whose weights are in pinned host
+ * memory (`backend:tensor` with `pinned`) stays on the device and reads
+ * them over PCIe. It holds for the whole process.
+ * @tparam boolean on
+ * @treturn boolean true when the Vulkan backend has the switch
+ * @function vk_host_read
+ */
+static int
+l_vk_host_read(lua_State *L)
+{
+#ifdef LGML_HAVE_SPV
+	ggml_backend_reg_t reg = ggml_backend_reg_by_name("Vulkan");
+	void (*fn)(bool);
+	void *addr = reg != NULL ? ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_set_host_read") : NULL;
+
+	if (addr != NULL) {
+		memcpy(&fn, &addr, sizeof(fn));
+		fn(lua_toboolean(L, 1));
+		lua_pushboolean(L, 1);
+		return 1;
+	}
+#endif
+	lua_pushboolean(L, 0);
+	return 1;
+}
+
 void
 lgml_open_ops_fused(lua_State *L)
 {
 	lgml_graph_ops(L, ops);
 	register_vk();
+	lua_pushcfunction(L, l_vk_host_read);
+	lua_setfield(L, -2, "vk_host_read");
 	/*** True when the Vulkan backend runs the fused ops on the device.
 	 * Without it a fused op on a GPU graph runs on the CPU.
 	 * @field vk_fused

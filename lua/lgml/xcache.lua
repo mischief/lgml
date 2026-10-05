@@ -200,12 +200,72 @@ function M.new(model, opts)
 		-- Fill every slot now, the experts of most score first.
 		self:apply(self.state:plan(n * #model.layers, self.decay, self.margin))
 	end
+	if opts.zerocopy and n > 0 and n < hp.n_expert then
+		self:zerocopy()
+	end
 	for il, xc in pairs(self.layers) do
 		model.layers[il].xc = xc
 	end
 	model.xcache = self
 	model.before_pass = M.before_pass
 	return self
+end
+
+--- Give the device a pinned host copy of the experts that no slot holds,
+-- which it reads over PCIe: the misses then run on the device, and a pass
+-- needs no CPU part. The slots stay as they are (no moves). xc.host holds
+-- the experts per field, xc.hmap (f32) the host row of each expert; held
+-- experts map to a dummy row, read at weight 0.
+function M:zerocopy()
+	assert(lgml.vk_host_read and lgml.vk_host_read(true), "zero-copy needs ggml patch 07")
+	local be = self.model.be
+	for il, xc in pairs(self.layers) do
+		local L = self.model.layers[il]
+		local map, hit = self.state:tables(il)
+		local rows, hmap = {}, {}
+		local held = {}
+		for e = 1, self.ne do
+			if hit[e] == 0 then
+				rows[#rows + 1] = e - 1
+				hmap[e] = #rows - 1
+			else
+				held[#held + 1] = e
+			end
+		end
+		-- A held expert maps to the first dummy row.
+		for _, e in ipairs(held) do
+			hmap[e] = #rows
+		end
+		-- Rows #rows .. #rows + K - 1 hold one dummy expert per pick
+		-- position, for held picks: a token never names a row twice.
+		local K = self.model.hp.n_used
+		local host = {}
+		for _, f in ipairs(FIELDS) do
+			local t = L[f]
+			if t then
+				local s = t:shape()
+				s[1] = #rows + K
+				local h = be:tensor(t:type(), s, nil, { weights = true, pinned = true })
+				for i, e in ipairs(rows) do
+					h:set_slice(i - 1, t, e)
+				end
+				for k = 0, K - 1 do
+					h:set_slice(#rows + k, t, rows[1])
+				end
+				host[f] = h
+			end
+		end
+		local dummy = {}
+		for k = 1, K do
+			dummy[k] = #rows + k - 1
+		end
+		xc.host = host
+		local tb = L.gate_inp:backend()
+		xc.hmap = tb:tensor("f32", { self.ne, 1 }, hmap, { weights = true })
+		xc.hzero = tb:tensor("f32", { 1, K }, dummy, { weights = true })
+		xc.static = true
+	end
+	self.swap = 0
 end
 
 --- An expert cache from `new`.

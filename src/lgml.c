@@ -639,7 +639,8 @@ static int tensor_set(lua_State *L);
  * @tparam string type ggml type name, such as "f32" or `"q8_0"`
  * @tparam {int,...} shape 1 to 4 positive sizes
  * @tparam[opt] string|table data initial contents, as for `tensor:set`
- * @tparam[opt] table opts `weights`: true to mark the storage as weights
+ * @tparam[opt] table opts `weights`: true to mark the storage as weights;
+ * `pinned`: true to put it in pinned host memory of the backend device
  * @treturn tensor the leaf
  * @raise if the type is unknown, the innermost size is not a multiple of
  * the type block size, or the device is out of memory
@@ -657,13 +658,16 @@ backend_tensor(lua_State *L)
 	ggml_backend_buffer_type_t bt;
 	ggml_backend_buffer_t buf;
 	struct store *s;
-	int rank, hasdata = !lua_isnoneornil(L, 4), weights = 0;
+	int rank, hasdata = !lua_isnoneornil(L, 4), weights = 0, pinned = 0;
 
 	rank = check_shape(L, 3, ne);
 	if (!lua_isnoneornil(L, 5)) {
 		luaL_checktype(L, 5, LUA_TTABLE);
 		lua_getfield(L, 5, "weights");
 		weights = lua_toboolean(L, -1);
+		lua_pop(L, 1);
+		lua_getfield(L, 5, "pinned");
+		pinned = lua_toboolean(L, -1);
 		lua_pop(L, 1);
 	}
 	if (ne[0] % ggml_blck_size(type) != 0)
@@ -678,6 +682,13 @@ backend_tensor(lua_State *L)
 		return luaL_error(L, "ggml_init failed");
 	gt = ggml_new_tensor(ctx, type, GGML_MAX_DIMS, ne);
 	bt = ggml_backend_get_default_buffer_type(b->be);
+	if (pinned) {
+		bt = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(b->be));
+		if (bt == NULL) {
+			ggml_free(ctx);
+			return luaL_error(L, "backend has no pinned host memory");
+		}
+	}
 	if (lgml_mem_check(L, bt, ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, bt),
 	    "a tensor") != NULL) {
 		ggml_free(ctx);

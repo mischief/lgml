@@ -97,6 +97,7 @@ local function xcache_opts(opts)
 		halflife = opts.moe_cache_halflife,
 		swap = opts.moe_cache_swap and mib(opts.moe_cache_swap, "moe_cache_swap"),
 		max = opts.moe_cache_max and mib(opts.moe_cache_max, "moe_cache_max"),
+		zerocopy = opts.moe_cache_zerocopy,
 	}
 	if v ~= true and v ~= "auto" then
 		x.bytes = mib(v, "moe_cache")
@@ -129,7 +130,7 @@ end
 local function new_xcache(model, x)
 	local xc = xcache.new(model, {
 		slots = x.slots, bytes = x.bytes, swap = x.swap, halflife = x.halflife,
-		profile = x.profile,
+		profile = x.profile, zerocopy = x.zerocopy,
 	})
 	L:info("expert cache", "slots", xc.n, "experts", xc.ne, "device_mib", xc.bytes // 1048576)
 	return xc

@@ -1725,6 +1725,17 @@ local function cached_experts(g, hp, L, x3, sel, w)
 	local hit = g:reshape(g:get_rows(xc.hit, flat), { n, K })
 	local dsel = g:cast(g:add(g:mul(g:sub(slot, xc.zero), hit), xc.zero), "i32")
 	local wd = g:mul(w, g:reshape(hit, { n, K, 1 }))
+	if xc.host then
+		-- Zero-copy: the device reads the misses from pinned host memory.
+		-- Held picks read a dummy row at weight 0: one shared row on the
+		-- matvec path (8 tokens or fewer), else one row per position, as
+		-- the batched path computes too few rows for a repeated id.
+		local hrow = g:reshape(g:get_rows(xc.hmap, flat), { n, K })
+		local hsel = n <= 8 and g:cast(hrow, "i32") or
+		    g:cast(g:sub(hrow, g:mul(g:sub(hrow, xc.hzero), hit)), "i32")
+		local dev = sum_picks(g, experts(g, hp, xc, x3, dsel, wd))
+		return g:add(dev, sum_picks(g, experts(g, hp, xc.host, x3, hsel, g:sub(w, wd))))
+	end
 	if not hp.gemma and not xc.router_cpu then
 		-- The CPU computes only the picks that no slot holds.
 		local up = not L.gate_up_exps and L.up_exps or nil
@@ -1787,8 +1798,9 @@ function M.moe(g, hp, L, x, h, taps, sfx)
 	end
 	-- From XCACHE_MAX_BATCH tokens up, the scheduler moves the CPU experts
 	-- to the device with the used experts copied: the cache adds nothing,
-	-- and its CPU ids there gave NaN on Vulkan.
-	if L.xc and L.xc.n > 0 and n < M.XCACHE_MAX_BATCH then
+	-- and its CPU ids there gave NaN on Vulkan. A zero-copy cache has no
+	-- CPU part, so every pass takes it.
+	if L.xc and L.xc.n > 0 and (n < M.XCACHE_MAX_BATCH or L.xc.host) then
 		return cached_experts(g, hp, L, x3, sel, w)
 	end
 	return sum_picks(g, experts(g, hp, L, x3, sel, w))
