@@ -11,6 +11,10 @@ local lgml = require("lgml")
 
 local M = {}
 
+-- Fused ops run on the device (see lgml.vk_fused). LGML_NO_FUSED turns
+-- them off, to compare.
+local FUSED = lgml.vk_fused and not os.getenv("LGML_NO_FUSED")
+
 -- The name of the n-gram table.
 local TABLE = "per_layer_token_embd.weight"
 
@@ -675,6 +679,10 @@ local function hc_mix(g, hp, x, wn, wd, wu, wi)
 	xn = g:reshape(xn, { n, HC * E })
 	local lo = g:silu(g:mul_mat(wd, xn))
 	local gate = g:mul_mat(wu, lo)
+	if FUSED then
+		local x3 = g:reshape(xn, { n, HC, E })
+		return g:hc_mean(x3, g:reshape(gate, { n, HC, E })), wi and g:mul_mat(wi, xn)
+	end
 	local gated = g:reshape(g:mul(xn, g:sigmoid(gate)), { n, HC, E })
 	local st = gated:strides()
 	local mixed = g:view(gated, { n, E }, { st[1] })
@@ -691,6 +699,13 @@ end
 -- scaled by 2 * sigmoid(inj), with inj the inject weights / hc.
 local function hc_add(g, hp, res, o, inj)
 	local n, E, HC = res:shape()[1], hp.n_embd, hp.hc
+	if FUSED then
+		local st = o:strides()
+		if st[2] ~= 4 or st[1] ~= 4 * E then
+			o = g:cont(o)
+		end
+		return g:hc_add(res, o, inj)
+	end
 	local w = g:scale(g:sigmoid(inj), 2)
 	local b = g:tile(g:reshape(o, { n, 1, E }), res)
 	return g:add(res, g:mul(b, g:reshape(w, { n, HC, 1 })))

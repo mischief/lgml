@@ -1,0 +1,32 @@
+#version 450
+// hc_add: d[t][h][e] = r[t][h][e] + o[t][e] * 2 * sigmoid(w[t][h]).
+// One invocation per element: x is e, y is the row t * HC + h.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer R { float r[]; };
+layout(binding = 1) readonly buffer O { float o[]; };
+layout(binding = 2) readonly buffer W { float w[]; };
+layout(binding = 3) writeonly buffer D { float d[]; };
+
+layout(push_constant) uniform P {
+	uint E;
+	uint HC;
+	uint rows;
+	uint off_r;
+	uint off_o;
+	uint off_w;
+	uint off_d;
+} p;
+
+void main()
+{
+	const uint e = gl_GlobalInvocationID.x;
+	const uint row = gl_GlobalInvocationID.y;
+	if (e >= p.E || row >= p.rows) {
+		return;
+	}
+	const uint t = row / p.HC;
+	const float g = 2.0 / (1.0 + exp(-w[p.off_w / 4 + row]));
+	d[p.off_d / 4 + row * p.E + e] = r[p.off_r / 4 + row * p.E + e] + o[p.off_o / 4 + t * p.E + e] * g;
+}

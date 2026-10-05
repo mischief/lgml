@@ -120,6 +120,7 @@ void		 lgml_open_ops_qwen3tts(lua_State *);
 void		 lgml_open_ops_vibevoice(lua_State *);
 void		 lgml_open_ops_nn(lua_State *);
 void		 lgml_open_proctitle(lua_State *);
+void		 lgml_open_ops_fused(lua_State *);
 void		 lgml_open_xcache(lua_State *);
 void		 lgml_open_train(lua_State *);
 void		 lgml_open_ngram(lua_State *);

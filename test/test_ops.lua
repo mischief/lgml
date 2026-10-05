@@ -342,5 +342,36 @@ do
 	ok(not pcall(t.to_host, t, hb), "to_host into a closed hostbuf fails")
 end
 
+-- The fused hyper-connection ops against their op chains.
+do
+	local T, HC, E = 3, 4, 40
+	local function vals(k, s)
+		local v = {}
+		for i = 1, k do
+			v[i] = math.sin(i * s)
+		end
+		return v
+	end
+	local r <close> = f32({ T, HC, E }, vals(T * HC * E, 0.37))
+	local o <close> = f32({ T, E }, vals(T * E, 0.71))
+	local w <close> = f32({ T, HC }, vals(T * HC, 1.3))
+	local want = run(function(g)
+		local s = g:scale(g:sigmoid(w), 2)
+		return g:add(r, g:mul(g:tile(g:reshape(o, { T, 1, E }), r), g:reshape(s, { T, HC, 1 })))
+	end)
+	near(run(function(g) return g:hc_add(r, o, w) end), want, "hc_add", 1e-5)
+	local x <close> = f32({ T, HC, E }, vals(T * HC * E, 0.53))
+	want = run(function(g)
+		local m = g:mul(x, g:sigmoid(r))
+		local st = m:strides()
+		local s = g:view(m, { T, E }, { st[1] })
+		for h = 1, HC - 1 do
+			s = g:add(s, g:view(m, { T, E }, { st[1] }, h * st[2]))
+		end
+		return s
+	end)
+	near(run(function(g) return g:hc_mean(x, r) end), want, "hc_mean", 1e-5)
+end
+
 print("1.." .. n)
 os.exit(failed and 1 or 0)

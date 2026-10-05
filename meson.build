@@ -73,8 +73,25 @@ if lua_cdir == ''
   lua_cdir = get_option('prefix') / 'lib' / 'lua' / '5.4'
 endif
 
+# Fused ops carry SPIR-V shaders for the Vulkan backend; without glslc
+# they run on the CPU only.
+glslc = find_program('glslc', required : false)
+spv_srcs = []
+spv_args = []
+if glslc.found()
+  foreach s : ['hc_add', 'hc_mean']
+    spv_srcs += custom_target(s + '.spv.h',
+      input : 'src/shaders' / s + '.comp',
+      output : s + '.spv.h',
+      command : [glslc, '--target-env=vulkan1.2', '-O', '-mfmt=c', '@INPUT@', '-o', '@OUTPUT@'])
+  endforeach
+  spv_args += '-DLGML_HAVE_SPV'
+endif
+
 lgml = shared_module('lgml',
   'src/lgml.c',
+  'src/ops_fused.c',
+  spv_srcs,
   'src/ops_orpheus.c',
   'src/ops_qwen3tts.c',
   'src/ops_vibevoice.c',
@@ -97,6 +114,7 @@ lgml = shared_module('lgml',
   'src/ngram.c',
   'src/lngram.c',
   dependencies : [ggml, lua, m, threads, png, jpeg, utf8proc],
+  c_args : spv_args,
   name_prefix : '',
   install : true,
   install_dir : lua_cdir,
