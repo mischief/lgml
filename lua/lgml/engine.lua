@@ -620,9 +620,10 @@ end
 
 --- The device bytes of the largest compute buffers of the engine.
 -- It plans prompt chunks of ubatch tokens over all n_ctx cells: one
--- alone plus, with batched slots, one per slot, as a dropped graph lives
--- until the collector takes its outputs. An image of the most tokens
--- adds its encoder. The pool grows to n_ctx for the plans and shrinks
+-- alone plus, with batched slots, one per slot, as a dropped batch graph
+-- lives until the collector takes its rows. With speculation on, the
+-- kept graphs and the draft head's passes add `plan_spec`. An image of
+-- the most tokens adds its encoder. The pool grows to n_ctx for the plans and shrinks
 -- back, so a full cache that does not fit raises the budget error.
 -- With ubatch "auto", the first call picks the chunk size; see `new`.
 -- @treturn ?integer the bytes, or nil for an engine without a pool
@@ -680,7 +681,7 @@ function E:reserve_ctx()
 				if not good then
 					error(r, 0)
 				end
-				return r, u
+				return r + self:plan_spec(), u
 			end
 		end
 	end)
@@ -733,6 +734,22 @@ function E:plan_chunks(u)
 	return r
 end
 
+-- The compute bytes that speculation adds to the plan, and the bytes
+-- of kept graphs it allows each cache (`self.spec_kept_bytes`). A
+-- verify pass runs at most 2 * max + 2 rows with logits for each. The
+-- slot keeps graphs up to twice that pass, the draft head's view of
+-- the cache as many, and the head's own pass takes one more.
+function E:plan_spec()
+	if not self.spec_on then
+		return 0
+	end
+	local n = 2 * self.spec_opts.max + 2
+	local v = self:plan_pass(1, n, self.pool.n_ctx, self.ubatch) + n * self.tk:n_vocab() * 4
+	self.spec_kept_bytes = 2 * v
+	L:info("speculation plan", "verify_mib", v // 1048576, "kept_mib", 2 * v // 1048576)
+	return 5 * v
+end
+
 -- Take u tokens per prompt pass from now on. With rings, the slots get
 -- new sequences that hold u more rows; they must be empty.
 function E:set_ubatch(u)
@@ -767,6 +784,10 @@ function E:memory()
 	if self.model.cache_size then
 		local per, fixed = self.model:cache_size(self.copts)
 		local n = #self.slots
+		-- A speculating hybrid model keeps a spare copy of one state.
+		if self.spec_on and self.model.recurrent then
+			n = n + 1
+		end
 		if self.pool then
 			r.cache = per * self.pool.n_ctx + fixed * n
 			r.cache_now = per * self.pool.cap + fixed * n
@@ -1175,7 +1196,7 @@ function E:batch_step(slot, ids)
 		if self.model.drop_batch then
 			self.model:drop_batch(false)
 		end
-		local ok, logits = pcall(replay.run, self.model, slot.cache, ids,
+		local ok, logits = pcall(self.run_pass, self, slot.cache, ids,
 		    { logits = "last", flash_attn = self.flash_attn })
 		self:release()
 		if not ok then
@@ -1269,19 +1290,26 @@ function E:flush()
 	if #list == 1 and self.model.drop_batch then
 		self.model:drop_batch(false)
 	elseif #list > 1 then
+		-- The requests of these slots read their last logits already.
 		for _, c in ipairs(caches) do
-			replay.drop(c)
+			replay.drop(c, true)
 		end
 	end
 	if #list == 1 then
 		-- One request: its slot's own replayed graph is the fast path.
 		ok, rows = pcall(function()
-			return { replay.run(self.model, caches[1], ids[1],
-			    { logits = "last", flash_attn = self.flash_attn }) }
+			return { self:run_pass(caches[1], ids[1], { logits = "last", flash_attn = self.flash_attn }) }
 		end)
 	elseif #list > 1 then
 		ok, rows = pcall(self.model.run_batch, self.model, caches, ids,
 		    { flash_attn = self.flash_attn })
+		if not ok and budget_mod.is_budget(rows) then
+			L:warn("a batch pass does not fit the memory budget; graphs go and it runs again",
+			    "err", rows)
+			self:relieve()
+			ok, rows = pcall(self.model.run_batch, self.model, caches, ids,
+			    { flash_attn = self.flash_attn })
+		end
 	end
 	self:release()
 	self.batch_passes = (self.batch_passes or 0) + 1
@@ -1323,12 +1351,66 @@ local function sampler_opts(req, think, extra)
 	return sampler.new(think and "qwen3_think" or "qwen3", o)
 end
 
+-- Free memory that later passes can make again, for a pass on cache
+-- that did not fit: the kept graphs of each slot, the graphs of idle
+-- slots, the batch graph when no other request runs, and the outputs
+-- that only the garbage collector still holds.
+function E:relieve(cache)
+	local alone = self:owned() <= 1
+	for _, s in ipairs(self.slots) do
+		replay.drop_kept(s.cache)
+		if s.cache ~= cache and not s.owner then
+			replay.drop(s.cache, true)
+		end
+	end
+	if alone and self.model.drop_batch then
+		self.model:drop_batch(false)
+	end
+	collectgarbage()
+	collectgarbage()
+	self.relieved = (self.relieved or 0) + 1
+end
+
+-- The smallest prompt chunk that a pass past the memory budget splits.
+local MIN_SPLIT = 64
+
+-- replay.run with one more try when the pass does not fit the memory
+-- budget: `relieve` frees what it can first. A prompt chunk that still
+-- does not fit runs in two halves; the result is that of the last.
+function E:run_pass(cache, ids, opts)
+	local ok, out = pcall(replay.run, self.model, cache, ids, opts)
+	if ok or not budget_mod.is_budget(out) then
+		if not ok then
+			error(out, 0)
+		end
+		return out
+	end
+	L:warn("a pass does not fit the memory budget; graphs go and it runs again", "tokens", #ids,
+	    "err", out)
+	self:relieve(cache)
+	ok, out = pcall(replay.run, self.model, cache, ids, opts)
+	-- Smaller chunks need the same cells, so a cache growth stays an error.
+	local cells = not ok and (tostring(out):find("the KV pool from", 1, true) or
+	    tostring(out):find("the KV cache from", 1, true))
+	if ok or not budget_mod.is_budget(out) or cells or #ids < 2 * MIN_SPLIT or opts.embd or
+	    opts.logits == "all" then
+		if not ok then
+			error(out, 0)
+		end
+		return out
+	end
+	local half = #ids // 2
+	L:warn("a prompt chunk does not fit the memory budget; it runs in halves", "tokens", #ids)
+	self:run_pass(cache, table.move(ids, 1, half, 1, {}), opts)
+	return self:run_pass(cache, table.move(ids, half + 1, #ids, 1, {}), opts)
+end
+
 -- Run ids at cache.n_past. Returns the logits node, which stays valid
 -- until the next pass: the cache keeps the graph for replay. rows is
 -- "last" (the default) or "all". embd holds embeddings for the ids: a
 -- non-causal pass reads them in place of the token embeddings.
 function E:eval(ids, rows, embd)
-	return replay.run(self.model, self.cache, ids, {
+	return self:run_pass(self.cache, ids, {
 		logits = rows or "last", flash_attn = self.flash_attn,
 		embd = embd, causal = embd == nil,
 	})
@@ -2375,19 +2457,24 @@ end
 -- table: `ready` (the sampled tokens, each `{ id, logprobs }`) and
 -- `redo` (kept tokens that the next pass must run again)
 function E:spec_step(sp, slot, toks, pend, smp, lim)
-	if slot and (slot.preempt or #self.pending > 0 or self.busy or self:owned() ~= 1) then
+	if sp.off or slot and (slot.preempt or #self.pending > 0 or self.busy or self:owned() ~= 1) then
 		return nil
 	end
 	local model = self.model
 	local cache = slot and slot.cache or self.cache
-	cache.replay_keep = SPEC_GRAPHS
+	cache.replay_keep, cache.replay_keep_bytes = SPEC_GRAPHS, self.spec_kept_bytes
 	-- A pass takes at most ubatch tokens; a ring takes at most its own.
 	local room = math.min(lim.k, cache.n_ctx - cache.n_past, cache.ubatch or self.ubatch) - #pend
 	local k = sp:choose(room)
 	local drafts = {}
 	if k > 0 then
-		drafts = sp.drafter:draft({ seq = sp.seq, logits = sp.logits, row = sp.row, hidden = sp.hidden,
-		    hidden_row = sp.hidden_row, cache = cache }, k)
+		local good, got = pcall(sp.drafter.draft, sp.drafter, { seq = sp.seq, logits = sp.logits,
+		    row = sp.row, hidden = sp.hidden, hidden_row = sp.hidden_row, cache = cache }, k)
+		if not good then
+			self:spec_memory(sp, cache, got)
+			return nil
+		end
+		drafts = got
 		-- An end token stays out of a draft: it ends the reply anyway.
 		for j = 1, #drafts do
 			if j > k or self.eog[drafts[j]] then
@@ -2410,6 +2497,9 @@ function E:spec_step(sp, slot, toks, pend, smp, lim)
 			model:drop_batch(false)
 		end
 		ok, res = pcall(self.verify, self, sp, cache, toks, ids, #pend, drafts, smp, lim)
+		if not ok and budget_mod.is_budget(res) then
+			ok, res = pcall(self.spec_memory, self, sp, cache, res)
+		end
 	end
 	if slot then
 		self:release()
@@ -2418,6 +2508,20 @@ function E:spec_step(sp, slot, toks, pend, smp, lim)
 		error(res, 0)
 	end
 	return res
+end
+
+-- A draft or verify pass did not fit the memory budget: speculation
+-- stops for this request and lets its graphs go, and the step runs as a
+-- plain decode step. Other errors go on.
+function E:spec_memory(sp, cache, err)
+	if not budget_mod.is_budget(err) then
+		error(err, 0)
+	end
+	L:warn("speculation does not fit the memory budget; it stops for this request", "err", err)
+	sp.off = true
+	cache.replay_keep = nil
+	self:relieve(cache)
+	return nil
 end
 
 -- The verify pass of `spec_step`: run ids, the np pending tokens and
