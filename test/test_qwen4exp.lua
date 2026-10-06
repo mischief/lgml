@@ -228,13 +228,18 @@ local function split_check(m)
 	for i = 1, #rest do
 		e = math.max(e, maxdiff(rest[i], all[11 + i]))
 	end
-	local ek = 0
+	local ek, eb, nb = 0, 0, 0
 	for il, x in pairs(one.x) do
 		if il > 0 then
 			ek = math.max(ek, maxdiff(c.x[il]:get(), x:get()))
+		elseif il < 0 then
+			eb = math.max(eb, maxdiff(c.x[il]:get(), x:get()))
+			nb = nb + 1
 		end
 	end
-	ok(e < TOL and ek < TOL, ("qsa: a pass within the budget keeps its keys (max error %.3g, keys %.3g)"):format(e, ek))
+	ok(e < TOL and ek < TOL and eb < TOL and nb > 0,
+	    ("qsa: a pass within the budget keeps its keys (max error %.3g, keys %.3g, block keys %.3g)")
+	    :format(e, ek, eb))
 end
 
 -- The n-gram rows of the Lua hash for a context with an EOS and a

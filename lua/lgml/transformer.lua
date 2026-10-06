@@ -1017,6 +1017,11 @@ local function seq_window(c, n_kv)
 	return lo, hi - lo
 end
 
+-- Bytes per position of a QSA layer's indexer keys and block keys.
+local function idx_row(hp, L)
+	return lgml.row_size("f16", L.idx) + lgml.row_size("f16", L.idx // hp.idx.ratio)
+end
+
 --- Bytes a cache from `cache` takes on the device.
 -- A layer with `cpu` set keeps its cache on the CPU; its bytes are the
 -- third and fourth results.
@@ -1048,7 +1053,7 @@ function M:cache_size(opts)
 		elseif not L.kv_src then
 			local row = lgml.row_size(tk, L.Hkv * L.D) + lgml.row_size(tv, L.Hkv * L.D)
 			if L.idx then
-				row = row + lgml.row_size("f16", L.idx)
+				row = row + idx_row(hp, L)
 			end
 			if L.swa then
 				p[2] = p[2] + ring * row
@@ -1066,7 +1071,7 @@ function M:cache_size(opts)
 		local L = mt.L
 		local p = L.cpu and s.cpu or s.dev
 		p[1] = p[1] + lgml.row_size(tk, L.Hkv * L.D) + lgml.row_size(tv, L.Hkv * L.D) +
-		    (L.idx and lgml.row_size("f16", L.idx) or 0)
+		    (L.idx and idx_row(hp, L) or 0)
 		p[2] = p[2] + 4 * hp.hc * hp.n_embd
 	end
 	return s.dev[1], s.dev[2], s.cpu[1], s.cpu[2]
@@ -1223,7 +1228,7 @@ local function snap_parts(self, cache, rows, state, hi)
 			end
 		elseif rows and not L.kv_src then
 			local src = cache.pool or cache
-			for _, t in ipairs({ src.k[il], src.v[il], src.x and src.x[il] }) do
+			for _, t in ipairs({ src.k[il], src.v[il], src.x and src.x[il], src.x and src.x[-il] }) do
 				local row = t:nbytes() // t:shape()[1]
 				add(t, rows * row, row)
 			end
@@ -1233,7 +1238,7 @@ local function snap_parts(self, cache, rows, state, hi)
 	if mt then
 		local src = cache.pool or cache
 		if rows then
-			for _, t in ipairs({ src.k[mt.il], src.v[mt.il], src.x and src.x[mt.il] }) do
+			for _, t in ipairs({ src.k[mt.il], src.v[mt.il], src.x and src.x[mt.il], src.x and src.x[-mt.il] }) do
 				local row = t:nbytes() // t:shape()[1]
 				add(t, rows * row, row)
 			end

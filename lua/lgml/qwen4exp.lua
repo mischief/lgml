@@ -426,10 +426,21 @@ local function host(self)
 	return self.host
 end
 
+-- Add the indexer keys and block keys of layer il to cache c.
+local function add_idx(c, be, il, rows, dim, ratio)
+	c.x[il] = be:tensor("f16", { rows, dim })
+	c.x[-il] = be:tensor("f16", { rows, dim // ratio })
+	c.x[il]:zero()
+	c.x[-il]:zero()
+end
+
 --- Add the qwen4exp parts of a cache: indexer keys of the QSA layers
 -- and token ids (with global true), and the PLE conv state.
 -- Extra row tensors go in c.x: x[il] holds the f16 indexer keys of
--- layer il, x[0] the i32 token ids of the cells (on the CPU).
+-- layer il, x[-il] its block keys, x[0] the i32 token ids of the cells
+-- (on the CPU). A block of ratio cells has one block key: each of its
+-- rows in x[-il] holds 1 / ratio of it, so the rows of a block hold the
+-- key in order.
 -- @tparam Model self the model
 -- @tparam table c the cache
 -- @tparam integer rows the rows of the global layers
@@ -447,8 +458,7 @@ function M.add_cache(self, c, rows, global)
 			c.pconv[il]:zero()
 		end
 		if L.idx and global then
-			c.x[il] = lbe:tensor("f16", { rows, L.idx })
-			c.x[il]:zero()
+			add_idx(c, lbe, il, rows, L.idx, hp.idx.ratio)
 		end
 	end
 	if hp.ple and global then
@@ -467,8 +477,7 @@ function M.add_cache(self, c, rows, global)
 			c.k[mt.il]:zero()
 			c.v[mt.il]:zero()
 			if L.idx then
-				c.x[mt.il] = lbe:tensor("f16", { rows, L.idx })
-				c.x[mt.il]:zero()
+				add_idx(c, lbe, mt.il, rows, L.idx, hp.idx.ratio)
 			end
 		end
 		if c.conv then
@@ -560,17 +569,24 @@ function M.leaves(self, inp, n)
 	end
 end
 
---- Make the QSA block positions leaf of one sequence, qsa_pos: the
--- position of the first cell of each block of the attention span. A
--- span with at most top_k / ratio blocks needs none.
+--- Make the QSA leaves of one sequence: the blocks that the pass writes
+-- (qsa_blk i32 and qsa_blk_rows i64) and the position of the first cell
+-- of each (qsa_blk_pos). A pass of n tokens writes at most
+-- (n - 2) // ratio + 2 blocks; a short list repeats its last block.
+-- qsa_sparse is true when the span has more than top_k / ratio blocks.
 -- @tparam Model self the model
--- @tparam table b the inputs or a batch entry
+-- @tparam table b the inputs or a batch entry, with n and rows
 -- @tparam integer span the cells that attention reads
 function M.seq_leaves(self, b, span)
 	local I = self.hp.idx
-	if I and span // I.ratio > I.top_k // I.ratio then
-		b.qsa_pos = self.be:tensor("i32", { span // I.ratio })
+	if not I or not b.rows then
+		return
 	end
+	local nb = (b.n + I.ratio - 2) // I.ratio + 1
+	b.qsa_blk = self.be:tensor("i32", { nb })
+	b.qsa_blk_rows = self.be:tensor("i64", { nb })
+	b.qsa_blk_pos = self.be:tensor("i32", { nb })
+	b.qsa_sparse = span // I.ratio > I.top_k // I.ratio
 end
 
 -- Pack integers as i32 bytes.
@@ -637,27 +653,26 @@ function M.fill(self, inp, b, c, ids, n_past, lo, off)
 			M.ngram_rows(p, prev, ids, inp.ple_list, off * p.heads)
 		end
 	end
-	if b.qsa_pos then
+	if b.qsa_blk then
+		-- A cell and its position share the offset in their block of
+		-- ratio cells: pool blocks hold whole blocks.
 		local R = hp.idx.ratio
-		local P = b.qsa_pos:shape()[1]
-		local pos = {}
-		if c.pool then
-			local B = c.pool.block
-			local at = {}
-			for i, blk in ipairs(c.blocks) do
-				at[blk] = i - 1
-			end
-			for j = 1, P do
-				local cell = lo + (j - 1) * R
-				local i = at[cell // B]
-				pos[j] = i and i * B + cell % B or 0
-			end
-		else
-			for j = 1, P do
-				pos[j] = (j - 1) * R
+		assert(lo % R == 0 and (not c.pool or c.pool.block % R == 0), "qsa: blocks must align")
+		local cells = T().cells(c, n_past, n)
+		local blk, pos = {}, {}
+		for k = 1, n do
+			local j = cells[k] // R
+			if blk[#blk] ~= j then
+				blk[#blk + 1] = j
+				pos[#pos + 1] = n_past + k - 1 - (n_past + k - 1) % R
 			end
 		end
-		b.qsa_pos:set(pos)
+		for k = #blk + 1, b.qsa_blk:shape()[1] do
+			blk[k], pos[k] = blk[k - 1], pos[k - 1]
+		end
+		b.qsa_blk:set(blk)
+		b.qsa_blk_rows:set(blk)
+		b.qsa_blk_pos:set(pos)
 	end
 end
 
@@ -810,30 +825,23 @@ end
 -- The QSA mask of one sequence in layer L: the base mask with -1e30
 -- on the visible complete blocks that the indexer does not pick. cur
 -- holds the layer inputs of the sequence, ikw the indexer keys after
--- this pass wrote them. With at most top_k / ratio blocks in the span
--- it is the base mask.
-local function qsa_mask(g, hp, L, cur, pos, ikw, lo, span, mask, qpos, qw)
+-- this pass wrote them, bkw the block keys (blocks, dim) after this
+-- pass wrote them. A span of at most top_k / ratio blocks (sparse
+-- false) gets the base mask.
+local function qsa_mask(g, hp, L, cur, pos, ikw, bkw, lo, span, mask, sparse, qw)
 	local I = hp.idx
 	local R, P, K = I.ratio, span // I.ratio, I.top_k // I.ratio
-	-- The dense mask does not read the keys. Expand the write, or later
+	-- The dense mask does not read the keys. Expand the writes, or later
 	-- passes find no keys for these cells.
 	g:expand(ikw)
-	if not qpos or P <= K then
+	g:expand(bkw)
+	if not sparse then
 		return mask
 	end
 	local n = cur:shape()[1]
 	local rope = { mode = hp.rope_mode, base = L.base, n_dims = L.n_rot, n_ctx_orig = hp.rope_ctx }
-	-- Each block key is the mean of its raw keys, normed, at the
-	-- position of its first cell.
 	local f2 = lgml.row_size("f16", I.dim)
-	local win = g:cast(g:view(ikw, { P, R, I.dim }, { R * f2, f2 }, lo * f2), "f32")
-	local st = win:strides()
-	local pk = g:cont(g:view(win, { P, I.dim }, { st[1] }))
-	for r = 1, R - 1 do
-		pk = g:add(pk, g:view(win, { P, I.dim }, { st[1] }, r * st[2]))
-	end
-	pk = g:mul(g:rms_norm(g:scale(pk, 1 / R), hp.eps), L.idx_k_norm)
-	pk = g:cast(g:rope(g:reshape(pk, { P, 1, I.dim }), qpos, rope), "f16")
+	local pk = g:view(bkw, { P, 1, I.dim }, { f2, f2 }, lo // R * f2)
 	local q = g:reshape(g:mul_mat(L.idx_q, cur), { n, I.heads, I.dim })
 	q = g:rope(g:mul(g:rms_norm(q, hp.eps), L.idx_q_norm), pos, rope)
 	-- A block is visible to a token when its last cell is.
@@ -852,8 +860,33 @@ local function qsa_mask(g, hp, L, cur, pos, ikw, lo, span, mask, qpos, qw)
 	return g:reshape(g:add(g:reshape(mask, { n, P, R }), cut), { n, span })
 end
 
+-- Write the block keys of the blocks that a pass wrote, b.qsa_blk, into
+-- the block keys xb of the cache: the mean of the indexer keys in ikw of
+-- each block, normed, roped at the position of its first cell. Returns
+-- the block keys (blocks, dim) after the write.
+local function block_keys(g, hp, L, ikw, xb, b)
+	local I = hp.idx
+	local R, D = I.ratio, I.dim
+	local rows = ikw:shape()[1] // R
+	local nb = b.qsa_blk:shape()[1]
+	local win = g:get_rows(g:reshape(ikw, { rows, R * D }), b.qsa_blk)
+	if win:type() ~= "f32" then
+		win = g:cast(win, "f32")
+	end
+	win = g:reshape(win, { nb, R, D })
+	local st = win:strides()
+	local bk = g:cont(g:view(win, { nb, D }, { st[1] }))
+	for r = 1, R - 1 do
+		bk = g:add(bk, g:view(win, { nb, D }, { st[1] }, r * st[2]))
+	end
+	bk = g:mul(g:rms_norm(g:scale(bk, 1 / R), hp.eps), L.idx_k_norm)
+	local rope = { mode = hp.rope_mode, base = L.base, n_dims = L.n_rot, n_ctx_orig = hp.rope_ctx }
+	bk = g:cast(g:rope(g:reshape(bk, { nb, 1, D }), b.qsa_blk_pos, rope), "f16")
+	return g:set_rows(g:reshape(xb, { rows, D }), g:reshape(bk, { nb, D }), b.qsa_blk_rows)
+end
+
 -- A QSA layer on its input cur: indexer, attention, output gate and
--- projection. It writes the indexer keys of the pass.
+-- projection. It writes the indexer keys and block keys of the pass.
 local function qsa_layer(self, g, inp, L, il, cur, shared)
 	local hp = self.hp
 	local tr = T()
@@ -864,19 +897,23 @@ local function qsa_layer(self, g, inp, L, il, cur, shared)
 		if inp.batch then
 			local list = {}
 			for i, b in ipairs(inp.batch) do
-				local c = b.cache
-				local ikw = g:set_rows(c.pool.x[il], g:cont(rows_of(g, kraw, b.off, b.n)), b.rows)
+				local x = b.cache.pool.x
+				local ikw = g:set_rows(x[il], g:cont(rows_of(g, kraw, b.off, b.n)), b.rows)
+				local bkw = block_keys(g, hp, L, ikw, x[-il], b)
 				local ci = g:cont(rows_of(g, cur, b.off, b.n))
 				local pi = g:cont(rows_of(g, inp.pos, b.off, b.n))
 				local wi = g:cont(rows_of(g, inp.qsa_w, b.off, b.n))
-				local m = qsa_mask(g, hp, L, ci, pi, ikw, b.lo, b.n_attn, b.mask, b.qsa_pos, wi)
+				local m = qsa_mask(g, hp, L, ci, pi, ikw, bkw, b.lo, b.n_attn, b.mask, b.qsa_sparse, wi)
 				list[i] = setmetatable({ mask = m }, { __index = b })
 			end
 			a = setmetatable({ batch = list }, { __index = inp })
 		else
 			local c = inp.cache
-			local ikw = g:set_rows((c.pool or c).x[il], kraw, inp.rows)
-			local m = qsa_mask(g, hp, L, cur, inp.pos, ikw, inp.lo, inp.n_attn, inp.mask, inp.qsa_pos, inp.qsa_w)
+			local x = (c.pool or c).x
+			local ikw = g:set_rows(x[il], kraw, inp.rows)
+			local bkw = block_keys(g, hp, L, ikw, x[-il], inp)
+			local m = qsa_mask(g, hp, L, cur, inp.pos, ikw, bkw, inp.lo, inp.n_attn, inp.mask, inp.qsa_sparse,
+			    inp.qsa_w)
 			a = setmetatable({ mask = m }, { __index = inp })
 		end
 	end
