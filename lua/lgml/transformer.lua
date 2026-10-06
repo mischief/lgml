@@ -70,6 +70,8 @@ local family = {
 	qwen4exp = { qk_norm = true, rope_ctx = true, hybrid = true, hc = true },
 	gemma4 = { qk_norm = true, gemma = true },
 	["diffusion-gemma"] = { qk_norm = true, gemma = true },
+	-- LLaDA-MoE-v2: a masked diffusion model; see `lgml.llada-moe-v2`.
+	["llada-moe-v2"] = { qk_norm = true, rope_ctx = true },
 }
 
 -- Check that text tokens can use neox rope. Their t, h and w positions
@@ -100,7 +102,8 @@ end
 -- field of a model. It holds arch, n_layer (without nextn layers),
 -- n_embd, n_head, n_head_kv, head_dim, n_rot, eps, rope_base, n_ctx,
 -- n_vocab (or nil), and the flags rope_mode, qk_norm, attn_gate, gemma.
--- MoE models add n_expert, n_used, gating and norm_topk. Gemma adds
+-- MoE models add n_expert, n_used, gating, norm_topk and expert_scale
+-- (the factor on the routed weights). Gemma adds
 -- head_dim_swa, n_rot_swa, rope_base_swa, n_swa, swa, softcap,
 -- n_kv_shared and n_embd_per_layer. Hybrid models add recr, d_conv,
 -- head_k, n_k_heads, n_v_heads and head_v; with rope sections, also
@@ -154,6 +157,7 @@ function M.config(meta)
 		hp.n_used = k("expert_used_count")
 		hp.gating = k("expert_gating_func", M.gating.SOFTMAX)
 		hp.norm_topk = k("expert_weights_norm", true)
+		hp.expert_scale = k("expert_weights_scale", 1)
 		if hp.gating ~= M.gating.SOFTMAX and hp.gating ~= M.gating.SIGMOID then
 			error(("%s: expert gating %s not supported"):format(a, tostring(hp.gating)))
 		end
@@ -332,8 +336,9 @@ function M.load_layer(w, hp, i, rope_freqs)
 			L.up_exps = get("ffn_up_exps.weight")
 		end
 		L.down_exps = get("ffn_down_exps.weight")
+		-- A shared expert can be gated (shexp_gate) or not.
 		L.shexp_gate = opt("ffn_gate_inp_shexp.weight")
-		if L.shexp_gate then
+		if L.shexp_gate or opt("ffn_gate_shexp.weight") then
 			L.gate_shexp = get("ffn_gate_shexp.weight")
 			L.up_shexp = get("ffn_up_shexp.weight")
 			L.down_shexp = get("ffn_down_shexp.weight")
@@ -1822,7 +1827,8 @@ end
 
 --- Build the routed experts of one layer.
 -- The router picks the top n_used experts; their weights sum to 1
--- when hp.norm_topk is set. Gemma routes on the rms-normed residual.
+-- when hp.norm_topk is set, then take the factor hp.expert_scale.
+-- Gemma routes on the rms-normed residual.
 -- This is a plain function.
 -- @static
 -- @param g the graph
@@ -1850,6 +1856,9 @@ function M.moe(g, hp, L, x, h, taps, sfx)
 	if hp.norm_topk then
 		w = g:div(w, g:clamp(g:sum_rows(w), 6.103515625e-5, math.huge))
 	end
+	if hp.expert_scale and hp.expert_scale ~= 1 then
+		w = g:scale(w, hp.expert_scale)
+	end
 	w = g:reshape(w, { n, K, 1 })
 	if L.down_exps_scale then
 		local s = g:tile(g:reshape(L.down_exps_scale, { 1, NE, 1 }), probs3)
@@ -1872,7 +1881,8 @@ end
 
 --- Build the FFN block of one layer, with its residual.
 -- A layer has a dense FFN (SwiGLU, or GeGLU on gemma), routed experts,
--- or both. A shared expert adds its output times sigmoid(gate . h).
+-- or both. A shared expert adds its output, times sigmoid(gate . h)
+-- when it has a gate.
 -- This is a plain function.
 -- @static
 -- @param g the graph
@@ -1901,10 +1911,13 @@ function M.ffn(g, hp, L, x, taps, sfx)
 			ex = g:mul(g:rms_norm(ex, eps), L.post_ffn_norm_2)
 		end
 		out = out and g:add(out, ex) or ex
-		if L.shexp_gate then
+		if L.gate_shexp then
 			local sh = g:swiglu_split(mm(g, L, "gate_shexp", h), mm(g, L, "up_shexp", h))
 			sh = mm(g, L, "down_shexp", sh)
-			out = g:add(out, g:mul(sh, g:sigmoid(g:mul_mat(L.shexp_gate, h))))
+			if L.shexp_gate then
+				sh = g:mul(sh, g:sigmoid(g:mul_mat(L.shexp_gate, h)))
+			end
+			out = g:add(out, sh)
 		end
 	end
 	if L.post_ffn_norm then
