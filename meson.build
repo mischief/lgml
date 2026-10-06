@@ -130,6 +130,7 @@ lgml = shared_module('lgml',
 
 install_subdir('lua/lgml', install_dir : lua_dir)
 install_data('bin/lgml-server', 'bin/lgml-worker', 'bin/lgml-repl', 'bin/lgml-finetune',
+  'bin/lgml-convert',
   install_dir : get_option('bindir'), install_mode : 'rwxr-xr-x')
 
 # Rock dependencies install into lua_modules (see lgml-scm-1.rockspec).
@@ -234,6 +235,9 @@ if lua_bin.found()
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
     timeout : 120)
   test('lora', lua_bin, args : [files('test/test_lora.lua')],
+    env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
+    timeout : 120)
+  test('convert', lua_bin, args : [files('test/test_convert.lua')],
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
     timeout : 120)
   test('finetune', lua_bin, args : [files('test/test_finetune.lua')],

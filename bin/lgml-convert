@@ -1,0 +1,59 @@
+#!/usr/bin/env lua5.4
+-- lgml-convert: convert a Hugging Face safetensors model to gguf.
+
+local root = ((arg and arg[0] or ""):match("^(.*)/[^/]*$") or ".") .. "/.."
+package.path = root .. "/lua/?.lua;" .. root .. "/lua/?/init.lua;" ..
+    root .. "/lua_modules/share/lua/5.4/?.lua;" .. package.path
+package.cpath = root .. "/" .. (os.getenv("LGML_BUILD") or "build") .. "/?.so;" .. root .. "/lua_modules/lib/lua/5.4/?.so;" ..
+    package.cpath
+require("lgml.strict").on()
+
+local getopt = require("lgml.getopt")
+local convert = require("lgml.convert")
+
+local USAGE = [[
+usage: lgml-convert [-h] [-t type] [-n name] [-j threads] [-q] dir out.gguf
+  dir                  Hugging Face model directory: config.json,
+                       tokenizer.json, tokenizer_config.json and
+                       safetensors weights, one file or an index
+  -t, --type type      output type: bf16 (default), f16, f32, q8_0,
+                       q6_K, q4_K_M or q5_K_M; norms and the MoE router
+                       stay f32
+  -n, --name name      general.name (default: the directory name)
+  -j, --threads n      quantizer threads (default: LGML_THREADS, else
+                       the physical cores)
+  -q, --quiet          no progress lines
+  -h, --help           show this help
+]]
+
+local function main(args)
+	local opts, rest = getopt.parse(args, "ht:n:j:q", {
+		help = "h", type = "t", name = "n", threads = "j", quiet = "q",
+	})
+	if not opts then
+		io.stderr:write("lgml-convert: ", rest, "\n", USAGE)
+		os.exit(2)
+	end
+	if opts.h then
+		io.stdout:write(USAGE)
+		return
+	end
+	if #rest ~= 2 then
+		io.stderr:write(USAGE)
+		os.exit(2)
+	end
+	local threads = opts.j and math.tointeger(tonumber(opts.j))
+	if opts.j and (not threads or threads < 1) then
+		io.stderr:write("lgml-convert: bad thread count\n")
+		os.exit(2)
+	end
+	local plan = convert.convert({
+		dir = rest[1], out = rest[2], type = opts.t, name = opts.n, threads = threads,
+		log = not opts.q and function(fmt, ...)
+			io.stderr:write(fmt:format(...), "\n")
+		end or nil,
+	})
+	io.stderr:write(("lgml-convert: wrote %d tensors to %s\n"):format(#plan, rest[2]))
+end
+
+main(arg)
