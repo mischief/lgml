@@ -122,7 +122,7 @@ end
 local function host_rows(hidden, n)
 	local lgml = require("lgml")
 	local sh = hidden:shape()
-	local row = lgml.row_size("f32", sh[2] * sh[3])
+	local row = lgml.row_size("f32", sh[2] * (sh[3] or 1))
 	local buf = lgml.hostbuf(n * row)
 	hidden:to_host(buf, 0, 0, n * row)
 	return buf

@@ -1086,11 +1086,17 @@ local function load_h(inp, opts)
 	end
 end
 
+-- The shape of n rows of trunk state: streams, or a Qwen3.5 hidden
+-- state.
+local function hshape(hp, n)
+	return hp.hc and { n, hp.hc, hp.n_embd } or { n, hp.n_embd }
+end
+
 function Head:inputs(ids, cache, opts)
 	local inp = T().inputs(self, ids, cache, opts)
 	local hp = self.hp
 	if opts.first and #ids > 1 then
-		inp.h_rest = self.be:tensor("f32", { #ids - 1, hp.hc, hp.n_embd })
+		inp.h_rest = self.be:tensor("f32", hshape(hp, #ids - 1))
 		load_h(inp, opts)
 	end
 	inp.first = opts.first
@@ -1109,8 +1115,16 @@ function Head:forward(g, inp)
 	if inp.h_rest then
 		hin = g:concat(hin, inp.h_rest, 1)
 	end
-	local res = mtp_block(self, g, inp, inp.ids, hin)
 	local n = inp.n
+	if not hp.hc then
+		-- Qwen3.5: the first step joins trunk states, the next its own.
+		local L = self.mtp.L
+		local out = T().mtp_block(self, g, inp, inp.ids, hin, inp.first and self.main.output_norm or L.head_norm)
+		local last = g:cont(rows_of(g, out, n - 1, 1))
+		local h = g:mul(g:rms_norm(last, hp.eps), L.head_norm)
+		return g:mul_mat(self.output, h), { h = g:cpy(last, hb) }
+	end
+	local res = mtp_block(self, g, inp, inp.ids, hin)
 	local last = g:cont(g:reshape(rows_of(g, res, n - 1, 1), { 1, hp.hc, hp.n_embd }))
 	local h = hc_mix(g, hp, last, self.mtp.L.hc_head_norm, self.mtp.L.hc_head_down, self.mtp.L.hc_head_up)
 	local logits = g:mul_mat(self.output, h)
@@ -1135,7 +1149,7 @@ end
 function M.mtp_draft(self, cache, pend, h_rest, k, flash, rows, min_p)
 	local hp = self.hp
 	if not self.mtp_hbuf then
-		self.mtp_hbuf = self.be:tensor("f32", { 1, hp.hc, hp.n_embd })
+		self.mtp_hbuf = self.be:tensor("f32", hshape(hp, 1))
 	end
 	local replay = require("lgml.replay")
 	local head = head_of(self)

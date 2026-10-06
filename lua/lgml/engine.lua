@@ -433,7 +433,7 @@ function M.new(opts)
 	end
 	-- Speculation loads the MTP layer of a model that has one.
 	local so = opts.speculative
-	local mtp = (so == true or type(so) == "table") and arch == "qwen4exp" and
+	local mtp = (so == true or type(so) == "table") and (arch == "qwen4exp" or arch == "qwen35") and
 	    (mtp_file(opts) or (type(so) ~= "table" or so.mtp ~= false)) or nil
 	local model = (transformer.supports(arch) and transformer or require("lgml." .. arch))
 	    .load(be, opts.model, (rules or mtp) and {

@@ -244,5 +244,40 @@ do
 end
 
 os.remove(path)
+
+-- 4. The MTP layer of a Qwen3.5 model: a plain load skips it, and
+-- speculation with it keeps greedy replies, with one slot and two.
+local qpath = tiny.tmp(".gguf")
+tiny.write(qpath, "qwen35", { hybrid = true, mtp = true, kv = {
+	{ "tokenizer.chat_template", gguf.STRING, "<|im_start|> <tool_call> <function= <think> tool | tojson" } } })
+do
+	local be <close> = assert(lgml.backend("CPU"))
+	local plain = transformer.load(be, qpath)
+	ok(plain.mtp == nil and plain.w:get("blk." .. tiny.NL .. ".nextn.eh_proj.weight") == nil,
+	    "qwen35: a plain load leaves the MTP layer in the file")
+	plain:close()
+	local m = transformer.load(be, qpath, { mtp = true })
+	local c = m:cache(256)
+	require("lgml.replay").run(m, c, table.move(PROMPT, 1, #PROMPT - 1, 1, {}), { logits = "last" })
+	local d = q4.mtp_draft(m, c, { PROMPT[#PROMPT] }, nil, 3, false)
+	local again = q4.mtp_draft(m, c, { PROMPT[#PROMPT] }, nil, 3)
+	ok(m.mtp and m.mtp.il == tiny.NL + 1 and #d == 3 and c.n_past == #PROMPT - 1 and
+	    table.concat(again, ",") == table.concat(d, ","), "qwen35: the head drafts and leaves the trunk's position")
+	m:close()
+end
+for _, slots in ipairs({ 1, 2 }) do
+	local tag = ("qwen35, %d slot%s: "):format(slots, slots > 1 and "s" or "")
+	local e = engine.new({ model = qpath, backend = "CPU", n_ctx = 2048, slots = slots, kv_initial = 256,
+		flash_attn = false, speculative = { max = 3, adaptive = false, min_p = 0 } })
+	ok(e.model.mtp ~= nil, tag .. "speculation loads the MTP layer")
+	for _, prompt in ipairs({ REPEAT, "count: 1 2 3 4 5 6 7 8 9" }) do
+		local plain = chat(e, req_of(e, prompt, { speculative = false }))
+		local d0 = e.spec_drafted or 0
+		local sp = chat(e, req_of(e, prompt, { speculative = true }))
+		ok(plain.res and sp.res and #sp.out > 0 and sp.out == plain.out and (e.spec_drafted or 0) > d0,
+		    tag .. "greedy reply equals plain decoding")
+	end
+end
+os.remove(qpath)
 print("1.." .. n)
 os.exit(failed and 1 or 0)

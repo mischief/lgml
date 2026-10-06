@@ -373,7 +373,18 @@ function M.load(be, path, opts)
 	if cpu and not be:cpu() then
 		error(path .. ": the placement moves weights to the CPU; open the backend with cpu = true")
 	end
-	local w = assert(be:load(path, cpu and { cpu = cpu, pinned = opts.pinned }))
+	-- The MTP layer past the trunk loads only with opts.mtp.
+	local skip
+	if not opts.mtp then
+		local pre = "blk." .. hp.n_layer .. "."
+		for _, t in ipairs(info.tensors) do
+			if t.name:sub(1, #pre) == pre then
+				skip = skip or {}
+				skip[t.name] = true
+			end
+		end
+	end
+	local w = assert(be:load(path, (cpu or skip) and { cpu = cpu, pinned = opts.pinned, skip = skip } or nil))
 	local function get(name)
 		return assert(w:get(name), name)
 	end
@@ -399,10 +410,40 @@ function M.load(be, path, opts)
 		L.cpu = L.attn_norm:backend() ~= be or nil
 		m.layers[i] = L
 	end
+	if opts.mtp and w:get("blk." .. hp.n_layer .. ".nextn.eh_proj.weight") then
+		M.load_mtp(m, w)
+	end
 	if opts.replay == false then
 		m.replay_key = false
 	end
 	return m
+end
+
+--- Load the MTP layer of a Qwen3.5 model from w.
+-- The layer is a full-attention layer after the trunk, with nextn
+-- weights that join the token embedding and the trunk's hidden state.
+-- It sets m.mtp: L (the layer) and il (its cache index, n_layer + 1).
+-- @tparam Model m the model
+-- @param w the weights that hold layer n_layer
+function M.load_mtp(m, w)
+	local hp = m.hp
+	local il = hp.n_layer + 1
+	local d
+	for i = hp.n_layer, 1, -1 do
+		if not hp.layers[i].recr then
+			d = hp.layers[i]
+			break
+		end
+	end
+	local hpm = setmetatable({ layers = setmetatable({ [il] = d }, { __index = hp.layers }) }, { __index = hp })
+	local L = M.load_layer(w, hpm, il, m.rope_freqs)
+	local p = "blk." .. (il - 1) .. ".nextn."
+	for _, f in ipairs({ "eh_proj", "enorm", "hnorm" }) do
+		L[f] = assert(w:get(p .. f .. ".weight"), p .. f)
+	end
+	L.head_norm = w:get(p .. "shared_head_norm.weight") or m.output_norm
+	L.cpu = L.attn_norm:backend() ~= m.be or nil
+	m.mtp = { L = L, il = il }
 end
 
 --- A loaded model, from `load`.
@@ -495,6 +536,25 @@ local function first_cap(n, initial)
 	return n
 end
 
+-- Add the MTP layer's parts to cache c: with global true its rows, and
+-- with recurrent states mtp_h, the trunk's hidden state at the last
+-- cached position (the input of the next row).
+local function add_mtp(self, c, rows, global)
+	local mt = self.mtp
+	local L = mt.L
+	local lbe = L.cpu and self.be:cpu() or self.be
+	if global then
+		c.k[mt.il] = lbe:tensor(c.type_k, { rows, L.Hkv * L.D })
+		c.v[mt.il] = lbe:tensor(c.type_v, { rows, L.Hkv * L.D })
+		c.k[mt.il]:zero()
+		c.v[mt.il]:zero()
+	end
+	if c.conv then
+		c.mtp_h = lbe:tensor("f32", { 1, self.hp.n_embd })
+		c.mtp_h:zero()
+	end
+end
+
 -- Add the per-sequence parts to cache c: rings, recurrent states, and
 -- with global true the full-attention rows (cap of them).
 local function add_layers(self, c, opts, global)
@@ -526,6 +586,8 @@ local function add_layers(self, c, opts, global)
 	end
 	if hp.hc then
 		q4.add_cache(self, c, c.cap, global)
+	elseif self.mtp then
+		add_mtp(self, c, c.cap, global)
 	end
 end
 
@@ -598,6 +660,8 @@ function M:pool(n_cells, opts)
 	end
 	if self.hp.hc then
 		q4.add_cache(self, p, cap, true)
+	elseif self.mtp then
+		add_mtp(self, p, cap, true)
 	end
 	return p
 end
@@ -1084,7 +1148,7 @@ function M:cache_size(opts)
 		local p = L.cpu and s.cpu or s.dev
 		p[1] = p[1] + lgml.row_size(tk, L.Hkv * L.D) + lgml.row_size(tv, L.Hkv * L.D) +
 		    (L.idx and idx_row(hp, L) or 0)
-		p[2] = p[2] + 4 * hp.hc * hp.n_embd
+		p[2] = p[2] + 4 * (hp.hc or 1) * hp.n_embd
 	end
 	return s.dev[1], s.dev[2], s.cpu[1], s.cpu[2]
 end
@@ -2060,6 +2124,56 @@ local function per_layer_inputs(self, g, inp, x)
 	return g:cont(g:permute(all, { 2, 1, 3 }))
 end
 
+-- Rows off+1 .. off+n of an (N, E) node.
+local function rows2(g, t, off, n)
+	local st = t:strides()
+	return g:view(t, { n, t:shape()[2] }, { st[1] }, off * st[1])
+end
+
+--- Build the MTP layer of a Qwen3.5 model.
+-- Each row joins a token with the hidden state h of the position
+-- before it. norm is the norm that h takes first: the trunk's output
+-- norm, or the MTP head norm when h is the MTP layer's own output.
+-- @param self the model, or the MTP head of `lgml.qwen4exp`
+-- @param g the graph
+-- @tparam table inp the inputs, at the positions of the rows
+-- @param ids the token ids (n)
+-- @param h the hidden states (n, n_embd), before norm
+-- @param norm the norm weight of h
+-- @return the layer output (n, n_embd), before norm
+function M.mtp_block(self, g, inp, ids, h, norm)
+	local hp, mt = self.hp, self.mtp
+	local L, eps = mt.L, hp.eps
+	local e = g:mul(g:rms_norm(g:get_rows(self.tok_embd, ids), eps), L.enorm)
+	h = g:mul(g:rms_norm(g:mul(g:rms_norm(h, eps), norm), eps), L.hnorm)
+	local x = g:mul_mat(L.eh_proj, g:concat(e, h, 2))
+	local q, k, v, gate = M.qkv(g, hp, L, x, inp.pos, inp.mpos)
+	local o = attention(hp, g, inp, mt.il, L, q, k, v, {})
+	return M.ffn(g, hp, L, M.attn_out(g, hp, L, o, gate, x))
+end
+
+-- The MTP rows of a pass: the layer runs on each token with the hidden
+-- state of the position before, so its cache follows the trunk's. The
+-- last row's hidden state becomes the input of the next pass.
+local function mtp_rows(self, g, inp, x)
+	local list = inp.batch or { { cache = inp.cache, off = 0, n = inp.n } }
+	local hin
+	for _, b in ipairs(list) do
+		local h = b.cache.mtp_h
+		if not h then
+			return
+		end
+		if b.n > 1 then
+			h = g:concat(h, g:cont(rows2(g, x, b.off, b.n - 1)), 1)
+		end
+		hin = hin and g:concat(hin, h, 1) or h
+	end
+	g:expand(M.mtp_block(self, g, inp, inp.ids, hin, self.output_norm))
+	for _, b in ipairs(list) do
+		g:expand(g:cpy(rows2(g, x, b.off + b.n - 1, 1), b.cache.mtp_h))
+	end
+end
+
 --- Build the forward graph.
 -- Recurrent state writes are in the graph; computing the logits runs
 -- them.
@@ -2127,6 +2241,9 @@ function M:forward(g, inp)
 		if il == inp.hidden then
 			return x, taps
 		end
+	end
+	if self.mtp and not inp.pool and (inp.cache or inp.batch) then
+		mtp_rows(self, g, inp, x)
 	end
 	if inp.logits == "rows" then
 		x = g:get_rows(x, inp.logit_rows)

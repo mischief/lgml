@@ -131,7 +131,10 @@ function M.write(path, arch, opts)
 	end
 	kv[#kv + 1] = { "general.architecture", gguf.STRING, arch }
 	kv[#kv + 1] = { "general.name", gguf.STRING, "tiny " .. arch }
-	key("block_count", gguf.UINT32, M.NL)
+	key("block_count", gguf.UINT32, M.NL + (opts.mtp and 1 or 0))
+	if opts.mtp then
+		key("nextn_predict_layers", gguf.UINT32, 1)
+	end
 	key("context_length", gguf.UINT32, opts.n_ctx or 256)
 	key("embedding_length", gguf.UINT32, E)
 	key("feed_forward_length", gguf.UINT32, F)
@@ -189,6 +192,25 @@ function M.write(path, arch, opts)
 			w(p .. "ffn_up.weight", { F, E })
 			w(p .. "ffn_down.weight", { E, F })
 		end
+	end
+	if opts.mtp then
+		-- A Qwen3.5 MTP layer: a gated attention layer with nextn weights.
+		local p = "blk." .. M.NL .. "."
+		norm(p .. "attn_norm.weight", E)
+		w(p .. "attn_q.weight", { H * D * 2, E })
+		w(p .. "attn_k.weight", { HKV * D, E })
+		w(p .. "attn_v.weight", { HKV * D, E })
+		w(p .. "attn_output.weight", { E, H * D })
+		norm(p .. "attn_q_norm.weight", D)
+		norm(p .. "attn_k_norm.weight", D)
+		norm(p .. "post_attention_norm.weight", E)
+		w(p .. "ffn_gate.weight", { F, E })
+		w(p .. "ffn_up.weight", { F, E })
+		w(p .. "ffn_down.weight", { E, F })
+		w(p .. "nextn.eh_proj.weight", { E, 2 * E })
+		norm(p .. "nextn.enorm.weight", E)
+		norm(p .. "nextn.hnorm.weight", E)
+		norm(p .. "nextn.shared_head_norm.weight", E)
 	end
 	for _, t in ipairs(opts.tensors or {}) do
 		add(t[1], t[2], t[3])
