@@ -12,8 +12,6 @@ option('vibevoice', type : 'string', value : '',
   description : 'VibeVoice model directory for TTS tests; empty skips them')
 option('vocab_dir', type : 'string', value : '',
   description : 'llama.cpp vocab test directory (ggml-vocab-*.gguf, .inp, .out); empty skips them')
-option('tok_gemma4', type : 'string', value : '',
-  description : 'Gemma-4 gguf for tokenizer special token tests (reads metadata only); empty skips them')
 option('ggml', type : 'combo', choices : ['auto', 'system', 'subproject'], value : 'subproject',
   description : 'ggml built from subprojects/ggml.wrap (static, with the lgml patch), or the system one; auto: the system one when found')
 option('lua_dir', type : 'string', value : '',

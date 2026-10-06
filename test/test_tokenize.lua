@@ -1,7 +1,7 @@
 -- Tokenizer tests. Output is TAP. A tiny vocab built here always runs.
 -- LGML_VOCAB_DIR names the llama.cpp vocab test files (models/ in its
--- tree). LGML_TOK_MODEL names a Qwen3 gguf for chat token checks.
--- LGML_TOK_GEMMA4 names a Gemma-4 gguf for special token checks.
+-- tree); its qwen35 and gemma-4 vocabs also give the chat and special
+-- token checks. No test needs model weights.
 local here = debug.getinfo(1, "S").source:match("^@(.*/)") or "./"
 package.path = here .. "?.lua;" .. package.path
 local lgml = require("lgml")
@@ -274,22 +274,36 @@ vocab_test("qwen35")
 vocab_test("llama-bpe")
 vocab_test("gemma-4")
 
--- Chat and special tokens on a Qwen3 model, if present.
-local model = os.getenv("LGML_TOK_MODEL") or ""
-if model == "" then
-	skip("qwen3 model", "LGML_TOK_MODEL not set")
-else
-	local tk <close> = assert(lgml.tokenizer(model))
+-- The vocab file of a llama.cpp test, or nil after a skip.
+local function vocab_file(name)
+	local path = dir .. "/ggml-vocab-" .. name .. ".gguf"
+	if dir == "" then
+		skip(name .. " special tokens", "LGML_VOCAB_DIR not set")
+		return nil
+	end
+	local f = io.open(path, "rb")
+	if not f then
+		skip(name .. " special tokens", "no " .. path)
+		return nil
+	end
+	f:close()
+	return path
+end
+
+-- Chat and special tokens of the Qwen vocab. It has the chat control
+-- tokens; user tokens such as <think> are [PADn] placeholders there.
+local qwen = vocab_file("qwen35")
+if qwen then
+	local tk <close> = assert(lgml.tokenizer(qwen))
 	local sp = tk:special()
 	ok(sp.tokens["<|im_start|>"] == 151644, "im_start id")
-	ok(sp.tokens["<think>"] == 151667, "think id")
-	ok(sp.eos == 151645 and sp.eot == 151645, "eos and eot")
+	ok(sp.eos == 151643 and sp.eot == 151645, "eos and eot")
 	local ids = tk:encode("<|im_start|>user\nhi<|im_end|>\n")
 	ok(same(ids, { 151644, 872, 198, 6023, 151645, 198 }), "chat encode")
 	local plain = tk:encode("<|im_start|>", { special = false })
 	ok(#plain > 1, "control token as text without special")
-	local think = tk:encode("<think>", { special = false })
-	ok(same(think, { 151667 }), "user token splits without special")
+	local user = tk:encode("[PAD151667]", { special = false })
+	ok(same(user, { 151667 }), "user token splits without special")
 	local text = "<|im_start|>assistant\n<think>\nok</think>\n\n" ..
 	    "<tool_call>\n{\"name\": \"f\"}\n</tool_call><|im_end|>"
 	ok(tk:decode(tk:encode(text)) == text, "chat round-trip")
@@ -331,11 +345,9 @@ else
 	ok(whole and table.concat(parts) == emoji, "streaming decoder")
 end
 
--- Special tokens on a Gemma-4 gguf, if present. Ids are from llama.cpp.
-local g4 = os.getenv("LGML_TOK_GEMMA4") or ""
-if g4 == "" then
-	skip("gemma4 model", "LGML_TOK_GEMMA4 not set")
-else
+-- Special tokens of the Gemma-4 vocab. Ids are from llama.cpp.
+local g4 = vocab_file("gemma-4")
+if g4 then
 	local tk <close> = assert(lgml.tokenizer(g4))
 	local sp = tk:special()
 	ok(sp.bos == 2 and sp.eos == 1 and sp.pad == 0 and sp.add_bos, "gemma4: bos, eos, pad")

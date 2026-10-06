@@ -188,9 +188,7 @@ if lua_bin.found()
   test('engine_apis', lua_bin, args : [files('test/test_engine_apis.lua')], timeout : 120)
   test('lazy_tools', lua_bin, args : [files('test/test_lazy_tools.lua')], timeout : 120)
   test('tokenize', lua_bin, args : [files('test/test_tokenize.lua')],
-    env : { 'LGML_VOCAB_DIR' : get_option('vocab_dir'),
-      'LGML_TOK_MODEL' : get_option('model'),
-      'LGML_TOK_GEMMA4' : get_option('tok_gemma4') }, timeout : 60)
+    env : { 'LGML_VOCAB_DIR' : get_option('vocab_dir') }, timeout : 60)
   test('nd', lua_bin, args : [files('test/test_nd.lua')], timeout : 120)
   test('router', lua_bin, args : [files('test/test_router.lua')], timeout : 30)
   test('embeddings', lua_bin, args : [files('test/test_embeddings.lua')],
