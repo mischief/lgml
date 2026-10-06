@@ -617,8 +617,9 @@ function E:load_vision(opts)
 		error(("%s: image embeddings have %d values; the model takes %d"):format(opts.mmproj,
 		    enc.hp.n_out, self.model.hp.n_embd))
 	end
-	if enc.mrope and not self.model.hp.sections then
-		error(("%s: the encoder needs a model with rope sections"):format(opts.mmproj))
+	-- qwen4exp builds its own layers, without M-RoPE positions.
+	if enc.mrope and (not self.model.hp.sections or self.model.hp.hc) then
+		error(("%s: the encoder needs a qwen35-family model with rope sections"):format(opts.mmproj))
 	end
 	local im = self.family.image or enc.image
 	if not im then
