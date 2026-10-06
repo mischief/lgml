@@ -718,29 +718,6 @@ backend_tensor(lua_State *L)
 	return 1;
 }
 
-/* Read the data of each tensor of ctx from the gguf file f. */
-static int
-read_tensors(FILE *f, const struct gguf_context *gctx, struct ggml_context *ctx, char *chunk)
-{
-	struct ggml_tensor *gt;
-	size_t base, off, n, done, size;
-
-	base = gguf_get_data_offset(gctx);
-	for (gt = ggml_get_first_tensor(ctx); gt != NULL; gt = ggml_get_next_tensor(ctx, gt)) {
-		off = base + gguf_get_tensor_offset(gctx, gguf_find_tensor(gctx, ggml_get_name(gt)));
-		size = ggml_nbytes(gt);
-		if (fseeko(f, (off_t)off, SEEK_SET) != 0)
-			return -1;
-		for (done = 0; done < size; done += n) {
-			n = size - done < LOAD_CHUNK ? size - done : LOAD_CHUNK;
-			if (fread(chunk, 1, n, f) != n)
-				return -1;
-			ggml_backend_tensor_set(gt, chunk, done, n);
-		}
-	}
-	return 0;
-}
-
 /*
  * Move the tensors of *ctx that the set at hidx names to a new context
  * *hctx, and the others to a new *ctx. Return the count moved; with none,
@@ -847,11 +824,14 @@ alloc_weights(struct ggml_context *ctx, ggml_backend_buffer_type_t bt, ggml_back
  * They go to pinned host memory of the device when it has some, so that
  * the device can read them fast for large batches, else to plain memory.
  * With `opts.skip`, the tensors it names stay in the file.
+ * Reads go through an io_uring with O_DIRECT where the build, kernel
+ * and file system allow it, else through stdio.
  * @tparam string path gguf file
  * @tparam[opt] table opts `cpu`: a set of tensor names, `{ [name] =
  * true }`, to put on the CPU backend; `pinned`: false to use plain
  * memory for them (default true); `skip`: a set of tensor names not to
- * load
+ * load; `uring`: false to read with stdio (also when the environment
+ * variable `LGML_LOAD_URING` is 0)
  * @treturn[1] weights the tensors
  * @return[2] nil if the file is not a gguf file
  * @treturn[2] string error message
@@ -869,14 +849,16 @@ backend_load(lua_State *L)
 	struct ggml_context *ctx = NULL, *hctx = NULL;
 	ggml_backend_buffer_t buf, hbuf = NULL;
 	ggml_backend_buffer_type_t hbt, cbt;
-	char *chunk;
-	FILE *f;
-	int e, hidx = 0, sidx, nh = 0, pinned = 1, skip = 0;
+	struct ggml_context *ctxs[2];
+	int e, hidx = 0, sidx, nh = 0, pinned = 1, skip = 0, uring = 1;
 
 	if (!lua_isnoneornil(L, 3)) {
 		luaL_checktype(L, 3, LUA_TTABLE);
 		if (lua_getfield(L, 3, "pinned") != LUA_TNIL)
 			pinned = lua_toboolean(L, -1);
+		lua_pop(L, 1);
+		if (lua_getfield(L, 3, "uring") != LUA_TNIL)
+			uring = lua_toboolean(L, -1);
 		lua_pop(L, 1);
 		if (lua_getfield(L, 3, "skip") != LUA_TNIL) {
 			luaL_checktype(L, -1, LUA_TTABLE);
@@ -955,25 +937,14 @@ backend_load(lua_State *L)
 		lua_pop(L, 1);
 	}
 
-	f = fopen(path, "rb");
-	e = errno;
-	chunk = f != NULL ? malloc(LOAD_CHUNK) : NULL;
-	if (chunk == NULL) {
-		if (f != NULL) {
-			e = ENOMEM;
-			fclose(f);
-		}
-		gguf_free(gctx);
-		return luaL_error(L, "%s: %s", path, strerror(e));
-	}
-	e = read_tensors(f, gctx, ctx, chunk);
-	if (e == 0 && hctx != NULL)
-		e = read_tensors(f, gctx, hctx, chunk);
-	free(chunk);
-	fclose(f);
+	ctxs[0] = ctx;
+	ctxs[1] = hctx;
+	e = lgml_gguf_read(path, gctx, ctxs, hctx != NULL ? 2 : 1, uring);
 	gguf_free(gctx);
-	if (e != 0)
+	if (e == EIO)
 		return luaL_error(L, "%s: short read", path);
+	if (e != 0)
+		return luaL_error(L, "%s: %s", path, strerror(e));
 	return 1;
 refuse:
 	gguf_free(gctx);
@@ -3950,5 +3921,6 @@ luaopen_lgml(lua_State *L)
 	lgml_open_train(L);
 	lgml_open_mem(L);
 	lgml_open_ngram(L);
+	lgml_open_gload(L);
 	return 1;
 }

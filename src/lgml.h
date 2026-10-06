@@ -126,6 +126,10 @@ ggml_backend_buffer_type_t lgml_host_read_buft(void);
 void		 lgml_open_xcache(lua_State *);
 void		 lgml_open_train(lua_State *);
 void		 lgml_open_ngram(lua_State *);
+void		 lgml_open_gload(lua_State *);
+struct gguf_context;
+int		 lgml_gguf_read(const char *, const struct gguf_context *,
+		    struct ggml_context *const *, int, int);
 
 /*
  * For op files. An op checks its graph with lgml_check_graph, takes

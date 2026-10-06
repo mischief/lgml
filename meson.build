@@ -121,6 +121,7 @@ lgml = shared_module('lgml',
   'src/mem.c',
   'src/ngram.c',
   'src/lngram.c',
+  'src/gload.c',
   dependencies : [ggml, lua, m, threads, png, jpeg, utf8proc, uring],
   c_args : spv_args,
   name_prefix : '',
@@ -221,6 +222,7 @@ if lua_bin.found()
   test('placement', lua_bin, args : [files('test/test_placement.lua')],
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
     timeout : 60)
+  test('load', lua_bin, args : [files('test/test_load.lua')], timeout : 60)
   test('xcache', lua_bin, args : [files('test/test_xcache.lua')],
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
     timeout : 120)
