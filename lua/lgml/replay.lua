@@ -26,8 +26,15 @@ local M = {}
 -- The most tokens of a pass whose graph a cache keeps for later.
 local SMALL = 64
 
--- Free one graph. With done true, its output nodes close too.
+-- Free one graph. With done true, its output nodes close too. With done
+-- "detach", they get their own storage and stay open.
 local function free(r, done)
+	if done == "detach" then
+		for _, t in ipairs(r.outs) do
+			t:detach()
+		end
+		done = false
+	end
 	r.g:close()
 	for _, t in pairs(r.inp) do
 		if type(t) == "userdata" then
@@ -42,12 +49,12 @@ local function free(r, done)
 end
 
 --- Drop the graphs that a cache holds.
--- Their compute buffers go when their output nodes close. With done
--- true, they close now, as the caller reads them no more. The graphs of
--- the caches in `cache.subs` (such as a draft head's view of the
--- cache) go too.
+-- Compute buffers go when the output nodes close: now with done true,
+-- or now with done "detach", which gives the outputs their own storage
+-- (see `tensor:detach`). The graphs of `cache.subs`, such as a draft
+-- head's view of the cache, go too.
 -- @tparam table cache the model cache
--- @tparam[opt] boolean done true to close the output nodes
+-- @param[opt] done true to close the output nodes, or "detach"
 function M.drop(cache, done)
 	if not cache then
 		return

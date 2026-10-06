@@ -93,6 +93,27 @@ for _, d in ipairs(devs) do
 	ok(math.abs(x:get()[1] - 0.25) < 1e-3, d.name .. ": graph grows between computes")
 end
 
+-- A detached output keeps its data after its graph closes, and the
+-- compute buffers go with the close.
+for _, d in ipairs(devs) do
+	local be <close> = assert(lgml.backend(d.name))
+	local a <close> = be:tensor("f32", { 2, 3 }, { 1, 2, 3, 4, 5, 6 })
+	local g = be:graph()
+	local s = g:scale(a, 2)
+	local keep = g:add(a, a)
+	g:compute(s, keep)
+	local before = (lgml.memory()[be:name()] or {}).compute or 0
+	ok(s:detach() and not a:detach(), d.name .. ": detach moves an output node, not a leaf")
+	g:close()
+	local after = (lgml.memory()[be:name()] or {}).compute or 0
+	ok(after == before, d.name .. ": an open output keeps the compute buffers")
+	keep:close()
+	after = (lgml.memory()[be:name()] or {}).compute or 0
+	near(s:get(), { 2, 4, 6, 8, 10, 12 }, d.name .. ": a detached output keeps its data")
+	ok(after < before, d.name .. ": the compute buffers go with the last open output")
+	s:close()
+end
+
 -- CPU threads: a default from the machine or LGML_THREADS, per backend.
 do
 	local def = lgml.threads()

@@ -611,9 +611,17 @@ function M:seq(pool, opts)
 end
 
 -- Drop the last batch graph. With done true, its output rows close too.
+-- With done "detach", the rows get their own storage (see
+-- `tensor:detach`) and the compute buffers go now.
 local function drop_batch(self, done)
 	local r = self.batch_replay
 	self.batch_replay = nil
+	if done == "detach" then
+		for _, t in ipairs(r.rows) do
+			t:detach()
+		end
+		done = false
+	end
 	r.g:close()
 	for _, part in ipairs({ r.inp, table.unpack(r.inp.batch) }) do
 		for _, t in pairs(part) do
@@ -644,13 +652,15 @@ function M:drop_batch(done)
 end
 
 -- Drop every graph that reads the tensors of pool p.
+-- The outputs stay readable in their own storage, and the compute
+-- buffers go now: a pass after a pool change plans larger graphs.
 local function drop_pool_graphs(self, p)
 	for c in pairs(p.seqs) do
-		replay.drop(c)
+		replay.drop(c, "detach")
 	end
 	local r = self.batch_replay
 	if r and r.pools and r.pools[p] then
-		drop_batch(self)
+		drop_batch(self, "detach")
 	end
 end
 
@@ -1103,7 +1113,7 @@ function M:grow(cache, rows)
 		list[i] = sl[1][sl[2]]
 	end
 	check_grow(list, cap, ("the KV cache from %d to %d rows"):format(cache.cap, cap))
-	replay.drop(cache)
+	replay.drop(cache, "detach")
 	local keep = math.min(cache.n_past, cache.cap)
 	local buf
 	for _, sl in ipairs(slots) do

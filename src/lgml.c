@@ -2580,6 +2580,60 @@ tensor_close(lua_State *L)
 	return 0;
 }
 
+/*** Give a computed output node its own storage, as a leaf.
+ * The node keeps its data, and the graph no longer keeps its compute
+ * buffers for it: they go when the graph closes. A tensor that is not a
+ * computed, contiguous output node stays as it is.
+ * @treturn boolean true when the tensor moved to its own storage
+ * @function tensor:detach
+ */
+static int
+tensor_detach(lua_State *L)
+{
+	struct tensor *t = check_tensor(L, 1);
+	struct graph *g = t->g;
+	struct ggml_tensor *node = t->t, *gt;
+	struct ggml_init_params ip;
+	struct ggml_context *ctx;
+	ggml_backend_buffer_t buf;
+	struct store *s;
+
+	if (g == NULL || !t->out || node->buffer == NULL || node->data == NULL ||
+	    !ggml_is_contiguous(node)) {
+		lua_pushboolean(L, 0);
+		return 1;
+	}
+	ip.mem_size = ggml_tensor_overhead();
+	ip.mem_buffer = NULL;
+	ip.no_alloc = true;
+	if ((ctx = ggml_init(ip)) == NULL)
+		return luaL_error(L, "ggml_init failed");
+	gt = ggml_new_tensor(ctx, node->type, GGML_MAX_DIMS, node->ne);
+	buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_buffer_get_type(node->buffer));
+	if (buf == NULL) {
+		ggml_free(ctx);
+		return luaL_error(L, "detach: out of memory");
+	}
+	ggml_backend_tensor_copy(node, gt);
+	lua_getiuservalue(L, 1, UV_PARENT);
+	lua_getiuservalue(L, -1, UV_PARENT);
+	s = push_store(L, lua_gettop(L), ctx, buf);
+	s->closed = 1;
+	if (--g->nouts == 0 && g->closed && g->b != NULL)
+		free_compute(g);
+	g->refs--;
+	t->t = gt;
+	t->s = s;
+	t->g = NULL;
+	t->out = 0;
+	s->refs++;
+	lua_setiuservalue(L, 1, UV_PARENT);
+	lua_pop(L, 2);
+	graph_release(g);
+	lua_pushboolean(L, 1);
+	return 1;
+}
+
 static struct tensor *
 check_storage(lua_State *L, int idx)
 {
@@ -3721,6 +3775,7 @@ static const luaL_Reg tensor_meta[] = {
 
 static const luaL_Reg tensor_methods[] = {
 	{ "close", tensor_close },
+	{ "detach", tensor_detach },
 	{ "set", tensor_set },
 	{ "get", tensor_get },
 	{ "bytes", tensor_bytes },
