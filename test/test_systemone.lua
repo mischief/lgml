@@ -180,6 +180,13 @@ local function test_attachments()
 	-- chat messages. Order: attachments, images, then the state.
 	r = assert(so.check(('{"state": "s", "questions": {"q": %s}, "images": [%q]}'):format(NOUL, JPEG_URL)))
 	ok(#r.images == 1 and r.images[1].mime == "image/jpeg", "the images field")
+	-- Clef and Jev send bare base64.
+	r = assert(so.check(('{"state": "s", "questions": {"q": %s}, "images": [%q, %q]}'):format(NOUL, PNG64,
+	    JPEG_URL:match(",(.*)$"))))
+	ok(#r.images == 2 and r.images[1].mime == "image/png" and r.images[2].mime == "image/jpeg" and
+	    r.images[2].bytes:sub(1, 3) == "\255\216\255", "bare base64 images")
+	check_fails(('{"state": "s", "questions": {"q": %s}, "images": ["aGVsbG8="]}'):format(NOUL),
+	    "body.images.0", "bare base64 that is not an image")
 	r = assert(so.check(('{"state": {"messages": [{"role": "user", "content": [' ..
 	    '{"type": "text", "text": "look"}, {"type": "image_url", "image_url": {"url": %q}}]}]}, ' ..
 	    '"questions": {"q": %s}, "attachments": [%q], "images": [%q]}'):format(PNG_URL, NOUL, JPEG_URL, JPEG_URL)))

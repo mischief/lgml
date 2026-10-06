@@ -161,12 +161,12 @@ local function rand(r, count, lo, width)
 end
 
 local function run(fn)
-	local done, res, err
+	local done, res, err, status
 	coroutine.wrap(function()
-		local good, a, b = pcall(fn)
+		local good, a, b, c = pcall(fn)
 		done = true
 		if good then
-			res, err = a, b
+			res, err, status = a, b, c
 		else
 			err = a
 		end
@@ -174,7 +174,7 @@ local function run(fn)
 	while not done do
 		uv.run("once")
 	end
-	return res, err
+	return res, err, status
 end
 
 -- prompts
@@ -379,7 +379,7 @@ end
 
 local CW, CH, CF = 16, 2, 32
 
-local function clef_model(path)
+local function clef_model(path, vision)
 	local r = tiny.rng(11)
 	local E, arch = tiny.E, "qwen3next"
 	local ts = {}
@@ -436,17 +436,24 @@ local function clef_model(path)
 		{ arch .. ".decision.head_count", gguf.UINT32, CH },
 		{ arch .. ".attention.layer_norm_epsilon", gguf.FLOAT32, 1e-5 },
 	}
-	return tiny.write(path, arch, { kv = kv, tensors = ts, n_ctx = 2048 })
+	-- With vision: rope sections and the Qwen image tokens.
+	local tokens
+	if vision then
+		kv[#kv + 1] = { arch .. ".rope.dimension_sections", { gguf.ARRAY, gguf.INT32 }, { 2, 1, 1, 0 } }
+		tokens = { { "<|vision_start|>", 3 }, { "<|image_pad|>", 3 }, { "<|vision_end|>", 3 } }
+	end
+	return tiny.write(path, arch, { kv = kv, tensors = ts, n_ctx = 2048, tokens = tokens })
 end
 
--- JointSchemaHead.forward of the model code, in plain Lua.
-local function clef_reference(e, w, req)
-	local rd = head.render_clef(e.tk, req)
+-- JointSchemaHead.forward of the model code, in plain Lua. rd and its
+-- hidden rows default to the text prompt of req.
+local function clef_reference(e, w, req, rd, hidden)
+	rd = rd or head.render_clef(e.tk, req)
 	local function v(name)
 		return w[name][2]
 	end
 	local eps = 1e-5
-	local hidden = hidden_rows(e.model, rd.ids, v("output_norm.weight"))
+	hidden = hidden or hidden_rows(e.model, rd.ids, v("output_norm.weight"))
 	local x = {}
 	for i, h in ipairs(hidden) do
 		x[i] = layer_norm(h, v("decision.hidden_norm.weight"), v("decision.hidden_norm.bias"), eps)
@@ -646,6 +653,165 @@ local function test_clef()
 	os.remove(path)
 end
 
+-- A PNG of w x h from px(x, y, k), a byte.
+local function png(w, h, px)
+	local lgml = require("lgml")
+	local be <close> = assert(lgml.backend("CPU"))
+	local v = {}
+	for k = 0, 2 do
+		for y = 0, h - 1 do
+			for x = 0, w - 1 do
+				v[k * w * h + y * w + x + 1] = px(x, y, k) / 255 * 2 - 1
+			end
+		end
+	end
+	local t <close> = be:tensor("f32", { 1, 3, h, w }, v)
+	return lgml.image_from(t):png()
+end
+
+-- The normed hidden rows of a Clef prompt with images in one pass: text
+-- rows from the token table, image rows from the encoder, and the
+-- M-RoPE positions of llama.cpp mtmd.
+local function image_hidden(e, w, rd)
+	local lgml = require("lgml")
+	local model, E = e.model, tiny.E
+	local k = e.vision.hp.n_deepstack
+	local tok = w["token_embd.weight"][2]
+	local zero = string.pack("<f", 0):rep(k * E)
+	local rows, ids, P, p, i = {}, {}, {}, 0, 1
+	local N = #rd.ids
+	while i <= N do
+		local key = type(rd.ids[i]) == "string" and e.image_key(rd.ids[i])
+		if key then
+			local buf, cnt = assert(e.vision:encode(e.images[key].prep))
+			local nx = e.vision:grid(e.images[key].prep)
+			local bytes = buf:bytes()
+			for j = 0, cnt - 1 do
+				rows[#rows + 1] = bytes:sub(j * (1 + k) * E * 4 + 1, (j + 1) * (1 + k) * E * 4)
+				ids[#ids + 1] = 0
+				P[#P + 1] = { p, p + j // nx, p + j % nx, 0 }
+			end
+			p = p + math.max(nx, cnt // nx)
+			i = i + cnt
+		else
+			local id = rd.ids[i]
+			local r = {}
+			for c = 1, E do
+				r[c] = string.pack("<f", tok[id * E + c])
+			end
+			rows[#rows + 1] = table.concat(r) .. zero
+			ids[#ids + 1] = id
+			P[#P + 1] = { p, p, p, p }
+			p, i = p + 1, i + 1
+		end
+	end
+	local mpos = {}
+	for s = 1, 4 do
+		for t = 1, N do
+			mpos[(s - 1) * N + t] = P[t][s]
+		end
+	end
+	local data = table.concat(rows)
+	local buf = lgml.hostbuf(#data)
+	buf:set(0, data)
+	local inp = model:inputs(ids, model:cache(N + 8), { hidden = model.hp.n_layer, embd = buf,
+		deepstack = k, mpos = mpos })
+	local g = model.be:graph()
+	local x = model:forward(g, inp)
+	g:compute(x)
+	local flat = x:get()
+	g:close()
+	local out_norm, hidden = w["output_norm.weight"][2], {}
+	for r = 1, N do
+		local h = table.move(flat, (r - 1) * E + 1, r * E, 1, {})
+		local s = 1 / math.sqrt(dot(h, h) / E + model.hp.eps)
+		for j = 1, E do
+			h[j] = h[j] * s * out_norm[j]
+		end
+		hidden[r] = h
+	end
+	return hidden
+end
+
+local function test_clef_images()
+	local vtiny = require("mmproj_qwen3vl_tiny")
+	local base64 = require("lgml.base64")
+	local path, mpath = tiny.tmp(".gguf"), tiny.tmp(".gguf")
+	local w = clef_model(path, true)
+	local mkv, mts = vtiny.build(tiny.E)
+	gguf.write(mpath, mkv, mts)
+	local function new(ub, mm)
+		return engine.new({ model = path, mmproj = mm, backend = "CPU", n_ctx = 2048, ubatch = ub,
+			flash_attn = false, image_min_tokens = 1, image_max_tokens = 16 })
+	end
+	local e = new(64, mpath)
+	ok(e.vision and e.vision.mrope and e.image_tokens[1] and e.image_tokens[2],
+	    "clef takes a qwen3vl mmproj")
+	local a = png(12, 8, function(x, y, c)
+		return (x * 29 + y * 53 + c * 71) % 256
+	end)
+	local b = png(20, 12, function(x, y, c)
+		return (x * 13 + y * 7 + c * 31) % 256
+	end)
+	local body = json.decode(REQ)
+	body.images = { base64.encode(a), base64.encode(b) }
+	local req = check(json.encode(body))
+	local r, err = run(function()
+		return e:decide(req, {})
+	end)
+	ok(r ~= nil and r.timings.images == 2, "clef decide runs with images" .. (r and "" or ": " .. tostring(err)))
+	if not r then
+		return
+	end
+	e.images = {}
+	local keys = assert(e:prepare_images(req.images))
+	local rd = head.render_clef(e.tk, req, nil, head.clef_media(e, keys))
+	ok(#rd.ids == r.usage.input_tokens and rd.ids[#head.render_clef(e.tk, req).ids + 1] ~= nil and
+	    rd.questions[1].span[1] == head.render_clef(e.tk, req).questions[1].span[1] + 6 + 15 + 5,
+	    "the images go before the state, with their tokens and a newline")
+	local ref = clef_reference(e, w, req, rd, image_hidden(e, w, rd))
+	e:drop_images()
+	local function same(x, y, tol)
+		local good = true
+		for _, q in ipairs(req.questions) do
+			local p, want = x.answers[q.id], y[q.id]
+			if q.type == "noul" then
+				good = good and math.abs(p.yes - (want["true"] or want.yes)) < tol
+			else
+				for j = 1, #p.probabilities do
+					local key = q.type == "choice" and q.options[j].key or tostring(j - 1)
+					good = good and math.abs(p.probabilities[j] - (want[key] or want.probabilities[j])) < tol
+				end
+			end
+		end
+		return good
+	end
+	ok(same(r, ref, 1e-3), "clef with images matches a one-pass reference")
+	-- Small passes split the images and the text.
+	local small = new(4, mpath)
+	local r2 = run(function()
+		return small:decide(req, {})
+	end)
+	ok(r2 and same(r, r2.answers, 1e-4), "small passes give the same answers")
+	local text = run(function()
+		return e:decide(check(REQ), {})
+	end)
+	ok(text and not same(r, text.answers, 1e-4), "the images change the answers")
+	local five = json.decode(REQ)
+	five.images = { body.images[1], body.images[1], body.images[1], body.images[1], body.images[1] }
+	local _, msg, status = run(function()
+		return e:decide(check(json.encode(five)), {})
+	end)
+	ok(status == 400 and msg:find("at most 4"), "clef takes at most 4 images")
+	local plain = new(64)
+	_, msg, status = run(function()
+		return plain:decide(req, {})
+	end)
+	ok(status == 400 and msg:find("mmproj"), "images without an mmproj give 400")
+	os.remove(path)
+	os.remove(mpath)
+end
+
 local function main()
 	test_text()
 	local path = tiny.tmp(".gguf")
@@ -657,6 +823,7 @@ local function main()
 	test_kev("qwen3")
 	test_kev("qwen3next")
 	test_clef()
+	test_clef_images()
 	print("1.." .. n)
 end
 

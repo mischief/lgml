@@ -15,6 +15,8 @@
 -- and all questions. A small transformer reads the hidden states of all
 -- tokens, the span means of each question and option, and the output
 -- embeddings of the option tokens. It gives one logit per option.
+-- With a vision encoder, images go before the state; the head reads
+-- their hidden states too.
 -- @module lgml.decide_head
 local lgml = require("lgml")
 local json = require("lgml.json")
@@ -36,6 +38,8 @@ M.CLEF_SYSTEM_PROMPT = "Read the complete state and schema. Decide every field j
     "must be exactly one of that field's allowed options."
 --- The most tokens of a Clef prompt; a longer state is cut to fit.
 M.CLEF_MAX_TOKENS = 16384
+--- The most images of a Clef request, as Jev allows.
+M.CLEF_MAX_IMAGES = 4
 --- The default descriptions of the Clef noul options.
 M.CLEF_NOUL = {
 	["true"] = "The proposition is true or the answer is yes.",
@@ -322,11 +326,13 @@ end
 -- @param tk the tokenizer
 -- @tparam table req the engine request
 -- @tparam[opt] int max the most tokens (default `CLEF_MAX_TOKENS`)
+-- @tparam[opt] table media entries after "STATE:\n", before the state:
+-- the image entries and their newline (see `clef_media`)
 -- @treturn table `{ ids, questions }`: each question has `type` (0
 -- noul, 1 choice, 2 score), `span` `{ first, last }` (1-based, last
 -- included) and `options`, each `{ key, span }`
 -- @raise status 400 when the schema alone does not fit
-function M.render_clef(tk, req, max)
+function M.render_clef(tk, req, max, media)
 	max = max or M.CLEF_MAX_TOKENS
 	local function enc(text)
 		return tk:encode(text, RAW)
@@ -366,6 +372,7 @@ function M.render_clef(tk, req, max)
 		qs[i] = out
 	end
 	local prefix = enc("<|im_start|>system\n" .. M.CLEF_SYSTEM_PROMPT .. "<|im_end|>\n<|im_start|>user\nSTATE:\n")
+	table.move(media or {}, 1, #(media or {}), #prefix + 1, prefix)
 	local suffix = enc("\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:")
 	local fixed = #prefix + #schema + #suffix
 	if fixed > max then
@@ -762,8 +769,9 @@ local function run_kev(e, req, sink, recipe)
 	return answers, nin
 end
 
--- Runs the Clef prompt from position 0 on the slot and gives the normed
--- hidden states of all tokens in a host buffer.
+-- Runs the Clef prompt ids from position 0 on the slot of e, which holds
+-- its lock. Gives the normed hidden states of all tokens in a host
+-- buffer, or nil when the sink is cancelled. Also M.clef_hidden.
 local function clef_hidden(e, ids, sink)
 	local model = e.model
 	local E = model.hp.n_embd
@@ -774,20 +782,75 @@ local function clef_hidden(e, ids, sink)
 	local function finish(g, x)
 		return g:mul(g:rms_norm(x, model.hp.eps), model.output_norm)
 	end
-	local opts = { hidden = model.hp.n_layer, flash_attn = e.flash_attn, tag = "clef" }
-	for i = 1, #ids, e.ubatch do
-		local part = table.move(ids, i, math.min(#ids, i + e.ubatch - 1), 1, {})
-		local out = e:run_pass(e.cache, part, opts, finish)
+	local delta = e.vision and e.vision.mrope and e.pos_deltas(ids)
+	local i = 1
+	while i <= #ids do
+		local j = math.min(#ids, i + e.ubatch - 1)
+		local key = e.image_key(ids[i])
+		local opts = { hidden = model.hp.n_layer, flash_attn = e.flash_attn, tag = "clef" }
+		if delta then
+			e.cache.pos_delta = delta(i - 1)
+		end
+		if key then
+			-- Image entries run on their embeddings; see `Engine:prefill`.
+			local last = e.vision.causal and j or #ids
+			j = i
+			while j < last and e.image_key(ids[j + 1]) == key do
+				j = j + 1
+			end
+			for k, v in pairs(e:image_opts(ids, i, j, e.cache.pos_delta or 0)) do
+				opts[k] = v
+			end
+		else
+			for k = i + 1, j do
+				if e.image_key(ids[k]) then
+					j = k - 1
+					break
+				end
+			end
+		end
+		local part = table.move(ids, i, j, 1, {})
+		local run = part
+		if key then
+			run = {}
+			for k = 1, #part do
+				run[k] = 0
+			end
+		end
+		local out = e:run_pass(e.cache, run, opts, finish)
 		out:to_host(buf, (i - 1) * row)
 		table.move(part, 1, #part, #e.tokens + 1, e.tokens)
 		e:publish(e.cache, e.tokens)
 		sink.computed = sink.computed + #part
+		i = j + 1
 		stream.sleep(0)
 		if sink:cancelled() then
 			return nil
 		end
 	end
 	return buf
+end
+M.clef_hidden = clef_hidden
+
+--- Makes the Clef media entries of the prepared images of a request:
+-- for each image, the begin token, one entry per embedding and the end
+-- token; then a newline, as `IMAGE_PLACEHOLDER` of the model code.
+-- @param e the engine, with a vision encoder
+-- @tparam {string,...} keys the image keys, from `Engine:prepare_images`
+-- @treturn table the entries
+function M.clef_media(e, keys)
+	local out = {}
+	for _, key in ipairs(keys) do
+		out[#out + 1] = e.image_tokens[1]
+		for i = 1, e.images[key].n do
+			out[#out + 1] = key .. ":" .. i
+		end
+		out[#out + 1] = e.image_tokens[2]
+	end
+	for _, id in ipairs(e.tk:encode("\n", RAW)) do
+		out[#out + 1] = id
+	end
+	return out
 end
 
 --- Computes the Clef logits of a rendering from the hidden states.
@@ -836,15 +899,45 @@ function M.clef_logits(be, h, rd, buf, n_embd)
 	return out
 end
 
+-- The prompt text for logs: an image becomes `<image key n tokens>`.
+local function shown(e, ids)
+	local parts, run, i = {}, {}, 1
+	while i <= #ids do
+		local key = type(ids[i]) == "string" and e.image_key(ids[i])
+		if key then
+			local j = i
+			while e.image_key(ids[j + 1] or 0) == key do
+				j = j + 1
+			end
+			parts[#parts + 1] = e.tk:decode(run)
+			parts[#parts + 1] = ("<image %s %d tokens>"):format(key:sub(1, 12), j - i + 1)
+			run, i = {}, j + 1
+		else
+			run[#run + 1] = ids[i]
+			i = i + 1
+		end
+	end
+	parts[#parts + 1] = e.tk:decode(run)
+	return table.concat(parts)
+end
+
 local function run_clef(e, req, sink, recipe)
 	local h = e.decide_head
-	local rd = M.render_clef(e.tk, req)
+	local media
+	if req.images and #req.images > 0 then
+		local keys, err = e:prepare_images(req.images)
+		if not keys then
+			error({ status = 400, msg = err })
+		end
+		media = M.clef_media(e, keys)
+	end
+	local rd = M.render_clef(e.tk, req, nil, media)
 	local ids = rd.ids
 	if #ids + 8 >= e.n_ctx then
 		error({ status = 400, msg = ("prompt has %d tokens; context is %d"):format(#ids, e.n_ctx) })
 	end
 	if log.want_prompt() then
-		log.prompt(L, "decide", e.tk:decode(ids), "model", e.id)
+		log.prompt(L, "decide", shown(e, ids), "model", e.id, "images", media and #req.images)
 	end
 	local buf = clef_hidden(e, ids, sink)
 	if not buf then
@@ -887,7 +980,8 @@ end
 --- Answers the questions of a request with the decision head of the
 -- engine (see `lgml.decide.run`, which calls this for the recipes of
 -- `lgml.decide.HEADS`). The model must have the head of the recipe;
--- `e.decide_head` holds it, from `load`. Images give status 400.
+-- `e.decide_head` holds it, from `load`. Clef takes up to
+-- `CLEF_MAX_IMAGES` images with a vision encoder; Kev images give 400.
 -- @param e the engine
 -- @tparam table req the engine request
 -- @tparam[opt] table ctl the cancel control
@@ -901,8 +995,13 @@ function M.run(e, req, ctl, recipe)
 	if not h or h.kind ~= recipe.prompt then
 		return nil, ("the model has no %s decision head"):format(recipe.prompt), 400
 	end
-	if req.images and #req.images > 0 then
+	local n_img = req.images and #req.images or 0
+	if n_img > 0 and recipe.prompt ~= "clef" then
 		return nil, recipe.prompt .. ": image input is not supported", 400
+	elseif n_img > 0 and not e.vision then
+		return nil, "image input is not supported: start the server with --mmproj", 400
+	elseif n_img > M.CLEF_MAX_IMAGES then
+		return nil, ("clef: at most %d images, got %d"):format(M.CLEF_MAX_IMAGES, n_img), 400
 	end
 	local sink = sink_of(ctl)
 	local run = recipe.prompt == "kev" and run_kev or run_clef
@@ -919,7 +1018,8 @@ function M.run(e, req, ctl, recipe)
 		model = e.id, answers = answers,
 		usage = { input_tokens = nin, output_tokens = 0 },
 		format = recipe.prompt,
-		timings = { images = 0, image_encode_ms = 0, prompt_n = sink.computed, cache_n = sink.cached },
+		timings = { images = n_img, image_encode_ms = e.image_ms or 0, prompt_n = sink.computed,
+			cache_n = sink.cached },
 	}
 end
 

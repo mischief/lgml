@@ -9,6 +9,7 @@
 local json = require("lgml.json")
 local tojson = require("lgml.chat.tojson")
 local media = require("lgml.chat.media")
+local base64 = require("lgml.base64")
 
 local M = {}
 
@@ -503,10 +504,21 @@ local function check_image(v, here)
 		    Unsupported), 0)
 	end
 	local head = url:match("^[^,]*")
-	if #url - #head > M.MAX_ATTACHMENT_BYTES // 3 * 4 + 8 then
+	local raw = scheme == "" and url:match("^[%w+/=%s]+$") ~= nil
+	if (raw and #url or #url - #head) > M.MAX_ATTACHMENT_BYTES // 3 * 4 + 8 then
 		bad(here, ("image larger than %d bytes"):format(M.MAX_ATTACHMENT_BYTES))
 	end
-	local bytes, mime = media.data_url(url)
+	local bytes, mime
+	if raw then
+		-- Bare base64, as Clef and Jev send images.
+		bytes, mime = base64.decode((url:gsub("%s", "")))
+		if not bytes then
+			bad(here, "image is not base64: " .. tostring(mime))
+		end
+		mime = bytes:sub(1, 8) == PNG_SIG and "image/png" or "image/jpeg"
+	else
+		bytes, mime = media.data_url(url)
+	end
 	if not bytes then
 		bad(here, mime)
 	end
@@ -654,7 +666,8 @@ end
 -- the Jev-like wrapper for vision models sends, or an OpenAI part
 -- `{ "type": "image_url", "image_url": { "url": ... } }`. Each image is
 -- a PNG or JPEG file of at most `MAX_ATTACHMENT_BYTES`. An http or
--- https URL gives status 400; other bad items give 422.
+-- https URL gives status 400; other bad items give 422. `images`, as
+-- Clef and Jev send it, takes the same items and bare base64 strings.
 --
 -- The engine request is:
 --
