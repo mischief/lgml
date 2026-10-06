@@ -20,6 +20,7 @@ local lgml = require("lgml")
 local json = require("lgml.json")
 local tojson = require("lgml.chat.tojson")
 local systemone = require("lgml.systemone")
+local decide = require("lgml.decide")
 local log = require("lgml.log")
 local stream = require("lgml.server.stream")
 
@@ -296,7 +297,8 @@ function M.clef_options(q)
 		out[1] = { "true", d["true"] }
 		out[2] = { "false", d["false"] }
 	elseif q.type == "choice" then
-		local keys = table.move(tojson.keys(c), 1, #tojson.keys(c), 1, {})
+		local names = tojson.keys(c)
+		local keys = table.move(names, 1, #names, 1, {})
 		table.sort(keys)
 		for i, k in ipairs(keys) do
 			out[i] = { k, c[k] }
@@ -748,7 +750,7 @@ local function run_kev(e, req, sink, recipe)
 			return nil
 		end
 		nin = nin + #row.ids
-		local t = require("lgml.decide").temperature(recipe, q.type, #logits)
+		local t = decide.temperature(recipe, q.type, #logits)
 		local p = softmax(logits, t)
 		L:debug("answer", "question", q.id, "type", q.type, "logits", logits, "temperature", t, "p", p)
 		local a = q.type == "noul" and { yes = p[2] } or { probabilities = p }
@@ -852,7 +854,7 @@ local function run_clef(e, req, sink, recipe)
 	local answers = {}
 	for qi, q in ipairs(req.questions) do
 		local cq, ls = rd.questions[qi], logits[qi]
-		local t = require("lgml.decide").temperature(recipe, q.type, #ls)
+		local t = decide.temperature(recipe, q.type, #ls)
 		local p = softmax(ls, t)
 		L:debug("answer", "question", q.id, "type", q.type, "logits", ls, "temperature", t, "p", p)
 		local a
