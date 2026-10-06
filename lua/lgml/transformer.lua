@@ -1732,6 +1732,11 @@ end
 -- offload batch of ggml-vulkan (GGML_OP_OFFLOAD_MIN_BATCH, default 32).
 M.XCACHE_MAX_BATCH = tonumber(os.getenv("GGML_OP_OFFLOAD_MIN_BATCH") or 32)
 
+--- True to count the picks and hits of a zero-copy expert cache, for
+-- `expert_cache:stats` and profiles. It slows decode: set it with
+-- LGML_XCACHE_COUNT=1 for profiling runs only.
+M.XCACHE_COUNT = os.getenv("LGML_XCACHE_COUNT") == "1"
+
 -- The expert outputs of a layer with an expert cache (see
 -- `lgml.xcache`). The device computes the picks in slots, the CPU the
 -- rest; a mask of the router weights keeps each pick on one side.
@@ -1752,6 +1757,14 @@ local function cached_experts(g, hp, L, x3, sel, w)
 		-- Held picks read a dummy row at weight 0: one shared row on the
 		-- matvec path (8 tokens or fewer), else one row per position, as
 		-- the batched path computes too few rows for a repeated id.
+		if M.XCACHE_COUNT then
+			-- The remap op counts the picks and hits on the CPU. A CPU
+			-- leaf sends the graph through the scheduler, which runs
+			-- the op there; the sync per layer slows decode.
+			xc.count_leaf = xc.count_leaf or x3:backend():cpu():tensor("f32", { 1 }, { 0 })
+			g:expand(g:scale(xc.count_leaf, 1))
+			g:expand(xc.state:remap(g, xc.il, g:reshape(flat, { n, K })))
+		end
 		local hrow = g:reshape(g:get_rows(xc.hmap, flat), { n, K })
 		local hsel = n <= 8 and g:cast(hrow, "i32") or
 		    g:cast(g:sub(hrow, g:mul(g:sub(hrow, xc.hzero), hit)), "i32")
