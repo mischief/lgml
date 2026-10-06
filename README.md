@@ -282,7 +282,7 @@ The `cpu` setup hides the Vulkan driver, so the tests use the CPU. The
 `-Dwhisper=`, `-Dwhisper_wav=`, `-Dorpheus=`, `-Dqwen3tts=`,
 `-Dvibevoice=`) or environment variables (`LGML_DIFFUSION_GEMMA`,
 `LGML_ZIMAGE`, `LGML_ZIMAGE_VAE`, `LGML_GEMMA4_VISION`,
-`LGML_VISION_IMAGE`), then run:
+`LGML_CLEF_VISION`, `LGML_VISION_IMAGE`), then run:
 
 ```sh
 meson test -C build --suite model

@@ -376,7 +376,8 @@ function M.render_clef(tk, req, max, media)
 	local suffix = enc("\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:")
 	local fixed = #prefix + #schema + #suffix
 	if fixed > max then
-		error({ status = 400, msg = ("the schema needs %d tokens; the most is %d"):format(fixed, max) })
+		local what = media and #media > 0 and "the images and the schema need" or "the schema needs"
+		error({ status = 400, msg = ("%s %d tokens; the most is %d"):format(what, fixed, max) })
 	end
 	local st = enc(M.clef_text(state_value(req)))
 	local ids = prefix

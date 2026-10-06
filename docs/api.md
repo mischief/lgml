@@ -1396,7 +1396,8 @@ Top-level fields. Any other field gives 422.
   are PNG or JPEG. A request with attachments goes to a model with
   capability `multimodal`.
 - `images` (OpenJev, as llama.cpp takes it): an array of images, as
-  `attachments`.
+  `attachments`. An item can also be bare base64, as Clef and Jev send
+  it.
 - A `state` of chat messages (an array of messages, or an object with
   a `messages` array) also gives images: each `image_url` part of a
   message `content` goes to the images, and the state keeps the other
@@ -1518,13 +1519,19 @@ takes the recipe of its head by default (`<arch>.decision.type`):
   name. A transformer head reads the hidden states of all tokens and
   gives one logit per option. The prompt runs from the start for each
   request, and is cut to 16384 tokens at the end of the state.
+  With a vision projector (`mmproj`, a `qwen3vl_merger` gguf), clef
+  takes up to 4 images. They go after `STATE:\n` as
+  `<|vision_start|>` embeddings `<|vision_end|>` each, then a newline,
+  and use M-RoPE positions as llama.cpp gives them. More images, or
+  images without a projector, give 400.
 
 Each question gets a softmax of the logits at the temperature of the
 gguf (1 when it has none); `lgml.recipe.temperature` changes it. The
 answers have Jev's rounding, as above. With `lgml.raw`, an answer has
 `lgml.logits` and `lgml.temperature`; a clef answer also has
 `lgml.keys`, the option order of the logits. `usage.input_tokens`
-counts the prompt tokens and `output_tokens` is 0. Images give 400.
+counts the prompt tokens, image tokens too, and `output_tokens` is 0.
+Kev gives 400 for images.
 
 ### System One errors
 
