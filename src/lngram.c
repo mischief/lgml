@@ -12,6 +12,7 @@
 
 #include <errno.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <ggml.h>
@@ -154,7 +155,11 @@ read_out(lua_State *L, struct ngram *r, const int64_t *rows, size_t n, int idx)
  * - `mode`: "direct" (O_DIRECT, the default), "pread" or "mmap". Direct
  *   mode falls back to "pread" where the system or file system has no
  *   direct I/O; `reader:info().mode` tells which one is in use.
- * - `threads`: parallel reads (default 8)
+ * - `uring`: read through an io_uring where the build and the kernel
+ *   have one (default true, or false when the environment variable
+ *   `LGML_NGRAM_URING` is 0); `reader:info().uring` tells whether one is
+ *   in use.
+ * - `threads`: parallel reads without an io_uring (default 8)
  * - `align`: direct I/O unit in bytes, a power of two (default: the
  *   first of 512 and 4096 that the file accepts)
  * @tparam string path gguf file that holds the table
@@ -171,9 +176,10 @@ l_ngram_open(lua_State *L)
 	const char *path = luaL_checkstring(L, 1), *meta = NULL;
 	const char *tensor = "per_layer_token_embd.weight";
 	struct reader *rd;
+	const char *env = getenv("LGML_NGRAM_URING");
 	lua_Integer threads = 8, align = 0;
 	char err[512];
-	int mode = NGRAM_DIRECT;
+	int mode = NGRAM_DIRECT, uring = env == NULL || strcmp(env, "0") != 0;
 
 	if (!lua_isnoneornil(L, 2)) {
 		luaL_checktype(L, 2, LUA_TTABLE);
@@ -187,6 +193,8 @@ l_ngram_open(lua_State *L)
 			threads = luaL_checkinteger(L, -1);
 		if (lua_getfield(L, 2, "align") != LUA_TNIL)
 			align = luaL_checkinteger(L, -1);
+		if (lua_getfield(L, 2, "uring") != LUA_TNIL)
+			uring = lua_toboolean(L, -1);
 		luaL_argcheck(L, threads >= 1 && threads <= 64, 2, "threads must be 1 to 64");
 		luaL_argcheck(L, align >= 0 && align <= 1 << 20, 2, "align out of range");
 	}
@@ -200,6 +208,8 @@ l_ngram_open(lua_State *L)
 		lua_pushstring(L, err);
 		return 2;
 	}
+	if (!uring)
+		ngram_uring(rd->r, 0);
 	return 1;
 }
 
@@ -323,7 +333,8 @@ setnum(lua_State *L, const char *k, lua_Number v)
 
 /*** Describe the table.
  * The result has `mode` ("direct", "pread" or "mmap"), `fell_back` (true
- * when direct mode was asked for but is not in use), `type`, `rows`,
+ * when direct mode was asked for but is not in use), `uring` (true when
+ * reads go through an io_uring), `type`, `rows`,
  * `head_dim`, `heads`, `dim` (heads * `head_dim`), `ngram_size`,
  * `heads_per_ngram`, `eos`, `image_token`, `row_bytes` and `align`.
  * @treturn table the description
@@ -340,6 +351,8 @@ reader_info(lua_State *L)
 	lua_setfield(L, -2, "mode");
 	lua_pushboolean(L, r->fell_back);
 	lua_setfield(L, -2, "fell_back");
+	lua_pushboolean(L, r->ring != NULL);
+	lua_setfield(L, -2, "uring");
 	lua_pushstring(L, ggml_type_name(r->type));
 	lua_setfield(L, -2, "type");
 	setint(L, "rows", r->nrows);

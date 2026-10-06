@@ -182,7 +182,19 @@ for _, mode in ipairs({ "pread", "mmap" }) do
 	ok(same(floats(b:bytes()), want), mode .. " matches direct")
 end
 
-local sep <close> = assert(lgml.ngram.open(nometa, { meta = path, mode = "pread" }))
+-- With and without the io_uring.
+print("# io_uring " .. (info.uring and "in use" or "not in use"))
+for _, mode in ipairs({ "direct", "pread" }) do
+	local m <close> = assert(lgml.ngram.open(path, { mode = mode, uring = false, threads = 2 }))
+	ok(m:info().uring == false, mode .. " without io_uring")
+	local b = lgml.hostbuf(nt * HEADS * DIM * 4)
+	m:embed(ids, prev, b)
+	ok(same(floats(b:bytes()), want), mode .. " without io_uring matches")
+end
+local mm <close> = assert(lgml.ngram.open(path, { mode = "mmap" }))
+ok(mm:info().uring == false, "mmap has no io_uring")
+
+local sep <close> =assert(lgml.ngram.open(nometa, { meta = path, mode = "pread" }))
 local b2 = lgml.hostbuf(nt * HEADS * DIM * 4)
 sep:embed(ids, prev, b2)
 ok(same(floats(b2:bytes()), want), "keys from a separate meta file")

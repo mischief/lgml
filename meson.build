@@ -65,6 +65,11 @@ png = dependency('libpng', default_options : wrap_opts)
 jpeg = dependency('libjpeg', default_options : wrap_opts)
 # utf8proc: Unicode NFC for tokenizer.json normalizers. Its tests fetch data at build time.
 utf8proc = dependency('libutf8proc', default_options : wrap_opts + ['tests=disabled'])
+# liburing: the n-gram reader reads through an io_uring; without it, on threads.
+uring = dependency('liburing', required : false)
+if uring.found()
+  uring = declare_dependency(dependencies : uring, compile_args : '-DLGML_HAVE_URING')
+endif
 
 lua_dir = get_option('lua_dir')
 if lua_dir == ''
@@ -115,7 +120,7 @@ lgml = shared_module('lgml',
   'src/mem.c',
   'src/ngram.c',
   'src/lngram.c',
-  dependencies : [ggml, lua, m, threads, png, jpeg, utf8proc],
+  dependencies : [ggml, lua, m, threads, png, jpeg, utf8proc, uring],
   c_args : spv_args,
   name_prefix : '',
   install : true,
@@ -162,7 +167,7 @@ test_ngram = executable('test_ngram',
   'test/test_ngram.c',
   'src/ngram.c',
   include_directories : include_directories('src'),
-  dependencies : [ggml, m, threads],
+  dependencies : [ggml, m, threads, uring],
 )
 test('ngram', test_ngram,
   env : { 'LGML_NGRAM' : get_option('ngram'), 'LGML_NGRAM_META' : get_option('ngram_meta') },
@@ -312,7 +317,7 @@ endif
 # fuzz/README.
 lfuzz = executable('lfuzz', 'fuzz/lfuzz.c',
   objects : lgml.extract_all_objects(recursive : true),
-  dependencies : [ggml, lua, m, png, jpeg, utf8proc, cc.find_library('dl', required : false)],
+  dependencies : [ggml, lua, m, png, jpeg, utf8proc, uring, cc.find_library('dl', required : false)],
   export_dynamic : true,
 )
 foreach t : ['json', 'chat', 'http', 'safetensors', 'vocab', 'wav', 'tokenize', 'image', 'grammar']

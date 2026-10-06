@@ -1,8 +1,9 @@
 /*
  * Tests of the n-gram table reader: the hash against rows from the
  * llama.cpp qwen4exp hash loop, IQ4_NL dequantization, the three read
- * modes on a small table, and the real table against ggml_get_rows on a
- * map of the file when LGML_NGRAM names it. Output is TAP.
+ * modes on a small table, reads with and without the io_uring, and the
+ * real table against ggml_get_rows on a map of the file when LGML_NGRAM
+ * names it. Output is TAP.
  */
 
 #define _GNU_SOURCE
@@ -11,6 +12,7 @@
 
 #include <fcntl.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +25,12 @@
 #include "ngram.h"
 
 #define EOS	248044
+
+#if defined(LGML_HAVE_URING)
+#define HAVE_RING 1
+#else
+#define HAVE_RING 0
+#endif
 
 static int ntest;
 
@@ -308,6 +316,145 @@ test_modes(const char *path)
 		free(out[m]);
 }
 
+/* Check rows[0..n) of out against their blocks. */
+static int
+rows_match(const int64_t *rows, size_t n, const float *out)
+{
+	struct iq4 b[2];
+	float want[T_DIM];
+	size_t i;
+
+	for (i = 0; i < n; i++) {
+		fill_block(&b[0], rows[i], 0);
+		fill_block(&b[1], rows[i], 1);
+		iq4_expect(&b[0], want);
+		iq4_expect(&b[1], want + 32);
+		if (memcmp(out + i * T_DIM, want, sizeof(want)) != 0)
+			return 0;
+	}
+	return 1;
+}
+
+struct far_read {
+	struct ngram	*r;
+	const int64_t	*rows;
+	size_t		 n;
+	float		*out;
+	int		 ret;
+};
+
+static void *
+far_read(void *arg)
+{
+	struct far_read *f = arg;
+
+	f->ret = ngram_read(f->r, f->rows, f->n, f->out);
+	return NULL;
+}
+
+/*
+ * Reads with and without the io_uring. Every other row in pread mode
+ * makes a span per row, many more than the ring holds at once.
+ */
+static void
+test_ring(const char *path)
+{
+	static int64_t rows[T_ROWS / 2 + 1];
+	static float out[2][(T_ROWS / 2 + 1) * T_DIM];
+	struct far_read f;
+	struct ngram *r;
+	pthread_t tid;
+	char err[256], name[64];
+	size_t n = 0;
+	int64_t row;
+	int m, on, use[2] = { 0, 0 };
+
+	for (row = T_ROWS - 1; row >= 0; row -= 2)
+		rows[n++] = row;
+	for (m = 0; m < 2; m++) {
+		for (on = 0; on < 2; on++) {
+			r = ngram_open(path, NULL, "per_layer_token_embd.weight", (enum ngram_mode)m,
+			    0, 4, err, sizeof(err));
+			ok(r != NULL, "ring: open");
+			use[on] = ngram_uring(r, on);
+			ok(ngram_read(r, rows, n, out[on]) == 0, "ring: read every other row");
+			printf("# mode %d, ring %d: %d reads\n", (int)r->mode, use[on],
+			    (int)r->st.reads);
+			ngram_close(r);
+		}
+		snprintf(name, sizeof(name), "ring: %s rows match", m == 0 ? "direct" : "pread");
+		ok(!use[0] && rows_match(rows, n, out[0]) &&
+		    memcmp(out[0], out[1], n * T_DIM * sizeof(float)) == 0, name);
+	}
+	ok(use[1] == HAVE_RING, "ring: in use when built with liburing");
+	/* Another thread reads: the reader makes a new ring there. */
+	r = ngram_open(path, NULL, "per_layer_token_embd.weight", NGRAM_DIRECT, 0, 4, err,
+	    sizeof(err));
+	ok(r != NULL, "ring: open for threads");
+	f.r = r;
+	f.rows = rows;
+	f.n = 50;
+	f.out = out[0];
+	f.ret = -1;
+	ok(pthread_create(&tid, NULL, far_read, &f) == 0 && pthread_join(tid, NULL) == 0 &&
+	    f.ret == 0 && rows_match(rows, 50, out[0]), "ring: read on another thread");
+	ok(ngram_read(r, rows + 50, 50, out[1]) == 0 && rows_match(rows + 50, 50, out[1]),
+	    "ring: read on this thread again");
+	printf("# ring %s after the thread reads\n", r->ring != NULL ? "in use" : "not in use");
+	ngram_close(r);
+}
+
+/* Many random rows of the real table, with and without the ring. */
+static void
+test_real_ring(const char *path, const char *meta)
+{
+	static const struct {
+		enum ngram_mode	 mode;
+		int		 ring;
+		const char	*name;
+	} cfg[] = {
+		{ NGRAM_MMAP, 0, "mmap" },
+		{ NGRAM_DIRECT, 1, "direct, ring" },
+		{ NGRAM_DIRECT, 0, "direct, threads" },
+		{ NGRAM_PREAD, 1, "pread, ring" },
+	};
+	size_t nr = 8192, i, c, len = 0;
+	uint64_t x = 88172645463325252ULL;
+	struct ngram *r;
+	int64_t *rows;
+	float *out[4];
+	char err[512], name[128];
+
+	rows = malloc(nr * sizeof(*rows));
+	for (c = 0; c < sizeof(cfg) / sizeof(cfg[0]); c++) {
+		r = ngram_open(path, meta, "per_layer_token_embd.weight", cfg[c].mode, 0, 8, err,
+		    sizeof(err));
+		ok(r != NULL, r != NULL ? "real ring: open" : err);
+		if (c == 0)
+			for (i = 0; i < nr; i++) {
+				x ^= x << 13;
+				x ^= x >> 7;
+				x ^= x << 17;
+				rows[i] = (int64_t)(x % (uint64_t)r->nrows);
+			}
+		len = nr * (size_t)r->head_dim;
+		out[c] = malloc(len * sizeof(float));
+		snprintf(name, sizeof(name), "real ring: %s", cfg[c].name);
+		ok(ngram_uring(r, cfg[c].ring) == (cfg[c].ring && HAVE_RING) &&
+		    ngram_read(r, rows, nr, out[c]) == 0, name);
+		printf("# %s: %d reads, %.3f ms\n", cfg[c].name, (int)r->st.reads,
+		    r->st.total_sec * 1e3);
+		if (c > 0) {
+			snprintf(name, sizeof(name), "real ring: %s matches mmap", cfg[c].name);
+			ok(memcmp(out[0], out[c], len * sizeof(float)) == 0, name);
+		}
+		ngram_close(r);
+	}
+	for (c = 0; c < sizeof(cfg) / sizeof(cfg[0]); c++)
+		free(out[c]);
+	free(rows);
+}
+
 /* The real table against ggml_get_rows on a map of the file. */
 static void
 test_real(const char *path, const char *meta)
@@ -387,10 +534,14 @@ main(void)
 	snprintf(path, sizeof(path), "ngram-test-%d.gguf", (int)getpid());
 	write_table(path);
 	test_modes(path);
+	test_ring(path);
 	unlink(path);
-	if (real != NULL && *real != '\0' && access(real, R_OK) == 0)
-		test_real(real, meta != NULL && *meta != '\0' ? meta : NULL);
-	else
+	if (meta != NULL && *meta == '\0')
+		meta = NULL;
+	if (real != NULL && *real != '\0' && access(real, R_OK) == 0) {
+		test_real(real, meta);
+		test_real_ring(real, meta);
+	} else
 		printf("ok %d - real table # SKIP LGML_NGRAM not set\n", ++ntest);
 	printf("1..%d\n", ntest);
 	return 0;

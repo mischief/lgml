@@ -61,6 +61,7 @@ struct ngram {
 	int			 threads;
 	char			*buf;		/* aligned read buffer */
 	size_t			 bufsize;
+	void			*ring;		/* struct io_uring, or NULL */
 	struct ngram_stats	 st;
 };
 
@@ -71,6 +72,7 @@ void		 ngram_rows(const struct ngram_params *, const int32_t *, size_t,
 struct ngram	*ngram_open(const char *, const char *, const char *, enum ngram_mode,
 		    size_t, int, char *, size_t);
 void		 ngram_close(struct ngram *);
+int		 ngram_uring(struct ngram *, int);
 int		 ngram_read(struct ngram *, const int64_t *, size_t, float *);
 
 #endif

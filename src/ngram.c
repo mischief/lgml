@@ -2,7 +2,8 @@
  * PLE n-gram hash embedding reader. The table is too large for memory,
  * so each pass reads only the rows it needs. A pass dedupes its rows,
  * sorts them by file offset, merges them into aligned spans, reads the
- * spans on a few threads and dequantizes each row to f32.
+ * spans through an io_uring (or on a few threads without one) and
+ * dequantizes each row to f32.
  */
 
 /* O_DIRECT, posix_fadvise and posix_memalign. */
@@ -25,11 +26,16 @@
 #include <ggml.h>
 #include <gguf.h>
 
+#if defined(LGML_HAVE_URING)
+#include <liburing.h>
+#endif
+
 #include "ngram.h"
 
 #define SPAN_MAX	((size_t)1 << 20)	/* longest merged read */
 #define SPANS_PER_THREAD 6		/* fewest spans that a read thread takes */
 #define BUF_MAX		((size_t)32 << 20)	/* read buffer of one chunk */
+#define RING_DEPTH	256		/* most ring reads in flight */
 
 struct pair {
 	int64_t		 row;
@@ -41,6 +47,7 @@ struct span {
 	size_t		 len;		/* bytes to read */
 	size_t		 need;		/* bytes that must arrive */
 	size_t		 boff;		/* offset in the read buffer */
+	size_t		 got;		/* bytes that arrived */
 };
 
 struct job {
@@ -346,6 +353,145 @@ pick_align(struct ngram *r, size_t align)
 	return -1;
 }
 
+#if defined(LGML_HAVE_URING)
+static void
+ring_exit(struct ngram *r)
+{
+	if (r->ring == NULL)
+		return;
+	io_uring_queue_exit(r->ring);
+	free(r->ring);
+	r->ring = NULL;
+}
+
+/*
+ * Set up the ring of r on this thread, with the table fds as fixed
+ * files 0 (direct) and 1 (buffered). A kernel without DEFER_TASKRUN
+ * gets a plain ring. Returns 0, or -1 without a ring.
+ */
+static int
+ring_init(struct ngram *r)
+{
+	static const unsigned flags[] = {
+		IORING_SETUP_CLAMP | IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN,
+		IORING_SETUP_CLAMP
+	};
+	struct io_uring_params p;
+	struct io_uring *ring;
+	int fds[2];
+	size_t i;
+
+	if ((ring = calloc(1, sizeof(*ring))) == NULL)
+		return -1;
+	for (i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
+		memset(&p, 0, sizeof(p));
+		p.flags = flags[i];
+		if (io_uring_queue_init_params(RING_DEPTH, ring, &p) == 0)
+			break;
+	}
+	if (i == sizeof(flags) / sizeof(flags[0])) {
+		free(ring);
+		return -1;
+	}
+	fds[0] = r->dfd;
+	fds[1] = r->fd;
+	if (io_uring_register_files(ring, fds, 2) != 0) {
+		io_uring_queue_exit(ring);
+		free(ring);
+		return -1;
+	}
+	r->ring = ring;
+	return 0;
+}
+
+static void
+ring_prep(struct io_uring *ring, struct ngram *r, int fi, struct span *sp, size_t i)
+{
+	struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+
+	/* Never NULL: the ring holds as many entries as reads in flight. */
+	io_uring_prep_read(sqe, fi, r->buf + sp[i].boff + sp[i].got,
+	    (unsigned)(sp[i].len - sp[i].got), (uint64_t)(sp[i].off + (off_t)sp[i].got));
+	sqe->flags |= IOSQE_FIXED_FILE;
+	io_uring_sqe_set_data64(sqe, i);
+	r->st.reads++;
+}
+
+/*
+ * Read spans [0, n) through the ring from fixed file fi, with up to
+ * the ring size queued or in flight. Returns 0 or the errno of a read,
+ * or -1 when the ring fails; then the caller reads the spans again.
+ */
+static int
+read_ring(struct ngram *r, int fi, struct span *sp, size_t n)
+{
+	struct io_uring *ring = r->ring;
+	struct io_uring_cqe *cqe;
+	size_t next = 0, busy = 0, fly = 0, depth = ring->sq.ring_entries, i;
+	unsigned head, seen;
+	int err = 0, ret, res;
+
+	for (i = 0; i < n; i++)
+		sp[i].got = 0;
+	while ((next < n && err == 0) || busy > 0) {
+		for (; next < n && err == 0 && busy < depth; next++, busy++)
+			ring_prep(ring, r, fi, sp, next);
+		ret = io_uring_submit_and_wait(ring, 1);
+		if (ret == -EINTR || ret == -EAGAIN || ret == -EBUSY)
+			ret = 0;
+		if (ret < 0) {
+			/* Wait for the reads in flight: they write to buf. */
+			while (fly > 0 && io_uring_wait_cqe(ring, &cqe) == 0) {
+				io_uring_cqe_seen(ring, cqe);
+				fly--;
+			}
+			return -1;
+		}
+		fly += (size_t)ret;
+		seen = 0;
+		io_uring_for_each_cqe(ring, head, cqe) {
+			seen++;
+			fly--;
+			i = (size_t)io_uring_cqe_get_data64(cqe);
+			res = cqe->res;
+			if (res > 0)
+				sp[i].got += (size_t)res;
+			if (err == 0 && (res == -EINTR || res == -EAGAIN ||
+			    (res > 0 && sp[i].got < sp[i].need))) {
+				/* Read the rest: the completed read freed an entry. */
+				ring_prep(ring, r, fi, sp, i);
+				continue;
+			}
+			busy--;
+			if (res <= 0 && err == 0)
+				err = res == 0 ? EIO : -res;
+		}
+		io_uring_cq_advance(ring, seen);
+	}
+	return err;
+}
+#endif
+
+/*
+ * Read through an io_uring when on is true, else on threads. Returns 1
+ * when a ring is in use, else 0. Map mode never uses a ring.
+ */
+int
+ngram_uring(struct ngram *r, int on)
+{
+#if defined(LGML_HAVE_URING)
+	if (!on || r->mode == NGRAM_MMAP)
+		ring_exit(r);
+	else if (r->ring == NULL)
+		ring_init(r);
+	return r->ring != NULL;
+#else
+	(void)r;
+	(void)on;
+	return 0;
+#endif
+}
+
 /*
  * Open the table tensor of the gguf file path. meta is the gguf file
  * with the <arch>.ple.* keys, or NULL for path. align is the direct I/O
@@ -447,6 +593,7 @@ ngram_open(const char *path, const char *meta, const char *tensor, enum ngram_mo
 		madvise(r->map, r->maplen, MADV_RANDOM);
 #endif
 	}
+	ngram_uring(r, 1);
 	gguf_free(c);
 	if (mc != NULL)
 		gguf_free(mc);
@@ -468,6 +615,7 @@ ngram_close(struct ngram *r)
 {
 	if (r == NULL)
 		return;
+	ngram_uring(r, 0);
 	if (r->map != NULL)
 		munmap(r->map, r->maplen);
 	if (r->dfd != -1)
@@ -524,6 +672,17 @@ read_all(struct ngram *r, int fd, struct span *sp, size_t n)
 	size_t nt, i, per;
 	int err = 0;
 
+#if defined(LGML_HAVE_URING)
+	if (r->ring != NULL) {
+		err = read_ring(r, fd == r->dfd ? 0 : 1, sp, n);
+		if (err >= 0)
+			return err;
+		/* Another thread made the ring, or it broke: make a new one. */
+		ring_exit(r);
+		ring_init(r);
+		err = 0;
+	}
+#endif
 	nt = (size_t)r->threads;
 	if (nt > sizeof(jobs) / sizeof(jobs[0]))
 		nt = sizeof(jobs) / sizeof(jobs[0]);

@@ -19,7 +19,8 @@ glslc, libpng, libjpeg, zlib and utf8proc. Meson builds ggml from
 fused ops and zero-copy experts need it. `-Dggml=system` links the
 system ggml in place; lgml then runs without those two. It builds the
 other four from the wraps in `subprojects` when the system lacks them.
-The default build type is debugoptimized.
+liburing is optional: with it, the n-gram table reader reads through an
+io_uring. The default build type is debugoptimized.
 
 ### Packages
 
@@ -29,7 +30,7 @@ Debian 13 (all of this builds ggml from the wrap):
 apt install build-essential git meson ninja-build cmake pkg-config \
     lua5.4 liblua5.4-dev luarocks libpng-dev libjpeg62-turbo-dev \
     zlib1g-dev libutf8proc-dev libvulkan-dev glslc glslang-tools \
-    spirv-headers mesa-vulkan-drivers
+    spirv-headers mesa-vulkan-drivers liburing-dev
 ```
 
 Gentoo:
@@ -38,7 +39,7 @@ Gentoo:
 emerge dev-lang/lua:5.4 dev-lua/luarocks dev-build/meson dev-build/ninja \
     dev-build/cmake media-libs/libpng media-libs/libjpeg-turbo sys-libs/zlib \
     dev-libs/libutf8proc media-libs/vulkan-loader dev-util/vulkan-headers \
-    media-libs/shaderc dev-util/glslang dev-util/spirv-headers
+    media-libs/shaderc dev-util/glslang dev-util/spirv-headers sys-libs/liburing
 ```
 
 The GPU needs a Vulkan driver (Mesa RADV for AMD). Without one, lgml
