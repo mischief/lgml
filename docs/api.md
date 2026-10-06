@@ -276,7 +276,7 @@ usage, the event stream framing and the tool call fragments.
 | `lora` | llama.cpp | supported | Adapter scales for this request: `[{"id": 0, "scale": 0.5}]`. Adapters that the list does not name get scale 0. Without `lora`, the global scales apply; see [Server properties and adapters](#server-properties-and-adapters). |
 | `reasoning_budget_tokens` | lgml | supported | A positive integer: the most reasoning tokens before the engine ends the reasoning block. See [Reasoning budget](#reasoning-budget). |
 | `speculative` | lgml | supported | `true` or `false` turns speculative decoding on or off for this request. Default: the model's `speculative` setting. See [Speculative decoding](#speculative-decoding). |
-| `diffusion` | lgml | supported | An object of sampler options of a LLaDA-MoE-v2 model: `steps`, `block_length`, `threshold`, `minimal_topk`, `temperature`. See [Diffusion models](#diffusion-models). |
+| `diffusion` | lgml | supported | An object of sampler options of a LLaDA-MoE-v2 model: `steps`, `block_length`, `threshold`, `minimal_topk`, `temperature`, `prefix_cache`. See [Diffusion models](#diffusion-models). |
 
 ### Reply fields
 
@@ -479,7 +479,12 @@ With `threshold: false`, each step unmasks a scheduled count, as
 `<|role_end|>` or end token. This model also takes `temperature` (Gumbel
 noise on the logits; 0 is argmax) and `diffusion`, an object with any of
 `steps` (default 64), `block_length` (64), `threshold` (1.0),
-`minimal_topk` (1) and `temperature` (0). Bad values give 400; with a
+`minimal_topk` (1), `temperature` (0) and `prefix_cache` (false). With
+`prefix_cache: true`, only the first step of a block runs the whole
+sequence; the other steps run the block alone on the keys and values
+that the first step made for the prompt and earlier blocks (the prefix
+cache of Fast-dLLM). This is not exact, and it is much faster with a
+long prompt. Bad values give 400; with a
 threshold, `steps * minimal_topk` must be at least `block_length`. The
 model setting `diffusion` (config key) changes the defaults. The timings
 add `blocks_n` (blocks run) and `steps_n` (steps run). The other

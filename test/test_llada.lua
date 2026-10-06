@@ -38,7 +38,11 @@ local function same(a, b)
 end
 
 -- Plain Lua forward of the reference model. Returns logits rows.
-local function ref_forward(W, ids)
+-- opts.p0 is the first position; opts.pre[layer] gives K and V rows
+-- before ids; opts.save[layer] gets the K and V rows of ids.
+local function ref_forward(W, ids, opts)
+	opts = opts or {}
+	local p0, pre, save = opts.p0 or 0, opts.pre, opts.save
 	local hp = tiny.hp
 	local E, H, HKV, D, X, K = hp.n_embd, hp.n_head, hp.n_head_kv, hp.head_dim, hp.n_expert, hp.n_used
 	local V, N = tiny.n_vocab, #ids
@@ -109,31 +113,41 @@ local function ref_forward(W, ids)
 			for hh = 0, HKV - 1 do
 				rms(k[t], W[p .. "attn_k_norm.weight"], hh * D, D)
 			end
-			rope(q[t], H, t - 1)
-			rope(k[t], HKV, t - 1)
+			rope(q[t], H, p0 + t - 1)
+			rope(k[t], HKV, p0 + t - 1)
 		end
+		if save then
+			save[il] = { k = k, v = v }
+		end
+		local kk, vv = {}, {}
+		if pre then
+			table.move(pre[il].k, 1, #pre[il].k, 1, kk)
+			table.move(pre[il].v, 1, #pre[il].v, 1, vv)
+		end
+		table.move(k, 1, N, #kk + 1, kk)
+		table.move(v, 1, N, #vv + 1, vv)
 		for t = 1, N do
 			local o = {}
 			for hh = 0, H - 1 do
 				local kh = hh // (H // HKV)
 				local sc, mx = {}, -math.huge
-				for s = 1, N do
+				for s = 1, #kk do
 					local d = 0
 					for i = 1, D do
-						d = d + q[t][hh * D + i] * k[s][kh * D + i]
+						d = d + q[t][hh * D + i] * kk[s][kh * D + i]
 					end
 					sc[s] = d / math.sqrt(D)
 					mx = math.max(mx, sc[s])
 				end
 				local z = 0
-				for s = 1, N do
+				for s = 1, #kk do
 					sc[s] = math.exp(sc[s] - mx)
 					z = z + sc[s]
 				end
 				for i = 1, D do
 					local a = 0
-					for s = 1, N do
-						a = a + sc[s] / z * v[s][kh * D + i]
+					for s = 1, #kk do
+						a = a + sc[s] / z * vv[s][kh * D + i]
 					end
 					o[hh * D + i] = a
 				end
@@ -288,8 +302,32 @@ do
 	ok(good, "select matches the README selection on 300 random cases")
 end
 
--- The README sampler over one block, on logits from the model. With
--- temperature 0 it is deterministic.
+-- Block logits from the plain Lua model. With cached, steps after the
+-- first run the block on the prefix K and V of the first step.
+local function lua_logits(W, cached)
+	local save
+	return function(x, P, C, step)
+		local rows, r0
+		if cached and step > 1 then
+			local pre = {}
+			for il, s in pairs(save) do
+				pre[il] = { k = table.move(s.k, 1, P, 1, {}), v = table.move(s.v, 1, P, 1, {}) }
+			end
+			rows, r0 = ref_forward(W, table.move(x, P + 1, P + C, 1, {}), { p0 = P, pre = pre }), 0
+		else
+			save = {}
+			rows, r0 = ref_forward(W, x, { save = save }), P
+		end
+		local flat = {}
+		for r = 1, C do
+			table.move(rows[r0 + r], 1, tiny.n_vocab, #flat + 1, flat)
+		end
+		return flat
+	end
+end
+
+-- The README sampler over one block, on logits from the model or from
+-- a function. With temperature 0 it is deterministic.
 local function ref_block(m, prefix, o)
 	local P, C, V = #prefix, o.block_length, tiny.n_vocab
 	local x = table.move(prefix, 1, P, 1, {})
@@ -306,7 +344,7 @@ local function ref_block(m, prefix, o)
 		if not any then
 			break
 		end
-		local lg = m:logits(x, P, C)
+		local lg = type(m) == "function" and m(x, P, C, step) or m:logits(x, P, C)
 		steps = steps + 1
 		local block, conf = {}, {}
 		local x0 = {}
@@ -353,6 +391,29 @@ do
 	end
 	-- Fewer steps than tokens: some steps unmask more than the minimum.
 	ok(first > 1 and first < 8, "threshold 1.0 unmasks several tokens in a step (" .. first .. " steps)")
+	-- Against the plain Lua model, exact and with the prefix cache.
+	for _, o in ipairs({ cases[1], cases[4] }) do
+		for _, pc in ipairs({ false, true }) do
+			local want, ws = ref_block(lua_logits(W2, pc), prefix, o)
+			local oo = setmetatable({ prefix_cache = pc }, { __index = o })
+			local copy = {}
+			for k in pairs(llada.DEFAULTS) do
+				copy[k] = oo[k]
+			end
+			local got, gs = m:denoise(prefix, copy)
+			ok(same(got, want) and gs == ws, ("denoise matches plain Lua, prefix cache %s, threshold %s (%d steps)")
+			    :format(tostring(pc), tostring(o.threshold), gs))
+		end
+	end
+	-- A second prefix cache run on a longer prefix grows the cache.
+	local long = {}
+	for i = 1, 300 do
+		long[i] = 65 + i % 26
+	end
+	local got = m:denoise(long, { prefix_cache = true, threshold = false, steps = 2, block_length = 8 })
+	ok(#got == 8 and m.pcache.cap >= 308, "the prefix cache grows")
+	m:drop_cache()
+	ok(m.pcache == nil, "drop_cache frees the cache")
 	-- Temperature: seeded noise repeats, and the block has no mask left.
 	local a = m:denoise(prefix, { temperature = 1, threshold = 0.5, steps = 8, block_length = 8, seed = 3 })
 	local b = m:denoise(prefix, { temperature = 1, threshold = 0.5, steps = 8, block_length = 8, seed = 3 })

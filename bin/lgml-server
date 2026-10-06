@@ -92,7 +92,7 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       diffusion = sampler defaults of a block diffusion
                       model such as LLaDA-MoE-v2: { steps, block_length,
                       threshold (false: scheduled), minimal_topk,
-                      temperature },
+                      temperature, prefix_cache },
                       engine = Lua module with new(opts), such as a TTS engine,
                       modes = list of completion, multimodal, decide,
                       transcription, speech, image_generation, embedding

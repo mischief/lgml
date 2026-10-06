@@ -13,7 +13,11 @@ M.__index = M
 
 --- The sampler defaults of the reference README.
 -- `threshold` false unmasks a scheduled count of tokens per step.
-M.DEFAULTS = { steps = 64, block_length = 64, threshold = 1.0, minimal_topk = 1, temperature = 0 }
+-- `prefix_cache` true is not in the reference; see `denoise`.
+M.DEFAULTS = {
+	steps = 64, block_length = 64, threshold = 1.0, minimal_topk = 1, temperature = 0,
+	prefix_cache = false,
+}
 
 --- Token names that end a reply, besides the tokenizer end tokens.
 M.END_TOKENS = { "<|role_end|>" }
@@ -48,7 +52,19 @@ end
 
 --- Close the weights.
 function M:close()
+	self:drop_cache()
 	self.tm:close()
+end
+
+--- Free the K and V rows that the prefix cache of `denoise` keeps.
+function M:drop_cache()
+	local c = self.pcache
+	self.pcache = nil
+	for _, part in ipairs(c and { c.k, c.v } or {}) do
+		for _, t in pairs(part) do
+			t:close()
+		end
+	end
 end
 
 --- Make the graph inputs of a pass over n tokens.
@@ -193,13 +209,38 @@ function M.options(o, def)
 		return nil, "temperature must be a number from 0"
 	elseif r.threshold and r.steps * r.minimal_topk < r.block_length then
 		return nil, "steps * minimal_topk must cover one block"
+	elseif type(r.prefix_cache) ~= "boolean" then
+		return nil, "prefix_cache must be a boolean"
 	end
 	return r
+end
+
+-- The graph of one kind of pass over list, with its inputs and sampling
+-- nodes. With a cache, a full pass runs [prefix | block] and keeps every
+-- K and V row; else the block runs alone on the cached prefix rows.
+local function pass(self, list, P, C, cache, temp, u)
+	local be, inp = self.be, nil
+	if not cache then
+		inp = self:inputs(P + C, P, C)
+	else
+		local full = #list > C
+		cache.n_past = full and 0 or P
+		inp = self.tm:inputs(list, cache, { flash_attn = self.flash_attn, causal = false, logits = "rows" })
+		inp.logit_rows = be:tensor("i32", { C })
+		inp.logit_rows:fill_range(full and P or 0)
+	end
+	local g = be:graph()
+	local x0, conf = M.sample_nodes(g, self.tm:forward(g, inp), temp, u)
+	return { g = g, inp = inp, x0 = x0, conf = conf }
 end
 
 --- Run the sampler over one block of mask tokens after prefix.
 -- Each step runs the whole sequence and unmasks positions by `select`.
 -- The step loop ends when no mask is left, or after opts.steps steps.
+-- With opts.prefix_cache, only the first step runs the whole sequence;
+-- later steps run the block on the prefix K and V of that step, as the
+-- prefix cache of Fast-dLLM does. This is faster on long prefixes and
+-- not exact. The cache stays with the model; see `drop_cache`.
 -- @tparam {int,...} prefix the prompt and earlier blocks
 -- @tparam[opt] table opts options: the sampler options of `options`,
 -- seed (for the noise when temperature > 0) and on_step: on_step(step,
@@ -216,23 +257,26 @@ function M:denoise(prefix, opts)
 	local o = assert(M.options(so))
 	local be, hp = self.be, self.hp
 	local P, C, V = #prefix, o.block_length, hp.n_vocab
-	local n = P + C
 	local ids = table.move(prefix, 1, P, 1, {})
 	local block = {}
 	for i = 1, C do
 		block[i] = hp.mask_id
 		ids[P + i] = hp.mask_id
 	end
-	local inp = self:inputs(n, P, C)
+	local cache = false
+	if o.prefix_cache then
+		self.pcache = self.pcache or self.tm:cache(hp.n_ctx, { initial = P + C })
+		cache = self.pcache
+	end
 	local u
 	if o.temperature > 0 then
 		u = be:tensor("f32", { C, V })
 	end
-	local g = be:graph()
-	local x0n, confn = M.sample_nodes(g, self.tm:forward(g, inp), o.temperature, u)
+	local full, part
 	local sched = not o.threshold and M.schedule(C, o.steps)
 	local seed, steps = math.tointeger(opts.seed) or 0, 0
 	local ok, err = pcall(function()
+		full = pass(self, ids, P, C, cache, o.temperature, u)
 		for step = 1, o.steps do
 			local masked = {}
 			for i = 1, C do
@@ -243,12 +287,19 @@ function M:denoise(prefix, opts)
 			if #masked == 0 then
 				break
 			end
-			inp.ids:set(ids)
+			local p = full
+			if cache and step > 1 then
+				part = part or pass(self, block, P, C, cache, o.temperature, u)
+				p = part
+				p.inp.ids:set(block)
+			else
+				p.inp.ids:set(ids)
+			end
 			if u then
 				u:fill("uniform", 2 ^ -40, 1, (seed * 7919 + steps) & 0x7fffffffffffffff)
 			end
-			g:compute(x0n, confn)
-			local x0, cv = x0n:get(), confn:get()
+			p.g:compute(p.x0, p.conf)
+			local x0, cv = p.x0:get(), p.conf:get()
 			steps = steps + 1
 			local conf = {}
 			for _, i in ipairs(masked) do
@@ -263,8 +314,10 @@ function M:denoise(prefix, opts)
 			end
 		end
 	end)
-	g:close()
-	M.close_inputs(inp)
+	for _, p in ipairs({ full, part }) do
+		p.g:close()
+		M.close_inputs(p.inp)
+	end
 	if u then
 		u:close()
 	end
