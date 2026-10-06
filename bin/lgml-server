@@ -68,6 +68,8 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       ubatch, repeat_stop_tokens, reasoning_budget_tokens
                       (--reasoning-budget), speculative = true, false or
                       the most draft tokens (--spec), spec_mtp (--spec-mtp),
+                      spec_draft and spec_min_p (the guesses and gate of
+                      an MTP head),
                       lora = "file[:scale]" or a
                       list of them or of { path, scale }, mmproj,
                       image_min_tokens, image_max_tokens,
@@ -296,6 +298,12 @@ local function model_engine(spec, managed)
 	if sp == true then
 		sp = 16
 	end
+	if spec.spec_draft ~= nil and not math.tointeger(spec.spec_draft) then
+		die("bad spec_draft " .. tostring(spec.spec_draft))
+	end
+	if spec.spec_min_p ~= nil and not (tonumber(spec.spec_min_p) and spec.spec_min_p >= 0 and spec.spec_min_p <= 1) then
+		die("bad spec_min_p " .. tostring(spec.spec_min_p))
+	end
 	local nslots = spec.slots and math.tointeger(tonumber(spec.slots))
 	if spec.slots and not (nslots and nslots >= 1 and nslots <= 64) then
 		die("bad slot count " .. tostring(spec.slots))
@@ -386,7 +394,8 @@ local function model_engine(spec, managed)
 			recipe = spec.recipe, cache_ram = ram, ctx_checkpoints = ckpt, lora = lora,
 			kv_initial = kvi, slots = nslots, repeat_stop_tokens = rst,
 			reasoning_budget_tokens = rbt, ubatch = ub,
-			speculative = sp and sp > 0 and { max = sp, mtp = spec.spec_mtp } or nil,
+			speculative = sp and sp > 0 and { max = sp, mtp = spec.spec_mtp, draft = spec.spec_draft,
+				min_p = spec.spec_min_p } or nil,
 			mmproj = spec.mmproj, image_min_tokens = imin, image_max_tokens = imax,
 			cpu_moe = spec.cpu_moe, n_cpu_moe = spec.n_cpu_moe, n_gpu_layers = spec.n_gpu_layers,
 			override = spec.override, moe_cache = spec.moe_cache,

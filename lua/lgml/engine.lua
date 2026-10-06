@@ -391,8 +391,11 @@ end
 --   buffers fit the memory budget, as `E:reserve` plans them. A model
 --   without a KV pool takes 512 for auto.
 -- - `speculative`: true, or a table, turns speculative decoding on by
---   default; a request can turn it on or off with `speculative`. The
---   table holds `max` (the most draft tokens, default 16), `adaptive`
+--   default; a request can turn it on or off with `speculative`, or
+--   give it a table of `max` and `min_p` for the MTP head, with `max`
+--   at most the model's. The table holds `max` (the most draft tokens,
+--   default 16), `draft` and `min_p` (the guesses and gate of the MTP
+--   head; default `max` or 3, and `lgml.spec.MTP_MIN_P`), `adaptive`
 --   (false drafts `max` tokens at each step, default true), and
 --   `ngram_min`, `ngram_max` for the prompt lookup drafter (see
 --   `lgml.spec.lookup`). `drafter`, a function of the request that
@@ -532,9 +535,11 @@ function M.new(opts)
 	e.spec_opts = { max = so.max or 16, ngram_min = so.ngram_min, ngram_max = so.ngram_max,
 	    drafter = so.drafter, adaptive = so.adaptive }
 	if not so.drafter and model.mtp then
-		e.spec_opts.drafter = function()
+		e.spec_opts.drafter = function(req)
+			local rs = type(req.speculative) == "table" and req.speculative or {}
+			local max = rs.max or so.draft or so.max
 			return spec.mtp(model, { ngram_min = so.ngram_min, ngram_max = so.ngram_max, flash_attn = fa,
-				max = so.max, min_p = so.min_p })
+				max = max and math.min(max, e.spec_opts.max), min_p = rs.min_p or so.min_p })
 		end
 	end
 	e.spec_costs = spec.costs()
@@ -2652,8 +2657,13 @@ function E:spec_start(req, prompt)
 		return nil
 	end
 	local o = self.spec_opts
+	-- A request table can lower max, not raise it past the plan.
+	local max = type(want) == "table" and want.max and math.min(want.max, o.max) or o.max
+	if max < 1 then
+		return nil
+	end
 	local drafter = o.drafter and o.drafter(req) or spec.lookup(o)
-	local sp = spec.session(drafter, self.spec_costs, { max = o.max, recurrent = self.model.recurrent,
+	local sp = spec.session(drafter, self.spec_costs, { max = max, recurrent = self.model.recurrent,
 	    adaptive = o.adaptive })
 	sp.seq = table.move(prompt, 1, #prompt, 1, {})
 	-- A saved state from an earlier request does not fit this one.

@@ -427,7 +427,12 @@ do
 	local cr = require("lgml.server.chat_request")
 	local msgs = require("lgml.json").array({ { role = "user", content = "hi" } })
 	ok(cr.check({ messages = msgs, speculative = true }) == true, "request: speculative true passes")
-	ok(not cr.check({ messages = msgs, speculative = 3 }), "request: speculative must be a boolean")
+	ok(not cr.check({ messages = msgs, speculative = 3 }), "request: speculative must be a boolean or an object")
+	ok(cr.check({ messages = msgs, speculative = { max = 2, min_p = 0.5 } }) == true,
+	    "request: speculative takes max and min_p")
+	ok(not cr.check({ messages = msgs, speculative = { max = 1.5 } }) and
+	    not cr.check({ messages = msgs, speculative = { min_p = 2 } }) and
+	    not cr.check({ messages = msgs, speculative = { other = 1 } }), "request: bad speculative objects fail")
 	local metrics = require("lgml.server.metrics")
 	metrics.reset()
 	metrics.chat("m", { prompt_n = 1, predicted_n = 9, draft_n = 8, draft_accepted = 6 })

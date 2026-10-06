@@ -231,6 +231,26 @@ local function never()
 	return false
 end
 
+-- speculative: a boolean, or an object of max and min_p.
+local function spec_value(v)
+	if type(v) == "boolean" then
+		return true
+	end
+	if not is_object(v) then
+		return false
+	end
+	for k, x in pairs(v) do
+		if k == "max" then
+			if not int_in(0, 64)(x) then
+				return false
+			end
+		elseif k ~= "min_p" or type(x) ~= "number" or x < 0 or x > 1 then
+			return false
+		end
+	end
+	return true
+end
+
 -- metadata: at most 16 string values; keys of at most 64 bytes, values
 -- of at most 512 bytes.
 local function metadata(v)
@@ -499,7 +519,9 @@ M.FIELDS = {
 	{ "lora", "table", is_list, "an array of { id, scale }", status = "supported", label = "llama.cpp" },
 	{ "reasoning_budget_tokens", "number", int_in(1), "a positive integer", status = "supported",
 	    label = "lgml" },
-	{ "speculative", "boolean", status = "supported", label = "lgml" },
+	{ "speculative", "boolean|table", spec_value,
+	    "a boolean, or an object of max (an integer 0 to 64) and min_p (a number 0 to 1)",
+	    status = "supported", label = "lgml" },
 	{ "diffusion", "table", is_object, "an object", status = "supported", label = "lgml" },
 }
 

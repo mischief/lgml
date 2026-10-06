@@ -277,6 +277,16 @@ for _, slots in ipairs({ 1, 2 }) do
 		ok(plain.res and sp.res and #sp.out > 0 and sp.out == plain.out and (e.spec_drafted or 0) > d0,
 		    tag .. "greedy reply equals plain decoding")
 	end
+	if slots == 1 then
+		-- A request object tunes the head with no reload.
+		local plain = chat(e, req_of(e, REPEAT, { speculative = false }))
+		local d0 = e.spec_drafted or 0
+		local one = chat(e, req_of(e, REPEAT, { speculative = { max = 1, min_p = 0 } }))
+		local d1 = e.spec_drafted or 0
+		local off = chat(e, req_of(e, REPEAT, { speculative = { max = 0 } }))
+		ok(one.out == plain.out and off.out == plain.out and d1 > d0 and (e.spec_drafted or 0) == d1,
+		    tag .. "a request object sets the draft length; max 0 drafts nothing")
+	end
 end
 os.remove(qpath)
 print("1.." .. n)

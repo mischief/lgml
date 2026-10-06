@@ -275,7 +275,7 @@ usage, the event stream framing and the tool call fragments.
 | `chat_template_kwargs` | llama.cpp | supported | `enable_thinking`, `reasoning_effort` (a string for the template), `preserve_thinking` (false drops old reasoning). |
 | `lora` | llama.cpp | supported | Adapter scales for this request: `[{"id": 0, "scale": 0.5}]`. Adapters that the list does not name get scale 0. Without `lora`, the global scales apply; see [Server properties and adapters](#server-properties-and-adapters). |
 | `reasoning_budget_tokens` | lgml | supported | A positive integer: the most reasoning tokens before the engine ends the reasoning block. See [Reasoning budget](#reasoning-budget). |
-| `speculative` | lgml | supported | `true` or `false` turns speculative decoding on or off for this request. Default: the model's `speculative` setting. See [Speculative decoding](#speculative-decoding). |
+| `speculative` | lgml | supported | `true` or `false` turns speculative decoding on or off for this request; an object of `max` and `min_p` tunes the MTP head. Default: the model's `speculative` setting. See [Speculative decoding](#speculative-decoding). |
 | `diffusion` | lgml | supported | An object of sampler options of a LLaDA-MoE-v2 model: `steps`, `block_length`, `threshold`, `minimal_topk`, `temperature`, `prefix_cache`. See [Diffusion models](#diffusion-models). |
 
 ### Reply fields
@@ -610,13 +610,17 @@ guesses gives k + 1 tokens.
   earlier place in the prompt or the reply and guesses the tokens that
   followed there. It gains most when the reply repeats the prompt, as
   in code edits.
-- A Qwen3.8-Flash-Next model (gguf arch qwen4exp) drafts with its MTP
-  head first: one more layer that guesses up to 3 tokens from the
-  state of the last layer, each guess from the one before. Prompt
-  lookup drafts when the head cannot. The head comes from the model
-  file when it holds the layer, or from an MTP gguf: the model setting
-  `spec_mtp` (`--spec-mtp`). With the head, every pass also runs the
-  MTP layer, so that its cache follows the prompt and the reply.
+- A Qwen3.8-Flash-Next model (gguf arch qwen4exp) or a Qwen3.5 model
+  with an MTP layer (gguf arch qwen35) drafts with its MTP head first:
+  one more layer that guesses tokens from the state of the last layer,
+  each guess from the one before. A guess below the gate probability
+  ends the draft. The model settings `spec_draft` (the most guesses,
+  default the `speculative` count or 3) and `spec_min_p` (the gate,
+  default 0.5) set them. Prompt lookup drafts when the head cannot. A
+  qwen4exp head comes from the model file when it holds the layer, or
+  from an MTP gguf: the model setting `spec_mtp` (`--spec-mtp`). With
+  the head, every pass also runs the MTP layer, so that its cache
+  follows the prompt and the reply.
 - The engine drafts only when it pays. It measures the time of passes
   of each size, and for each request, the part of the guesses that
   stays. It drafts the length (1, 2, 4, 8 or 16 tokens) that gives the
@@ -637,7 +641,15 @@ guesses gives k + 1 tokens.
 
 The model setting `speculative` (config key, or `--spec` for one
 model) turns it on by default: `true`, or a table with `max` (the most
-draft tokens, default 16). A request field `speculative` overrides it.
+draft tokens, default 16). A request field `speculative` overrides it:
+`true` or `false`, or an object with `max` (the most guesses of the MTP
+head, at most the model's count; 0 turns speculation off) and `min_p`
+(the gate). The object tunes the head for one request with no reload:
+
+```json
+{"model": "qwen3.8-27b", "messages": [...], "speculative": {"max": 2, "min_p": 0.5}}
+```
+
 The diffusion engine ignores the field.
 
 ### Log probabilities
