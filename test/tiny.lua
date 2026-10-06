@@ -40,8 +40,8 @@ local function vocab_kv(extra)
 		types[#types + 1] = t[2]
 	end
 	for _, t in ipairs(extra or {}) do
-		tokens[#tokens + 1] = t
-		types[#types + 1] = 1
+		tokens[#tokens + 1] = type(t) == "table" and t[1] or t
+		types[#types + 1] = type(t) == "table" and t[2] or 1
 	end
 	return {
 		{ "tokenizer.ggml.model", gguf.STRING, "gpt2" },
@@ -61,8 +61,10 @@ end
 -- 4, ff = 32, fused = true }, gives each layer routed experts in place
 -- of the dense FFN (arch "qwen3moe"); fused puts gate and up in one
 -- tensor. opts.kv adds { name, type, value } entries. opts.tokens
--- adds normal tokens to the vocab, such as "<tool_call>". Returns the
--- tensors, { name = { shape, values } }.
+-- adds normal tokens to the vocab, such as "<tool_call>", or
+-- { text, token type } pairs. opts.tensors adds f32 tensors
+-- { name, shape, values }. opts.hybrid makes another arch hybrid, as
+-- qwen3next. Returns the tensors, { name = { shape, values } }.
 function M.write(path, arch, opts)
 	opts = opts or {}
 	local r = M.rng(#arch * 7919 + (opts.seed or 0))
@@ -115,7 +117,7 @@ function M.write(path, arch, opts)
 		end
 		add(name, { d }, v)
 	end
-	local hybrid = arch == "qwen3next"
+	local hybrid = arch == "qwen3next" or opts.hybrid == true
 	-- Delta net sizes: 2 key heads, 4 value heads, head size 16.
 	local NK, NV, S, K = 2, 4, 16, 4
 	if hybrid then
@@ -187,6 +189,9 @@ function M.write(path, arch, opts)
 			w(p .. "ffn_up.weight", { F, E })
 			w(p .. "ffn_down.weight", { E, F })
 		end
+	end
+	for _, t in ipairs(opts.tensors or {}) do
+		add(t[1], t[2], t[3])
 	end
 	for _, e in ipairs(opts.kv or {}) do
 		kv[#kv + 1] = e

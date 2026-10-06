@@ -515,6 +515,23 @@ function M.nimble_recipe()
 	return r
 end
 
+--- The prompt formats of models with a decision head (see
+-- `lgml.decide_head`). Read only.
+M.HEADS = { kev = true, clef = true }
+
+--- Returns the recipe of a decision head: kind is `"kev"` or `"clef"`.
+-- The head scores each option once. Only the temperatures of the recipe
+-- apply.
+-- @tparam string kind the head kind
+-- @treturn table the recipe
+function M.head_recipe(kind)
+	assert(M.HEADS[kind], "unknown decision head")
+	local r = M.default_recipe()
+	r.prompt = kind
+	r.permutations.choice = 1
+	return r
+end
+
 local function per_prim(v, name, check)
 	if type(v) == "number" then
 		local t = {}
@@ -547,7 +564,8 @@ local CHECKS = {
 -- `permutations`, `temperature`, `prior_weight`, `bias` and
 -- `temp_k_slope`, each a number or a table by primitive. A table with a
 -- `recipe` field is read as `recipe.json`. `mode` must be `"index"`,
--- `state_last` false and `prompt` `"jevify"` when given.
+-- `state_last` false and `prompt` `"jevify"`, `"nimble"` or a head of
+-- `HEADS` when given.
 -- @tparam table base the base recipe
 -- @tparam[opt] table over the fields to change
 -- @treturn[1] table a new recipe
@@ -574,8 +592,9 @@ function M.recipe(base, over)
 		return nil, "recipe mode must be index"
 	elseif over.state_last ~= nil and over.state_last ~= false then
 		return nil, "recipe state_last must be false"
-	elseif over.prompt ~= nil and over.prompt ~= M.PROMPT_FORMAT and over.prompt ~= "nimble" then
-		return nil, "recipe prompt must be " .. M.PROMPT_FORMAT .. " or nimble"
+	elseif over.prompt ~= nil and over.prompt ~= M.PROMPT_FORMAT and over.prompt ~= "nimble" and
+	    not M.HEADS[over.prompt] then
+		return nil, "recipe prompt must be " .. M.PROMPT_FORMAT .. ", nimble, kev or clef"
 	end
 	if over.prompt ~= nil then
 		r.prompt = over.prompt
@@ -658,6 +677,15 @@ local function temp_for(r, prim, k)
 	end
 	return math.max(t, 0.05)
 end
+
+--- Returns the temperature of a question type with k options: a
+-- temperature set in the request recipe, else the fitted one of the
+-- model file (by option count bucket, then by type), else the recipe's.
+-- @tparam table r the recipe, with `fitted` from `model_temperatures`
+-- @tparam string prim the question type
+-- @tparam int k the option count
+-- @treturn number the temperature
+M.temperature = temp_for
 
 local function softmax(s, t)
 	t = t or 1.0
@@ -1040,6 +1068,9 @@ function M.run(e, req, ctl)
 			e.decide_temps = M.model_temperatures(e.model.meta) or false
 		end
 		recipe.fitted = e.decide_temps or nil
+	end
+	if M.HEADS[recipe.prompt] then
+		return require("lgml.decide_head").run(e, req, ctl, recipe)
 	end
 	local images = req.images or {}
 	local keys, markers

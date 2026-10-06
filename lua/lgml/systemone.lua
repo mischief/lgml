@@ -444,6 +444,9 @@ local function check_question(id, q)
 	if type(q.instructions) == "table" then
 		out.instructions_compact = M.compact(q.instructions)
 	end
+	if is_object(q.criteria) or is_array(q.criteria) then
+		out.criteria_compact = M.compact(q.criteria)
+	end
 	CHECK[kind](q, loc, out)
 	return out
 end
@@ -661,7 +664,10 @@ end
 --   order. A choice has `options`, an array of `{ key, text }`. A score
 --   has `levels`, an array of texts. A noul can have `yes` and `no`,
 --   the texts of `criteria.true` and `criteria.false`. Every text is
---   `describe` of the JSON value.
+--   `describe` of the JSON value. `criteria_compact` is the criteria
+--   as `compact` JSON, with key order, for engines that need the raw
+--   values; `instructions_compact` is that of JSON instructions.
+-- - `state_compact`: the `compact` JSON of a JSON state
 -- - `raw`, `recipe`: the lgml extension object `lgml` of the body
 -- - `images`: the attachments in order, each `{ bytes, mime }`; nil
 --   when there are none

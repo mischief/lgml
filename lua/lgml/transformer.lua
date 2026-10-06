@@ -65,6 +65,8 @@ local family = {
 	qwen3next = { qk_norm = true, rope_ctx = true, hybrid = true, ssm_tile = true },
 	qwen35 = { qk_norm = true, rope_ctx = true, hybrid = true },
 	qwen35moe = { qk_norm = true, rope_ctx = true, hybrid = true },
+	-- Clef: a qwen35 backbone; its decision head is in `lgml.decide_head`.
+	clef = { qk_norm = true, rope_ctx = true, hybrid = true },
 	qwen4exp = { qk_norm = true, rope_ctx = true, hybrid = true, hc = true },
 	gemma4 = { qk_norm = true, gemma = true },
 	["diffusion-gemma"] = { qk_norm = true, gemma = true },
@@ -88,7 +90,7 @@ end
 --- Tell if the transformer handles a gguf architecture.
 -- @tparam string arch the `general.architecture` value
 -- @treturn boolean true for llama, qwen3, qwen3moe, qwen3next, qwen35,
--- qwen35moe, qwen4exp and gemma4
+-- qwen35moe, clef, qwen4exp and gemma4
 function M.supports(arch)
 	return family[arch] ~= nil
 end

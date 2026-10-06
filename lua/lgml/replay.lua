@@ -144,16 +144,24 @@ end
 -- once and its graph lives as long as the returned nodes
 -- @tparam {integer,...} ids the token ids
 -- @tparam table opts the input options
--- @tparam[opt] function finish `finish(g, out, taps)` adds nodes after
--- the forward output and returns the nodes to compute; default the
--- output
+-- @tparam[opt] function finish `finish(g, out, taps, inp)` adds nodes
+-- after the forward output and returns the nodes to compute; default
+-- the output. It can put its own input leaves in inp; `opts.fill(inp)`
+-- then sets them before each compute.
 -- @return the computed nodes
 function M.run(model, cache, ids, opts, finish)
 	finish = finish or function(_, x) return x end
+	local function build(g, inp)
+		local out, taps = model:forward(g, inp)
+		return { finish(g, out, taps, inp) }
+	end
 	if not cache then
 		local inp = model:inputs(ids, nil, opts)
 		local g = model.be:graph()
-		local outs = { finish(g, model:forward(g, inp)) }
+		local outs = build(g, inp)
+		if opts.fill then
+			opts.fill(inp)
+		end
 		if model.before_pass then
 			model:before_pass()
 		end
@@ -186,8 +194,11 @@ function M.run(model, cache, ids, opts, finish)
 		park(cache, r)
 		local inp = model:inputs(ids, cache, opts)
 		local g = model.be:graph()
-		r = { key = key, g = g, inp = inp, outs = { finish(g, model:forward(g, inp)) }, bytes = 0 }
+		r = { key = key, g = g, inp = inp, outs = build(g, inp), bytes = 0 }
 		cache.replay = r
+	end
+	if opts.fill then
+		opts.fill(r.inp)
 	end
 	if model.before_pass then
 		model:before_pass()

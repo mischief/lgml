@@ -29,6 +29,7 @@ local engine_api = require("lgml.server.engine")
 local replay = require("lgml.replay")
 local transformer = require("lgml.transformer")
 local decide = require("lgml.decide")
+local decide_head = require("lgml.decide_head")
 local prompt_cache = require("lgml.prompt_cache")
 local kvpool = require("lgml.kvpool")
 local grammar = require("lgml.grammar")
@@ -345,7 +346,9 @@ end
 -- - `id`: model id (default: the gguf `general.name`, or `"lgml"`)
 -- - `recipe`: a decision recipe for `decide`, from `lgml.decide.recipe`
 --   a recipe file path, or "jevify" (the default) or "nimble" (see
---   `lgml.decide.nimble_recipe`)
+--   `lgml.decide.nimble_recipe`), or "kev" or "clef" for a model with a
+--   decision head (see `lgml.decide_head`). A model file whose metadata
+--   names a kev or clef head takes that recipe by default.
 -- - `cache_ram`: MiB of host RAM for the prompt store and the state
 --   index (default 8192; 0 turns them off, -1 means no limit); see
 --   `lgml.prompt_cache`
@@ -509,8 +512,13 @@ function M.new(opts)
 		reasoning_budget = opts.reasoning_budget_tokens,
 		lazy_tool_grammar = opts.lazy_tool_grammar,
 	}, E)
+	-- A model file with a decision head picks its recipe.
+	local head = decide_head.kind(info.meta)
 	if opts.recipe == "nimble" then
 		e.recipe = decide.nimble_recipe()
+	elseif decide.HEADS[opts.recipe] or (opts.recipe == nil and head) then
+		e.recipe = decide.head_recipe(opts.recipe or head)
+		e.decide_head = decide_head.load(model, e.recipe.prompt)
 	elseif opts.recipe == "jevify" then
 		e.recipe = decide.default_recipe()
 	elseif type(opts.recipe) == "string" then
@@ -1463,9 +1471,10 @@ local MIN_SPLIT = 64
 
 -- replay.run with one more try when the pass does not fit the memory
 -- budget: `relieve` frees what it can first. A prompt chunk that still
--- does not fit runs in two halves; the result is that of the last.
-function E:run_pass(cache, ids, opts)
-	local ok, out = pcall(replay.run, self.model, cache, ids, opts)
+-- does not fit runs in two halves; the result is that of the last. A
+-- pass with a finish (see `lgml.replay.run`) never splits.
+function E:run_pass(cache, ids, opts, finish)
+	local ok, out = pcall(replay.run, self.model, cache, ids, opts, finish)
 	if ok or not budget_mod.is_budget(out) then
 		if not ok then
 			error(out, 0)
@@ -1475,12 +1484,12 @@ function E:run_pass(cache, ids, opts)
 	L:warn("a pass does not fit the memory budget; graphs go and it runs again", "tokens", #ids,
 	    "err", out)
 	self:relieve(cache)
-	ok, out = pcall(replay.run, self.model, cache, ids, opts)
+	ok, out = pcall(replay.run, self.model, cache, ids, opts, finish)
 	-- Smaller chunks need the same cells, so a cache growth stays an error.
 	local cells = not ok and (tostring(out):find("the KV pool from", 1, true) or
 	    tostring(out):find("the KV cache from", 1, true))
 	if ok or not budget_mod.is_budget(out) or cells or #ids < 2 * MIN_SPLIT or opts.embd or
-	    opts.logits == "all" then
+	    opts.logits == "all" or finish then
 		if not ok then
 			error(out, 0)
 		end
