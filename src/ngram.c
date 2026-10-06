@@ -28,6 +28,7 @@
 #include "ngram.h"
 
 #define SPAN_MAX	((size_t)1 << 20)	/* longest merged read */
+#define SPANS_PER_THREAD 6		/* fewest spans that a read thread takes */
 #define BUF_MAX		((size_t)32 << 20)	/* read buffer of one chunk */
 
 struct pair {
@@ -526,9 +527,13 @@ read_all(struct ngram *r, int fd, struct span *sp, size_t n)
 	nt = (size_t)r->threads;
 	if (nt > sizeof(jobs) / sizeof(jobs[0]))
 		nt = sizeof(jobs) / sizeof(jobs[0]);
-	/* Two spans or more for each thread. */
-	if (nt > n / 2)
-		nt = n / 2;
+	/*
+	 * SPANS_PER_THREAD spans or more for each thread: a thread costs
+	 * more to start than a few reads take, so a decode step reads on
+	 * few threads and a long prompt on all of them.
+	 */
+	if (nt > n / SPANS_PER_THREAD)
+		nt = n / SPANS_PER_THREAD;
 	if (nt < 1)
 		nt = 1;
 	per = (n + nt - 1) / nt;
