@@ -675,16 +675,15 @@ end
 local function kev_row(e, h, row, shared, sink)
 	local p, first = row.ids, row.first
 	-- The hidden states of the options must be computed now: keep at
-	-- most the tokens before the first option.
+	-- most the tokens before the first option. The prefill ends after
+	-- its start token, so the shared state can get a checkpoint.
 	local n = e:reuse(table.move(p, 1, first, 1, {}))
 	sink.cached = sink.cached + n
-	if n < first - 1 then
-		local stops = shared > n and shared < first - 1 and { shared } or nil
-		if not e:prefill(table.move(p, 1, first - 1, 1, {}), n + 1, sink, stops) then
-			return nil
-		end
-		sink.computed = sink.computed + first - 1 - n
+	local stops = shared > n and shared < first and { shared } or nil
+	if not e:prefill(table.move(p, 1, first, 1, {}), n + 1, sink, stops) then
+		return nil
 	end
+	sink.computed = sink.computed + first - n
 	local want = {}
 	for k, pos in ipairs(row.ends) do
 		want[pos] = k
@@ -692,7 +691,7 @@ local function kev_row(e, h, row, shared, sink)
 	want[#p] = 0
 	local D = 2 * h.dim
 	local vec = {}
-	local i = first
+	local i = first + 1
 	while i <= #p do
 		local j = math.min(#p, i + e.ubatch - 1)
 		local ids = table.move(p, i, j, 1, {})

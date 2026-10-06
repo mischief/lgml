@@ -1359,6 +1359,8 @@ Each model has a prompt format, set by `--recipe` (config `recipe`):
   Bespoke-Nimble. Use it with a Nimble model. The context and the
   schema of every question go into one JSON user turn, and the answer
   is a code `A..Z`. See [Nimble format](#nimble-format).
+- `kev`, `clef`: the decision head of a Kev or Clef gguf, which picks
+  it by default. See [Decision heads](#decision-heads).
 
 ### Request
 
@@ -1438,7 +1440,7 @@ JSON.
   - `temp_k_slope`: for K > 2 options, the temperature grows by
     `temp_k_slope * log2(K / 2)`. Default 0.
   - `mode` must be `index` and `state_last` must be false, when given.
-    `prompt` is `jevify` or `nimble`.
+    `prompt` is `jevify`, `nimble`, `kev` or `clef`.
 
   A recipe that fails these rules gives 422 with a `detail` list, and
   `loc` is `["body", "lgml", "recipe"]`.
@@ -1495,6 +1497,34 @@ does with the Bespoke-Nimble model:
 
 The questions share the prompt up to the requested field, so they
 share the KV cache and run in batched passes.
+
+### Decision heads
+
+A gguf of a decision model with a head, as llama.cpp converts it,
+takes the recipe of its head by default (`<arch>.decision.type`):
+
+- `kev` (Kev, a pointer head): each question is one row on the shared
+  state: `<|fim_prefix|>` state `<|fim_middle|>` instructions, then
+  `<|box_start|>` option `<|box_end|>` per option, then
+  `<|fim_suffix|>`. A JSON state, instructions or description is
+  flattened to `key: value` lines, as Kev's `render`. Options keep the
+  request order; a noul has `no` then `yes`. The logit of an option is
+  `q . k / sqrt(d)`, from the projection `cls.output` of the normed
+  hidden states of the last token (q) and of the option's `<|box_end|>`
+  (k). The rows reuse the state through the KV cache.
+- `clef` (Clef, a joint schema head): one prompt holds the state and
+  all the questions in request order, as Clef's `encode_record`, with
+  JSON as compact text with sorted keys. Choice options are sorted by
+  name. A transformer head reads the hidden states of all tokens and
+  gives one logit per option. The prompt runs from the start for each
+  request, and is cut to 16384 tokens at the end of the state.
+
+Each question gets a softmax of the logits at the temperature of the
+gguf (1 when it has none); `lgml.recipe.temperature` changes it. The
+answers have Jev's rounding, as above. With `lgml.raw`, an answer has
+`lgml.logits` and `lgml.temperature`; a clef answer also has
+`lgml.keys`, the option order of the logits. `usage.input_tokens`
+counts the prompt tokens and `output_tokens` is 0. Images give 400.
 
 ### System One errors
 
