@@ -47,6 +47,8 @@ if not ggml.found()
     'GGML_BUILD_TESTS' : false,
     'GGML_BUILD_EXAMPLES' : false,
   })
+  # Vendored code: new compiler warnings must not stop the build.
+  ggml_opts.set_override_option('werror', 'false')
   ggml_proj = cmake.subproject('ggml', options : ggml_opts)
   ggml = declare_dependency(dependencies : [
     ggml_proj.dependency('ggml'), ggml_proj.dependency('ggml-base'),

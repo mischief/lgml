@@ -71,7 +71,8 @@ png_format(int c)
 static int
 fail(char *err, const char *msg)
 {
-	snprintf(err, IMAGE_ERRLEN, "%s", msg != NULL && msg[0] != '\0' ? msg : "bad image");
+	snprintf(err, IMAGE_ERRLEN, "%.*s", IMAGE_ERRLEN - 1,
+	    msg != NULL && msg[0] != '\0' ? msg : "bad image");
 	return -1;
 }
 
@@ -327,11 +328,12 @@ jpeg_encode(const struct image *im, int quality, size_t *outlen)
 	struct jpeg_compress_struct cc;
 	struct jerr e;
 	char err[IMAGE_ERRLEN];
-	unsigned char *out = NULL, *tmp;
+	unsigned char *out = NULL, *line;
 	unsigned long size = 0;
 	size_t c = (size_t)im->c, i, y;
 	/* volatile: read after longjmp. */
 	volatile int oc = im->c <= 2 ? 1 : 3;
+	unsigned char *volatile tmp;
 	JSAMPROW row;
 
 	if (im->p == NULL || im->c < 1 || im->c > 4 || quality < 1 || quality > 100)
@@ -357,12 +359,13 @@ jpeg_encode(const struct image *im, int quality, size_t *outlen)
 	jpeg_set_defaults(&cc);
 	jpeg_set_quality(&cc, quality, TRUE);
 	jpeg_start_compress(&cc, TRUE);
+	line = tmp;
 	for (y = 0; y < (size_t)im->h; y++) {
 		row = im->p + y * (size_t)im->w * c;
 		if (c != (size_t)oc) {
 			for (i = 0; i < (size_t)im->w * (size_t)oc; i++)
-				tmp[i] = row[i / (size_t)oc * c + i % (size_t)oc];
-			row = tmp;
+				line[i] = row[i / (size_t)oc * c + i % (size_t)oc];
+			row = line;
 		}
 		jpeg_write_scanlines(&cc, &row, 1);
 	}
