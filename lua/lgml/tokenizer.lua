@@ -55,9 +55,12 @@ end
 -- @param tk the C tokenizer object
 -- @tparam[opt] table opts options
 -- opts.special: false drops control and unknown tokens (default true)
+-- opts.keep: control token pieces to keep with special false, as a set,
+-- such as the tool call tags of a chat family
 -- @treturn Decoder a new decoder
 function M.decoder(tk, opts)
 	local special = not (opts and opts.special == false)
+	local keep = opts and opts.keep or {}
 	local pending = ""
 	local d = {}
 
@@ -71,7 +74,7 @@ function M.decoder(tk, opts)
 	function d.push(_, id)
 		local piece, kind = tk:token(id)
 		if kind == "unused" or (not special and
-		    (kind == "control" or kind == "unknown")) then
+		    (kind == "control" or kind == "unknown") and not keep[piece]) then
 			return ""
 		end
 		pending = pending .. piece

@@ -235,7 +235,7 @@ function E:run(req, sink, so)
 	local seed = math.tointeger(req.seed) or self.seed or math.random(0, 0x7fffffff)
 	local out = output.new(sink, self.family.new_parser({ tools = req.tools or {} }),
 	    { stop = req.stop, one_call = req.parallel_tool_calls == false })
-	local dec = tokenizer.decoder(self.tk, { special = false })
+	local dec = tokenizer.decoder(self.tk, { special = false, keep = self.family.preserved })
 
 	local t0 = lgml.clock()
 	local prefix = table.move(prompt, 1, #prompt, 1, {})

@@ -343,6 +343,19 @@ if qwen then
 	end
 	parts[#parts + 1] = dec:flush()
 	ok(whole and table.concat(parts) == emoji, "streaming decoder")
+
+	-- Without special tokens, keep still renders the listed control tokens.
+	local function decoded(opts)
+		local d = require("lgml.tokenizer").decoder(tk, opts)
+		local s = {}
+		for _, id in ipairs(tk:encode("<|im_start|>hi<|im_end|>")) do
+			s[#s + 1] = d:push(id)
+		end
+		return table.concat(s) .. d:flush()
+	end
+	ok(decoded({ special = false }) == "hi" and
+	    decoded({ special = false, keep = { ["<|im_start|>"] = true } }) == "<|im_start|>hi",
+	    "decoder keeps the listed control tokens")
 end
 
 -- Special tokens of the Gemma-4 vocab. Ids are from llama.cpp.

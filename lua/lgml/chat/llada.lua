@@ -7,6 +7,10 @@ local tojson = require("lgml.chat.tojson")
 
 local M = {}
 
+--- Control tokens that replies keep as text: the tool call tags are
+-- special tokens in this vocab, and the parser needs them.
+M.preserved = { ["<tool_call>"] = true, ["</tool_call>"] = true }
+
 local TOOLS_HEAD = "# Tools\n\nYou may call one or more functions to assist with "
 	.. "the user query.\n\nYou are provided with function signatures within "
 	.. "<tools></tools> XML tags:\n<tools>"
