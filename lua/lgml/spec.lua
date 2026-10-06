@@ -95,6 +95,11 @@ end
 local Mtp = {}
 Mtp.__index = Mtp
 
+--- The default draft gate of the MTP head: 0.5. On Qwen3.8-Flash-Next
+-- with sampling and thinking, ungated drafts made decode slower than no
+-- drafts; this gate made it about 20% faster than no drafts.
+M.MTP_MIN_P = 0.5
+
 --- An MTP drafter: the model's own draft head (see
 -- `lgml.qwen4exp.mtp_draft`), then prompt lookup when the head cannot
 -- draft. The head takes the state of the trunk at the row that gave
@@ -103,11 +108,13 @@ Mtp.__index = Mtp
 -- @param model the model, with mtp
 -- @tparam[opt] table opts `max` (the most guesses of the head, default
 -- 3), `min_p` (a guess whose probability is below it ends the draft;
--- default 0), `flash_attn`, and the options of `lookup`
+-- default `MTP_MIN_P`, 0 drafts all), `flash_attn`, and the options of
+-- `lookup`
 -- @treturn table the drafter
 function M.mtp(model, opts)
 	opts = opts or {}
-	return setmetatable({ model = model, max = opts.max or 3, min_p = opts.min_p, flash = opts.flash_attn,
+	return setmetatable({ model = model, max = opts.max or 3, min_p = opts.min_p or M.MTP_MIN_P,
+		flash = opts.flash_attn,
 		lookup = M.lookup(opts), hidden = true, drafted = 0, used = 0 }, Mtp)
 end
 

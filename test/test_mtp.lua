@@ -188,8 +188,9 @@ end
 local REPEAT = ("the cat sat on the mat and the dog sat on the log "):rep(4)
 for _, slots in ipairs({ 1, 2 }) do
 	local tag = ("engine, %d slot%s: "):format(slots, slots > 1 and "s" or "")
+	-- The random head is unsure of its guesses: min_p 0 keeps them.
 	local e = engine.new({ model = path, backend = "CPU", n_ctx = 2048, slots = slots, kv_initial = 256,
-		flash_attn = false, speculative = { max = 3, adaptive = false } })
+		flash_attn = false, speculative = { max = 3, adaptive = false, min_p = 0 } })
 	ok(e.model.mtp ~= nil, tag .. "speculation loads the MTP layer")
 	local plain = chat(e, req_of(e, REPEAT, { speculative = false }))
 	local d0, a0 = e.spec_drafted or 0, e.spec_accepted or 0
@@ -207,13 +208,22 @@ for _, slots in ipairs({ 1, 2 }) do
 		flash_attn = false, cache_ram = 0 })
 	local b = chat(fresh, req_of(fresh, nil, { messages = turn2 }))
 	ok(a.res and a.out == b.out, tag .. "the next turn equals a cold engine")
+	-- The default gate drops the unsure guesses of the random head; the
+	-- reply stays that of plain decoding.
+	if slots == 1 then
+		local g = engine.new({ model = path, backend = "CPU", n_ctx = 2048, slots = 1, kv_initial = 256,
+			flash_attn = false, speculative = { max = 3, adaptive = false } })
+		local gp = chat(g, req_of(g, REPEAT, { speculative = true }))
+		ok(gp.res and gp.out == plain.out and (g.spec_drafted or 0) < drafted,
+		    ("%sthe default gate drops unsure guesses (%d drafted)"):format(tag, g.spec_drafted or 0))
+	end
 end
 
 -- 3. The head drafts after a rejection too: the redo tokens run with
 -- the trunk rows of the pass that the state lost.
 do
 	local e = engine.new({ model = path, backend = "CPU", n_ctx = 2048, slots = 1, kv_initial = 256,
-		flash_attn = false, speculative = { max = 3, adaptive = false } })
+		flash_attn = false, speculative = { max = 3, adaptive = false, min_p = 0 } })
 	local used, made = 0, nil
 	local mk = e.spec_opts.drafter
 	e.spec_opts.drafter = function(req)
