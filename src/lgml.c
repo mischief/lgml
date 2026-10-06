@@ -3935,6 +3935,7 @@ luaopen_lgml(lua_State *L)
 	lgml_open_sample(L);
 	lgml_open_tokenize(L);
 	lgml_open_safetensors(L);
+	lgml_open_quant(L);
 	lgml_open_audio(L);
 	lgml_open_image(L);
 	lgml_open_sha256(L);

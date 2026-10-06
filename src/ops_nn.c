@@ -651,49 +651,6 @@ op_expand(lua_State *L)
  * @section end
  */
 
-/*** Quantize f32 values with the ggml reference quantizer.
- * @tparam string type ggml type name; types that need an importance
- * matrix do not work
- * @tparam string data f32 values as raw bytes
- * @tparam[opt] int n_per_row values in each row; the default is all values
- * @treturn string quantized bytes
- * @raise if the type is not supported, or `n_per_row` does not divide the
- * values or is not a multiple of the block size
- * @function quantize
- */
-static int
-l_quantize(lua_State *L)
-{
-	const char *name = luaL_checkstring(L, 1);
-	size_t len, size;
-	const char *src = luaL_checklstring(L, 2, &len);
-	int64_t n = (int64_t)(len / sizeof(float));
-	lua_Integer per = luaL_optinteger(L, 3, n);
-	enum ggml_type type = GGML_TYPE_COUNT;
-	luaL_Buffer lb;
-	float *f;
-	int i;
-
-	for (i = 0; i < GGML_TYPE_COUNT; i++)
-		if (ggml_type_name((enum ggml_type)i) != NULL &&
-		    strcmp(ggml_type_name((enum ggml_type)i), name) == 0)
-			type = (enum ggml_type)i;
-	if (type == GGML_TYPE_COUNT || ggml_quantize_requires_imatrix(type))
-		return luaL_error(L, "quantize: unsupported type '%s'", name);
-	luaL_argcheck(L, len % sizeof(float) == 0 && n > 0, 2, "need f32 values");
-	luaL_argcheck(L, per >= 1 && n % per == 0 && per % ggml_blck_size(type) == 0, 3,
-	    "n_per_row must divide the values and be a multiple of the block size");
-	f = malloc(len);
-	if (f == NULL)
-		return luaL_error(L, "out of memory");
-	memcpy(f, src, len);
-	size = ggml_row_size(type, per) * (size_t)(n / per);
-	ggml_quantize_chunk(type, f, luaL_buffinitsize(L, &lb, size), 0, n / per, per, NULL);
-	free(f);
-	luaL_pushresultsize(&lb, size);
-	return 1;
-}
-
 /***
  * Multiply rows by a Walsh-Hadamard matrix. rot is the f32 (n, n)
  * matrix from `tensor:fill("hadamard")` and x is f32 (rows, n). The op
@@ -765,6 +722,4 @@ void
 lgml_open_ops_nn(lua_State *L)
 {
 	lgml_graph_ops(L, ops);
-	lua_pushcfunction(L, l_quantize);
-	lua_setfield(L, -2, "quantize");
 }

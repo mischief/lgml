@@ -110,6 +110,7 @@ void		 lgml_tensor_methods(lua_State *, const luaL_Reg *);
 void		 lgml_open_sample(lua_State *);
 void		 lgml_open_tokenize(lua_State *);
 void		 lgml_open_safetensors(lua_State *);
+void		 lgml_open_quant(lua_State *);
 void		 lgml_open_audio(lua_State *);
 void		 lgml_open_image(lua_State *);
 void		 lgml_open_sha256(lua_State *);

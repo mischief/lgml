@@ -747,6 +747,7 @@ src_gguf(struct tok_src *s, struct gguf_context *c, const char *def_model,
 	s->unk = meta_int(c, "tokenizer.ggml.unknown_token_id", -1);
 	s->eot = meta_int(c, "tokenizer.ggml.eot_token_id", -1);
 	s->add_bos = meta_int(c, "tokenizer.ggml.add_bos_token", 0) != 0;
+	s->nfc = meta_int(c, "tokenizer.ggml.normalizer.nfc", 0) != 0;
 	return NULL;
 }
 
@@ -835,10 +836,61 @@ template_id(lua_State *L, int root, int added, int last)
 	return id;
 }
 
+/* The gguf pre-tokenizer names of known tokenizer.json Split regexes. */
+static const struct {
+	const char	*regex;
+	const char	*pre;
+} split_pre[] = {
+	{ "'(?i:[sdmt]|ll|ve|re)|[^\\r\\n\\p{L}\\p{N}]?+\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]++"
+	    "[\\r\\n]*|\\s*[\\r\\n]|\\s+(?!\\S)|\\s+", "llada-moe" },
+};
+
+/*
+ * The gguf pre-tokenizer name for the tokenizer.json pre_tokenizer at
+ * idx, or NULL. It is ByteLevel with its GPT-2 regex, or a Sequence of a
+ * known Split regex and ByteLevel without a regex.
+ */
+static const char *
+json_pre(lua_State *L, int idx)
+{
+	const char *ty, *re, *pre = NULL;
+	size_t i;
+
+	if (!lua_istable(L, idx) || (ty = field_str(L, idx, "type")) == NULL)
+		return NULL;
+	if (strcmp(ty, "ByteLevel") == 0)
+		return field_bool(L, idx, "use_regex", 1) &&
+		    !field_bool(L, idx, "add_prefix_space", 0) ? "gpt2" : NULL;
+	if (strcmp(ty, "Sequence") != 0)
+		return NULL;
+	lua_getfield(L, idx, "pretokenizers");
+	if (!lua_istable(L, -1) || lua_rawlen(L, -1) != 2) {
+		lua_pop(L, 1);
+		return NULL;
+	}
+	lua_rawgeti(L, -1, 1);
+	lua_rawgeti(L, -2, 2);
+	if (lua_istable(L, -2) && lua_istable(L, -1) &&
+	    (ty = field_str(L, -2, "type")) != NULL && strcmp(ty, "Split") == 0 &&
+	    (ty = field_str(L, -2, "behavior")) != NULL && strcmp(ty, "Isolated") == 0 &&
+	    !field_bool(L, -2, "invert", 0) &&
+	    (ty = field_str(L, -1, "type")) != NULL && strcmp(ty, "ByteLevel") == 0 &&
+	    !field_bool(L, -1, "use_regex", 1) && !field_bool(L, -1, "add_prefix_space", 0)) {
+		lua_getfield(L, -2, "pattern");
+		re = lua_istable(L, -1) ? field_str(L, -1, "Regex") : NULL;
+		for (i = 0; re != NULL && i < sizeof(split_pre) / sizeof(split_pre[0]); i++)
+			if (strcmp(re, split_pre[i].regex) == 0)
+				pre = split_pre[i].pre;
+		lua_pop(L, 1);
+	}
+	lua_pop(L, 3);
+	return pre;
+}
+
 /*
  * The source from a decoded tokenizer.json at root: a BPE model with
- * the ByteLevel pre-tokenizer, and no normalizer or NFC. The table must
- * stay on the stack while the source is in use.
+ * a pre-tokenizer that json_pre knows, and no normalizer or NFC. The
+ * table must stay on the stack while the source is in use.
  */
 static const char *
 src_json(lua_State *L, int root, struct tok_src *s)
@@ -862,10 +914,9 @@ src_json(lua_State *L, int root, struct tok_src *s)
 		s->nfc = 1;
 	}
 	lua_getfield(L, root, "pre_tokenizer");
-	if (!lua_istable(L, -1) || (str = field_str(L, -1, "type")) == NULL ||
-	    strcmp(str, "ByteLevel") != 0 || !field_bool(L, -1, "use_regex", 1) ||
-	    field_bool(L, -1, "add_prefix_space", 0)) {
-		err = "unsupported pre_tokenizer (need ByteLevel with use_regex and no prefix space)";
+	if ((s->pre = json_pre(L, lua_gettop(L))) == NULL) {
+		err = "unsupported pre_tokenizer (need ByteLevel with use_regex, or a known "
+		    "Split regex then ByteLevel, and no prefix space)";
 		goto done;
 	}
 	lua_getfield(L, root, "model");
@@ -1139,7 +1190,9 @@ tok_load(struct tokenizer *t, const struct tok_src *src)
 	if (t->gemma4)
 		t->max_digits = 0;
 	else if (pre != NULL && (strcmp(pre, "qwen2") == 0 ||
-	    strcmp(pre, "deepseek-r1-qwen") == 0 || strcmp(pre, "qwen35") == 0))
+	    strcmp(pre, "deepseek-r1-qwen") == 0 || strcmp(pre, "qwen35") == 0 ||
+	    strcmp(pre, "bailingmoe") == 0 || strcmp(pre, "bailingmoe2") == 0 ||
+	    strcmp(pre, "llada-moe") == 0))
 		t->max_digits = 1;
 	else if (pre != NULL && (strcmp(pre, "llama-bpe") == 0 ||
 	    strcmp(pre, "llama3") == 0))
@@ -1819,13 +1872,15 @@ read_json_file(lua_State *L, const char *path, size_t *lenp)
 
 /*** Load a BPE tokenizer from gguf metadata or a tokenizer.json.
  * From gguf, it supports the gpt2 model with the gpt2, qwen2,
- * deepseek-r1-qwen, llama-bpe or llama3 pre-tokenizer, and the gemma4
- * model, as llama.cpp does. opts.model and opts.pre stand in for keys
- * the file does not have.
+ * deepseek-r1-qwen, llama-bpe, llama3, bailingmoe, bailingmoe2 or
+ * llada-moe pre-tokenizer, and the gemma4 model, as llama.cpp does.
+ * opts.model and opts.pre stand in for keys the file does not have.
+ * The lgml key `tokenizer.ggml.normalizer.nfc` turns on NFC.
  *
  * A file that starts with `{` is a Hugging Face tokenizer.json. It
  * needs a BPE model without byte fallback, the ByteLevel pre-tokenizer
- * with its GPT-2 regex, and no normalizer or NFC. Added tokens split
+ * with its GPT-2 regex or a known Split regex followed by ByteLevel,
+ * and no normalizer or NFC. Added tokens split
  * first: special ones are control tokens, others user tokens.
  * `lstrip` and `rstrip` take ASCII white space. The first and last
  * special tokens of a TemplateProcessing post-processor are bos and
