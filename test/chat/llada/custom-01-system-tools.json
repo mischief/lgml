@@ -1,0 +1,13 @@
+{
+ "messages": [
+  {"role": "system", "content": "You are helpful."},
+  {"role": "user", "content": "What is the weather?"},
+  {"role": "assistant", "content": "", "tool_calls": [
+   {"type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]},
+  {"role": "tool", "content": "sunny"},
+  {"role": "tool", "content": "warm"},
+  {"role": "system", "content": "Be brief."},
+  {"role": "user", "content": "thanks"}
+ ],
+ "add_generation_prompt": true
+}

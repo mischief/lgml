@@ -10,7 +10,10 @@
 local M = {}
 
 --- Family module names by family name.
-M.families = { qwen3 = "lgml.chat.qwen3", qwen35 = "lgml.chat.qwen35", gemma4 = "lgml.chat.gemma4" }
+M.families = {
+	qwen3 = "lgml.chat.qwen3", qwen35 = "lgml.chat.qwen35", gemma4 = "lgml.chat.gemma4",
+	llada = "lgml.chat.llada",
+}
 
 local GEMMA4_ARCH = { gemma4 = true, ["diffusion-gemma"] = true }
 local QWEN3_ARCH = { qwen3 = true, qwen3moe = true, qwen3next = true, qwen35moe = true }
@@ -21,8 +24,8 @@ end
 
 --- Finds the chat family for gguf metadata.
 -- @tparam table meta the gguf metadata
--- @treturn[1] string the family name: `"qwen3"`, `"qwen35"` or
--- `"gemma4"`
+-- @treturn[1] string the family name: `"qwen3"`, `"qwen35"`,
+-- `"gemma4"` or `"llada"`
 -- @treturn[2] nil
 -- @treturn[2] string an error message
 function M.detect(meta)
@@ -40,6 +43,9 @@ function M.detect(meta)
 	-- llama.cpp picks gemma4 by the template's tool call syntax.
 	if has(tpl, "'<|tool_call>call:'") or (tpl == "" and GEMMA4_ARCH[arch]) then
 		return "gemma4"
+	end
+	if has(tpl, "<role>HUMAN</role>") or (tpl == "" and arch == "llada-moe-v2") then
+		return "llada"
 	end
 	return nil, string.format("chat: no template for architecture %q", tostring(arch))
 end

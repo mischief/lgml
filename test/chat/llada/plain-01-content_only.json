@@ -1,0 +1,14 @@
+{
+ "messages": [
+  {
+    "role": "user",
+    "content": "Hello, please help me with a task."
+  },
+  {
+    "role": "assistant",
+    "content": "Hello! I'm here to help you with your task."
+  }
+]
+,
+ "add_generation_prompt": false
+}

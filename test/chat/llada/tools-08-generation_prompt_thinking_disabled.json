@@ -1,0 +1,11 @@
+{
+ "messages": [
+  {
+    "role": "user",
+    "content": "Hello, please help me with a task."
+  }
+]
+,
+ "tools": [{"type": "function", "function": {"name": "test_function_name", "description": "A test function for debugging", "parameters": {"type": "object", "properties": {"param1": {"type": "string", "description": "First parameter"}, "param2": {"type": "string", "description": "Second parameter"}}, "required": ["param1"]}}}],
+ "add_generation_prompt": true
+}

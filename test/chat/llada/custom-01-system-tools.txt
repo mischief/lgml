@@ -1,0 +1,10 @@
+<role>SYSTEM</role>You are helpful.
+detailed thinking off<|role_end|><role>HUMAN</role>What is the weather?<|role_end|><role>ASSISTANT</role><tool_call>
+{"name": "get_weather", "arguments": {"city": "Paris"}}
+</tool_call><|role_end|><role>OBSERVATION</role>
+<tool_response>
+sunny
+</tool_response>
+<tool_response>
+warm
+</tool_response><|role_end|><role>SYSTEM</role>Be brief.<|role_end|><role>HUMAN</role>thanks<|role_end|><role>ASSISTANT</role>

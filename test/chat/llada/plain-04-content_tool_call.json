@@ -1,0 +1,26 @@
+{
+ "messages": [
+  {
+    "role": "user",
+    "content": "Hello, please help me with a task."
+  },
+  {
+    "role": "assistant",
+    "content": "I'll help you by calling a function.",
+    "tool_calls": [
+      {
+        "type": "function",
+        "function": {
+          "name": "test_function_name",
+          "arguments": {
+            "param1": "value1",
+            "param2": "value2"
+          }
+        }
+      }
+    ]
+  }
+]
+,
+ "add_generation_prompt": false
+}

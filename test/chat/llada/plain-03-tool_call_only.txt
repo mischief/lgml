@@ -1,0 +1,3 @@
+<role>SYSTEM</role>detailed thinking off<|role_end|><role>HUMAN</role>Hello, please help me with a task.<|role_end|><role>ASSISTANT</role><tool_call>
+{"name": "test_function_name", "arguments": {"param1": "value1", "param2": "value2"}}
+</tool_call><|role_end|>

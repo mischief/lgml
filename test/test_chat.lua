@@ -9,6 +9,7 @@ local chat = require("lgml.chat")
 local qwen3 = require("lgml.chat.qwen3")
 local gemma4 = require("lgml.chat.gemma4")
 local qwen35 = require("lgml.chat.qwen35")
+local llada = require("lgml.chat.llada")
 local tojson = require("lgml.chat.tojson")
 local media = require("lgml.chat.media")
 
@@ -200,6 +201,29 @@ local function test_qwen35_fixtures(sub, variant)
 			diff(name, got, want)
 		end
 	end
+end
+
+-- Fixtures in llada/: tools-* and plain-* come from
+-- llama-debug-template-parser on the LLaDA-MoE-v2-Instruct template;
+-- custom-* are written by hand from that template.
+local function test_llada_fixtures()
+	local names = fixtures("chat/llada")
+	ok(#names >= 17, "at least 17 llada fixtures")
+	for _, name in ipairs(names) do
+		local req = decode(slurp(dir .. "/chat/llada/" .. name .. ".json"))
+		local got = llada.render(req.messages, {
+			tools = req.tools, add_generation_prompt = req.add_generation_prompt ~= false,
+		})
+		local want = slurp(dir .. "/chat/llada/" .. name .. ".txt")
+		if not ok(got == want, "llada render " .. name) then
+			diff(name, got, want)
+		end
+	end
+	local tpl = "{{- '<role>SYSTEM</role>' }}{{- '<role>HUMAN</role>' }}"
+	local m, fam = chat.load({ ["general.architecture"] = "llada-moe-v2", ["tokenizer.chat_template"] = tpl })
+	ok(fam == "llada" and m == llada, "llada family from the template")
+	ok(select(2, chat.load({ ["general.architecture"] = "llada-moe-v2" })) == "llada",
+	    "llada family from the arch")
 end
 
 local function test_tojson()
@@ -746,6 +770,7 @@ test_fixtures()
 test_gemma4_fixtures()
 test_qwen35_fixtures("chat/qwen35", nil)
 test_qwen35_fixtures("chat/qwen35/effort", "effort")
+test_llada_fixtures()
 test_parser()
 test_gemma4_parser()
 test_qwen35_parser()

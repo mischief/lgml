@@ -1,0 +1,15 @@
+{
+ "messages": [
+  {
+    "role": "user",
+    "content": "Hello, please help me with a task."
+  },
+  {
+    "role": "assistant",
+    "content": "Hello! I'm here to help you with your task.",
+    "reasoning_content": "The user is greeting me and asking for help. I should respond politely."
+  }
+]
+,
+ "add_generation_prompt": false
+}

@@ -1,0 +1,6 @@
+<role>SYSTEM</role>detailed thinking off<|role_end|><role>HUMAN</role>Hello, please help me with a task.<|role_end|><role>ASSISTANT</role>
+<think>
+The user is greeting me and asking for help. I should respond politely.
+</think>
+
+Hello! I'm here to help you with your task.<|role_end|>
