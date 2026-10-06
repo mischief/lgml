@@ -24,5 +24,6 @@ void		*png_encode(const struct image *, size_t *);
 void		*jpeg_encode(const struct image *, int, size_t *);
 int		 image_resize(const struct image *, int, int, struct image *);
 int		 image_resize_bilinear(const struct image *, int, int, struct image *);
+int		 image_resize_bicubic(const struct image *, int, int, struct image *);
 
 #endif

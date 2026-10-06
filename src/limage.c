@@ -247,10 +247,11 @@ image_jpeg(lua_State *L)
  * The "area" filter is a triangle, widened to average over the area
  * when the image shrinks. The "bilinear" filter is the one of llama.cpp
  * clip: it maps corner pixels to corner pixels, reads 4 pixels, and
- * rounds toward zero.
+ * rounds toward zero. The "bicubic" filter is Pillow's, as llama.cpp mtmd
+ * uses it: separable, a = -0.5, widened when the image shrinks.
  * @tparam int w new width, 1 to 32768
  * @tparam int h new height, 1 to 32768
- * @tparam[opt="area"] string filter "area" or "bilinear"
+ * @tparam[opt="area"] string filter "area", "bilinear" or "bicubic"
  * @treturn image new image
  * @raise if a size is out of range or memory runs out
  * @function image:resize
@@ -258,7 +259,9 @@ image_jpeg(lua_State *L)
 static int
 image_resize_l(lua_State *L)
 {
-	static const char *const filters[] = { "area", "bilinear", NULL };
+	static const char *const filters[] = { "area", "bilinear", "bicubic", NULL };
+	static int (*const fns[])(const struct image *, int, int, struct image *) = {
+		image_resize, image_resize_bilinear, image_resize_bicubic };
 	struct image *im = check_image(L, 1);
 	lua_Integer w = luaL_checkinteger(L, 2), h = luaL_checkinteger(L, 3);
 	int f = luaL_checkoption(L, 4, "area", filters);
@@ -267,8 +270,7 @@ image_resize_l(lua_State *L)
 	luaL_argcheck(L, w >= 1 && w <= IMAGE_MAX_SIDE, 2, "width out of range");
 	luaL_argcheck(L, h >= 1 && h <= IMAGE_MAX_SIDE, 3, "height out of range");
 	r = new_image(L);
-	if ((f == 0 ? image_resize(im, (int)w, (int)h, &tmp) :
-	    image_resize_bilinear(im, (int)w, (int)h, &tmp)) != 0)
+	if (fns[f](im, (int)w, (int)h, &tmp) != 0)
 		return luaL_error(L, "resize: image too large or out of memory");
 	*r = tmp;
 	return 1;

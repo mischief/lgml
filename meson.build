@@ -257,6 +257,9 @@ if lua_bin.found()
   test('vision', lua_bin, args : [files('test/test_vision.lua')],
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
     timeout : 120)
+  test('qwen3vl', lua_bin, args : [files('test/test_qwen3vl.lua')],
+    env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
+    timeout : 120)
 
   # Tests that load large models run one at a time, in the 'model'
   # suite. Each skips when its option is empty. An empty LGML_THREADS

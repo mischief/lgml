@@ -69,13 +69,14 @@ end
 --- Decode an image and give it the size a vision encoder takes.
 -- The image becomes RGB (alpha dropped). With `opts.fixed`, it has
 -- exactly that size; else `smart_size` picks the size. When the size
--- changes, a bilinear resize and `fit` place it on a black canvas.
+-- changes, a resize and `fit` place it on a black canvas.
 -- @tparam string|userdata img file bytes (PNG or JPEG) or an `lgml.image`
 -- @tparam table opts options:
 --
 -- - `align`: the side multiple
 -- - `min_pixels`, `max_pixels`: the pixel count range
 -- - `fixed`: `{ w, h }` for a fixed size (default nil)
+-- - `filter`: the `image:resize` filter (default "bilinear")
 -- @treturn[1] userdata the RGB `lgml.image`
 -- @treturn[2] nil
 -- @treturn[2] string an error message
@@ -99,7 +100,7 @@ function M.prepare(img, opts)
 		return rgb:crop(0, 0, tw, th)
 	end
 	local nw, nh, x, y = M.fit(rgb.width, rgb.height, tw, th)
-	local small <close> = rgb:resize(nw, nh, "bilinear")
+	local small <close> = rgb:resize(nw, nh, opts.filter or "bilinear")
 	return small:place(tw, th, x, y)
 end
 

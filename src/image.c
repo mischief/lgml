@@ -4,6 +4,7 @@
  * the libraries allocate anything, and the libraries check the rest.
  */
 
+#include <math.h>
 #include <setjmp.h>
 #include <stdint.h>
 #include <stdio.h>	/* jpeglib.h needs FILE */
@@ -552,4 +553,139 @@ image_resize_bilinear(const struct image *src, int w, int h, struct image *dst)
 		}
 	}
 	return 0;
+}
+
+/* Pillow's bicubic kernel, a = -0.5. */
+static double
+cubic(double x)
+{
+	const double a = -0.5;
+
+	x = x < 0 ? -x : x;
+	if (x < 1)
+		return ((a + 2) * x - (a + 3)) * x * x + 1;
+	if (x < 2)
+		return (((x - 5) * x + 8) * x - 4) * a;
+	return 0;
+}
+
+#define PIL_BITS	22
+
+/*
+ * Fixed-point taps of Pillow's resample for one axis: first source
+ * index and count of each output, and ksize weights per output.
+ */
+static int
+pil_taps(int in, int out, int **bounds, int32_t **wt, int *ksize)
+{
+	double scale = (double)in / out, fscale = scale < 1 ? 1 : scale;
+	double support = 2 * fscale, center, ww, *pre;
+	int xx, x, xmin, xmax, k;
+
+	k = (int)ceil(support) * 2 + 1;
+	pre = malloc((size_t)out * (size_t)k * sizeof(double));
+	*bounds = malloc((size_t)out * 2 * sizeof(int));
+	*wt = malloc((size_t)out * (size_t)k * sizeof(int32_t));
+	if (pre == NULL || *bounds == NULL || *wt == NULL) {
+		free(pre);
+		free(*bounds);
+		free(*wt);
+		return -1;
+	}
+	for (xx = 0; xx < out; xx++) {
+		center = (xx + 0.5) * scale;
+		ww = 0;
+		xmin = (int)(center - support + 0.5);
+		xmin = xmin < 0 ? 0 : xmin;
+		xmax = (int)(center + support + 0.5);
+		xmax = (xmax > in ? in : xmax) - xmin;
+		for (x = 0; x < xmax; x++) {
+			pre[(size_t)xx * k + x] = cubic((x + xmin - center + 0.5) / fscale);
+			ww += pre[(size_t)xx * k + x];
+		}
+		for (x = 0; x < xmax; x++)
+			if (ww != 0)
+				pre[(size_t)xx * k + x] /= ww;
+		for (; x < k; x++)
+			pre[(size_t)xx * k + x] = 0;
+		(*bounds)[xx * 2] = xmin;
+		(*bounds)[xx * 2 + 1] = xmax;
+	}
+	for (x = 0; x < out * k; x++)
+		(*wt)[x] = (int32_t)(pre[x] * (1 << PIL_BITS) + (pre[x] < 0 ? -0.5 : 0.5));
+	free(pre);
+	*ksize = k;
+	return 0;
+}
+
+static unsigned char
+clip8(int32_t v)
+{
+	v >>= PIL_BITS;
+	return v < 0 ? 0 : v > 255 ? 255 : (unsigned char)v;
+}
+
+/*
+ * Bicubic resize as Pillow and llama.cpp mtmd: separable passes, rows
+ * first, with 22-bit fixed-point weights. An axis that keeps its size
+ * gets no pass.
+ */
+int
+image_resize_bicubic(const struct image *src, int w, int h, struct image *dst)
+{
+	struct image tmp;
+	const struct image *in = src;
+	int *bx = NULL, *by = NULL, kx = 0, ky = 0, x, y, j;
+	int32_t *wx = NULL, *wy = NULL, acc;
+	size_t c = (size_t)src->c, k;
+	const unsigned char *p;
+
+	memset(dst, 0, sizeof(*dst));
+	memset(&tmp, 0, sizeof(tmp));
+	if ((w != src->w && pil_taps(src->w, w, &bx, &wx, &kx) != 0) ||
+	    (h != src->h && pil_taps(src->h, h, &by, &wy, &ky) != 0))
+		goto fail;
+	if (w != src->w) {
+		if (image_alloc(&tmp, w, src->h, src->c) != 0)
+			goto fail;
+		for (y = 0; y < src->h; y++)
+			for (x = 0; x < w; x++)
+				for (k = 0; k < c; k++) {
+					acc = 1 << (PIL_BITS - 1);
+					p = src->p + ((size_t)y * (size_t)src->w + (size_t)bx[x * 2]) * c + k;
+					for (j = 0; j < bx[x * 2 + 1]; j++)
+						acc += p[(size_t)j * c] * wx[(size_t)x * kx + j];
+					tmp.p[((size_t)y * (size_t)w + (size_t)x) * c + k] = clip8(acc);
+				}
+		in = &tmp;
+	}
+	if (image_alloc(dst, w, h, src->c) != 0)
+		goto fail;
+	if (h == src->h) {
+		memcpy(dst->p, in->p, (size_t)w * (size_t)h * c);
+	} else {
+		for (y = 0; y < h; y++)
+			for (x = 0; x < w; x++)
+				for (k = 0; k < c; k++) {
+					acc = 1 << (PIL_BITS - 1);
+					p = in->p + ((size_t)by[y * 2] * (size_t)w + (size_t)x) * c + k;
+					for (j = 0; j < by[y * 2 + 1]; j++)
+						acc += p[(size_t)j * (size_t)w * c] * wy[(size_t)y * ky + j];
+					dst->p[((size_t)y * (size_t)w + (size_t)x) * c + k] = clip8(acc);
+				}
+	}
+	image_free(&tmp);
+	free(bx);
+	free(wx);
+	free(by);
+	free(wy);
+	return 0;
+fail:
+	image_free(&tmp);
+	image_free(dst);
+	free(bx);
+	free(wx);
+	free(by);
+	free(wy);
+	return -1;
 }

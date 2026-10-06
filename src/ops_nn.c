@@ -523,6 +523,38 @@ op_upscale(lua_State *L)
 	    mode == 0 ? GGML_SCALE_MODE_NEAREST : GGML_SCALE_MODE_BILINEAR), a->rank);
 }
 
+/*** Resize the two innermost dimensions to a new size.
+ * "bilinear" with align_corners maps the corner samples to the corner
+ * samples, as torch interpolate(align_corners=True).
+ * @tparam tensor a f32 (N, C, H, W) input
+ * @tparam int h new height, 1 to 2^20
+ * @tparam int w new width, 1 to 2^20
+ * @tparam[opt="bilinear"] string mode "nearest" or "bilinear"
+ * @tparam[opt=false] boolean align_corners align the corners (bilinear only)
+ * @treturn tensor (N, C, h, w) node
+ * @raise if a is not f32 or a size is out of range
+ * @function graph:interpolate
+ */
+static int
+op_interpolate(lua_State *L)
+{
+	static const char *const names[] = { "nearest", "bilinear", NULL };
+	struct graph *g = lgml_check_graph(L, 1);
+	struct tensor *a = lgml_operand(L, g, 2);
+	lua_Integer h = luaL_checkinteger(L, 3), w = luaL_checkinteger(L, 4);
+	int mode = luaL_checkoption(L, 5, "bilinear", names);
+	uint32_t m = mode == 0 ? GGML_SCALE_MODE_NEAREST : GGML_SCALE_MODE_BILINEAR;
+
+	check_f32(L, a->t, "interpolate", "a");
+	luaL_argcheck(L, h >= 1 && h <= (lua_Integer)1 << 20, 3, "height out of range");
+	luaL_argcheck(L, w >= 1 && w <= (lua_Integer)1 << 20, 4, "width out of range");
+	if (lua_toboolean(L, 6) && mode == 1)
+		m |= GGML_SCALE_FLAG_ALIGN_CORNERS;
+	lgml_reserve(L, g, 1);
+	return lgml_push_node(L, g, ggml_interpolate(g->ctx, a->t, (int64_t)w, (int64_t)h,
+	    a->t->ne[2], a->t->ne[3], m), 4);
+}
+
 /*** 2-D convolution, as torch conv2d without bias.
  * stride, pad and dilation apply to both axes. By default the op runs
  * as im2col and a matrix product; its columns hold IC * KH * KW values
@@ -721,6 +753,7 @@ static const luaL_Reg ops[] = {
 	{ "gated_delta_net", op_gated_delta_net },
 	{ "pad", op_pad },
 	{ "upscale", op_upscale },
+	{ "interpolate", op_interpolate },
 	{ "conv2d", op_conv2d },
 	{ "pool2d", op_pool2d },
 	{ "hadamard", op_hadamard },

@@ -103,7 +103,8 @@ end
 -- MoE models add n_expert, n_used, gating and norm_topk. Gemma adds
 -- head_dim_swa, n_rot_swa, rope_base_swa, n_swa, swa, softcap,
 -- n_kv_shared and n_embd_per_layer. Hybrid models add recr, d_conv,
--- head_k, n_k_heads, n_v_heads and head_v.
+-- head_k, n_k_heads, n_v_heads and head_v; with rope sections, also
+-- sections (4 integers) and rope_multi (the rope mode of image tokens).
 -- `layers[i]` describes layer i: recr, swa, D, Hkv, n_rot, base,
 -- freqs (true when rope_freqs applies) and kv_src (the layer whose
 -- cache it reads, or nil).
@@ -192,6 +193,10 @@ function M.config(meta)
 		local sec = k("rope.dimension_sections")
 		if sec then
 			check_sections(a, sec, hp.n_rot)
+			-- Image tokens use them, interleaved as llama.cpp does for
+			-- Qwen3.5.
+			hp.sections = { sec[1] or 0, sec[2] or 0, sec[3] or 0, sec[4] or 0 }
+			hp.rope_multi = "imrope"
 		end
 	end
 	local kv_start = n_layer - (hp.n_kv_shared or 0)
@@ -1423,7 +1428,11 @@ local function fill(hp, inp, cache, ids, opts)
 	if inp.embd then
 		inp.embd:from_host(opts.embd, opts.embd_off or 0, 0, inp.embd:nbytes())
 	end
-	inp.pos:fill_range(n_past)
+	-- After an image, rope positions trail the cells by cache.pos_delta.
+	inp.pos:fill_range(n_past + (cache and cache.pos_delta or 0))
+	if inp.mpos then
+		inp.mpos:set(opts.mpos)
+	end
 	if cache and cache.pool then
 		inp.mask:fill_blocks({ n_past = n_past, block = cache.pool.block, blocks = cache.blocks,
 			lo = inp.lo, causal = inp.causal })
@@ -1476,12 +1485,16 @@ end
 -- use 0 for them there, as llama.cpp does.
 -- opts.embd_off: the byte offset of the first row in opts.embd
 -- (default 0).
+-- opts.deepstack: k deepstack features follow each embd row; layer i
+-- (i <= k) adds feature i to its output (default 0).
+-- opts.mpos: 4 * n section-major rope positions, as of image tokens.
 -- opts.causal: false lets the tokens of this pass see each other both
 -- ways, as llama.cpp does for gemma image tokens (default true).
+-- Text positions start at n_past + `cache.pos_delta` (default 0).
 -- @treturn table fields n, n_past, n_kv, n_attn, n_swa_attn, lo, cache,
--- flash_attn, logits, hidden, pool, causal, and the tensors ids, pos, mask,
--- mask_swa (with sliding layers), rows and rows_swa (with a cache), and
--- embd (with opts.embd)
+-- flash_attn, logits, hidden, pool, causal, deepstack, and the tensors
+-- ids, pos, mask, mask_swa (with sliding layers), rows and rows_swa
+-- (with a cache), embd (with opts.embd) and mpos (with opts.mpos)
 -- @raise when the pass does not fit the cache, or n_past is not where
 -- the recurrent state is
 function M:inputs(ids, cache, opts)
@@ -1501,6 +1514,7 @@ function M:inputs(ids, cache, opts)
 		n = n, n_attn = n_attn, n_swa_attn = n_swa_attn, lo = lo, cache = cache,
 		flash_attn = opts.flash_attn, logits = opts.logits or "all",
 		hidden = opts.hidden, pool = opts.pool, causal = opts.causal ~= false,
+		deepstack = opts.embd and opts.deepstack or 0,
 		ids = be:tensor("i32", { n }, ids),
 		pos = be:tensor("i32", { n }),
 		mask = be:tensor(mt, { n, n_attn }),
@@ -1509,7 +1523,13 @@ function M:inputs(ids, cache, opts)
 		inp.mask_swa = be:tensor(mt, { n, n_swa_attn })
 	end
 	if opts.embd then
-		inp.embd = be:tensor("f32", { n, hp.n_embd })
+		inp.embd = be:tensor("f32", { n, hp.n_embd * (1 + inp.deepstack) })
+	end
+	if opts.mpos then
+		if not hp.sections then
+			error(hp.arch .. ": the model has no rope sections for image positions")
+		end
+		inp.mpos = be:tensor("i32", { 4 * n })
 	end
 	if cache then
 		inp.rows = be:tensor("i64", { n })
@@ -1544,6 +1564,9 @@ function M:replay_key(cache, n, opts)
 	local key = ("%d:%d:%d:%s:%s:%s:%s:%s:%s:%s"):format(n, n_attn, n_swa_attn, tostring(opts.flash_attn),
 	    opts.logits or "all", tostring(opts.hidden), tostring(opts.pool), tostring(opts.embd ~= nil),
 	    tostring(opts.causal ~= false), self.lora_key or "")
+	if opts.mpos or (opts.embd and opts.deepstack) then
+		key = key .. (":m%s.%d"):format(tostring(opts.mpos ~= nil), opts.embd and opts.deepstack or 0)
+	end
 	if cache.pool then
 		key = key .. (":%d@%d.%d"):format(lo, cache.pool.id, cache.pool.gen)
 	end
@@ -1574,13 +1597,17 @@ end
 -- @tparam table L the layer
 -- @param x the layer input (n, n_embd)
 -- @param pos the i32 positions (n)
+-- @param[opt] mpos the i32 multi-section positions (4 * n); they replace pos
 -- @return queries (n, n_head, D)
 -- @return keys (n, Hkv, D), or nil
 -- @return values (n, Hkv, D), or nil
 -- @return the output gate (n, n_head, D), or nil
-function M.qkv(g, hp, L, x, pos)
+function M.qkv(g, hp, L, x, pos, mpos)
 	local eps, n, H, D = hp.eps, x:shape()[1], hp.n_head, L.D
 	local rope = { mode = hp.rope_mode, base = L.base, n_dims = L.n_rot, n_ctx_orig = hp.rope_ctx }
+	if mpos then
+		rope.mode, rope.sections, pos = hp.rope_multi, hp.sections, mpos
+	end
 	local cur = L.attn_norm and g:mul(g:rms_norm(x, eps), L.attn_norm) or x
 	local q, gate, k, v
 	if hp.attn_gate then
@@ -2037,8 +2064,16 @@ function M:forward(g, inp)
 	end
 	local hp, n = self.hp, inp.n
 	local taps, shared = {}, {}
-	local x
-	if inp.embd then
+	local x, ds
+	if inp.embd and inp.deepstack > 0 then
+		-- Each row is [embedding | feature 1 | ... | feature k].
+		local E, f4 = hp.n_embd, lgml.row_size("f32", 1)
+		local st = { E * (1 + inp.deepstack) * f4 }
+		x, ds = g:cont(g:view(inp.embd, { n, E }, st)), {}
+		for i = 1, inp.deepstack do
+			ds[i] = g:view(inp.embd, { n, E }, st, i * E * f4)
+		end
+	elseif inp.embd then
 		x = inp.embd
 	else
 		x = g:get_rows(self.tok_embd, inp.ids)
@@ -2055,7 +2090,7 @@ function M:forward(g, inp)
 			local la = inp.batch and M.linear_attention_batch or linear_attention
 			x = g:add(la(hp, g, inp, L, il, cur, taps, sfx), x)
 		else
-			local q, k, v, gate = M.qkv(g, hp, L, x, inp.pos)
+			local q, k, v, gate = M.qkv(g, hp, L, x, inp.pos, inp.mpos)
 			local o = attention(hp, g, inp, il, L, q, k, v, shared)
 			x = M.attn_out(g, hp, L, o, gate, x)
 		end
@@ -2069,6 +2104,9 @@ function M:forward(g, inp)
 		end
 		if L.out_scale then
 			x = g:mul(x, L.out_scale)
+		end
+		if ds and ds[il] then
+			x = g:add(x, ds[il])
 		end
 		taps["l_out" .. sfx] = x
 		if il == inp.hidden then
@@ -2172,7 +2210,7 @@ local function fill_batch(hp, inp, ids)
 		local c, n = b.cache, b.n
 		local n_past = c.n_past
 		for j = 1, n do
-			pos[#pos + 1] = n_past + j - 1
+			pos[#pos + 1] = n_past + (c.pos_delta or 0) + j - 1
 		end
 		if c.rs_pos and n_past == 0 then
 			for l in pairs(c.conv) do

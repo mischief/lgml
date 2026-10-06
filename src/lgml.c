@@ -1985,50 +1985,80 @@ optfield(lua_State *L, int idx, const char *k, float def)
 
 /*** Apply rotary position embedding.
  * opts fields: `n_dims` (even, at most `head_dim`; default `head_dim`), mode
- * ("normal" or "neox"), base (10000), scale (1), `n_ctx_orig` (0),
- * `ext_factor` (0), `attn_factor` (1), `beta_fast` (32), `beta_slow` (1).
+ * ("normal", "neox", "mrope", "imrope" or "vision"), base (10000), scale (1),
+ * `n_ctx_orig` (0), `ext_factor` (0), `attn_factor` (1), `beta_fast` (32),
+ * `beta_slow` (1), and `sections` (4 integers, for the multi-section modes).
+ * The multi-section modes take 4 positions per token, section-major: all
+ * first positions, then all second ones, and so on. See `ggml_rope_multi`.
  * @tparam tensor a (tokens, heads, `head_dim`)
- * @tparam tensor pos i32 (tokens) positions
+ * @tparam tensor pos i32 (tokens) positions, or (4 * tokens) for a
+ * multi-section mode
  * @tparam table opts options
  * @tparam[opt] tensor freq f32 frequency factors, at least `n_dims` / 2
  * @treturn tensor node with the shape of a
- * @raise on a bad `n_dims`, pos or freq
+ * @raise on a bad `n_dims`, pos, sections or freq
  * @function graph:rope
  */
 static int
 graph_rope(lua_State *L)
 {
-	static const char *const modes[] = { "normal", "neox", NULL };
-	static const int modev[] = { GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX };
+	static const char *const modes[] = { "normal", "neox", "mrope", "imrope", "vision", NULL };
+	static const int modev[] = { GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX,
+	    GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_IMROPE, GGML_ROPE_TYPE_VISION };
 	struct graph *g = check_graph(L, 1);
 	struct tensor *a = operand(L, g, 2);
 	struct tensor *b = operand(L, g, 3);
 	struct tensor *c = opt_operand(L, g, 5);
 	struct ggml_tensor *r;
-	int n_dims, mode, n_ctx_orig;
+	int n_dims, mode, n_ctx_orig, multi, i, sec[GGML_MROPE_SECTIONS] = { 0 };
+	float base, scale, ext, attn, fast, slow;
 
 	luaL_checktype(L, 4, LUA_TTABLE);
 	lua_getfield(L, 4, "n_dims");
 	n_dims = lua_isnil(L, -1) ? (int)a->t->ne[0] : (int)luaL_checkinteger(L, -1);
 	lua_pop(L, 1);
 	lua_getfield(L, 4, "mode");
-	mode = modev[luaL_checkoption(L, -1, "normal", modes)];
+	i = luaL_checkoption(L, -1, "normal", modes);
+	mode = modev[i];
+	multi = i >= 2;
 	lua_pop(L, 1);
 	lua_getfield(L, 4, "n_ctx_orig");
 	n_ctx_orig = (int)luaL_optinteger(L, -1, 0);
 	lua_pop(L, 1);
+	if (multi) {
+		if (lua_getfield(L, 4, "sections") != LUA_TTABLE)
+			return luaL_error(L, "a multi-section rope needs 4 sections");
+		for (i = 0; i < GGML_MROPE_SECTIONS; i++) {
+			lua_geti(L, -1, i + 1);
+			sec[i] = (int)luaL_optinteger(L, -1, 0);
+			lua_pop(L, 1);
+			if (sec[i] < 0)
+				return luaL_error(L, "sections must not be negative");
+		}
+		lua_pop(L, 1);
+	}
 
 	if (n_dims <= 0 || n_dims > a->t->ne[0] || n_dims % 2 != 0)
 		return luaL_error(L, "n_dims must be even and at most head_dim");
-	if (b->t->type != GGML_TYPE_I32 || !ggml_is_vector(b->t) || a->t->ne[2] != b->t->ne[0])
-		return luaL_error(L, "pos must be i32 with one entry per token");
+	if (b->t->type != GGML_TYPE_I32 || !ggml_is_vector(b->t) ||
+	    a->t->ne[2] * (multi ? GGML_MROPE_SECTIONS : 1) != b->t->ne[0])
+		return luaL_error(L, multi ? "pos must be i32 with 4 entries per token" :
+		    "pos must be i32 with one entry per token");
 	if (c != NULL && (c->t->type != GGML_TYPE_F32 || c->t->ne[0] < n_dims / 2))
 		return luaL_error(L, "freq must be f32 with n_dims / 2 entries");
+	base = optfield(L, 4, "base", 10000.0f);
+	scale = optfield(L, 4, "scale", 1.0f);
+	ext = optfield(L, 4, "ext_factor", 0.0f);
+	attn = optfield(L, 4, "attn_factor", 1.0f);
+	fast = optfield(L, 4, "beta_fast", 32.0f);
+	slow = optfield(L, 4, "beta_slow", 1.0f);
 	reserve(L, g, 1);
-	r = ggml_rope_ext(g->ctx, a->t, b->t, c != NULL ? c->t : NULL, n_dims, mode, n_ctx_orig,
-	    optfield(L, 4, "base", 10000.0f), optfield(L, 4, "scale", 1.0f),
-	    optfield(L, 4, "ext_factor", 0.0f), optfield(L, 4, "attn_factor", 1.0f),
-	    optfield(L, 4, "beta_fast", 32.0f), optfield(L, 4, "beta_slow", 1.0f));
+	if (multi)
+		r = ggml_rope_multi(g->ctx, a->t, b->t, c != NULL ? c->t : NULL, n_dims, sec, mode,
+		    n_ctx_orig, base, scale, ext, attn, fast, slow);
+	else
+		r = ggml_rope_ext(g->ctx, a->t, b->t, c != NULL ? c->t : NULL, n_dims, mode,
+		    n_ctx_orig, base, scale, ext, attn, fast, slow);
 	return push_node(L, g, r, a->rank);
 }
 

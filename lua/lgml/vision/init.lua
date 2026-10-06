@@ -1,14 +1,14 @@
 --- Vision encoders from llama.cpp mmproj gguf files.
 -- `load` picks the module for the projector type. An encoder gives
 -- `prepare(img)`, `tokens(img)` and `encode(img)`; see
--- `lgml.vision.gemma4`.
+-- `lgml.vision.gemma4` and `lgml.vision.qwen3vl`.
 -- @module lgml.vision
 local lgml = require("lgml")
 
 local M = {}
 
 --- Encoder modules by `clip.vision.projector_type`.
-M.projectors = { gemma4v = "lgml.vision.gemma4" }
+M.projectors = { gemma4v = "lgml.vision.gemma4", qwen3vl_merger = "lgml.vision.qwen3vl" }
 
 --- Load a vision encoder.
 -- @param be the lgml backend
