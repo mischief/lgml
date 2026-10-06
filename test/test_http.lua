@@ -324,6 +324,9 @@ local function assemble(events)
 			if c.usage then
 				a.usage = c.usage
 			end
+			if #c.choices == 0 then
+				a.usage_timings = c.timings
+			end
 			local ch = c.choices[1]
 			local d = ch and ch.delta or {}
 			if i == 1 then
@@ -364,6 +367,9 @@ local function test_stream(port)
 	ok(a.finish == "tool_calls" and a.timings, "stream finish and timings")
 	ok(a.usage and a.usage.completion_tokens == 7 and
 	    a.usage.prompt_tokens_details.cached_tokens == 0, "stream usage chunk")
+	ok(a.usage_timings and a.usage_timings.predicted_n == a.timings.predicted_n and
+	    a.usage_timings.predicted_per_second == a.timings.predicted_per_second,
+	    "stream usage chunk has the timings of the finish chunk")
 	ok(a.done_last, "stream ends with [DONE]")
 
 	r = roundtrip(port, request("POST", "/v1/chat/completions",

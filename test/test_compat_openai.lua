@@ -525,6 +525,7 @@ local function check_stream(case, text)
 	local name = case.name
 	ok(framed and list[#list] == "[DONE]", name .. ": data: lines and a final [DONE]")
 	local id, created, finish, role, usage_chunks, null_usage = nil, nil, {}, {}, 0, true
+	local fin_t
 	local c = EX.chunks
 	for i, ev in ipairs(list) do
 		if ev ~= "[DONE]" then
@@ -536,6 +537,8 @@ local function check_stream(case, text)
 				usage_chunks = usage_chunks + 1
 				same_shape(c.usage, ev, name .. ": usage chunk shape")
 				ok(i == #list - 1, name .. ": the usage chunk is the last before [DONE]")
+				ok(json.encode(ev.timings or {}) == json.encode(fin_t or {}),
+				    name .. ": the usage chunk has the timings of the finish chunk")
 			else
 				if case.usage then
 					null_usage = null_usage and ev.usage == json.null
@@ -548,6 +551,7 @@ local function check_stream(case, text)
 					same_shape(c.first, ev, name .. ": first chunk shape")
 				elseif ch.finish_reason ~= json.null then
 					finish[ch.index] = ch.finish_reason
+					fin_t = fin_t or ev.timings
 					same_shape(c.last, ev, name .. ": last chunk shape")
 				elseif ch.delta.content then
 					same_shape(c.content, ev, name .. ": content chunk shape")

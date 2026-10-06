@@ -437,7 +437,9 @@ local function run_chat(eng, res, body, model)
 	if not r.stream then
 		return reply_whole(r)
 	end
-	if r.include_usage and not send(r, chunk(r, {}, { usage = usage_object(r) })) then
+	-- The usage chunk repeats the timings of the finish chunk, for
+	-- clients that read the speed where they read the usage.
+	if r.include_usage and not send(r, chunk(r, {}, { usage = usage_object(r), timings = timings_of(r) })) then
 		res.close = true
 		return
 	end

@@ -672,8 +672,9 @@ one `data:` line with a `chat.completion.chunk` object:
 4. A last choice chunk with `delta: {}`, `finish_reason` and `timings`
    (llama.cpp). With `n` above 1, steps 1 to 4 repeat for each choice,
    with its `index`.
-5. With `stream_options.include_usage`, a chunk with `choices: []` and
-   `usage`. The other chunks then have `usage: null`, as OpenAI sends.
+5. With `stream_options.include_usage`, a chunk with `choices: []`,
+   `usage` and the `timings` of the finish chunk. The other chunks then
+   have `usage: null`, as OpenAI sends.
 6. `data: [DONE]`.
 
 While no bytes go out for 10 seconds, such as while a long prompt
