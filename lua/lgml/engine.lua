@@ -617,14 +617,19 @@ function E:load_vision(opts)
 		error(("%s: image embeddings have %d values; the model takes %d"):format(opts.mmproj,
 		    enc.hp.n_out, self.model.hp.n_embd))
 	end
-	local im = self.family.image
+	if enc.mrope and not self.model.hp.sections then
+		error(("%s: the encoder needs a model with rope sections"):format(opts.mmproj))
+	end
+	local im = self.family.image or enc.image
 	if not im then
 		error(("chat: the %s template has no image tokens"):format(self.family_name))
 	end
-	self.image_id = self.tk:special().tokens[im.token]
+	local sp = self.tk:special().tokens
+	self.image_id = sp[im.token]
 	if not self.image_id then
 		error("tokenizer has no image token " .. im.token)
 	end
+	self.image_tokens = { sp[im.begin], sp[im.finish] }
 	self.vision, self.image_marker = enc, im.begin .. im.token .. im.finish
 	self.embd_store = {}
 end
@@ -1526,6 +1531,67 @@ local function span_start(prompt, n)
 	return n
 end
 
+-- The merged grid of an image key of an M-RoPE encoder, or nil.
+local function key_grid(key)
+	local nx, ny = key:match("/(%d+)x(%d+)$")
+	return tonumber(nx), tonumber(ny)
+end
+
+-- A function of n: the delta of the text rope positions after the first
+-- n entries of prompt. An image of nx * ny entries takes max(nx, ny)
+-- positions, as in llama.cpp mtmd.
+local function pos_deltas(prompt)
+	local ends, d = {}, 0
+	for i, v in ipairs(prompt) do
+		if type(v) == "string" then
+			local key, k = v:match("^(.*):(%d+)$")
+			local nx, ny = key_grid(key)
+			if nx and tonumber(k) == nx * ny then
+				d = d + math.max(nx, ny) - nx * ny
+				ends[#ends + 1] = { i, d }
+			end
+		end
+	end
+	return function(n)
+		local r = 0
+		for _, e in ipairs(ends) do
+			if e[1] > n then
+				break
+			end
+			r = e[2]
+		end
+		return r
+	end
+end
+E.pos_deltas, M.pos_deltas = pos_deltas, pos_deltas
+E.image_key = image_key
+
+--- Pass options for entries i..j of a prompt, all of one image: its
+-- embeddings, and with an M-RoPE encoder, the positions of its entries.
+-- delta is the text position delta before the image.
+-- @treturn table options for `run_pass`, without logits and flash_attn
+function E:image_opts(prompt, i, j, delta)
+	local key, first = prompt[i]:match("^(.*):(%d+)$")
+	first = tonumber(first)
+	local enc = self.vision
+	local k = enc.hp.n_deepstack or 0
+	local o = {
+		embd = self:image_embd(key), deepstack = k > 0 and k or nil, causal = enc.causal == true,
+		embd_off = (first - 1) * lgml.row_size("f32", self.model.hp.n_embd * (1 + k)),
+	}
+	if enc.mrope then
+		-- t is the start; rows and columns count from it.
+		local nx = key_grid(key)
+		local n, p0, m = j - i + 1, i - first + delta, {}
+		for s = 0, n - 1 do
+			local idx = first - 1 + s
+			m[s + 1], m[n + s + 1], m[2 * n + s + 1], m[3 * n + s + 1] = p0, p0 + idx // nx, p0 + idx % nx, 0
+		end
+		o.mpos = m
+	end
+	return o
+end
+
 --- Make the slot for a prompt the active one.
 -- The slot with the longest shared prefix wins. When no slot shares
 -- at least `SLOT_MIN_SHARED` tokens, an empty slot or the least recently
@@ -1981,7 +2047,7 @@ function E:fork_rows(n, prompts, ck, sink)
 					model:grow(c, n)
 					model.copy_block(cache.pool, cache.blocks[j + 1], c.blocks[j + 1], part)
 				end
-				c.n_past = n
+				c.n_past, c.pos_delta = n, cache.pos_delta
 				if ck then
 					model:restore(c, ck)
 				end
@@ -2050,6 +2116,8 @@ function E:prefill_batched(st, req, slot, prompt, from, stops, sink)
 	local logits
 	local i, c = from, 1
 	self:note(sink, slot, "prompt", from - 1, #prompt)
+	-- The prompt has no images: text positions are the cells.
+	slot.cache.pos_delta = nil
 	while i <= #prompt do
 		local j = math.min(#prompt, i + self.ubatch - 1)
 		if stops[c] and stops[c] <= j then
@@ -2112,20 +2180,29 @@ function E:prefill(prompt, from, sink, extra)
 		self:share_state(self.cache, self.tokens, self.pc.ckpts)
 	end
 	self:note(sink, self.slot, "prompt", from - 1, #prompt)
+	local delta = self.vision and self.vision.mrope and pos_deltas(prompt)
 	while i <= #prompt do
 		local j = math.min(#prompt, i + self.ubatch - 1)
 		if stops[c] and stops[c] <= j then
 			j = stops[c]
 		end
 		local key = image_key(prompt[i])
-		local embd
+		local opts = { logits = "last", flash_attn = self.flash_attn }
+		if delta then
+			self.cache.pos_delta = delta(i - 1)
+		end
 		if key then
-			assert(prompt[i] == key .. ":1", "prefill starts inside an image")
+			-- A causal image can run in chunks; others run whole.
+			local causal = self.vision.causal
+			assert(causal or prompt[i] == key .. ":1", "prefill starts inside an image")
+			local last = causal and j or #prompt
 			j = i
-			while j < #prompt and image_key(prompt[j + 1]) == key do
+			while j < last and image_key(prompt[j + 1]) == key do
 				j = j + 1
 			end
-			embd = self:image_embd(key)
+			for k, v in pairs(self:image_opts(prompt, i, j, self.cache.pos_delta or 0)) do
+				opts[k] = v
+			end
 		else
 			for k = i + 1, j do
 				if image_key(prompt[k]) then
@@ -2135,12 +2212,12 @@ function E:prefill(prompt, from, sink, extra)
 			end
 		end
 		local ids = table.move(prompt, i, j, 1, {})
-		if embd then
+		if key then
 			for k = 1, #ids do
 				ids[k] = 0
 			end
 		end
-		logits = self:eval(ids, "last", embd)
+		logits = self:run_pass(self.cache, ids, opts)
 		table.move(prompt, i, j, #self.tokens + 1, self.tokens)
 		self:publish(self.cache, self.tokens)
 		self:note(sink, self.slot, "prompt", j, #prompt)
@@ -2154,6 +2231,9 @@ function E:prefill(prompt, from, sink, extra)
 		if sink:cancelled() then
 			return nil
 		end
+	end
+	if delta then
+		self.cache.pos_delta = delta(#prompt)
 	end
 	return logits
 end
@@ -2352,24 +2432,39 @@ function E:lazy_tool_opts(req, tags, opened)
 	    free_block = tags and { tags[1], tags[2], inside = opened } or nil }
 end
 
+-- The key and prepared image of image bytes, if this request has them.
+function E:find_image(bytes)
+	local base = "img:" .. lgml.sha256(bytes)
+	for key, have in pairs(self.images or {}) do
+		if have.base == base then
+			return key, have
+		end
+	end
+	return base, nil
+end
+
 -- Prepare the images of a request, each `{ bytes }`, for the encoder.
--- Returns their keys in order (`"img:<sha256>"`), or nil and an error
--- message. drop_images frees them.
+-- Returns their keys in order (`"img:<sha256>"`, with `/<nx>x<ny>`, the
+-- merged grid, for an M-RoPE encoder), or nil and an error message.
+-- drop_images frees them.
 function E:prepare_images(images)
 	self.images = self.images or {}
-	local keys = {}
+	local keys, enc = {}, self.vision
 	for k, img in ipairs(images) do
-		local key = "img:" .. lgml.sha256(img.bytes)
-		local have = self.images[key]
+		local key, have = self:find_image(img.bytes)
 		if not have then
-			local prep, err = self.vision:prepare(img.bytes)
+			local prep, err = enc:prepare(img.bytes)
 			if not prep then
 				return nil, ("image %d: %s"):format(k, err)
 			end
-			have = { prep = prep, n = self.vision:tokens(prep) }
+			have = { prep = prep, n = enc:tokens(prep), base = key }
+			if enc.mrope then
+				key = ("%s/%dx%d"):format(key, enc:grid(prep))
+			end
 			self.images[key] = have
 		end
-		if have.n > (self.cache.ubatch or have.n) then
+		-- A causal image can run in several passes.
+		if not enc.causal and have.n > (self.cache.ubatch or have.n) then
 			return nil, ("image %d has %d tokens; a pass takes %d"):format(k, have.n,
 			    self.cache.ubatch)
 		end
@@ -2428,7 +2523,7 @@ function E:shown_prompt(text, images)
 	if #images == 0 then
 		return text
 	end
-	local tok = self.family.image.token
+	local tok = (self.family.image or self.vision.image).token
 	local k = 0
 	return (text:gsub(tok:gsub("%p", "%%%0"), function()
 		k = k + 1
@@ -2436,8 +2531,7 @@ function E:shown_prompt(text, images)
 		if not img then
 			return tok
 		end
-		local key = "img:" .. lgml.sha256(img.bytes)
-		local have = self.images and self.images[key]
+		local key, have = self:find_image(img.bytes)
 		return ("<image %d %s %dB %d tokens>"):format(k, key:sub(1, 12), #img.bytes,
 		    have and have.n or 0)
 	end))

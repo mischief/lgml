@@ -573,8 +573,13 @@ function M.bind(tpl)
 		end,
 		new_parser = M.new_parser,
 		tool_grammar = M.tool_grammar,
+		image = M.image,
 	}
 end
+
+--- The image tokens, as llama.cpp mtmd for Qwen-VL: `begin` and
+-- `finish` go around the soft `token`, one for each image embedding.
+M.image = { begin = "<|vision_start|>", token = "<|image_pad|>", finish = "<|vision_end|>" }
 
 --- Makes an output parser. This is `lgml.chat.qwen35_parser.new_parser`.
 -- @function new_parser

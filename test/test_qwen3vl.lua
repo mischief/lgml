@@ -7,6 +7,7 @@ package.path = here .. "?.lua;" .. package.path
 local lgml = require("lgml")
 local vision = require("lgml.vision")
 local transformer = require("lgml.transformer")
+local engine = require("lgml.engine")
 local gguf = require("gguf")
 local tiny = require("tiny")
 local vtiny = require("mmproj_qwen3vl_tiny")
@@ -321,6 +322,17 @@ do
 	    ("a 5x3 grid matches a plain forward (max diff %.3g)"):format(d))
 	ok(enc:measure() > 0, "measure plans the largest image")
 	os.remove(path)
+end
+
+-- Text rope positions: the image layout of a prompt.
+do
+	local p = { 1, 2, "img:a/3x2:1", "img:a/3x2:2", "img:a/3x2:3", "img:a/3x2:4", "img:a/3x2:5",
+		"img:a/3x2:6", 7, "img:b/1x4:1", "img:b/1x4:2", "img:b/1x4:3", "img:b/1x4:4", 8 }
+	local delta = engine.pos_deltas(p)
+	ok(delta(2) == 0 and delta(5) == 0 and delta(8) == -3 and delta(9) == -3 and delta(13) == -3 and
+	    delta(14) == -3, "an image takes max(nx, ny) positions")
+	local q = { 1, "img:c:1", "img:c:2", 2 }
+	ok(engine.pos_deltas(q)(4) == 0, "images without a grid keep text positions")
 end
 
 -- A tiny qwen35: text passes with and without rope sections, M-RoPE
