@@ -189,7 +189,10 @@ local function maxdiff(ref, got, r0, C)
 	return m
 end
 
+-- detect reads only files named .gguf.
 local path = os.tmpname()
+os.remove(path)
+path = path .. ".gguf"
 local W = tiny.write(path)
 local be = assert(lgml.backend(DEVICE))
 local MASK = tiny.id("<|mask|>")
