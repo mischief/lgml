@@ -94,6 +94,10 @@ return {
 		-- mem = MiB would set the count in place of the measure.
 		{ id = "zimage", model = "/home/you/models/zimage", engine = "lgml.image.engine",
 			backend = "Vulkan0", text_backend = "CPU" },
+		-- A block diffusion chat model. diffusion sets the sampler
+		-- defaults; prefix_cache trades exactness for speed on long prompts.
+		{ id = "llada", model = "/home/you/models/LLaDA-MoE-v2-30B-A3B-Instruct-Q4_K_M.gguf",
+			backend = "Vulkan0", ctx = 8192, diffusion = { prefix_cache = false } },
 		{ id = "orpheus", model = "/home/you/models/orpheus", engine = "lgml.tts.orpheus" },
 		{ id = "qwen3-tts", model = "/home/you/models/qwen3-tts", engine = "lgml.tts.qwen3tts" },
 		-- Models on the CPU do not count against vram.
