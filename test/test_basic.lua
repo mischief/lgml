@@ -114,6 +114,32 @@ for _, d in ipairs(devs) do
 	s:close()
 end
 
+-- Graphs that share a compute buffer run in turn and count it once.
+for _, d in ipairs(devs) do
+	local be <close> = assert(lgml.backend(d.name))
+	local a <close> = be:tensor("f32", { 64, 64 })
+	a:fill("uniform", 0, 1, 1)
+	local base = (lgml.memory()[be:name()] or {}).compute or 0
+	local g1 = be:graph()
+	local g2 = be:graph(nil, g1)
+	local s1 = g1:scale(g1:add(a, a), 3)
+	local s2 = g2:scale(g2:mul(a, a), 0)
+	g1:compute(s1)
+	g2:compute(s2)
+	local one = (lgml.memory()[be:name()] or {}).compute - base
+	g1:compute(s1)
+	local v1 = s1:get()
+	g2:compute(s2)
+	ok(v1[1] == 6 * a:get()[1] and s2:get()[1] == 0 and one == g1:buffer_size() and one == g2:buffer_size(),
+	    d.name .. ": shared graphs run in turn on one buffer")
+	ok(not pcall(be.graph, be, nil, a), d.name .. ": share takes a graph")
+	s1:close()
+	g1:close()
+	s2:close()
+	g2:close()
+	ok(((lgml.memory()[be:name()] or {}).compute or 0) == base, d.name .. ": the shared buffer goes with the graphs")
+end
+
 -- CPU threads: a default from the machine or LGML_THREADS, per backend.
 do
 	local def = lgml.threads()

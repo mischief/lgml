@@ -85,6 +85,37 @@ store_release(struct store *s)
 	backend_release(s->b);
 }
 
+/*
+ * A compute allocator. Graphs that share one share its buffer; last is
+ * the graph that the buffer holds the plan of.
+ */
+struct galloc {
+	ggml_gallocr_t		 ga;
+	int			 refs;
+	struct graph		*last;
+	int			 mem_key;
+	size_t			 mem_bytes;
+};
+
+/* Drop the reference of g to its allocator. */
+static void
+galloc_drop(struct graph *g)
+{
+	struct galloc *a = g->galloc;
+
+	g->galloc = NULL;
+	if (a == NULL)
+		return;
+	if (a->last == g)
+		a->last = NULL;
+	if (--a->refs > 0)
+		return;
+	if (a->mem_bytes > 0)
+		lgml_mem_add(a->mem_key, MEM_COMPUTE, 0, a->mem_bytes);
+	ggml_gallocr_free(a->ga);
+	free(a);
+}
+
 static void
 graph_release(struct graph *g)
 {
@@ -95,8 +126,7 @@ graph_release(struct graph *g)
 	for (i = 0; i < 2; i++)
 		if (g->mem_bytes[i] > 0)
 			lgml_mem_add(g->mem_key[i], MEM_COMPUTE, 0, g->mem_bytes[i]);
-	if (g->galloc != NULL)
-		ggml_gallocr_free(g->galloc);
+	galloc_drop(g);
 	if (g->sched != NULL)
 		ggml_backend_sched_free(g->sched);
 	free(g->saved);
@@ -106,7 +136,6 @@ graph_release(struct graph *g)
 	for (i = 0; i < g->nctx; i++)
 		ggml_free(g->ctxs[i]);
 	free(g->ctxs);
-	g->galloc = NULL;
 	g->ctxs = NULL;
 	g->nctx = 0;
 	g->ctx = NULL;
@@ -1059,7 +1088,13 @@ backend_map(lua_State *L)
  * The graph grows as ops add ggml tensors, up to 1048576 of them. Some
  * ops add more than one. The size is a hint for the first room; a close
  * hint saves a few copies of the graph as it grows.
+ *
+ * Graphs that share a compute buffer run one at a time: each compute
+ * plans again when another graph ran last, and the nodes of the others
+ * lose their data. Mixed graphs do not share.
  * @tparam[opt=16384] int size the first room in ggml tensors, 1 to 1048576
+ * @tparam[opt] graph share a graph of this backend to share the compute
+ * buffer with
  * @treturn graph the graph
  * @function backend:graph
  */
@@ -1068,9 +1103,14 @@ backend_graph(lua_State *L)
 {
 	struct backend *b = check_backend(L, 1);
 	lua_Integer size = luaL_optinteger(L, 2, GRAPH_SIZE);
-	struct graph *g;
+	struct graph *g, *share = NULL;
 
 	luaL_argcheck(L, size >= 1 && size <= GRAPH_MAX, 2, "size out of range");
+	if (!lua_isnoneornil(L, 3)) {
+		share = check_graph(L, 3);
+		luaL_argcheck(L, share->b == b && share->galloc != NULL, 3,
+		    "not a graph of this backend");
+	}
 	g = lua_newuserdatauv(L, sizeof(*g), 2);
 	memset(g, 0, sizeof(*g));
 	g->closed = 1;
@@ -1083,9 +1123,18 @@ backend_graph(lua_State *L)
 	/* From here graph_release frees what exists, on error too. */
 	g->b = b;
 	b->refs++;
-	g->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(b->be));
-	if (g->galloc == NULL)
-		return luaL_error(L, "ggml_gallocr_new failed");
+	if (share != NULL) {
+		g->galloc = share->galloc;
+		g->galloc->refs++;
+	} else {
+		g->galloc = calloc(1, sizeof(*g->galloc));
+		if (g->galloc == NULL)
+			return luaL_error(L, "out of memory");
+		g->galloc->refs = 1;
+		g->galloc->ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(b->be));
+		if (g->galloc->ga == NULL)
+			return luaL_error(L, "ggml_gallocr_new failed");
+	}
 	g->size = size < 64 ? 64 : (int)size;
 	g->gf = lgml_new_cgraph(L, g, g->size, 0);
 	g->ctx = graph_ctx(L, g, (size_t)(size + CTX_SLACK) * ggml_tensor_overhead());
@@ -1246,10 +1295,8 @@ free_compute(struct graph *g)
 	restore_srcs(g);
 	if (g->sched != NULL)
 		ggml_backend_sched_free(g->sched);
-	if (g->galloc != NULL)
-		ggml_gallocr_free(g->galloc);
 	g->sched = NULL;
-	g->galloc = NULL;
+	galloc_drop(g);
 	for (i = 0; i < g->nctx; i++) {
 		for (node = ggml_get_first_tensor(g->ctxs[i]); node != NULL;
 		    node = ggml_get_next_tensor(g->ctxs[i], node)) {
@@ -2410,6 +2457,7 @@ static void
 account_graph(struct graph *g)
 {
 	ggml_backend_buffer_type_t bt[2];
+	struct galloc *a;
 	size_t sz[2] = { 0, 0 };
 	int i;
 
@@ -2419,7 +2467,14 @@ account_graph(struct graph *g)
 		sz[0] = ggml_backend_sched_get_buffer_size(g->sched, g->b->be);
 		sz[1] = ggml_backend_sched_get_buffer_size(g->sched, g->b->cpu->be);
 	} else if (g->galloc != NULL) {
-		sz[0] = ggml_gallocr_get_buffer_size(g->galloc, 0);
+		/* The allocator counts its buffer once for all its graphs. */
+		a = g->galloc;
+		if (a->mem_bytes > 0)
+			lgml_mem_add(a->mem_key, MEM_COMPUTE, 0, a->mem_bytes);
+		a->mem_key = lgml_mem_key(bt[0]);
+		a->mem_bytes = ggml_gallocr_get_buffer_size(a->ga, 0);
+		if (a->mem_bytes > 0)
+			lgml_mem_add(a->mem_key, MEM_COMPUTE, a->mem_bytes, 0);
 	}
 	for (i = 0; i < 2; i++) {
 		if (g->mem_bytes[i] > 0)
@@ -2450,20 +2505,23 @@ graph_compute(lua_State *L)
 	size_t sz[2], cur;
 
 	mark_outputs(L, g);
-	if (g->plan_nodes == ggml_graph_n_nodes(g->gf) && g->plan_tensors == g->ntensors)
+	if (g->plan_nodes == ggml_graph_n_nodes(g->gf) && g->plan_tensors == g->ntensors &&
+	    (g->use_sched || g->galloc->last == g))
 		goto run;
 	clear_plan(L, g);
 	/* The memory guard sees the growth of the buffer before it happens. */
 	if (!g->mixed) {
 		measure_plan(g, sz);
-		cur = ggml_gallocr_get_buffer_size(g->galloc, 0);
+		cur = ggml_gallocr_get_buffer_size(g->galloc->ga, 0);
 		if (sz[0] > cur)
 			lgml_mem_need(L, ggml_backend_get_default_buffer_type(g->b->be), sz[0] - cur,
 			    "a graph");
 	}
 	g->use_sched = g->mixed;
-	if (g->mixed ? plan_sched(g) != 0 : !ggml_gallocr_alloc_graph(g->galloc, g->gf))
+	if (g->mixed ? plan_sched(g) != 0 : !ggml_gallocr_alloc_graph(g->galloc->ga, g->gf))
 		return luaL_error(L, "graph allocation failed");
+	if (!g->mixed)
+		g->galloc->last = g;
 	account_graph(g);
 	g->plan_nodes = ggml_graph_n_nodes(g->gf);
 	g->plan_tensors = g->ntensors;
@@ -2495,7 +2553,7 @@ graph_buffer_size(lua_State *L)
 		    g->b->cpu->be));
 		return 2;
 	}
-	lua_pushinteger(L, (lua_Integer)ggml_gallocr_get_buffer_size(g->galloc, 0));
+	lua_pushinteger(L, (lua_Integer)ggml_gallocr_get_buffer_size(g->galloc->ga, 0));
 	lua_pushinteger(L, 0);
 	return 2;
 }

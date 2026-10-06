@@ -65,7 +65,7 @@ struct graph {
 	int			 ctx_left;	/* tensor slots left in ctx */
 	struct ggml_cgraph	*gf;
 	int			 grads;		/* gf has gradient arrays */
-	ggml_gallocr_t		 galloc;
+	struct galloc		*galloc;	/* can be shared with other graphs */
 	int			 size;		/* node and leaf slots of gf */
 	int			 ntensors;
 	int			 nleaves;	/* leaf operands from other stores */
