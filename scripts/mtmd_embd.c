@@ -70,7 +70,7 @@ main(int argc, char **argv)
 		fprintf(stderr, "%s: load failed\n", argv[2]);
 		return 1;
 	}
-	bw = mtmd_helper_bitmap_init_from_file(ctx, argv[3], false);
+	bw = mtmd_helper_bitmap_init_from_file(ctx, argv[3], false, mtmd_helper_init_opt_default());
 	if (bw.bitmap == NULL) {
 		fprintf(stderr, "%s: decode failed\n", argv[3]);
 		return 1;
@@ -78,7 +78,9 @@ main(int argc, char **argv)
 	if (argc == 6 && save(argv[5], mtmd_bitmap_get_data(bw.bitmap),
 	    mtmd_bitmap_get_n_bytes(bw.bitmap)) != 0)
 		return 1;
+	memset(&text, 0, sizeof(text));
 	text.text = mtmd_default_marker();
+	text.text_len = strlen(text.text);
 	text.add_special = false;
 	text.parse_special = true;
 	bm[0] = bw.bitmap;

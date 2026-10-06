@@ -294,6 +294,10 @@ if lua_bin.found()
   test('vision_model', lua_bin, args : [files('test/test_vision_model.lua')],
     suite : 'model', env : { 'LGML_THREADS' : '' },
     is_parallel : false, timeout : 3600)
+  # LGML_CLEF_VISION, LGML_VISION_IMAGE and the llama.cpp tools come from the environment.
+  test('qwen3vl_model', lua_bin, args : [files('test/test_qwen3vl_model.lua')],
+    suite : 'model', env : { 'LGML_THREADS' : '' },
+    is_parallel : false, timeout : 3600)
   # LGML_ZIMAGE_VAE (ae.safetensors) and optional LGML_VAE_REF come from the environment.
   test('image_model', lua_bin, args : [files('test/test_image_model.lua')],
     suite : 'model', env : { 'LGML_THREADS' : '' },
