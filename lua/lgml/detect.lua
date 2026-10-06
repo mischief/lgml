@@ -107,6 +107,18 @@ local function list(set)
 	return out
 end
 
+-- The gguf metadata of path, or nil. `lgml.gguf` loads the C module
+-- but starts no backend.
+local function gguf_meta(path)
+	if type(path) ~= "string" or not path:match("%.gguf$") then
+		return nil
+	end
+	local ok, info = pcall(function()
+		return require("lgml").gguf(path)
+	end)
+	return ok and info and info.meta or nil
+end
+
 --- Test for a gguf embedding model.
 -- The function reads the gguf metadata with `lgml.gguf`, which loads
 -- the C module but starts no backend.
@@ -114,13 +126,7 @@ end
 -- @treturn boolean true when path is a gguf file whose
 -- `<arch>.pooling_type` is set and not 0 (none)
 function M.is_embedding(path)
-	if type(path) ~= "string" or not path:match("%.gguf$") then
-		return false
-	end
-	local ok, info = pcall(function()
-		return require("lgml").gguf(path)
-	end)
-	local meta = ok and info and info.meta
+	local meta = gguf_meta(path)
 	if not meta then
 		return false
 	end
@@ -128,9 +134,21 @@ function M.is_embedding(path)
 	return v ~= nil and v ~= 0
 end
 
+--- Architectures of block diffusion chat models.
+M.DIFFUSION = { ["diffusion-gemma"] = true, ["llada-moe-v2"] = true }
+
+--- Test for a gguf block diffusion chat model.
+-- @tparam string path the model path
+-- @treturn boolean true when the gguf architecture is in `DIFFUSION`
+function M.is_diffusion(path)
+	local meta = gguf_meta(path)
+	return meta ~= nil and M.DIFFUSION[meta["general.architecture"]] == true
+end
+
 --- The engine module for a model spec with no `engine`.
 -- A Whisper directory or `stt` gives `lgml.stt_engine`, a gguf
--- embedding model `lgml.embed_engine`, and other models `lgml.engine`.
+-- embedding model `lgml.embed_engine`, a block diffusion model
+-- `lgml.diffusion_engine`, and other models `lgml.engine`.
 -- @tparam table spec the model spec: `model` and `stt`
 -- @treturn string the module name
 function M.engine_of(spec)
@@ -138,6 +156,8 @@ function M.engine_of(spec)
 		return "lgml.stt_engine"
 	elseif M.is_embedding(spec.model) then
 		return "lgml.embed_engine"
+	elseif M.is_diffusion(spec.model) then
+		return "lgml.diffusion_engine"
 	end
 	return "lgml.engine"
 end

@@ -500,6 +500,7 @@ M.FIELDS = {
 	{ "reasoning_budget_tokens", "number", int_in(1), "a positive integer", status = "supported",
 	    label = "lgml" },
 	{ "speculative", "boolean", status = "supported", label = "lgml" },
+	{ "diffusion", "table", is_object, "an object", status = "supported", label = "lgml" },
 }
 
 -- Checks the type and the value of field c in b.

@@ -18,7 +18,7 @@ local USAGE = "usage: lgml-worker --fd n (-m model | --fake) [-b backend] [-t th
     "                   [--recipe file] [--cache-ram MiB] [--ctx-checkpoints n]\n" ..
     "                   [--kv-initial n] [--slots n] [--repeat-stop n]\n" ..
     "                   [--reasoning-budget n] [--ubatch n|auto] [--spec n] [--spec-mtp file]\n" ..
-    "                   [--lora file[:scale]]...\n" ..
+    "                   [--lora file[:scale]]... [--diffusion json]\n" ..
     "                   [--mmproj file] [--image-min-tokens n] [--image-max-tokens n]\n" ..
     "                   [--cpu-moe] [--n-cpu-moe n|auto] [--n-gpu-layers n]\n" ..
     "                   [--override-tensor pattern=backend]...\n" ..
@@ -39,7 +39,7 @@ local opts, rest = getopt.parse(arg, "m:b:t:c:", {
 	["recipe="] = false, ["cache-ram="] = false, ["ctx-checkpoints="] = false, ["lora="] = false,
 	["kv-initial="] = false, ["slots="] = false, ["repeat-stop="] = false,
 	["reasoning-budget="] = false, ["ubatch="] = false,
-	["spec="] = false, ["spec-mtp="] = false,
+	["spec="] = false, ["spec-mtp="] = false, ["diffusion="] = false,
 	["mmproj="] = false, ["image-min-tokens="] = false, ["image-max-tokens="] = false,
 	["fake-size="] = false, ["fake-load-ms="] = false, ["fake-delay="] = false,
 	["fake-delta="] = false, ["mem-margin="] = false, ["mem-limit="] = false,
@@ -120,7 +120,14 @@ local function load()
 		})
 	end
 	local kind = require("lgml.detect").engine_of({ model = opts.m, stt = opts.stt })
-	if kind == "lgml.stt_engine" then
+	if kind == "lgml.diffusion_engine" then
+		-- --diffusion is a JSON object of sampler option defaults.
+		local sampler = opts.diffusion and require("lgml.json").decode(opts.diffusion)
+		return require("lgml.diffusion_engine").new({
+			model = opts.m, backend = opts.b, threads = threads, n_ctx = opts.c and tonumber(opts.c),
+			flash_attn = not opts["no-fa"], id = opts.alias, sampler = sampler,
+		})
+	elseif kind == "lgml.stt_engine" then
 		return require("lgml.stt_engine").new({
 			model = opts.m, backend = opts.b, threads = threads, id = opts.alias,
 		})

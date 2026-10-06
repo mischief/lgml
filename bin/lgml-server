@@ -89,6 +89,10 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       moe_cache_zerocopy = true: fixed slots, and the
                       device reads the other experts from pinned host
                       memory over PCIe (needs the lgml ggml patch),
+                      diffusion = sampler defaults of a block diffusion
+                      model such as LLaDA-MoE-v2: { steps, block_length,
+                      threshold (false: scheduled), minimal_topk,
+                      temperature },
                       engine = Lua module with new(opts), such as a TTS engine,
                       modes = list of completion, multimodal, decide,
                       transcription, speech, image_generation, embedding
@@ -322,13 +326,17 @@ local function model_engine(spec, managed)
 	local kind = not spec.engine and detect.engine_of(spec)
 	local stt = kind == "lgml.stt_engine"
 	local embed = kind == "lgml.embed_engine"
+	local diff = kind == "lgml.diffusion_engine"
 	local okm, modes = pcall(detect.modes, spec)
 	if not okm then
 		die(modes)
 	end
 	local lora = adapters(spec)
-	if #lora > 0 and (stt or embed or spec.engine) then
+	if #lora > 0 and (stt or embed or diff or spec.engine) then
 		die("lora needs a chat model")
+	end
+	if spec.diffusion ~= nil and (type(spec.diffusion) ~= "table" or not diff) then
+		die("diffusion needs a table and a block diffusion model")
 	end
 	local imin, imax = spec.image_min_tokens and math.tointeger(tonumber(spec.image_min_tokens)),
 	    spec.image_max_tokens and math.tointeger(tonumber(spec.image_max_tokens))
@@ -347,10 +355,15 @@ local function model_engine(spec, managed)
 	local okp, rules = pcall(require("lgml.placement").rules, spec)
 	if not okp then
 		die(rules)
-	elseif (rules or spec.moe_cache) and (stt or embed or spec.engine) then
+	elseif (rules or spec.moe_cache) and (stt or embed or diff or spec.engine) then
 		die("cpu_moe, n_cpu_moe, n_gpu_layers, override and moe_cache need a chat model")
 	end
-	if spec.inproc and spec.engine then
+	if spec.inproc and diff then
+		return require("lgml.diffusion_engine").new({
+			model = spec.model, backend = spec.backend, threads = threads, n_ctx = n_ctx,
+			flash_attn = spec.flash_attn ~= false, id = spec.id, sampler = spec.diffusion,
+		})
+	elseif spec.inproc and spec.engine then
 		return require(spec.engine).new({
 			model = spec.model, backend = spec.backend, text_backend = spec.text_backend,
 			threads = threads, id = spec.id, n_ctx = n_ctx, max_side = side,
@@ -433,6 +446,9 @@ local function model_engine(spec, managed)
 	end
 	if spec.engine then
 		table.move({ "--engine", spec.engine }, 1, 2, #wargs + 1, wargs)
+	end
+	if spec.diffusion then
+		table.move({ "--diffusion", require("lgml.json").encode(spec.diffusion) }, 1, 2, #wargs + 1, wargs)
 	end
 	local function start(o)
 		return require("lgml.server.remote_engine").new({

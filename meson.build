@@ -246,6 +246,9 @@ if lua_bin.found()
   test('diffusion_gemma', lua_bin, args : [files('test/test_diffusion_gemma.lua')],
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
     timeout : 120)
+  test('llada', lua_bin, args : [files('test/test_llada.lua')],
+    env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
+    timeout : 120)
   test('qwen_moe', lua_bin, args : [files('test/test_qwen_moe.lua')],
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
     timeout : 120)

@@ -276,6 +276,7 @@ usage, the event stream framing and the tool call fragments.
 | `lora` | llama.cpp | supported | Adapter scales for this request: `[{"id": 0, "scale": 0.5}]`. Adapters that the list does not name get scale 0. Without `lora`, the global scales apply; see [Server properties and adapters](#server-properties-and-adapters). |
 | `reasoning_budget_tokens` | lgml | supported | A positive integer: the most reasoning tokens before the engine ends the reasoning block. See [Reasoning budget](#reasoning-budget). |
 | `speculative` | lgml | supported | `true` or `false` turns speculative decoding on or off for this request. Default: the model's `speculative` setting. See [Speculative decoding](#speculative-decoding). |
+| `diffusion` | lgml | supported | An object of sampler options of a LLaDA-MoE-v2 model: `steps`, `block_length`, `threshold`, `minimal_topk`, `temperature`. See [Diffusion models](#diffusion-models). |
 
 ### Reply fields
 
@@ -466,6 +467,23 @@ once, with no sampler chain. It takes `seed`, `max_tokens`,
 `logit_bias`, `logprobs: true`, `response_format` with a schema,
 `json_schema`, `grammar`, `lora`, other `chat_template_kwargs`, and
 `tool_choice` `required` or a named function.
+
+LLaDA-MoE-v2 (gguf architecture `llada-moe-v2`) runs the block sampler
+of its reference. The engine appends `block_length` mask tokens and runs
+the whole sequence at each step, with no KV cache. Each step unmasks
+every masked position whose confidence (the probability of its argmax
+token, rounded to bf16) is at least `threshold`, and at least the
+`minimal_topk` most confident ones. A block takes at most `steps` steps.
+With `threshold: false`, each step unmasks a scheduled count, as
+`get_num_transfer_tokens` of the reference. The reply ends at the first
+`<|role_end|>` or end token. This model also takes `temperature` (Gumbel
+noise on the logits; 0 is argmax) and `diffusion`, an object with any of
+`steps` (default 64), `block_length` (64), `threshold` (1.0),
+`minimal_topk` (1) and `temperature` (0). Bad values give 400; with a
+threshold, `steps * minimal_topk` must be at least `block_length`. The
+model setting `diffusion` (config key) changes the defaults. The timings
+add `blocks_n` (blocks run) and `steps_n` (steps run). The other
+diffusion models give 400 for `diffusion` and `temperature`.
 
 ### Constrained output
 

@@ -1,10 +1,14 @@
---- Chat engine for block diffusion models (DiffusionGemma).
--- It serves `lgml.server.openai`; the interface is in
--- `lgml.server.engine`. Each block of canvas_length tokens is denoised,
--- trimmed at an end token or a loop, streamed to the sink, and appended
--- to the prompt for the next block. One slot. The prompt KV cache keeps
--- the shared prefix across blocks and requests.
+--- Chat engine for block diffusion models (DiffusionGemma, LLaDA-MoE-v2).
+-- It serves `lgml.server.openai` (see `lgml.server.engine`). Each block
+-- is denoised, cut at the model's `trim`, streamed, and appended to the
+-- prompt for the next block. One slot. A model with `kv_cache` keeps
+-- the shared prompt prefix across blocks and requests.
 -- @module lgml.diffusion_engine
+
+-- The model module is `lgml.<general.architecture>`, with `load`,
+-- `trim`, `Model:denoise` and `hp.canvas` (the block length). With
+-- `options` it takes sampler options (see `lgml.llada-moe-v2`).
+-- `END_TOKENS` names more tokens that end a reply.
 local lgml = require("lgml")
 local budget = require("lgml.budget")
 local chat = require("lgml.chat")
@@ -32,9 +36,11 @@ local MAX_LOOP_CUTS = 3
 -- - `family`: a chat family module (default: from the gguf)
 -- - `seed`: the seed when a request has none (default: random)
 -- - `steps`: denoising steps per block
+-- - `sampler`: sampler option defaults, for a model module with
+--   `options` (`steps` above also sets one)
 -- @treturn Engine the engine
 -- @raise when the backend, the model or its tokenizer does not load,
--- or when no chat template fits the model
+-- when no chat template fits the model, or on bad sampler options
 function M.new(opts)
 	local be = assert(lgml.backend(opts.backend, { threads = opts.threads }))
 	local info = assert(lgml.gguf(opts.model))
@@ -42,16 +48,34 @@ function M.new(opts)
 	local model = arch.load(be, opts.model, { flash_attn = opts.flash_attn })
 	local n_ctx = math.min(opts.n_ctx or 4096, model.hp.n_ctx)
 	local e = setmetatable({
-		be = be, model = model, family = opts.family or chat.load(info.meta),
+		be = be, model = model, arch = arch, family = opts.family or chat.load(info.meta),
 		tk = assert(tokenizer.open(opts.model)),
 		n_ctx = n_ctx, canvas = model.hp.canvas, seed = opts.seed, steps = opts.steps,
 		id = opts.id or info.meta["general.name"] or "lgml",
-		cache = model:kv_cache(n_ctx, opts.flash_attn and "f16" or "f32"),
 		busy = false, waiting = {},
 	}, E)
+	if model.kv_cache then
+		e.cache = model:kv_cache(n_ctx, opts.flash_attn and "f16" or "f32")
+	end
+	if arch.options then
+		local def = {}
+		for k, v in pairs(opts.sampler or {}) do
+			def[k] = v
+		end
+		def.steps = def.steps or opts.steps
+		def.block_length = def.block_length or model.hp.canvas
+		e.sampler = assert(arch.options(def))
+	end
 	e.eog = {}
-	for _, id in ipairs(e.tk:special().eog or {}) do
+	local special = e.tk:special()
+	for _, id in ipairs(special.eog or {}) do
 		e.eog[id] = true
+	end
+	for _, name in ipairs(arch.END_TOKENS or {}) do
+		local id = special.tokens and special.tokens[name]
+		if id then
+			e.eog[id] = true
+		end
 	end
 	return e
 end
@@ -105,13 +129,17 @@ local NEUTRAL = {
 	{ "logprobs", false },
 }
 
--- The first field of req that the engine cannot do, or nil.
-local function unsupported(req)
+-- The first field of req that the engine cannot do, or nil. A model
+-- with sampler options takes temperature and diffusion.
+local function unsupported(req, options)
 	for _, f in ipairs(NEUTRAL) do
 		local v = req[f[1]]
-		if v ~= nil and v ~= f[2] then
+		if v ~= nil and v ~= f[2] and not (options and f[1] == "temperature") then
 			return f[1]
 		end
+	end
+	if req.diffusion ~= nil and not options then
+		return "diffusion"
 	end
 	local kw = req.chat_template_kwargs
 	for k in pairs(type(kw) == "table" and kw or {}) do
@@ -149,13 +177,34 @@ function E:chat(req, sink)
 	if type(req.messages) ~= "table" or #req.messages == 0 then
 		return nil, "messages must be a non-empty array", 400
 	end
-	local bad = unsupported(req)
+	local bad = unsupported(req, self.sampler)
 	if bad then
 		return nil, ("%s: a diffusion model does not take it"):format(bad), 400
 	end
+	-- Sampler options: the engine's, then temperature and the fields of
+	-- the request object diffusion.
+	local so
+	if self.sampler then
+		local o = {}
+		for k, v in pairs(self.sampler) do
+			o[k] = v
+		end
+		o.temperature = req.temperature or o.temperature
+		if req.diffusion ~= nil and type(req.diffusion) ~= "table" then
+			return nil, "diffusion must be an object", 400
+		end
+		for k, v in pairs(req.diffusion or {}) do
+			o[k] = v
+		end
+		local err
+		so, err = self.arch.options(o)
+		if not so then
+			return nil, "diffusion: " .. err, 400
+		end
+	end
 	self:acquire()
-	local ok, a, b, c = pcall(self.run, self, req, sink)
-	if not ok then
+	local ok, a, b, c = pcall(self.run, self, req, sink, so)
+	if not ok and self.cache then
 		-- The cache may not match its token list now.
 		self.cache.n, self.cache.tokens = 0, {}
 	end
@@ -166,8 +215,8 @@ function E:chat(req, sink)
 	return a, b, c
 end
 
-function E:run(req, sink)
-	local C = self.canvas
+function E:run(req, sink, so)
+	local C = so and so.block_length or self.canvas
 	local text = self.family.render(req.messages, {
 		tools = req.tools, add_generation_prompt = true, enable_thinking = thinking(req),
 	})
@@ -190,27 +239,32 @@ function E:run(req, sink)
 
 	local t0 = lgml.clock()
 	local prefix = table.move(prompt, 1, #prompt, 1, {})
-	local cached, cancelled = 0, false
-	while cached < self.cache.n and cached < #prompt and
-	    self.cache.tokens[cached + 1] == prompt[cached + 1] do
+	local cached, cancelled, c = 0, false, self.cache
+	while c and cached < c.n and cached < #prompt and c.tokens[cached + 1] == prompt[cached + 1] do
 		cached = cached + 1
 	end
 	if sink.prompt and not sink:prompt(#prompt, cached) then
 		return true
 	end
+	local dopts = {}
+	for k, v in pairs(so or {}) do
+		dopts[k] = v
+	end
+	dopts.seed, dopts.steps = seed, so and so.steps or self.steps
+	dopts.kv_cache, dopts.cache = c ~= nil, c
+	function dopts.on_step()
+		stream.sleep(0)
+		cancelled = sink:cancelled()
+		return not cancelled
+	end
 	local n, cuts, reason, stopped = 0, 0, "length", false
+	local steps, blocks = 0, 0
 	while n < max and #prefix + C <= self.n_ctx do
-		local canvas = self.model:denoise(prefix, {
-			seed = seed, steps = self.steps, kv_cache = true, cache = self.cache,
-			on_step = function()
-				stream.sleep(0)
-				cancelled = sink:cancelled()
-				return not cancelled
-			end,
-		})
+		local canvas, s = self.model:denoise(prefix, dopts)
 		if cancelled then
 			return true
 		end
+		steps, blocks = steps + s, blocks + 1
 		local cut, stop = self.model.trim(canvas, self.eog)
 		cut = math.min(cut, max - n)
 		for i = 1, cut do
@@ -253,6 +307,7 @@ function E:run(req, sink)
 		cache_n = cached, prompt_n = #prompt - cached,
 		predicted_n = n, predicted_ms = (t1 - t0) * 1000,
 		predicted_per_second = n / math.max(t1 - t0, 1e-9),
+		steps_n = steps, blocks_n = blocks,
 	})
 	return true
 end
