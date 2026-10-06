@@ -1707,13 +1707,20 @@ local function experts(g, hp, W, x3, sel, w)
 	return g:mul(g:mul_mat_id(W.down_exps, act, sel), w)
 end
 
--- The sum over the K picks of ex (n, K, E).
+-- The sum over the K picks of ex (n, K, E). The views go into the graph
+-- first, so the adds are adjacent nodes: ggml-vulkan fuses them into
+-- one multi-add dispatch.
 local function sum_picks(g, ex)
 	local n, K, E = table.unpack(ex:shape())
 	local st = ex:strides()
-	local out = g:view(ex, { n, E }, { st[1] })
+	local views = {}
+	for j = 0, K - 1 do
+		views[j] = g:view(ex, { n, E }, { st[1] }, j * st[2])
+		g:expand(views[j])
+	end
+	local out = views[0]
 	for j = 1, K - 1 do
-		out = g:add(out, g:view(ex, { n, E }, { st[1] }, j * st[2]))
+		out = g:add(out, views[j])
 	end
 	if K == 1 then
 		out = g:cont(out)
