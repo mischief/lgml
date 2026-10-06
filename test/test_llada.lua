@@ -427,6 +427,66 @@ do
 	local _ = W2
 end
 
+-- Chunked full passes against one graph. CPU flash attention picks its
+-- kernel by the query count, so with it the chunks hold 64 rows and up.
+-- The logits use the plain model, whose flash attention error is small.
+do
+	local p4, p5 = os.tmpname(), os.tmpname()
+	tiny.write(p4, { out_gain = 30 })
+	tiny.write(p5)
+	local long = {}
+	for i = 1, 200 do
+		long[i] = 60 + (i * 7) % 40
+	end
+	for _, fa in ipairs({ false, true }) do
+		local m = llada.load(be, p5, { flash_attn = fa })
+		local want = m:logits(long, 180, 20, 1000)
+		local tol = fa and TOL_FA or 1e-4
+		for _, ch in ipairs(fa and { 67, 70, 100, 150 } or { 16, 33, 64, 100, 150 }) do
+			local got = m:logits(long, 180, 20, ch)
+			local d, top = 0, true
+			for r = 0, 19 do
+				local a, b, av, bv = 0, 0, -math.huge, -math.huge
+				for j = 1, tiny.n_vocab do
+					local x, y = want[r * tiny.n_vocab + j], got[r * tiny.n_vocab + j]
+					d = math.max(d, math.abs(x - y))
+					if x > av then
+						a, av = j, x
+					end
+					if y > bv then
+						b, bv = j, y
+					end
+				end
+				top = top and a == b
+			end
+			ok(#got == #want and top and d < tol, ("chunked logits match one graph, flash %s, chunk %d (max diff %.2g)")
+			    :format(fa, ch, d))
+		end
+		m:close()
+		m = llada.load(be, p4, { flash_attn = fa })
+		local o = { threshold = 0.9, steps = 8, block_length = 8 }
+		for _, pc in ipairs({ false, true }) do
+			o.prefix_cache = pc
+			o.chunk = 1000
+			local a, as = m:denoise(long, o)
+			m:drop_cache()
+			for _, ch in ipairs({ 64, 70 }) do
+				o.chunk = ch
+				local b, bs = m:denoise(long, o)
+				m:drop_cache()
+				ok(same(a, b) and as == bs, ("chunked denoise matches one graph, flash %s, prefix cache %s, chunk %d")
+				    :format(fa, pc, ch))
+			end
+		end
+		local c1, k1 = m:plan(100)
+		local c2, k2 = m:plan(400, { prefix_cache = true })
+		ok(c1 > 0 and k1 == 0 and c2 > c1 and k2 > 0, ("plan gives compute and cache bytes (%d, %d)"):format(c2, k2))
+		m:close()
+	end
+	os.remove(p4)
+	os.remove(p5)
+end
+
 -- The engine against the README generate loop, with eos early stop on
 -- <|role_end|>. Its output row is a scaled copy of the row of a token
 -- that the model makes in the third block, so it wins there.
@@ -438,6 +498,8 @@ do
 	local e = engine.new({ model = p3, backend = DEVICE, n_ctx = 256, seed = 1,
 		flash_attn = DEVICE ~= "CPU", sampler = { block_length = 8, steps = 8 } })
 	require("lgml.server.engine").check(e)
+	local mem = e:memory()
+	ok(mem.compute > 0 and mem.cache == 0 and e.n_ctx == 256, "the engine plans its compute memory")
 	local r = { text = {} }
 	function r.content(_, t)
 		r.text[#r.text + 1] = t

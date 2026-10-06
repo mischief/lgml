@@ -490,6 +490,15 @@ model setting `diffusion` (config key) changes the defaults. The timings
 add `blocks_n` (blocks run) and `steps_n` (steps run). The other
 diffusion models give 400 for `diffusion` and `temperature`.
 
+A LLaDA-MoE-v2 pass over more than `ubatch` tokens (default 512; see
+[Prompt chunks](#prompt-chunks)) runs layer by layer in chunks of at
+most that many rows. Each chunk attends to the keys and values of all
+rows of its layer, so the result is the same as one pass. Its compute
+memory holds one chunk, plus the residual of all rows (`n_embd` f32
+values per row) and the keys and values of two layers. The worker plans
+the longest pass at the context size at load, and cuts the context
+when the pass does not fit.
+
 ### Constrained output
 
 - `response_format: {"type": "text"}`: no constraint.

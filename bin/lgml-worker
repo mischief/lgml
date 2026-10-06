@@ -126,6 +126,7 @@ local function load()
 		return require("lgml.diffusion_engine").new({
 			model = opts.m, backend = opts.b, threads = threads, n_ctx = opts.c and tonumber(opts.c),
 			flash_attn = not opts["no-fa"], id = opts.alias, sampler = sampler,
+			ubatch = math.tointeger(tonumber(opts.ubatch)),
 		})
 	elseif kind == "lgml.stt_engine" then
 		return require("lgml.stt_engine").new({

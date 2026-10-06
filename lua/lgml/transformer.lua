@@ -1603,11 +1603,13 @@ end
 -- @param x the layer input (n, n_embd)
 -- @param pos the i32 positions (n)
 -- @param[opt] mpos the i32 multi-section positions (4 * n); they replace pos
--- @return queries (n, n_head, D)
+-- @tparam[opt] string part "q" builds the queries and gate alone, "kv"
+-- the keys and values alone (default all)
+-- @return queries (n, n_head, D), or nil
 -- @return keys (n, Hkv, D), or nil
 -- @return values (n, Hkv, D), or nil
 -- @return the output gate (n, n_head, D), or nil
-function M.qkv(g, hp, L, x, pos, mpos)
+function M.qkv(g, hp, L, x, pos, mpos, part)
 	local eps, n, H, D = hp.eps, x:shape()[1], hp.n_head, L.D
 	local rope = { mode = hp.rope_mode, base = L.base, n_dims = L.n_rot, n_ctx_orig = hp.rope_ctx }
 	if mpos then
@@ -1615,21 +1617,21 @@ function M.qkv(g, hp, L, x, pos, mpos)
 	end
 	local cur = L.attn_norm and g:mul(g:rms_norm(x, eps), L.attn_norm) or x
 	local q, gate, k, v
-	if hp.attn_gate then
+	if part ~= "kv" and hp.attn_gate then
 		-- q_proj gives [q | gate] per head.
 		local f4 = lgml.row_size("f32", 1)
 		local qg = mm(g, L, "wq", cur)
 		local st = { H * 2 * D * f4, 2 * D * f4 }
 		q = g:view(qg, { n, H, D }, st)
 		gate = g:view(qg, { n, H, D }, st, D * f4)
-	else
+	elseif part ~= "kv" then
 		q = g:reshape(mm(g, L, "wq", cur), { n, H, D })
 	end
-	if L.q_norm then
+	if q and L.q_norm then
 		q = g:mul(g:rms_norm(q, eps), L.q_norm)
 	end
-	q = g:rope(q, pos, rope, L.freqs)
-	if not L.wk then
+	q = q and g:rope(q, pos, rope, L.freqs)
+	if not L.wk or part == "q" then
 		return q, nil, nil, gate
 	end
 	local kraw = mm(g, L, "wk", cur)

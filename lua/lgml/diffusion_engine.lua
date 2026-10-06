@@ -12,6 +12,7 @@
 local lgml = require("lgml")
 local budget = require("lgml.budget")
 local chat = require("lgml.chat")
+local log = require("lgml.log")
 local tokenizer = require("lgml.tokenizer")
 local stream = require("lgml.server.stream")
 local output = require("lgml.chat.output")
@@ -19,10 +20,14 @@ local output = require("lgml.chat.output")
 local M = {}
 local E = {}
 E.__index = E
+local L = log.new("diffusion")
 
 -- A block cut short by a loop starts the next block at the cut. After
 -- this many such blocks in a row, generation stops.
 local MAX_LOOP_CUTS = 3
+
+-- The least context that `memory` cuts to.
+local MIN_FIT_CTX = 8192
 
 --- Loads a model and makes an engine.
 -- @tparam table opts the options:
@@ -38,6 +43,8 @@ local MAX_LOOP_CUTS = 3
 -- - `steps`: denoising steps per block
 -- - `sampler`: sampler option defaults, for a model module with
 --   `options` (`steps` above also sets one)
+-- - `ubatch`: the most rows of one pass graph, for a model that runs
+--   long passes in chunks (default: the model's)
 -- @treturn Engine the engine
 -- @raise when the backend, the model or its tokenizer does not load,
 -- when no chat template fits the model, or on bad sampler options
@@ -45,7 +52,7 @@ function M.new(opts)
 	local be = assert(lgml.backend(opts.backend, { threads = opts.threads }))
 	local info = assert(lgml.gguf(opts.model))
 	local arch = require("lgml." .. info.meta["general.architecture"])
-	local model = arch.load(be, opts.model, { flash_attn = opts.flash_attn })
+	local model = arch.load(be, opts.model, { flash_attn = opts.flash_attn, chunk = opts.ubatch })
 	local n_ctx = math.min(opts.n_ctx or 4096, model.hp.n_ctx)
 	local e = setmetatable({
 		be = be, model = model, arch = arch, family = opts.family or chat.load(info.meta),
@@ -82,6 +89,40 @@ end
 
 --- A chat engine. It implements `lgml.server.engine.Engine`.
 -- @type Engine
+
+--- The memory plan of the engine, for `lgml.budget.report`.
+-- A model with `plan` plans its largest passes at n_ctx with the
+-- sampler defaults. When they do not fit the memory budget, the context
+-- drops by a quarter, in steps of 256, down to 8192.
+-- @treturn table `{ backend, compute, cache, cache_now }`: the device
+-- bytes of the passes, and of a prefix cache at n_ctx (0 without one)
+function E:memory()
+	local model, so = self.model, self.sampler or {}
+	if not model.plan then
+		return { backend = self.be }
+	end
+	while true do
+		local ok, c, cache = pcall(function()
+			local c, cache = model:plan(self.n_ctx, { block_length = so.block_length, prefix_cache = so.prefix_cache })
+			local fits, err = lgml.memory_check(self.be, c + cache, "the compute buffers")
+			if not fits then
+				error(err, 0)
+			end
+			return c, cache
+		end)
+		if ok then
+			L:info("memory plan", "n_ctx", self.n_ctx, "chunk", model.chunk, "compute_mib", c // 1048576,
+			    "cache_mib", cache // 1048576)
+			return { backend = self.be, compute = c, cache = cache, cache_now = 0 }
+		end
+		local n = self.n_ctx * 3 // 4 // 256 * 256
+		if not budget.is_budget(c) or n < MIN_FIT_CTX then
+			error(c, 0)
+		end
+		L:warn("context cut to fit the memory budget", "n_ctx", n, "from", self.n_ctx)
+		self.n_ctx = n
+	end
+end
 
 --- Lists the one model of the engine.
 -- @treturn {table,...} `{ { id, context_length = n_ctx } }`

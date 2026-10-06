@@ -3,9 +3,12 @@
 -- shared expert and a scale on the routed weights. Attention is not
 -- causal: each position sees every position, so no K or V can be kept
 -- between passes. `denoise` runs the block sampler of the reference
--- README over one block of mask tokens after a prefix.
+-- README over one block of mask tokens after a prefix. A pass over more
+-- rows than a chunk runs layer by layer over chunks of rows, so its
+-- compute memory does not grow with the rows; see `plan`.
 -- @module lgml.llada-moe-v2
 local lgml = require("lgml")
+local kv = require("lgml.kv")
 local transformer = require("lgml.transformer")
 
 local M = {}
@@ -19,6 +22,9 @@ M.DEFAULTS = {
 	prefix_cache = false,
 }
 
+--- The default most rows of one pass graph; longer passes run in chunks.
+M.CHUNK = 512
+
 --- Token names that end a reply, besides the tokenizer end tokens.
 M.END_TOKENS = { "<|role_end|>" }
 
@@ -28,8 +34,8 @@ M.END_TOKENS = { "<|role_end|>" }
 -- `diffusion.block_length`, else 64.
 -- @tparam lgml.backend be the backend that holds the weights
 -- @tparam string path the gguf file
--- @tparam[opt] table opts options: flash_attn, and placement and
--- pinned as for `lgml.transformer.load`
+-- @tparam[opt] table opts options: flash_attn, chunk (default `CHUNK`),
+-- and placement and pinned as for `lgml.transformer.load`
 -- @treturn Model the model
 -- @raise when the file does not load, a tensor is missing, or the
 -- metadata has no mask token
@@ -42,12 +48,13 @@ function M.load(be, path, opts)
 	assert(hp.mask_id, path .. ": no mask token id")
 	hp.canvas = meta["diffusion.block_length"] or M.DEFAULTS.block_length
 	hp.n_ctx = hp.n_ctx or 4096
-	return setmetatable({ be = be, tm = tm, hp = hp, meta = meta, flash_attn = opts.flash_attn }, M)
+	return setmetatable({ be = be, tm = tm, hp = hp, meta = meta, flash_attn = opts.flash_attn,
+		chunk = opts.chunk or M.CHUNK }, M)
 end
 
 --- A loaded model.
 -- Fields: `be`, `tm` (the `lgml.transformer` model), `hp` (its config,
--- with `mask_id` and `canvas`), `meta` and `flash_attn`.
+-- with `mask_id` and `canvas`), `meta`, `flash_attn` and `chunk`.
 -- @type Model
 
 --- Close the weights.
@@ -215,23 +222,152 @@ function M.options(o, def)
 	return r
 end
 
--- The graph of one kind of pass over list, with its inputs and sampling
--- nodes. With a cache, a full pass runs [prefix | block] and keeps every
--- K and V row; else the block runs alone on the cached prefix rows.
-local function pass(self, list, P, C, cache, temp, u)
-	local be, inp = self.be, nil
-	if not cache then
-		inp = self:inputs(P + C, P, C)
-	else
-		local full = #list > C
-		cache.n_past = full and 0 or P
-		inp = self.tm:inputs(list, cache, { flash_attn = self.flash_attn, causal = false, logits = "rows" })
-		inp.logit_rows = be:tensor("i32", { C })
-		inp.logit_rows:fill_range(full and P or 0)
+-- The K and V leaves by layer for a chunked pass of n rows: those of the
+-- cache, or two scratch layers that the layers take in turn. Also the
+-- cache fields that `lgml.kv` reads, and the scratch leaves.
+local function kv_leaves(self, n, cache)
+	if cache then
+		self.tm:grow(cache, n)
+		return cache.k, cache.v, cache, {}
+	end
+	local be, L1 = self.be, self.tm.layers[1]
+	local ty = self.flash_attn and "f16" or "f32"
+	local s, K, V = {}, {}, {}
+	for i = 1, 4 do
+		s[i] = be:tensor(ty, { n, L1.Hkv * L1.D })
+	end
+	for il = 1, #self.tm.layers do
+		K[il], V[il] = s[1 + (il - 1) % 2], s[3 + (il - 1) % 2]
+	end
+	return K, V, { type_k = ty, type_v = ty, be = be }, s
+end
+
+-- A full pass of n rows in chunks of at most U rows, layer by layer, as
+-- one graph per layer that runs each chunk in turn. The graph of layer
+-- il reads the chunk rows of the residual h, attends to the K and V of
+-- all n rows, writes the rows back and writes the K and V of layer
+-- il + 1. Graph 1 makes the embeddings and the K and V of layer 1. The
+-- graphs and the head graph p.g share one compute buffer.
+local function chunked(self, n, U, r0, C, cache)
+	local be, hp, tm = self.be, self.hp, self.tm
+	local nc = (n + U - 1) // U
+	U = (n + nc - 1) // nc
+	local K, V, kc, scratch = kv_leaves(self, n, cache)
+	local p = {
+		n = n, U = U, nc = nc, graphs = {},
+		h = be:tensor("f32", { n, hp.n_embd }), ids = be:tensor("i32", { U }),
+		rows = be:tensor("i32", { U }), logit_rows = be:tensor("i32", { C }),
+	}
+	p.leaves = { p.h, p.ids, p.rows, p.logit_rows, table.unpack(scratch) }
+	p.logit_rows:fill_range(r0)
+	local NL = #tm.layers
+	local function keys(g, il, x)
+		local L = tm.layers[il]
+		local _, k, v = transformer.qkv(g, hp, L, x, p.rows, nil, "kv")
+		local w = L.Hkv * L.D
+		k = g:reshape(kv.rotate(g, k, kv.rot_k(kc, L.D)), { U, w })
+		v = g:reshape(kv.rotate(g, v, kv.rot_v(kc, L.D)), { U, w })
+		return g:set_rows(K[il], k, p.rows), g:set_rows(V[il], v, p.rows)
 	end
 	local g = be:graph()
-	local x0, conf = M.sample_nodes(g, self.tm:forward(g, inp), temp, u)
-	return { g = g, inp = inp, x0 = x0, conf = conf }
+	local x = g:get_rows(tm.tok_embd, p.ids)
+	if hp.embd_scale then
+		x = g:scale(x, hp.embd_scale)
+	end
+	p.graphs[1] = { g = g, out = { g:set_rows(p.h, x, p.rows), keys(g, 1, x) } }
+	for il, L in ipairs(tm.layers) do
+		g = be:graph(nil, p.graphs[1].g)
+		x = g:get_rows(p.h, p.rows)
+		local q, _, _, gate = transformer.qkv(g, hp, L, x, p.rows, nil, "q")
+		local rk, rv = kv.rot_k(kc, L.D), kv.rot_v(kc, L.D)
+		local k, v = kv.views(g, kc, K[il], V[il], n, L.Hkv, L.D)
+		local o = transformer.attend(g, kv.rotate(g, q, rk), k, v, nil, hp.attn_scale or 1 / math.sqrt(L.D),
+		    self.flash_attn, rv)
+		x = transformer.ffn(g, hp, L, transformer.attn_out(g, hp, L, o, gate, x))
+		local out = { g:set_rows(p.h, x, p.rows) }
+		if il < NL then
+			out[2], out[3] = keys(g, il + 1, x)
+		end
+		p.graphs[il + 1] = { g = g, out = out }
+	end
+	p.g = be:graph(nil, p.graphs[1].g)
+	p.logits = transformer.head(p.g, hp, tm.output_norm, tm.output, p.g:get_rows(p.h, p.logit_rows), tm.lora_out)
+	return p
+end
+
+-- Run the layer graphs of a chunked pass on its n token ids. The last
+-- chunk repeats its last row to fill U rows; the copies write the same
+-- values.
+local function run_layers(p, ids)
+	local n, U, rows, cid = p.n, p.U, {}, {}
+	for gi, gr in ipairs(p.graphs) do
+		for c = 0, p.nc - 1 do
+			for i = 1, U do
+				local r = math.min(c * U + i, n)
+				rows[i], cid[i] = r - 1, ids[r]
+			end
+			p.rows:set(rows)
+			if gi == 1 then
+				p.ids:set(cid)
+			end
+			gr.g:compute(table.unpack(gr.out))
+		end
+	end
+end
+
+-- Close a pass from `pass` or `chunked`.
+local function close_pass(p)
+	for _, gr in ipairs(p.graphs or {}) do
+		for _, t in ipairs(gr.out) do
+			t:close()
+		end
+		gr.g:close()
+	end
+	for _, t in ipairs({ p.x0, p.conf, p.logits }) do
+		t:close()
+	end
+	p.g:close()
+	if p.inp then
+		M.close_inputs(p.inp)
+	end
+	for _, t in ipairs(p.leaves or {}) do
+		t:close()
+	end
+end
+
+-- One kind of pass over list, with its sampling nodes: chunked when it
+-- is a full pass of more than U rows. With a cache, a full pass runs
+-- [prefix | block] and keeps every K and V row; else the block runs
+-- alone on the cached prefix rows. A pass with share takes the compute
+-- buffer of that graph. p.run(ids) computes p.x0 and p.conf.
+local function pass(self, list, P, C, U, cache, temp, u, share)
+	local be, full = self.be, not cache or #list > C
+	local p
+	if full and #list > U then
+		p = chunked(self, #list, U, P, C, cache)
+		function p.run(ids)
+			run_layers(p, ids)
+			p.g:compute(p.x0, p.conf)
+		end
+	else
+		local inp
+		if not cache then
+			inp = self:inputs(P + C, P, C)
+		else
+			cache.n_past = full and 0 or P
+			inp = self.tm:inputs(list, cache, { flash_attn = self.flash_attn, causal = false, logits = "rows" })
+			inp.logit_rows = be:tensor("i32", { C })
+			inp.logit_rows:fill_range(full and P or 0)
+		end
+		local g = be:graph(nil, share)
+		p = { g = g, inp = inp, logits = self.tm:forward(g, inp) }
+		function p.run(ids)
+			inp.ids:set(ids)
+			g:compute(p.x0, p.conf)
+		end
+	end
+	p.x0, p.conf = M.sample_nodes(p.g, p.logits, temp, u)
+	return p
 end
 
 --- Run the sampler over one block of mask tokens after prefix.
@@ -241,10 +377,11 @@ end
 -- later steps run the block on the prefix K and V of that step, as the
 -- prefix cache of Fast-dLLM does. This is faster on long prefixes and
 -- not exact. The cache stays with the model; see `drop_cache`.
+-- A full pass over more than opts.chunk rows runs in chunks; see `plan`.
 -- @tparam {int,...} prefix the prompt and earlier blocks
 -- @tparam[opt] table opts options: the sampler options of `options`,
--- seed (for the noise when temperature > 0) and on_step: on_step(step,
--- block) returns false to stop
+-- seed (for the noise when temperature > 0), chunk (default the `chunk`
+-- of the model) and on_step: on_step(step, block) returns false to stop
 -- @treturn {int,...} the block; positions still masked hold mask_id
 -- @treturn int the steps run
 -- @raise on bad sampler options
@@ -256,7 +393,7 @@ function M:denoise(prefix, opts)
 	end
 	local o = assert(M.options(so))
 	local be, hp = self.be, self.hp
-	local P, C, V = #prefix, o.block_length, hp.n_vocab
+	local P, C, V, U = #prefix, o.block_length, hp.n_vocab, opts.chunk or self.chunk
 	local ids = table.move(prefix, 1, P, 1, {})
 	local block = {}
 	for i = 1, C do
@@ -276,7 +413,7 @@ function M:denoise(prefix, opts)
 	local sched = not o.threshold and M.schedule(C, o.steps)
 	local seed, steps = math.tointeger(opts.seed) or 0, 0
 	local ok, err = pcall(function()
-		full = pass(self, ids, P, C, cache, o.temperature, u)
+		full = pass(self, ids, P, C, U, cache, o.temperature, u)
 		for step = 1, o.steps do
 			local masked = {}
 			for i = 1, C do
@@ -289,16 +426,13 @@ function M:denoise(prefix, opts)
 			end
 			local p = full
 			if cache and step > 1 then
-				part = part or pass(self, block, P, C, cache, o.temperature, u)
+				part = part or pass(self, block, P, C, U, cache, o.temperature, u, full.g)
 				p = part
-				p.inp.ids:set(block)
-			else
-				p.inp.ids:set(ids)
 			end
 			if u then
 				u:fill("uniform", 2 ^ -40, 1, (seed * 7919 + steps) & 0x7fffffffffffffff)
 			end
-			p.g:compute(p.x0, p.conf)
+			p.run(p == part and block or ids)
 			local x0, cv = p.x0:get(), p.conf:get()
 			steps = steps + 1
 			local conf = {}
@@ -315,8 +449,7 @@ function M:denoise(prefix, opts)
 		end
 	end)
 	for _, p in ipairs({ full, part }) do
-		p.g:close()
-		M.close_inputs(p.inp)
+		close_pass(p)
 	end
 	if u then
 		u:close()
@@ -331,10 +464,25 @@ end
 -- @tparam {int,...} ids the token ids
 -- @tparam[opt] int r0 the first row, 0-based (default 0)
 -- @tparam[opt] int C the row count (default all rows from r0)
+-- @tparam[opt] int chunk the most rows of one graph (default the
+-- `chunk` of the model)
 -- @treturn {number,...} the logits, C rows of n_vocab values
-function M:logits(ids, r0, C)
+function M:logits(ids, r0, C, chunk)
 	r0 = r0 or 0
 	C = C or #ids - r0
+	if #ids > (chunk or self.chunk) then
+		local p = chunked(self, #ids, chunk or self.chunk, r0, C)
+		local ok, v = pcall(function()
+			run_layers(p, ids)
+			p.g:compute(p.logits)
+			return p.logits:get()
+		end)
+		close_pass(p)
+		if not ok then
+			error(v, 0)
+		end
+		return v
+	end
 	local inp = self:inputs(#ids, r0, C)
 	inp.ids:set(ids)
 	local g = self.be:graph()
@@ -344,6 +492,80 @@ function M:logits(ids, r0, C)
 	g:close()
 	M.close_inputs(inp)
 	return v
+end
+
+-- The device bytes of the leaves of p.
+local function leaf_bytes(p)
+	local b = 0
+	for _, t in ipairs(p.leaves or {}) do
+		b = b + t:nbytes()
+	end
+	for _, t in pairs(p.inp or {}) do
+		if type(t) == "userdata" then
+			b = b + t:nbytes()
+		end
+	end
+	return b
+end
+
+--- Plan the compute memory of the largest passes of `denoise`.
+-- It builds them and runs nothing: a single graph of `chunk` rows, and
+-- with n_ctx above that, a chunked pass of n_ctx rows. A chunked pass
+-- keeps the residual of all rows (n_ctx x n_embd f32) and, without the
+-- prefix cache, the K and V rows of two layers. With prefix_cache it
+-- plans on a cache of n_ctx rows and the block pass too.
+-- @tparam int n_ctx the most rows of a pass
+-- @tparam[opt] table opts block_length (default `hp.canvas`) and
+-- prefix_cache
+-- @treturn int the device bytes, with the input leaves and noise draws
+-- @treturn int the device bytes of a prefix cache of n_ctx rows, or 0
+function M:plan(n_ctx, opts)
+	opts = opts or {}
+	local be, C, U = self.be, opts.block_length or self.hp.canvas, self.chunk
+	local ids, cache, u, single, ch, part = {}, nil, nil, nil, nil, nil
+	local function measure(g, ...)
+		return (g:measure(...))
+	end
+	local ok, r, cb = pcall(function()
+		if opts.prefix_cache then
+			cache = self.tm:cache(n_ctx)
+		end
+		local n = math.min(n_ctx, math.max(U, C + 1))
+		for i = 1, math.max(n, n_ctx) do
+			ids[i] = 0
+		end
+		u = be:tensor("f32", { C, self.hp.n_vocab })
+		single = pass(self, table.move(ids, 1, n, 1, {}), n - C, C, n, cache, 1, u)
+		local best = measure(single.g, single.x0, single.conf) + leaf_bytes(single)
+		if n_ctx > U then
+			ch = pass(self, ids, n_ctx - C, C, U, cache, 1, u)
+			local d = measure(ch.g, ch.x0, ch.conf)
+			for _, gr in ipairs(ch.graphs) do
+				d = math.max(d, measure(gr.g, table.unpack(gr.out)))
+			end
+			if cache then
+				part = pass(self, table.move(ids, 1, C, 1, {}), n_ctx - C, C, U, cache, 1, u, ch.g)
+				d = math.max(d, measure(part.g, part.x0, part.conf) + leaf_bytes(part))
+			end
+			best = math.max(best, d + leaf_bytes(ch))
+		end
+		return best + u:nbytes(), cache and transformer.cache_bytes(cache) or 0
+	end)
+	for _, p in ipairs({ single, ch, part }) do
+		close_pass(p)
+	end
+	for _, t in ipairs({ u }) do
+		t:close()
+	end
+	for _, side in ipairs(cache and { cache.k, cache.v } or {}) do
+		for _, t in pairs(side) do
+			t:close()
+		end
+	end
+	if not ok then
+		error(r, 0)
+	end
+	return r, cb
 end
 
 --- Find the tokens to keep from a block: those before the first token
