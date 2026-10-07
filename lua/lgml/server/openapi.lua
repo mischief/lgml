@@ -555,6 +555,28 @@ local function misc_schemas(c)
 		modalities = obj({ vision = { type = "boolean" } }),
 	}, nil, "llama-server /props subset."))
 	c.LoraAdapter = ext(obj({ id = int(), path = str(), scale = num() }))
+	c.DecisionRequest = obj({
+		model = str("Any name; one this server does not serve goes to the default decision model."),
+		input = { anyOf = json.array({ str(), arr({ type = "object" }) }),
+			description = "Text, or user messages of input_text and input_image (data URL) parts." },
+		questions = arr(obj({
+			type = { type = "string", enum = json.array({ "predicate", "choice", "score" }) },
+			name = str(), instructions = str(),
+			choices = arr(obj({ value = { type = { "string", "number" } }, description = str() }, { "value" })),
+			levels = arr(obj({ label = str(), description = str() }, { "label" })),
+		}, { "type", "instructions" })),
+	}, { "input", "questions" })
+	c.Decision = obj({
+		id = str(), object = { const = "decision" }, created_at = int(), model = str(),
+		answers = arr(obj({
+			type = { type = "string", enum = json.array({ "predicate", "choice", "score" }) },
+			name = str(), probability = num(), choice = { type = { "string", "number" } },
+			score = num(), confidence = num(),
+			probabilities = arr(obj({ value = { type = { "string", "number" } }, label = str(),
+				probability = num() })),
+		}, { "type" })),
+		usage = obj({ input_tokens = int(), total_tokens = int() }),
+	})
 	c.LoadRequest = obj({ model = str() }, { "model" })
 	c.Success = obj({ success = { const = true } })
 	c.Health = obj({ status = { const = "ok" } })
@@ -782,6 +804,12 @@ local function operations()
 				["500"] = reply("Engine error.", "application/json", ref("SystemOneError")),
 				["503"] = reply("Worker or load failure.", "application/json", ref("SystemOneError")),
 			},
+		} },
+		["/decisions"] = { POST = {
+			tag = "openai", summary = "Decisions (OpenAI): predicate, choice and score answers",
+			requestBody = json_body(ref("DecisionRequest")),
+			responses = with({ ["200"] = reply("Answers.", "application/json", ref("Decision"),
+			    { "elapsed-ms" }) }, { 400, 404, 500, 503 }),
 		} },
 		["/models"] = { GET = {
 			tag = "openai", summary = "List models",

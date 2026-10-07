@@ -30,6 +30,7 @@ Labels in this file:
 - [Transcriptions](#transcriptions)
 - [Embeddings](#embeddings)
 - [System One decisions](#system-one-decisions)
+- [Decisions](#decisions)
 - [Models](#models)
 - [Load and unload](#load-and-unload)
 - [Server properties and adapters](#server-properties-and-adapters)
@@ -61,6 +62,7 @@ for one handler.
 | POST | `/v1/audio/transcriptions`, `/audio/transcriptions` | OpenAI | [Transcriptions](#transcriptions) |
 | POST | `/v1/embeddings`, `/embeddings` | OpenAI | [Embeddings](#embeddings) |
 | POST | `/v1/systemone`, `/systemone` | lgml (Jev) | [System One decisions](#system-one-decisions) |
+| POST | `/v1/decisions`, `/decisions` | OpenAI | [Decisions](#decisions) |
 | GET | `/v1/models`, `/models` | OpenAI | [Models](#models) |
 | POST | `/models/load`, `/v1/models/load` | lgml | [Load and unload](#load-and-unload) |
 | POST | `/models/unload`, `/v1/models/unload` | lgml | [Load and unload](#load-and-unload) |
@@ -1645,6 +1647,52 @@ curl -s localhost:8080/v1/systemone -d '{
   "state": "The player has 3 hp. A troll blocks the door.",
   "questions": {"flee": {"type": "noul", "instructions": "Should the player flee?"}},
   "lgml": {"raw": true, "recipe": {"temperature": {"noul": 1.5}}}}'
+```
+
+## Decisions
+
+`POST /v1/decisions` (alias `/decisions`). This is OpenAI's Decisions
+API on the System One engine: the same models, prompt formats and
+decision heads answer it. Clients of the OpenAI SDK
+(`client.decisions.create`) work as they are.
+
+- `model`: a model that serves decisions, or any other name, such as
+  `gpt-6-luna`; a name this server does not serve goes to the default
+  decision model. The reply keeps the requested name.
+- `input`: a string, or user messages whose content is a string or
+  `input_text` and `input_image` parts. Images must be inline base64
+  data URLs; an http or https URL, or a `file_id`, gives 400. The text
+  parts join with a blank line.
+- `questions`: an array of questions. Each has a `type`, its
+  `instructions`, and an optional `name` that the answer repeats.
+  - `predicate`: the answer has `probability`, P(true).
+  - `choice`: `choices` of `{value, description}`; the answer has the
+    `choice`, the `probabilities` of every value and the `confidence`.
+  - `score`: ordered `levels` of `{label, description}`; the answer
+    has `score`, the probability-weighted mean of the level indices
+    from 0, the `probabilities` and the `confidence`.
+- `lgml`: the extension object of System One (`raw`, `recipe`).
+
+The question types are those of System One (`predicate` is `noul`),
+with its limits: 2 to 255 choices, 2 to 26 levels, at most 64
+questions. Probabilities round to 2 places, `score` and `confidence`
+to 4. Confidence follows Jev: for a choice `(p_max - 1/K) / (1 - 1/K)`,
+for a score `1 - d / d_uniform`, with d the mean distance of the level
+index from the mode. These give OpenAI's published examples.
+
+The reply is `{id, object: "decision", created_at, model, answers,
+usage}`; `usage` counts input tokens only. Errors use the OpenAI error
+shape with status 400, and the `param` of a bad field.
+
+```sh
+curl -s localhost:8091/v1/decisions -d '{
+  "model": "gpt-6-luna",
+  "input": "I was charged twice for my order.",
+  "questions": [{"type": "choice", "name": "department",
+    "instructions": "Which department should handle this complaint?",
+    "choices": [{"value": "billing", "description": "Payments, invoices, and refunds."},
+      {"value": "technical", "description": "Problems using the product."},
+      {"value": "other", "description": "Requests outside these categories."}]}]}'
 ```
 
 ## Models

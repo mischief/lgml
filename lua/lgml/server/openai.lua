@@ -14,6 +14,7 @@ local metrics = require("lgml.server.metrics")
 local detect = require("lgml.detect")
 local media = require("lgml.chat.media")
 local systemone = require("lgml.systemone")
+local decisions = require("lgml.decisions")
 local base64 = require("lgml.base64")
 local embeddings = require("lgml.server.embeddings")
 local log = require("lgml.log")
@@ -795,6 +796,53 @@ local function systemone_route(eng, req, res)
 	}))
 end
 
+-- OpenAI decisions: a model name this server does not serve, such as
+-- gpt-6-luna, goes to the default decision model; the reply keeps it.
+local function decisions_route(eng, req, res)
+	if type(eng.decide) ~= "function" then
+		return res:error(404, "this server does not serve decisions")
+	end
+	local dreq, infos, status, param = decisions.check(req.body)
+	if not dreq then
+		return res:error(status or 400, infos, "invalid_request_error", param)
+	end
+	local t0 = uv.hrtime()
+	local asked = dreq.model
+	local has_images = #(dreq.images or {}) > 0
+	if asked and eng.model_for and not eng:model_for(asked, "decide", has_images) then
+		dreq.model = nil
+	end
+	local model = served_model(eng, dreq.model, "decide", has_images)
+	log.note("model", model)
+	log.note("questions", #dreq.questions)
+	local r, msg, st = eng:decide(dreq, {
+		cancelled = function()
+			return res.s:gone()
+		end,
+	})
+	if res.s:gone() then
+		res.close = true
+		return
+	end
+	metrics.request(model, "decide", r ~= nil)
+	if not r then
+		return res:error(st or 500, msg or "decision failed")
+	end
+	if r.usage then
+		log.note("prompt_tokens", r.usage.input_tokens)
+	end
+	log.note("cached_tokens", r.timings and r.timings.cache_n)
+	dreq.model = asked
+	local ok, text = pcall(decisions.reply, dreq, infos, r, rand_id("dec_", 24))
+	if not ok then
+		return res:error(500, tostring(text))
+	end
+	return res:send(200, text, metrics.headers(r.timings or {}, {
+		["Content-Type"] = "application/json",
+		["x-lgml-elapsed-ms"] = ("%.3f"):format((uv.hrtime() - t0) / 1e6),
+	}))
+end
+
 -- images
 
 --- Image sides in pixels are multiples of this.
@@ -1148,6 +1196,11 @@ function M.install(srv, eng, opts)
 	end
 	srv:route("POST", "/v1/systemone", decide)
 	srv:route("POST", "/systemone", decide)
+	local function decisions_handler(req, res)
+		return decisions_route(eng, req, res)
+	end
+	srv:route("POST", "/v1/decisions", decisions_handler)
+	srv:route("POST", "/decisions", decisions_handler)
 	local function gen(req, res)
 		return images(eng, req, res)
 	end
