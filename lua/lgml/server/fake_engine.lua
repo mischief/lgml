@@ -109,7 +109,7 @@ local function plan(req)
 	end
 	p[#p + 1] = { "content", "Let me " }
 	p[#p + 1] = { "content", "check the weather." }
-	local tool = req.tools and req.tools[1]
+	local tool = req.tool_choice ~= "none" and req.tools and req.tools[1]
 	local name = tool and tool["function"] and tool["function"].name
 	local tc = req.tool_choice
 	if type(tc) == "table" and type(tc["function"]) == "table" then

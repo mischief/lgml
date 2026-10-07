@@ -419,8 +419,9 @@ local function tool_named(tools, name)
 end
 
 -- Checks tool_choice against the tools and puts it in a normal form:
--- "none" drops the tools, and allowed_tools keeps the tools that it
--- names, with its mode as tool_choice.
+-- allowed_tools keeps the tools that it names, with its mode as
+-- tool_choice. "none" keeps the tools in the prompt, so it has the
+-- prefix of the turns before it; the engine reads no calls.
 local function normal_tool_choice(b)
 	local tc, tools = b.tool_choice, b.tools
 	if type(tc) == "table" and tc.type == "allowed_tools" then
@@ -435,9 +436,7 @@ local function normal_tool_choice(b)
 		end
 		b.tools, b.tool_choice, tools, tc = keep, tc.allowed_tools.mode, keep, tc.allowed_tools.mode
 	end
-	if tc == "none" then
-		b.tools = nil
-	elseif tc == "required" and not (tools and #tools > 0) then
+	if tc == "required" and not (tools and #tools > 0) then
 		return nil, 'tool_choice "required" needs tools'
 	elseif type(tc) == "table" and not tool_named(tools, choice_name(tc)) then
 		return nil, ("tool_choice: %s is not in tools"):format(choice_name(tc))

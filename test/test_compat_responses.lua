@@ -245,7 +245,8 @@ local function test_requests()
 		tools = { { type = "function", name = "get_time" } } } }))
 	ok(status == 200 and #last.tools == 1 and b.output[#b.output].name == "get_time", "allowed_tools")
 	status, b = post(body({ tools = TOOLS, tool_choice = "none" }))
-	ok(last.tools == nil and b.output[#b.output].type == "message", "tool_choice none")
+	ok(last.tools ~= nil and last.tool_choice == "none" and b.output[#b.output].type == "message",
+	    "tool_choice none")
 	status, b = post(body({ text = { format = { type = "json_schema", name = "p",
 		schema = { type = "object", properties = { a = { type = "string" } } }, strict = true } } }))
 	ok(status == 200 and type(last.grammar) == "string" and b.text.format.name == "p",

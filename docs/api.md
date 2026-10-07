@@ -412,8 +412,9 @@ Image input:
 
 ### Tool choice
 
-- `none`: the server does not give the tools to the chat template, and
-  the reply has no tool calls.
+- `none`: the chat template still gets the tools, so the prompt keeps
+  the prefix of earlier turns in the prompt cache, but the reply has no
+  tool calls: a call the model writes stays text.
 - `auto` (the default): the model answers or calls tools. Without
   `tools`, the reply has no tool calls.
 - `required`: the model must call one or more of the tools; with

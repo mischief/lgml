@@ -2941,8 +2941,9 @@ function E:run_prompt(req, sink, st)
 		    "grammar", gopts.grammar and first_lines(gopts.grammar, 6), "root", gopts.grammar_root,
 		    "triggers", gopts.triggers and #gopts.triggers)
 	end
-	-- With no tools, as with tool_choice "none", the parser reads no calls.
-	local out = output.new(sink, self.family.new_parser({ tools = req.tools or {}, enable_thinking = think }),
+	-- With no tools, or tool_choice "none", the parser reads no calls.
+	local calls = req.tool_choice ~= "none" and req.tools or {}
+	local out = output.new(sink, self.family.new_parser({ tools = calls, enable_thinking = think }),
 	    { stop = req.stop, one_call = req.parallel_tool_calls == false })
 	local dec = tokenizer.decoder(self.tk, { special = false })
 
