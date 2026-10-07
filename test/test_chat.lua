@@ -672,10 +672,22 @@ local qwen35_cases = {
 		{ B(0, "now"), A(0, "{}"), E(0), C("Done.") },
 	},
 	{
-		"unclosed think",
+		"unclosed think, cut call",
 		"still thinking <tool_call>\n<function=now>",
 		{ tools = QT },
-		{ R("still thinking <tool_call>\n<function=now>") },
+		{ R("still thinking"), C("<tool_call>\n<function=now>") },
+	},
+	{
+		"a call inside the think block ends it",
+		"Check the pages.\n" .. qcall("get_weather", { { "city", "Oslo" } }),
+		{ tools = QT },
+		{ R("Check the pages."), B(0, "get_weather"), A(0, '{"city":"Oslo"}'), E(0) },
+	},
+	{
+		"a call to an unknown name stays reasoning",
+		"maybe " .. qcall("rm", {}) .. "\n</think>\n\nok",
+		{ tools = QT },
+		{ R("maybe " .. qcall("rm", {})), C("ok") },
 	},
 }
 

@@ -105,6 +105,45 @@ function P:step_content(final)
 	return false
 end
 
+local TOPEN = "<tool_call>\n"
+local TCALL = TOPEN .. FOPEN
+local TEND = "</think>"
+
+-- Qwen3.5 can open a call inside its reasoning, with no `</think>`.
+-- A call to a declared tool there ends the reasoning; other text,
+-- such as a call to an unknown name, stays reasoning.
+function P:step_reasoning(final)
+	if not self.tools then
+		return hermes.P.step_reasoning(self, final)
+	end
+	local buf, pos = self.buf, 1
+	local t = buf:find(TEND, 1, true)
+	while true do
+		local c = buf:find(TCALL, pos, true)
+		if not c or (t and t < c) then
+			break
+		end
+		local r = self:bare_at(c + #TOPEN, final)
+		if r == "call" or r == "wait" then
+			self:emit("reasoning", buf:sub(1, c - 1))
+			self.buf = buf:sub(c)
+			if r == "wait" then
+				return false
+			end
+			self:switch("content")
+			return true
+		end
+		pos = c + 1
+	end
+	if t then
+		return hermes.P.step_reasoning(self, final)
+	end
+	local k = final and 0 or math.max(partial(buf, TEND), partial(buf, TCALL))
+	self:emit("reasoning", buf:sub(1, #buf - k))
+	self.buf = buf:sub(#buf - k + 1)
+	return false
+end
+
 -- A bare call that is not a call: its "<" is content, and the scan
 -- goes on after it.
 function P:fallback(raw)
