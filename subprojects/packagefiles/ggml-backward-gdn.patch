@@ -354,10 +354,18 @@ index f1f66a6..f932333 100644
      uint32_t nb02, nb03, nb12, nb13;
      uint32_t nb21, nb22, nb31;
 diff --git a/src/ggml-vulkan/ggml-vulkan-types.h b/src/ggml-vulkan/ggml-vulkan-types.h
-index 4158ff7..526c9a5 100644
+index 4158ff7..feff50a 100644
 --- a/src/ggml-vulkan/ggml-vulkan-types.h
 +++ b/src/ggml-vulkan/ggml-vulkan-types.h
-@@ -986,6 +986,7 @@ struct vk_device_struct {
+@@ -822,6 +822,7 @@ struct vk_device_struct {
+     vk_pipeline pipeline_mul_mat_vec_p021_f16_f32[p021_max_gqa_ratio];
+     vk_pipeline pipeline_mul_mat_vec_nc_f16_f32;
+     vk_pipeline pipeline_get_rows[GGML_TYPE_COUNT];
++    vk_pipeline pipeline_dequant_transpose_f16[GGML_TYPE_COUNT];
+     vk_pipeline pipeline_get_rows_f32[GGML_TYPE_COUNT];
+     vk_pipeline pipeline_get_rows_back_f32;
+     vk_pipeline pipeline_acc_f32;
+@@ -986,6 +987,7 @@ struct vk_device_struct {
      vk_pipeline pipeline_lightning_indexer_f32[GGML_TYPE_COUNT];
      // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
      vk_pipeline pipeline_gated_delta_net[4][2];
@@ -366,10 +374,35 @@ index 4158ff7..526c9a5 100644
      vk_pipeline pipeline_ssm_scan_f32_d256;
      vk_pipeline pipeline_ssm_conv_f32;
 diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
-index c9e1cec..927c22a 100644
+index c9e1cec..790303a 100644
 --- a/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -3743,6 +3743,18 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+@@ -3140,6 +3140,24 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_Q4_K], "get_rows_q4_k", get_rows_q4_k_len, get_rows_q4_k_data, "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_Q5_K], "get_rows_q5_k", get_rows_q5_k_len, get_rows_q5_k_data, "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_Q6_K], "get_rows_q6_k", get_rows_q6_k_len, get_rows_q6_k_data, "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
++
++#define CREATE_DQT(TYPE, name) \
++    ggml_vk_create_pipeline(device, device->pipeline_dequant_transpose_f16[TYPE], "dqt_" #name, dqt_##name##_len, dqt_##name##_data, \
++        "main", 2, 3 * sizeof(uint32_t), {256, 16, 1}, {}, 1);
++    CREATE_DQT(GGML_TYPE_Q4_0, q4_0)
++    CREATE_DQT(GGML_TYPE_Q4_1, q4_1)
++    CREATE_DQT(GGML_TYPE_Q5_0, q5_0)
++    CREATE_DQT(GGML_TYPE_Q5_1, q5_1)
++    CREATE_DQT(GGML_TYPE_Q8_0, q8_0)
++    CREATE_DQT(GGML_TYPE_Q2_K, q2_k)
++    CREATE_DQT(GGML_TYPE_Q3_K, q3_k)
++    CREATE_DQT(GGML_TYPE_Q4_K, q4_k)
++    CREATE_DQT(GGML_TYPE_Q5_K, q5_k)
++    CREATE_DQT(GGML_TYPE_Q6_K, q6_k)
++    CREATE_DQT(GGML_TYPE_IQ4_NL, iq4_nl)
++    CREATE_DQT(GGML_TYPE_IQ4_XS, iq4_xs)
++#undef CREATE_DQT
++
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_TQ1_0], "get_rows_tq1_0", get_rows_tq1_0_len, get_rows_tq1_0_data, "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_TQ2_0], "get_rows_tq2_0", get_rows_tq2_0_len, get_rows_tq2_0_data, "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_IQ1_S],   "get_rows_iq1_s",   get_rows_iq1_s_len,   get_rows_iq1_s_data,   "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+@@ -3743,6 +3761,18 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
          }
      }
  
@@ -388,10 +421,25 @@ index c9e1cec..927c22a 100644
      if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
          ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d128, "ssm_scan_128_f32", ssm_scan_subgroup_f32_len, ssm_scan_subgroup_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {128, device->subgroup_size}, 1, true, true);
          ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d256, "ssm_scan_256_f32", ssm_scan_subgroup_f32_len, ssm_scan_subgroup_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {256, device->subgroup_size}, 1, true, true);
-@@ -5482,6 +5494,39 @@ void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
+@@ -5482,6 +5512,54 @@ void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
  #endif
  }
  
++// A 2-D transposed view of contiguous quantized rows, of a type with a
++// dequantize-and-transpose shader.
++static bool ggml_vk_is_quant_transpose(const ggml_tensor * t) {
++    switch (t->type) {
++        case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1:
++        case GGML_TYPE_Q8_0: case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K:
++        case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K: case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS:
++            break;
++        default:
++            return false;
++    }
++    return t->ne[2] == 1 && t->ne[3] == 1 && t->nb[1] == ggml_type_size(t->type) &&
++        t->nb[0] % ggml_type_size(t->type) == 0 && t->ne[1] % ggml_blck_size(t->type) == 0;
++}
++
 +static bool ggml_vk_has_to_fp16(ggml_type type) {
 +    switch (type) {
 +        case GGML_TYPE_Q1_0:
@@ -428,7 +476,7 @@ index c9e1cec..927c22a 100644
  vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type type) {
      VK_LOG_DEBUG("ggml_vk_get_to_fp16()");
      switch (type) {
-@@ -9159,6 +9204,21 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+@@ -9159,6 +9237,21 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
              return ctx->device->pipeline_gated_delta_net[si][kda];
          }
          return nullptr;
@@ -450,7 +498,7 @@ index c9e1cec..927c22a 100644
      case GGML_OP_SSM_SCAN:
          if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
              const uint32_t d_state = src0->ne[0];
-@@ -10270,6 +10330,56 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx,
+@@ -10270,6 +10363,56 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx,
          pc, { H, n_seqs, S_v });
  }
  
@@ -507,10 +555,27 @@ index c9e1cec..927c22a 100644
  void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
      const ggml_tensor * src0 = dst->src[0];
      const ggml_tensor * src1 = dst->src[1];
-@@ -10627,6 +10737,20 @@ void ggml_vk_repeat_back(ggml_backend_vk_context * ctx, vk_context& subctx, cons
+@@ -10627,6 +10770,37 @@ void ggml_vk_repeat_back(ggml_backend_vk_context * ctx, vk_context& subctx, cons
  }
  
  void ggml_vk_cpy(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
++    if (ggml_vk_is_quant_transpose(src0) && dst->type == GGML_TYPE_F16) {
++        // the transpose of quantized rows: dequantize and transpose in one pass
++        GGML_ASSERT(ggml_is_contiguous(dst));
++        vk_pipeline pipeline = ctx->device->pipeline_dequant_transpose_f16[src0->type];
++        GGML_ASSERT(pipeline != nullptr);
++        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
++        const uint32_t k = (uint32_t)src0->ne[1];
++        const uint32_t n = (uint32_t)src0->ne[0];
++        const uint32_t row_blocks = (uint32_t)(src0->nb[0] / ggml_type_size(src0->type));
++        const std::vector<uint32_t> pc = { k, n, row_blocks };
++        // ggml_nbytes divides the transposed rows by the block size; bind all of them
++        vk_subbuffer a = ggml_vk_tensor_subbuffer(ctx, src0);
++        a.size = (size_t)n * src0->nb[0];
++        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, ggml_vk_tensor_subbuffer(ctx, dst) }, pc,
++            { k, n, 1 });
++        return;
++    }
 +    if (ggml_is_quantized(src0->type) && dst->type == GGML_TYPE_F16) {
 +        // contiguous rows, through the dequant shader of the matmul path
 +        GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(dst));
@@ -528,7 +593,7 @@ index c9e1cec..927c22a 100644
      uint32_t ne = (uint32_t)ggml_nelements(src0);
      if (ggml_is_quantized(src0->type) && ggml_is_quantized(dst->type)) {
          // Convert from number of logical elements to 2- or 4-byte units.
-@@ -12801,6 +12925,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
+@@ -12801,6 +12975,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
  
          break;
  
@@ -540,7 +605,7 @@ index c9e1cec..927c22a 100644
      case GGML_OP_SSM_SCAN:
          ggml_vk_ssm_scan(ctx, compute_ctx, node);
  
-@@ -15739,6 +15868,13 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+@@ -15739,6 +15918,17 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                      return true;
                  }
  
@@ -550,11 +615,15 @@ index c9e1cec..927c22a 100644
 +                    ggml_vk_has_to_fp16(src0_type)) {
 +                    return true;
 +                }
++                if (src1_type == GGML_TYPE_F16 && ggml_vk_is_quant_transpose(op->src[0]) &&
++                    ggml_is_contiguous(op)) {
++                    return true;
++                }
 +
                  if (
                      (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_I32) ||
                      (src0_type == GGML_TYPE_I32 && src1_type == GGML_TYPE_F32)
-@@ -15789,7 +15925,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+@@ -15789,7 +15979,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     op->type == GGML_TYPE_F32;
          case GGML_OP_SILU_BACK:
          case GGML_OP_RMS_NORM_BACK:
@@ -563,7 +632,7 @@ index c9e1cec..927c22a 100644
          case GGML_OP_SQR:
          case GGML_OP_SQRT:
          case GGML_OP_SIN:
-@@ -16014,6 +16150,20 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+@@ -16014,6 +16204,20 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                  }
                  return op->type == GGML_TYPE_F32;
              }
@@ -584,6 +653,84 @@ index c9e1cec..927c22a 100644
          case GGML_OP_SSM_SCAN:
              {
                  for (int i = 0; i < 6; i++) {
+diff --git a/src/ggml-vulkan/vulkan-shaders/dequant_transpose.comp b/src/ggml-vulkan/vulkan-shaders/dequant_transpose.comp
+new file mode 100644
+index 0000000..ca43a9c
+--- /dev/null
++++ b/src/ggml-vulkan/vulkan-shaders/dequant_transpose.comp
+@@ -0,0 +1,72 @@
++#version 450
++
++// Dequantize contiguous rows of a quantized matrix and write the
++// transpose as f16: row r, column c of the source goes to d[c*N + r].
++// A workgroup takes a tile of TR rows by TC columns through shared
++// memory, so both the reads and the writes are coalesced.
++
++#extension GL_EXT_control_flow_attributes : enable
++#extension GL_EXT_shader_16bit_storage : require
++
++#include "types.glsl"
++
++layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
++#if defined(A_TYPE_PACKED16)
++layout (binding = 0) readonly buffer A_PACKED16 {A_TYPE_PACKED16 data_a_packed16[];};
++#endif
++#if defined(A_TYPE_PACKED32)
++layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32[];};
++#endif
++layout (binding = 1) writeonly buffer D {float16_t data_d[];};
++
++#include "dequant_funcs.glsl"
++
++layout (push_constant) uniform parameter {
++    uint K;            // columns: the length of a source row
++    uint N;            // rows
++    uint row_blocks;   // blocks between the starts of two source rows
++} p;
++
++layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
++
++const uint TC = 256;   // a multiple of every QUANT_K
++const uint TR = 16;
++
++shared float tile[TR][TC];
++
++void main() {
++#ifdef NEEDS_INIT_IQ_SHMEM
++    init_iq_shmem(gl_WorkGroupSize);
++#endif
++    const uint c0 = gl_WorkGroupID.x * TC;
++    const uint r0 = gl_WorkGroupID.y * TR;
++    const uint tid = gl_LocalInvocationID.x;
++    const uint y_offset = QUANT_R == 1 ? 1 : QUANT_K / 2;
++
++    // each invocation dequantizes value pairs, as get_rows does
++    [[unroll]] for (uint pp = 0; pp < TR * TC / 2 / 256; pp++) {
++        const uint pair = tid + pp * 256;
++        const uint r = pair / (TC / 2);
++        const uint i00 = c0 + (pair % (TC / 2)) * 2;
++        if (r0 + r < p.N && i00 < p.K) {
++            const uint ib = (r0 + r) * p.row_blocks + i00 / QUANT_K;
++            const uint iqs = (i00 % QUANT_K) / QUANT_R;
++            const uint iybs = i00 - i00 % QUANT_K;
++            vec2 v = dequantize(ib, iqs, 0);
++            const vec2 dm = get_dm(ib, 0);
++            v = v * dm.x + dm.y;
++            tile[r][iybs + iqs - c0] = v.x;
++            tile[r][iybs + iqs + y_offset - c0] = v.y;
++        }
++    }
++    barrier();
++
++    [[unroll]] for (uint q = 0; q < TR * TC / 256; q++) {
++        const uint e = tid + q * 256;
++        const uint c = e / TR;
++        const uint r = e % TR;
++        if (r0 + r < p.N && c0 + c < p.K) {
++            data_d[(c0 + c) * p.N + r0 + r] = float16_t(tile[r][c]);
++        }
++    }
++}
 diff --git a/src/ggml-vulkan/vulkan-shaders/gated_delta_net_back.comp b/src/ggml-vulkan/vulkan-shaders/gated_delta_net_back.comp
 new file mode 100644
 index 0000000..a8e4ec6
@@ -837,10 +984,24 @@ index 0000000..a8e4ec6
 +    STORE_TILE(G, off_ds + (is * H + ih) * SS)
 +}
 diff --git a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
-index 7597b3d..6bb1bc7 100644
+index 7597b3d..25440b4 100644
 --- a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
 +++ b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
-@@ -1155,6 +1155,7 @@ void process_shaders() {
+@@ -833,6 +833,13 @@ void process_shaders() {
+             string_to_spv("dequant_" + tname + "_transpose", "dequant_" + tname + ".comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float16_t"}, {"DEQUANT_TRANSPOSE", "1"}}));
+         }
+ 
++        // Dequantize and transpose to f16, for the mul_mat gradient of a quantized weight.
++        if (tname == "q4_0" || tname == "q4_1" || tname == "q5_0" || tname == "q5_1" || tname == "q8_0" ||
++            tname == "q2_k" || tname == "q3_k" || tname == "q4_k" || tname == "q5_k" || tname == "q6_k" ||
++            tname == "iq4_nl" || tname == "iq4_xs") {
++            string_to_spv("dqt_" + tname, "dequant_transpose.comp", merge_maps(base_dict, {{data_a_key, "1"}}));
++        }
++
+         shader = (tname == "f32" || tname == "f16" || tname == "bf16") ? "get_rows.comp" : "get_rows_quant.comp";
+ 
+         if (tname == "f16") {
+@@ -1155,6 +1162,7 @@ void process_shaders() {
      string_to_spv("gated_delta_net_f32", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "1"}}));
      string_to_spv("gated_delta_net_f32_nocluster", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "0"}}));
      string_to_spv("gated_delta_net_f32_shmem", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "0"}, {"USE_SUBGROUP_CLUSTERED", "0"}}));

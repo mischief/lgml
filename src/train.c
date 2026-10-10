@@ -413,7 +413,7 @@ static int
 out_prod_as_mul_mat(struct graph *g, struct ggml_tensor *t, struct ggml_tensor *ids)
 {
 	struct ggml_context *ctx = g->ctx;
-	struct ggml_tensor *a = t->src[0], *b = t->src[1], *x, *y, *yb, *part, *sum = NULL;
+	struct ggml_tensor *a = t->src[0], *b = t->src[1], *x, *xv, *y, *yb, *part, *sum = NULL;
 	int64_t k = a->ne[1], rows, r0, n;
 
 	y = ggml_transpose(ctx, b);
@@ -431,19 +431,22 @@ out_prod_as_mul_mat(struct graph *g, struct ggml_tensor *t, struct ggml_tensor *
 	for (r0 = 0; r0 < k; r0 += n) {
 		n = k - r0 < rows ? k - r0 : rows;
 		/*
-		 * Nodes, not leaves, so their memory frees after the mul_mat. A
-		 * backend that cannot cast the rows to f16 dequantizes them with
-		 * get_rows. The transpose keeps one type: Vulkan copies that fast.
+		 * Nodes, not leaves, so their memory frees after the mul_mat.
+		 * Best: cast the transposed rows to f16 in one pass. Then: cast the
+		 * rows, or get_rows them, and transpose that.
 		 */
-		x = ggml_cast(ctx, ggml_view_2d(ctx, a, a->ne[0], n, a->nb[1], r0 * a->nb[1]),
-		    GGML_TYPE_F16);
+		xv = ggml_view_2d(ctx, a, a->ne[0], n, a->nb[1], r0 * a->nb[1]);
+		x = ggml_cast(ctx, ggml_transpose(ctx, xv), GGML_TYPE_F16);
 		if (!ggml_backend_supports_op(g->b->be, x)) {
-			if (ids == NULL || k > ids->ne[0])
-				return 0;
-			x = ggml_get_rows(ctx, a, ggml_view_1d(ctx, ids, n, r0 * ggml_element_size(ids)));
-			x = ggml_cast(ctx, x, GGML_TYPE_F16);
+			x = ggml_cast(ctx, xv, GGML_TYPE_F16);
+			if (!ggml_backend_supports_op(g->b->be, x)) {
+				if (ids == NULL || k > ids->ne[0])
+					return 0;
+				x = ggml_get_rows(ctx, a, ggml_view_1d(ctx, ids, n, r0 * ggml_element_size(ids)));
+				x = ggml_cast(ctx, x, GGML_TYPE_F16);
+			}
+			x = ggml_cont(ctx, ggml_transpose(ctx, x));
 		}
-		x = ggml_cont(ctx, ggml_transpose(ctx, x));
 		/* y is contiguous, so a block of its columns has rows in order. */
 		yb = n == k ? y : ggml_cont(ctx, ggml_view_4d(ctx, y, n, y->ne[1], y->ne[2], y->ne[3],
 		    y->nb[1], y->nb[2], y->nb[3], r0 * ggml_element_size(y)));
