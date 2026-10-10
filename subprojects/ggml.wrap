@@ -6,6 +6,8 @@ method = cmake
 # ggml-vulkan-02: a Vulkan fix from llama.cpp that ggml has not synced yet.
 # ggml-vulkan-lgml: custom ops with SPIR-V shaders (see src/ops_fused.c) and
 # device reads of pinned host tensors (see lgml.vk_host_read).
+# ggml-backward-gdn: gradients of the gated delta net layer ops for training.
 diff_files = ggml-vulkan-release.patch,
 	ggml-vulkan-02-vulkan-MOE-aware-mat_mul_id-tile-selecti.patch,
-	ggml-vulkan-lgml.patch
+	ggml-vulkan-lgml.patch,
+	ggml-backward-gdn.patch

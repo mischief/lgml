@@ -251,6 +251,43 @@ do
 	end, { lower = true })
 end
 
+-- The ops of a gated delta net layer.
+do
+	local a = randn({ 3, 5 })
+	check("sigmoid", { a }, function(g, p) return g:sigmoid(p[1]) end)
+	local x = randn({ 2, 3, 8 })
+	check("l2_norm", { x }, function(g, p) return g:l2_norm(p[1], 1e-6) end)
+	local b, c = randn({ 2, 3, 3 }), randn({ 2, 1, 8 })
+	check("concat last dim", { x, b }, function(g, p) return g:concat(p[1], p[2], 3) end)
+	check("concat middle dim", { x, c }, function(g, p) return g:concat(p[1], p[2], 2) end)
+	-- 2 sequences, 6 channels, 5 tokens after the 3 state columns.
+	local sx, w = randn({ 2, 6, 8 }), randn({ 6, 4 })
+	check("ssm_conv", { sx, w }, function(g, p) return g:ssm_conv(p[1], p[2]) end)
+end
+
+-- The gated delta net: q and k with fewer heads than v, a scalar gate
+-- and a gate per channel (KDA), two sequences, and the input state.
+-- 70 tokens cross a checkpoint of the backward pass. GPU backends take
+-- only head sizes of 16 and up.
+for _, case in ipairs({ { "", 1, 5, 4 }, { " KDA", 4, 5, 4 }, { " 70 tokens", 1, 70, 4 },
+    { " size 16", 1, 70, 16 }, { " size 16 KDA", 16, 9, 16 } }) do
+	local label, ng, T, S = case[1], case[2], case[3], case[4]
+	local B, Hk, H = 2, 2, 4
+	if GPU and S < 16 then
+		goto skip
+	end
+	local q, k = randn({ B, T, Hk, S }, 0, 0.5 / math.sqrt(S / 4)), randn({ B, T, Hk, S }, 0,
+	    0.5 / math.sqrt(S / 4))
+	local v = randn({ B, T, H, S })
+	local gate = randn({ B, T, H, ng }, -0.3, 0.1)
+	local beta = randn({ B, T, H, 1 }, 0.5, 0.1)
+	local s0 = randn({ B, H, S, S }, 0, 0.3)
+	check("gated_delta_net" .. label, { q, k, v, gate, beta, s0 }, function(g, p)
+		return g:gated_delta_net(p[1], p[2], p[3], p[4], p[5], p[6])
+	end)
+	::skip::
+end
+
 -- A frozen quantized weight between the loss and a trainable leaf. The
 -- CPU quantizes x in the forward pass, so the check compares with the
 -- gradient through an f32 copy of the weight.
@@ -286,7 +323,7 @@ end
 do
 	local x = randn({ 2, 4 })
 	x:requires_grad()
-	for _, op in ipairs({ "sigmoid", "tanh", "gelu", "mean" }) do
+	for _, op in ipairs({ "tanh", "gelu", "mean" }) do
 		local g <close> = be:graph()
 		local loss = g:sum(g[op](g, x))
 		local good, err = pcall(loss.backward, loss)

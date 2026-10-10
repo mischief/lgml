@@ -232,6 +232,10 @@ no_grad_op(const struct ggml_tensor *t)
 	case GGML_OP_IM2COL:
 	case GGML_OP_POOL_2D:
 	case GGML_OP_CROSS_ENTROPY_LOSS:
+	case GGML_OP_L2_NORM:
+	case GGML_OP_CONCAT:
+	case GGML_OP_SSM_CONV:
+	case GGML_OP_GATED_DELTA_NET:
 		return NULL;
 	case GGML_OP_UNARY:
 		switch (ggml_get_unary_op(t)) {
@@ -244,6 +248,7 @@ no_grad_op(const struct ggml_tensor *t)
 		case GGML_UNARY_OP_EXP:
 		case GGML_UNARY_OP_EXPM1:
 		case GGML_UNARY_OP_SOFTPLUS:
+		case GGML_UNARY_OP_SIGMOID:
 			return NULL;
 		default:
 			return ggml_unary_op_name(ggml_get_unary_op(t));
@@ -334,7 +339,8 @@ check_backward(lua_State *L, struct ggml_cgraph *gf, struct ggml_tensor *loss)
 		}
 		if (!needs[i] || t->op == GGML_OP_NONE)
 			continue;
-		count++;
+		/* The ssm_conv gradient takes a few ops per kernel column. */
+		count += t->op == GGML_OP_SSM_CONV ? 4 * (int)t->src[1]->ne[0] : 1;
 		if ((why = no_grad_op(t)) != NULL) {
 			bad = why;
 			why = "the op has no gradient in ggml";
