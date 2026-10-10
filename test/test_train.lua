@@ -290,7 +290,8 @@ end
 
 -- A frozen quantized weight between the loss and a trainable leaf. The
 -- CPU quantizes x in the forward pass, so the check compares with the
--- gradient through an f32 copy of the weight.
+-- gradient through an f32 copy of the weight. A GPU takes the gradient
+-- through an f16 copy, which rounds it.
 do
 	local wq, wf = be:tensor("q8_0", { 6, 32 }), be:tensor("f32", { 6, 32 })
 	local g <close> = be:graph()
@@ -313,7 +314,8 @@ do
 		for i = 1, #want do
 			worst = math.max(worst, math.abs(got[i] - want[i]))
 		end
-		ok(worst < 1e-4, ("mul_mat q8_0 weight%s: max error %.2e"):format(lower and " lowered" or "",
+		ok(worst < (GPU and 5e-3 or 1e-4), ("mul_mat q8_0 weight%s: max error %.2e"):format(
+		    lower and " lowered" or "",
 		    worst))
 	end
 	x:requires_grad(false)

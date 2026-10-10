@@ -18,6 +18,8 @@
 #include <lua.h>
 #include <lauxlib.h>
 
+#include <ggml-cpu.h>
+
 #include "lgml.h"
 
 /*
@@ -390,25 +392,84 @@ as_f32(struct ggml_context *ctx, struct ggml_tensor *a, struct ggml_tensor *ids)
 /* Largest f32 copy of a quantized weight to make for one out_prod. */
 #define DEQUANT_MAX	((int64_t)1 << 30)
 
+/* Largest f32 block of a quantized weight to dequantize at once on a GPU. */
+#define GPU_BLOCK_MAX	((int64_t)1 << 28)
+
+static void
+set_op(struct ggml_tensor *t, enum ggml_op op, struct ggml_tensor *a, struct ggml_tensor *b)
+{
+	t->op = op;
+	t->src[0] = a;
+	t->src[1] = b;
+	memset(t->op_params, 0, sizeof(t->op_params));
+}
+
 /*
- * The ggml gradient of mul_mat uses out_prod on quantized, transposed
- * or permuted operands. The CPU out_prod dequantizes a quantized weight
- * once for each gradient row; an f32 copy made once is about twice as
- * fast for a whole step. Weights with a copy over DEQUANT_MAX bytes,
- * such as a large output projection, keep the slow form where the
- * backend has it. A backend without the other forms gets contiguous
- * f32 operands. Return nonzero if a node changed.
+ * Make out_prod node t a mul_mat: out_prod(a, b) is mul_mat(a^T, b^T).
+ * A quantized a goes as f16 copies of blocks of its rows, and t sums
+ * the products of the blocks. Return nonzero if t changed.
+ */
+static int
+out_prod_as_mul_mat(struct graph *g, struct ggml_tensor *t, struct ggml_tensor *ids)
+{
+	struct ggml_context *ctx = g->ctx;
+	struct ggml_tensor *a = t->src[0], *b = t->src[1], *x, *y, *yb, *part, *sum = NULL;
+	int64_t k = a->ne[1], rows, r0, n;
+
+	y = ggml_transpose(ctx, b);
+	if (!ggml_is_quantized(a->type)) {
+		x = ggml_transpose(ctx, a);
+		x = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
+		set_op(t, GGML_OP_MUL_MAT, x, ggml_is_contiguous(y) ? y : ggml_cont(ctx, y));
+		return 1;
+	}
+	if (ids == NULL || a->ne[2] != 1 || a->ne[3] != 1 || k > ids->ne[0])
+		return 0;
+	rows = GPU_BLOCK_MAX / (4 * a->ne[0]);
+	rows = rows < 1 ? 1 : rows;
+	for (r0 = 0; r0 < k; r0 += n) {
+		n = k - r0 < rows ? k - r0 : rows;
+		x = ggml_get_rows(ctx, a, ggml_view_1d(ctx, ids, n, r0 * ggml_element_size(ids)));
+		/*
+		 * Nodes, not leaves, so their memory frees after the mul_mat. The
+		 * transpose keeps one type: Vulkan has a fast copy for that.
+		 */
+		x = ggml_cont(ctx, ggml_transpose(ctx, ggml_cast(ctx, x, GGML_TYPE_F16)));
+		yb = ggml_cont(ctx, ggml_view_4d(ctx, y, n, y->ne[1], y->ne[2], y->ne[3],
+		    y->nb[1], y->nb[2], y->nb[3], r0 * y->nb[0]));
+		if (r0 + n < k) {
+			part = ggml_mul_mat(ctx, x, yb);
+			sum = sum ? ggml_add(ctx, sum, part) : part;
+		} else if (sum) {
+			set_op(t, GGML_OP_ADD, sum, ggml_mul_mat(ctx, x, yb));
+		} else {
+			set_op(t, GGML_OP_MUL_MAT, x, yb);
+		}
+	}
+	return 1;
+}
+
+/*
+ * Lower the out_prod nodes of the mul_mat gradients. A GPU gets mul_mat.
+ * The CPU gets an f32 copy of a quantized weight, made once, unless the
+ * copy passes DEQUANT_MAX. A backend without out_prod on the operands
+ * gets contiguous f32 operands. Return nonzero if a node changed.
  */
 static int
 lower_out_prod(struct graph *g, struct ggml_cgraph *gf, struct ggml_tensor *ids, int all)
 {
 	struct ggml_tensor *t, *a, *b;
 	int i, lack, changed = 0;
+	int gpu = !ggml_backend_is_cpu(g->b->be);
 
 	for (i = 0; i < ggml_graph_n_nodes(gf); i++) {
 		t = ggml_graph_node(gf, i);
 		if (t->op != GGML_OP_OUT_PROD)
 			continue;
+		if (gpu && out_prod_as_mul_mat(g, t, ids)) {
+			changed = 1;
+			continue;
+		}
 		a = t->src[0];
 		b = t->src[1];
 		lack = all || !ggml_backend_supports_op(g->b->be, t);
