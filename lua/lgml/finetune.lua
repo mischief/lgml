@@ -393,10 +393,19 @@ end
 --   (default: at the end of each epoch)
 -- - `save_every`, `save`: `save(step)` runs every save_every steps
 -- - `log`: `log(event)` gets { kind = "step", step, epoch, loss, lr,
---   tokens, seconds, grad_norm } and { kind = "eval", step, loss }
+--   tokens, seconds, grad_norm, skipped } and { kind = "eval", step, loss }
+--
+-- A step whose loss or gradient norm is not finite makes no update, and
+-- its event has skipped = true. MAX_SKIPS skips in a row raise an error.
 -- @tparam table opts the options
 -- @treturn table { steps, loss (of the last step), eval (the last eval
 -- loss, or nil) }
+local MAX_SKIPS = 8
+
+local function finite(x)
+	return x == x and x ~= math.huge and x ~= -math.huge
+end
+
 function M.train(opts)
 	local model, ad = opts.model, opts.adapter
 	M.check(model)
@@ -420,7 +429,7 @@ function M.train(opts)
 		return min_lr + (lr - min_lr) * 0.5 * (1 + math.cos(math.pi * f))
 	end
 	local log = opts.log or function() end
-	local step, last, ev = 0, nil, nil
+	local step, last, ev, skips = 0, nil, nil, 0
 	local function eval()
 		if opts.eval and #opts.eval > 0 then
 			ev = M.evaluate(model, opts.eval)
@@ -453,10 +462,19 @@ function M.train(opts)
 			step = step + 1
 			opt.lr = lr_at(step)
 			local gnorm = opts.clip and opt:clip(opts.clip) or nil
-			opt:step()
-			last = sum / m
-			log({ kind = "step", step = step, epoch = epoch, loss = last, lr = opt.lr,
-			    tokens = tokens, seconds = lgml.clock() - t0, grad_norm = gnorm })
+			local skip = not finite(sum) or (gnorm ~= nil and not finite(gnorm))
+			if skip then
+				skips = skips + 1
+				if skips >= MAX_SKIPS then
+					error(("finetune: %d steps in a row have a loss or gradient that is not finite"):format(skips))
+				end
+			else
+				skips = 0
+				opt:step()
+				last = sum / m
+			end
+			log({ kind = "step", step = step, epoch = epoch, loss = sum / m, lr = opt.lr,
+			    tokens = tokens, seconds = lgml.clock() - t0, grad_norm = gnorm, skipped = skip })
 			if opts.eval_every and opts.eval_every > 0 and step % opts.eval_every == 0 then
 				eval()
 			end

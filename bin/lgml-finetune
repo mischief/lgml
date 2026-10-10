@@ -296,9 +296,10 @@ local function main(args)
 		end,
 		log = function(ev)
 			if ev.kind == "step" then
-				io.stdout:write(("step %d epoch %d loss %.4f lr %.3g tokens %d %.1fs%s\n"):format(
+				io.stdout:write(("step %d epoch %d loss %.4f lr %.3g tokens %d %.1fs%s%s\n"):format(
 				    ev.step, ev.epoch, ev.loss, ev.lr, ev.tokens, ev.seconds,
-				    ev.grad_norm and (" gnorm %.3f"):format(ev.grad_norm) or ""))
+				    ev.grad_norm and (" gnorm %.3f"):format(ev.grad_norm) or "",
+				    ev.skipped and " skipped" or ""))
 			else
 				io.stdout:write(("eval step %d loss %.4f\n"):format(ev.step, ev.loss))
 			end

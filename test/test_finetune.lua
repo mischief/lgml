@@ -203,6 +203,35 @@ do
 	end })
 	ok(table.concat(got, ",") == table.concat(want, ","),
 	    ("shuffle = false keeps the order: %s"):format(table.concat(got, ",")))
+
+	-- A step with a loss that is not finite makes no update; too many in
+	-- a row stop the run.
+	local real, calls = finetune.loss, 0
+	finetune.loss = function(...)
+		calls = calls + 1
+		local l = real(...)
+		return calls == 2 and 0 / 0 or l
+	end
+	local ad3 = lora.new(m, { rank = 2 })
+	local before, flags = nil, {}
+	finetune.train({ model = m, adapter = ad3, train = seq, lr = 1e-3, shuffle = false, steps = 2,
+	    log = function(e)
+		if e.kind == "step" then
+			flags[#flags + 1] = e.skipped and "skip" or "ok"
+			if e.step == 1 then
+				before = ad3:params()[2]:get()[1]
+			end
+		end
+	end })
+	ok(table.concat(flags, ",") == "ok,skip" and ad3:params()[2]:get()[1] == before,
+	    "a step with a NaN loss is skipped and changes nothing")
+	finetune.loss = function()
+		return 0 / 0
+	end
+	local good, err = pcall(finetune.train, { model = m, adapter = lora.new(m, { rank = 2 }),
+	    train = mbs, lr = 1e-3, epochs = 3 })
+	ok(not good and tostring(err):find("not finite", 1, true), "steps that stay NaN stop the run")
+	finetune.loss = real
 	m:close()
 end
 
