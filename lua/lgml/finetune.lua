@@ -382,7 +382,8 @@ end
 --   (0), `optimizer` ("adamw" or "sgd"), `seed` (1)
 -- - `recompute`: run the backward pass one layer at a time (see `loss`)
 -- - `clip`: the largest global gradient norm (default: no clipping)
--- - `eval_every`: steps between evals (default: at the end of each epoch)
+-- - `eval_every`: steps between evals, and one before the first step
+--   (default: at the end of each epoch)
 -- - `save_every`, `save`: `save(step)` runs every save_every steps
 -- - `log`: `log(event)` gets { kind = "step", step, epoch, loss, lr,
 --   tokens, seconds, grad_norm } and { kind = "eval", step, loss }
@@ -403,6 +404,9 @@ function M.train(opts)
 			ev = M.evaluate(model, opts.eval)
 			log({ kind = "eval", step = step, loss = ev })
 		end
+	end
+	if opts.eval_every and opts.eval_every > 0 then
+		eval()
 	end
 	for epoch = 1, opts.epochs or 1 do
 		local order = table.move(opts.train, 1, #opts.train, 1, {})
