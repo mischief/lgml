@@ -1,13 +1,8 @@
 [wrap-git]
-url = https://github.com/ggml-org/ggml.git
-revision = ffa4e8b80930029a35991f94e7c8a93cd67730ab
+url = https://github.com/mischief/ggml.git
+revision = 9b4c9e8f557c5c1dfbd2dd514d9e23c18b0c6dc2
 depth = 1
 method = cmake
-# ggml-vulkan-02: a Vulkan fix from llama.cpp that ggml has not synced yet.
-# ggml-vulkan-lgml: custom ops with SPIR-V shaders (see src/ops_fused.c) and
-# device reads of pinned host tensors (see lgml.vk_host_read).
-# ggml-backward-gdn: gradients of the gated delta net layer ops for training.
-diff_files = ggml-vulkan-release.patch,
-	ggml-vulkan-02-vulkan-MOE-aware-mat_mul_id-tile-selecti.patch,
-	ggml-vulkan-lgml.patch,
-	ggml-backward-gdn.patch
+# Branch lgml of the fork: ggml master ffa4e8b with the Vulkan release
+# build, a llama.cpp Vulkan fix ggml has not synced yet, lgml's custom op
+# shaders and host read buffers, and the training backward passes.
