@@ -396,6 +396,21 @@ do
 	end
 	ok(good, "sgd step")
 
+	-- The gradient 2p has norm 2 * sqrt(14); clip scales it to norm 1.
+	p:set({ 1, -2, 3 })
+	sgd:zero_grad()
+	g:compute(loss)
+	local norm = sgd:clip(1)
+	local gr, n2 = p:grad():get(), 0
+	for i = 1, 3 do
+		n2 = n2 + gr[i] ^ 2
+	end
+	ok(math.abs(norm - 2 * math.sqrt(14)) < 1e-4 and math.abs(math.sqrt(n2) - 1) < 1e-5 and
+	    math.abs(gr[1] - 2 / (2 * math.sqrt(14))) < 1e-5, ("clip: norm %.4f, then %.4f"):format(norm,
+	    math.sqrt(n2)))
+	ok(math.abs(sgd:clip(5) - 1) < 1e-5 and math.abs(p:grad():get()[1] - 1 / math.sqrt(14)) < 1e-5,
+	    "clip under the bound leaves the gradient")
+
 	p:set({ 1, -2, 3 })
 	local adam = optim.adamw({ p }, { lr = 0.01, betas = { 0.9, 0.99 }, eps = 1e-8,
 	    weight_decay = 0.1 })

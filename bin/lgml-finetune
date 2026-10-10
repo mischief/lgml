@@ -25,6 +25,7 @@ usage: lgml-finetune [-h] -m model -d data [-o out] [-b backend] [-t n] [-r rank
                      [--eval-split f] [--eval-every n] [--save-every n]
                      [--init adapter] [--seed n] [--think] [--format name]
                      [--recompute] [--override-tensor pattern=backend]
+                     [--clip x]
   -m, --model file     base gguf model: a dense llama or qwen3, or a
                        qwen35 hybrid; its weights may be quantized
   -d, --data file      JSONL training data, one object per line:
@@ -52,6 +53,8 @@ usage: lgml-finetune [-h] -m model -d data [-o out] [-b backend] [-t n] [-r rank
       --lr x           learning rate (default 1e-4)
       --warmup n       steps of linear learning rate warmup (default 0)
       --wd x           weight decay (default 0)
+      --clip x         clip the global gradient norm to x; 0 for none
+                       (default 1)
       --optimizer name adamw or sgd (default adamw)
   -e, --epochs n       passes over the data (default 1)
   -c, --ctx n          the most tokens in one micro-batch; longer
@@ -104,7 +107,7 @@ local function main(args)
 		["grad-accum="] = false, ["eval="] = false, ["eval-split="] = false,
 		["eval-every="] = false, ["save-every="] = false, ["init="] = false,
 		["seed="] = false, think = false, ["format="] = false, recompute = false,
-		["override-tensor="] = false,
+		["override-tensor="] = false, ["clip="] = false,
 	}, { ["override-tensor"] = true })
 	if not opts then
 		io.stderr:write("lgml-finetune: ", rest, "\n", USAGE)
@@ -251,14 +254,16 @@ local function main(args)
 		lr = num(opts, "lr", 1e-4), warmup = num(opts, "warmup", 0, true),
 		weight_decay = num(opts, "wd", 0), optimizer = optimizer, seed = seed,
 		eval_every = num(opts, "eval-every", nil, true), recompute = opts.recompute,
+		clip = num(opts, "clip", 1) > 0 and num(opts, "clip", 1) or nil,
 		save_every = num(opts, "save-every", 0, true),
 		save = function(step)
 			save(("%s-step%d.gguf"):format(base, step))
 		end,
 		log = function(ev)
 			if ev.kind == "step" then
-				io.stdout:write(("step %d epoch %d loss %.4f lr %.3g tokens %d %.1fs\n"):format(
-				    ev.step, ev.epoch, ev.loss, ev.lr, ev.tokens, ev.seconds))
+				io.stdout:write(("step %d epoch %d loss %.4f lr %.3g tokens %d %.1fs%s\n"):format(
+				    ev.step, ev.epoch, ev.loss, ev.lr, ev.tokens, ev.seconds,
+				    ev.grad_norm and (" gnorm %.3f"):format(ev.grad_norm) or ""))
 			else
 				io.stdout:write(("eval step %d loss %.4f\n"):format(ev.step, ev.loss))
 			end

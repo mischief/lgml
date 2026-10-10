@@ -65,6 +65,39 @@ function Opt:zero_grad()
 	end
 end
 
+--- Clip the gradients by their global norm.
+-- When the L2 norm of all gradients together passes max_norm, every
+-- gradient scales down by the same factor to max_norm.
+-- @tparam number max_norm the largest norm
+-- @treturn number the norm before clipping
+function Opt:clip(max_norm)
+	local be = self.params[1]:backend()
+	if not self.gnorm then
+		local g = be:graph(4 * #self.params + 64)
+		local total
+		for _, p in ipairs(self.params) do
+			local s = g:sum(g:sqr(p:grad()))
+			total = total and g:add(total, s) or s
+		end
+		self.gnorm, self.gnorm_out = g, total
+		-- The scale graph multiplies every gradient by the factor in cf.
+		local gs = be:graph(4 * #self.params + 64)
+		self.cf = be:tensor("f32", { 1 })
+		local nodes = {}
+		for i, p in ipairs(self.params) do
+			nodes[i] = gs:cpy(gs:mul(p:grad(), self.cf), p:grad())
+		end
+		self.gscale, self.gscale_nodes = gs, nodes
+	end
+	self.gnorm:compute(self.gnorm_out)
+	local norm = math.sqrt(self.gnorm_out:get()[1])
+	if norm > max_norm then
+		self.cf:set({ max_norm / norm })
+		self.gscale:compute(table.unpack(self.gscale_nodes))
+	end
+	return norm
+end
+
 -- The step graph: one update node per parameter, and the moments.
 function Opt:build()
 	local be = self.params[1]:backend()
@@ -111,9 +144,15 @@ end
 --- Free the step graph and the moments.
 -- The optimizer builds them again at the next step, with zero moments.
 function Opt:close()
-	if self.g then
-		self.g:close()
-		self.g = nil
+	for _, k in ipairs({ "g", "gnorm", "gscale" }) do
+		if self[k] then
+			self[k]:close()
+			self[k] = nil
+		end
+	end
+	if self.cf then
+		self.cf:close()
+		self.cf = nil
 	end
 	for _, list in ipairs({ self.m or {}, self.v or {} }) do
 		for _, t in ipairs(list) do

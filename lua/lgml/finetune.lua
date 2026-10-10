@@ -381,10 +381,11 @@ end
 -- - `epochs` (1), `accum` (1), `lr` (1e-4), `warmup` (0), `weight_decay`
 --   (0), `optimizer` ("adamw" or "sgd"), `seed` (1)
 -- - `recompute`: run the backward pass one layer at a time (see `loss`)
+-- - `clip`: the largest global gradient norm (default: no clipping)
 -- - `eval_every`: steps between evals (default: at the end of each epoch)
 -- - `save_every`, `save`: `save(step)` runs every save_every steps
 -- - `log`: `log(event)` gets { kind = "step", step, epoch, loss, lr,
---   tokens, seconds } and { kind = "eval", step, loss }
+--   tokens, seconds, grad_norm } and { kind = "eval", step, loss }
 -- @tparam table opts the options
 -- @treturn table { steps, loss (of the last step), eval (the last eval
 -- loss, or nil) }
@@ -420,10 +421,11 @@ function M.train(opts)
 			end
 			step = step + 1
 			opt.lr = warmup > 0 and step <= warmup and lr * step / warmup or lr
+			local gnorm = opts.clip and opt:clip(opts.clip) or nil
 			opt:step()
 			last = sum / m
 			log({ kind = "step", step = step, epoch = epoch, loss = last, lr = opt.lr,
-			    tokens = tokens, seconds = lgml.clock() - t0 })
+			    tokens = tokens, seconds = lgml.clock() - t0, grad_norm = gnorm })
 			if opts.eval_every and opts.eval_every > 0 and step % opts.eval_every == 0 then
 				eval()
 			end
