@@ -424,18 +424,26 @@ out_prod_as_mul_mat(struct graph *g, struct ggml_tensor *t, struct ggml_tensor *
 		set_op(t, GGML_OP_MUL_MAT, x, y);
 		return 1;
 	}
-	if (ids == NULL || a->ne[2] != 1 || a->ne[3] != 1 || k > ids->ne[0])
+	if (a->ne[2] != 1 || a->ne[3] != 1)
 		return 0;
 	rows = GPU_BLOCK_MAX / (4 * a->ne[0]);
 	rows = rows < 1 ? 1 : rows;
 	for (r0 = 0; r0 < k; r0 += n) {
 		n = k - r0 < rows ? k - r0 : rows;
-		x = ggml_get_rows(ctx, a, ggml_view_1d(ctx, ids, n, r0 * ggml_element_size(ids)));
 		/*
-		 * Nodes, not leaves, so their memory frees after the mul_mat. The
-		 * transpose keeps one type: Vulkan has a fast copy for that.
+		 * Nodes, not leaves, so their memory frees after the mul_mat. A
+		 * backend that cannot cast the rows to f16 dequantizes them with
+		 * get_rows. The transpose keeps one type: Vulkan copies that fast.
 		 */
-		x = ggml_cont(ctx, ggml_transpose(ctx, ggml_cast(ctx, x, GGML_TYPE_F16)));
+		x = ggml_cast(ctx, ggml_view_2d(ctx, a, a->ne[0], n, a->nb[1], r0 * a->nb[1]),
+		    GGML_TYPE_F16);
+		if (!ggml_backend_supports_op(g->b->be, x)) {
+			if (ids == NULL || k > ids->ne[0])
+				return 0;
+			x = ggml_get_rows(ctx, a, ggml_view_1d(ctx, ids, n, r0 * ggml_element_size(ids)));
+			x = ggml_cast(ctx, x, GGML_TYPE_F16);
+		}
+		x = ggml_cont(ctx, ggml_transpose(ctx, x));
 		/* y is contiguous, so a block of its columns has rows in order. */
 		yb = n == k ? y : ggml_cont(ctx, ggml_view_4d(ctx, y, n, y->ne[1], y->ne[2], y->ne[3],
 		    y->nb[1], y->nb[2], y->nb[3], r0 * ggml_element_size(y)));

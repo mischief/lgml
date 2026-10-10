@@ -366,7 +366,7 @@ index 4158ff7..526c9a5 100644
      vk_pipeline pipeline_ssm_scan_f32_d256;
      vk_pipeline pipeline_ssm_conv_f32;
 diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
-index c9e1cec..e479b95 100644
+index c9e1cec..927c22a 100644
 --- a/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -3743,6 +3743,18 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
@@ -388,7 +388,47 @@ index c9e1cec..e479b95 100644
      if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
          ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d128, "ssm_scan_128_f32", ssm_scan_subgroup_f32_len, ssm_scan_subgroup_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {128, device->subgroup_size}, 1, true, true);
          ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d256, "ssm_scan_256_f32", ssm_scan_subgroup_f32_len, ssm_scan_subgroup_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {256, device->subgroup_size}, 1, true, true);
-@@ -9159,6 +9171,21 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+@@ -5482,6 +5494,39 @@ void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
+ #endif
+ }
+ 
++static bool ggml_vk_has_to_fp16(ggml_type type) {
++    switch (type) {
++        case GGML_TYPE_Q1_0:
++        case GGML_TYPE_Q2_0:
++        case GGML_TYPE_Q4_0:
++        case GGML_TYPE_Q4_1:
++        case GGML_TYPE_Q5_0:
++        case GGML_TYPE_Q5_1:
++        case GGML_TYPE_Q8_0:
++        case GGML_TYPE_Q2_K:
++        case GGML_TYPE_Q3_K:
++        case GGML_TYPE_Q4_K:
++        case GGML_TYPE_Q5_K:
++        case GGML_TYPE_Q6_K:
++        case GGML_TYPE_IQ1_S:
++        case GGML_TYPE_IQ1_M:
++        case GGML_TYPE_IQ2_XXS:
++        case GGML_TYPE_IQ2_XS:
++        case GGML_TYPE_IQ2_S:
++        case GGML_TYPE_IQ3_XXS:
++        case GGML_TYPE_IQ3_S:
++        case GGML_TYPE_IQ4_XS:
++        case GGML_TYPE_IQ4_NL:
++        case GGML_TYPE_MXFP4:
++        case GGML_TYPE_NVFP4:
++        case GGML_TYPE_TQ1_0:
++        case GGML_TYPE_TQ2_0:
++            return true;
++        default:
++            return false;
++    }
++}
++
+ vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type type) {
+     VK_LOG_DEBUG("ggml_vk_get_to_fp16()");
+     switch (type) {
+@@ -9159,6 +9204,21 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
              return ctx->device->pipeline_gated_delta_net[si][kda];
          }
          return nullptr;
@@ -410,7 +450,7 @@ index c9e1cec..e479b95 100644
      case GGML_OP_SSM_SCAN:
          if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
              const uint32_t d_state = src0->ne[0];
-@@ -10270,6 +10297,56 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx,
+@@ -10270,6 +10330,56 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx,
          pc, { H, n_seqs, S_v });
  }
  
@@ -467,7 +507,28 @@ index c9e1cec..e479b95 100644
  void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
      const ggml_tensor * src0 = dst->src[0];
      const ggml_tensor * src1 = dst->src[1];
-@@ -12801,6 +12878,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
+@@ -10627,6 +10737,20 @@ void ggml_vk_repeat_back(ggml_backend_vk_context * ctx, vk_context& subctx, cons
+ }
+ 
+ void ggml_vk_cpy(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
++    if (ggml_is_quantized(src0->type) && dst->type == GGML_TYPE_F16) {
++        // contiguous rows, through the dequant shader of the matmul path
++        GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(dst));
++        vk_pipeline pipeline = ggml_vk_get_to_fp16(ctx, src0->type);
++        GGML_ASSERT(pipeline != nullptr);
++        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
++        const uint32_t k = (uint32_t)src0->ne[0];
++        const uint32_t m = (uint32_t)(ggml_nelements(src0) / src0->ne[0]);
++        const std::vector<uint32_t> pc = { m, k, k, k, (uint32_t)ggml_nelements(src0) };
++        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
++            { ggml_vk_tensor_subbuffer(ctx, src0), ggml_vk_tensor_subbuffer(ctx, dst) }, pc,
++            { (uint32_t)ggml_nelements(src0), 1, 1 });
++        return;
++    }
+     uint32_t ne = (uint32_t)ggml_nelements(src0);
+     if (ggml_is_quantized(src0->type) && ggml_is_quantized(dst->type)) {
+         // Convert from number of logical elements to 2- or 4-byte units.
+@@ -12801,6 +12925,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
  
          break;
  
@@ -479,7 +540,21 @@ index c9e1cec..e479b95 100644
      case GGML_OP_SSM_SCAN:
          ggml_vk_ssm_scan(ctx, compute_ctx, node);
  
-@@ -15789,7 +15871,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+@@ -15739,6 +15868,13 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                     return true;
+                 }
+ 
++                // dequantize to f16 through the matmul dequant shaders
++                if (ggml_is_quantized(src0_type) && src1_type == GGML_TYPE_F16 &&
++                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op) &&
++                    ggml_vk_has_to_fp16(src0_type)) {
++                    return true;
++                }
++
+                 if (
+                     (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_I32) ||
+                     (src0_type == GGML_TYPE_I32 && src1_type == GGML_TYPE_F32)
+@@ -15789,7 +15925,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     op->type == GGML_TYPE_F32;
          case GGML_OP_SILU_BACK:
          case GGML_OP_RMS_NORM_BACK:
@@ -488,7 +563,7 @@ index c9e1cec..e479b95 100644
          case GGML_OP_SQR:
          case GGML_OP_SQRT:
          case GGML_OP_SIN:
-@@ -16014,6 +16096,20 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+@@ -16014,6 +16150,20 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                  }
                  return op->type == GGML_TYPE_F32;
              }
