@@ -23,8 +23,10 @@ local M = {}
 local A = {}
 A.__index = A
 
---- The default targets of `new`: attention and dense FFN projections.
-M.TARGETS = { "attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up", "ffn_down" }
+--- The default targets of `new`: attention, gated delta net and dense
+-- FFN projections.
+M.TARGETS = { "attn_q", "attn_k", "attn_v", "attn_output", "attn_qkv", "attn_gate", "ssm_in", "ssm_out",
+	"ffn_gate", "ffn_up", "ffn_down" }
 
 -- PEFT module names to gguf weight names after "blk.N.".
 local PEFT = {

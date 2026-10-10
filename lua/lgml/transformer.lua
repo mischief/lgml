@@ -620,6 +620,29 @@ function M:cache(n_ctx, opts)
 	return c
 end
 
+--- Make zero recurrent states for a pass without a cache.
+-- Training passes put them in `inp.rs`; the graph reads them and does
+-- not write them. Close them with `close_states`.
+-- @treturn table { conv, ssm } by layer, or nil without recurrent layers
+function M:zero_states()
+	if not self.recurrent then
+		return nil
+	end
+	local rs = {}
+	add_layers(self, rs, {}, false)
+	return { conv = rs.conv, ssm = rs.ssm }
+end
+
+--- Close states from `zero_states`.
+-- @tparam table rs the states
+function M.close_states(rs)
+	for _, part in ipairs({ rs.conv, rs.ssm }) do
+		for _, t in pairs(part) do
+			t:close()
+		end
+	end
+end
+
 --- Make a KV pool: one buffer of full-attention rows that several
 -- sequences share.
 -- The pool holds the K and V rows of the global attention layers in
@@ -2066,8 +2089,11 @@ end
 
 -- A gated delta net layer on the normed input x. The conv and delta
 -- net states come from the cache; the graph writes the new states back.
+-- Without a cache the states come from inp.rs (see `zero_states`) and
+-- are not written.
 local function linear_attention(hp, g, inp, L, il, x, taps, sfx)
 	local n, c = inp.n, inp.cache
+	local rs = c or inp.rs
 	local nk, nv, hk, hv = hp.n_k_heads, hp.n_v_heads, hp.head_k, hp.head_v
 	local kd, vd, cd = nk * hk, nv * hv, conv_dim(hp)
 	local f4 = lgml.row_size("f32", 1)
@@ -2083,10 +2109,12 @@ local function linear_attention(hp, g, inp, L, il, x, taps, sfx)
 	gate = g:reshape(gate, { 1, n, nv, 1 })
 
 	-- Conv over the saved d_conv - 1 columns and the new ones.
-	local xin = g:concat(c.conv[il], g:transpose(qkv), 3)
-	local s = xin:strides()
-	local last = g:view(xin, { 1, cd, hp.d_conv - 1 }, { s[1], s[2] }, n * f4)
-	g:expand(g:cpy(last, c.conv[il]))
+	local xin = g:concat(rs.conv[il], g:transpose(qkv), 3)
+	if c then
+		local s = xin:strides()
+		local last = g:view(xin, { 1, cd, hp.d_conv - 1 }, { s[1], s[2] }, n * f4)
+		g:expand(g:cpy(last, c.conv[il]))
+	end
 	local conv = g:silu(g:ssm_conv(xin, L.conv))
 	taps["conv_output_silu" .. sfx] = conv
 
@@ -2097,11 +2125,13 @@ local function linear_attention(hp, g, inp, L, il, x, taps, sfx)
 	q = repeat_heads(g, hp, g:l2_norm(q, hp.eps), n)
 	k = repeat_heads(g, hp, g:l2_norm(k, hp.eps), n)
 
-	local out = g:gated_delta_net(q, k, v, gate, beta, c.ssm[il])
+	local out = g:gated_delta_net(q, k, v, gate, beta, rs.ssm[il])
 	local o = g:view(out, { 1, n, nv, hv }, { n * vd * f4, vd * f4, hv * f4 })
-	local ns = g:view(out, { 1, nv, hv, hv }, { nv * hv * hv * f4, hv * hv * f4, hv * f4 },
-	    n * vd * f4)
-	g:expand(g:cpy(ns, c.ssm[il]))
+	if c then
+		local ns = g:view(out, { 1, nv, hv, hv }, { nv * hv * hv * f4, hv * hv * f4, hv * f4 },
+		    n * vd * f4)
+		g:expand(g:cpy(ns, c.ssm[il]))
+	end
 	taps["attn_output" .. sfx] = o
 
 	z = g:reshape(z, { 1, n, nv, hv })

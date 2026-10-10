@@ -10,8 +10,9 @@
 -- tokens, so a step minimizes the mean over all its tokens.
 --
 -- Training needs ops that have gradients in ggml: dense attention
--- models (llama, qwen3) with soft_max attention. `bin/lgml-finetune`
--- is the command line front end.
+-- models (llama, qwen3) with soft_max attention, and gated delta net
+-- hybrids (qwen3next, qwen35). A hybrid takes one sample per
+-- micro-batch. `bin/lgml-finetune` is the command line front end.
 -- @module lgml.finetune
 local lgml = require("lgml")
 local json = require("lgml.json")
@@ -25,10 +26,7 @@ local M = {}
 -- @raise when a part of the model has no gradient in ggml
 function M.check(model)
 	local hp = model.hp
-	if model.recurrent then
-		error(hp.arch .. ": gated delta net layers have no gradient in ggml; " ..
-		    "training needs a dense attention model such as llama or qwen3", 0)
-	elseif hp.n_expert then
+	if hp.n_expert then
 		error(hp.arch .. ": routed experts (mul_mat_id) have no gradient in ggml", 0)
 	elseif hp.gemma or hp.n_swa then
 		error(hp.arch .. ": gelu, soft capping and sliding windows have no gradient in ggml", 0)
@@ -240,6 +238,7 @@ local function inputs(model, mb)
 		hidden = model.hp.n_layer,
 		ids = be:tensor("i32", { n }, ids), pos = be:tensor("i32", { n }, pos),
 		mask = be:tensor("f32", { n, n }, table.concat(mask)),
+		rs = model:zero_states(),
 	}
 	return inp, rows, targets
 end
@@ -254,6 +253,9 @@ end
 -- @treturn number the mean loss over the loss tokens
 function M.loss(model, mb, weight, backward)
 	local be, hp = model.be, model.hp
+	-- The recurrent state would carry from one sample to the next.
+	assert(not model.recurrent or #mb.samples == 1,
+	    "a recurrent model takes one sample per micro-batch")
 	local inp, rows, targets = inputs(model, mb)
 	local sel = be:tensor("i32", { #rows }, rows)
 	local labels = be:tensor("f32", { #rows, hp.n_vocab })
@@ -269,8 +271,13 @@ function M.loss(model, mb, weight, backward)
 	end
 	g:compute(obj, loss)
 	local v = loss:get()[1]
-	for _, t in ipairs({ inp.ids, inp.pos, inp.mask, sel, labels }) do
+	-- With its outputs closed, the graph frees its compute buffers when
+	-- it closes, not when the collector finds the nodes.
+	for _, t in ipairs({ obj, loss, x, logits, inp.ids, inp.pos, inp.mask, sel, labels }) do
 		t:close()
+	end
+	if inp.rs then
+		transformer.close_states(inp.rs)
 	end
 	return v
 end

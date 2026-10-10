@@ -108,8 +108,33 @@ do
 	local want = (la * ma + lb * mb) / (ma + mb)
 	ok(#both == 1 and math.abs(lab - want) < 1e-4, ("packed loss %.5f, separate %.5f"):format(lab,
 	    want))
-	local good, err = pcall(finetune.check, { hp = { arch = "qwen35" }, recurrent = true })
-	ok(not good and tostring(err):find("gated delta net", 1, true), "hybrid models raise")
+	m:close()
+end
+
+-- A gated delta net hybrid trains, with its delta net projections in
+-- the adapter, one sample per micro-batch.
+do
+	local qp = tmp(".gguf")
+	tiny.write(qp, "qwen35", { hybrid = true })
+	local qtk = assert(tokenizer.open(qp))
+	local be <close> = assert(lgml.backend("CPU"))
+	local m = transformer.load(be, qp)
+	local ss = finetune.encode_text(qtk, "mi cmila .i do cmila .i ko cmila\n", 32)
+	local good = pcall(finetune.loss, m, finetune.pack({ ss[1], ss[1] }, 64)[1])
+	ok(not good, "two samples in one micro-batch of a hybrid raise")
+	local ad = lora.new(m, { rank = 4 })
+	local names = table.concat(ad.names, " ")
+	ok(names:find("ssm_in", 1, true) and names:find("ssm_out", 1, true) and
+	    names:find("attn_q.", 1, true), "the adapter covers delta net and attention layers")
+	local losses = {}
+	finetune.train({ model = m, adapter = ad, train = finetune.pack(ss, 32, 1), epochs = 30,
+	    lr = 1e-2, log = function(e)
+		if e.kind == "step" then
+			losses[#losses + 1] = e.loss
+		end
+	end })
+	ok(#losses == 30 and losses[#losses] < losses[1] / 4, ("hybrid train loss %.3f -> %.4f"):format(
+	    losses[1] or 0, losses[#losses] or 0))
 	m:close()
 end
 

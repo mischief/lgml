@@ -43,8 +43,9 @@ usage: lgml-finetune [-h] -m model -d data [-o out] [-b backend] [-t n] [-r rank
       --alpha a        LoRA alpha; the scale is alpha / rank (default
                        2 * rank)
       --targets list   comma-separated weights to adapt (default
-                       attn_q,attn_k,attn_v,attn_output,ffn_gate,
-                       ffn_up,ffn_down); "output" adds the output
+                       attn_q,attn_k,attn_v,attn_output,attn_qkv,
+                       attn_gate,ssm_in,ssm_out,ffn_gate,ffn_up,
+                       ffn_down); "output" adds the output
                        projection
       --lr x           learning rate (default 1e-4)
       --warmup n       steps of linear learning rate warmup (default 0)
@@ -169,6 +170,10 @@ local function main(args)
 		end
 	end
 	local batch = num(opts, "batch", nil, true)
+	if model.recurrent then
+		-- The recurrent state would carry from one sample to the next.
+		batch = 1
+	end
 	local tmb, trimmed = finetune.pack(train, ctx, batch)
 	local emb = finetune.pack(eval, ctx, batch)
 	if trimmed > 0 then
