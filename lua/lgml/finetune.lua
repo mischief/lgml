@@ -298,9 +298,11 @@ local function loss_recompute(model, inp, sel, labels, weight)
 		obj:backward()
 		g:compute(obj)
 		close_all({ obj, x })
-		H[il + 1]:close()
+		-- A gradient is a leaf of its own: close it too, or it holds
+		-- device memory until the collector runs.
+		close_all({ H[il + 1]:grad(), H[il + 1] })
 	end
-	H[1]:close()
+	close_all({ H[1]:grad(), H[1] })
 	return v
 end
 
