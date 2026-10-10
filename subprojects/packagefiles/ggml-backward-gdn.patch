@@ -366,7 +366,7 @@ index 4158ff7..526c9a5 100644
      vk_pipeline pipeline_ssm_scan_f32_d256;
      vk_pipeline pipeline_ssm_conv_f32;
 diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
-index c9e1cec..95b4d94 100644
+index c9e1cec..e479b95 100644
 --- a/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -3743,6 +3743,18 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
@@ -380,7 +380,7 @@ index c9e1cec..95b4d94 100644
 +                const std::string name = "gated_delta_net_back_f32_d" + std::to_string(gdn_sizes[si]) + (kda ? "_kda" : "");
 +                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_back[si][kda], name.c_str(),
 +                    gated_delta_net_back_f32_len, gated_delta_net_back_f32_data, "main", 8,
-+                    sizeof(vk_op_gated_delta_net_back_push_constants), {1, 1, 1}, {gdn_sizes[si], kda}, 1);
++                    sizeof(vk_op_gated_delta_net_back_push_constants), {1, 1, 1}, {gdn_sizes[si], kda, (gdn_sizes[si] / 8) * (gdn_sizes[si] / 8)}, 1);
 +            }
 +        }
 +    }
@@ -511,22 +511,31 @@ index c9e1cec..95b4d94 100644
                  for (int i = 0; i < 6; i++) {
 diff --git a/src/ggml-vulkan/vulkan-shaders/gated_delta_net_back.comp b/src/ggml-vulkan/vulkan-shaders/gated_delta_net_back.comp
 new file mode 100644
-index 0000000..9f15daf
+index 0000000..a8e4ec6
 --- /dev/null
 +++ b/src/ggml-vulkan/vulkan-shaders/gated_delta_net_back.comp
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,246 @@
 +#version 450
 +
 +// Gradients of gated_delta_net (K == 1). One workgroup takes one value
-+// head of one sequence, with one invocation per row of the state. The
-+// state M is stored as in the forward pass: M[j*S_V + i] = S[i][j].
-+// The states, kept every C tokens and recomputed for one chunk at a
-+// time, and the gradient of the state live in the scratch of dst.
++// head of one sequence. The state M is stored as in the forward pass:
++// M[j*S_V + i] = S[i][j]. Each invocation keeps an 8x8 tile of the
++// state and of its gradient in registers; row and column sums go
++// through shared memory. The states, kept every C tokens and recomputed
++// for one chunk at a time, live in the scratch of dst.
++
++#extension GL_KHR_shader_subgroup_basic : require
++#extension GL_KHR_shader_subgroup_arithmetic : require
++#extension GL_EXT_control_flow_attributes : require
 +
 +layout(constant_id = 0) const uint S_V = 128;
 +layout(constant_id = 1) const uint KDA = 0;
++layout(constant_id = 2) const uint NT = 256;   // (S_V / TB)^2 invocations
 +
-+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
++const uint TB = 8;              // tile side
++const uint NB = S_V / TB;       // tiles per side
++
++layout(local_size_x_id = 2, local_size_y = 1, local_size_z = 1) in;
 +
 +layout(push_constant) uniform Parameters {
 +    uint H, T, B, Hk;
@@ -546,176 +555,211 @@ index 0000000..9f15daf
 +layout(binding = 4) readonly buffer BetaBuf  { float data_beta[];  };
 +layout(binding = 5) readonly buffer StateBuf { float data_state[]; };
 +layout(binding = 6) readonly buffer DyBuf    { float data_dy[];    };
-+layout(binding = 7) coherent buffer DstBuf   { float data_dst[];   };
++layout(binding = 7)          buffer DstBuf   { float data_dst[];   };
 +
-+shared float sk[S_V], sq[S_V], sv[S_V], sdo[S_V], sea[S_V], ska[S_V];
-+shared float sd[S_V], sdu[S_V], r1[S_V], r2[S_V], r3[S_V];
++shared float sk[S_V], sq[S_V], sv[S_V], sdo[S_V], sea[S_V], ska[S_V], sd[S_V], sdu[S_V];
++// partial sums: [tile column][row] for row sums, [tile row][column] for column sums
++shared float red0[NB * S_V], red1[NB * S_V], red2[NB * S_V], red3[NB * S_V];
++shared float ssum[64];
++shared float sbeta;
 +
-+uint ih, is, ik, tid;
++uint ih, is, ik, tid, j0, i0;
 +
-+// Loads the inputs of token t into shared memory. Returns beta.
-+float load_token(uint t) {
++// The sum of x over the workgroup, in every invocation.
++float wg_sum(float x) {
++    x = subgroupAdd(x);
++    if (subgroupElect()) {
++        ssum[gl_SubgroupID] = x;
++    }
 +    barrier();
-+    sk[tid]  = data_k[is * sk3 + t * sk2 + ik * sk1 + tid];
-+    sq[tid]  = data_q[is * sq3 + t * sq2 + ik * sq1 + tid];
-+    sv[tid]  = data_v[is * sv3 + t * sv2 + ih * sv1 + tid];
-+    sdo[tid] = data_dy[((is * T + t) * H + ih) * S_V + tid];
-+    const uint gi = (is * T + t) * H + ih;
-+    sea[tid] = exp(KDA != 0 ? data_g[gi * S_V + tid] : data_g[gi]);
-+    ska[tid] = sea[tid] * sk[tid];
-+    barrier();
-+    return data_beta[gi];
-+}
-+
-+// One forward step on row tid of the state at M.
-+void step_row(uint M, float beta) {
-+    const uint row = M + tid * S_V;
 +    float s = 0.0;
-+    for (uint i = 0; i < S_V; i++) {
-+        const float m = data_dst[row + i] * sea[i];
-+        data_dst[row + i] = m;
-+        s += m * sk[i];
++    for (uint i = 0; i < gl_NumSubgroups; i++) {
++        s += ssum[i];
 +    }
-+    const float dl = beta * (sv[tid] - s);
-+    for (uint i = 0; i < S_V; i++) {
-+        data_dst[row + i] += dl * sk[i];
-+    }
++    barrier();
++    return s;
 +}
 +
-+void copy_row(uint from, uint to) {
-+    for (uint i = 0; i < S_V; i++) {
-+        data_dst[to + tid * S_V + i] = data_dst[from + tid * S_V + i];
++// Loads the inputs of token t into shared memory.
++void load_token(uint t) {
++    barrier();
++    const uint gi = (is * T + t) * H + ih;
++    for (uint x = tid; x < S_V; x += NT) {
++        sk[x]  = data_k[is * sk3 + t * sk2 + ik * sk1 + x];
++        sq[x]  = data_q[is * sq3 + t * sq2 + ik * sq1 + x];
++        sv[x]  = data_v[is * sv3 + t * sv2 + ih * sv1 + x];
++        sdo[x] = data_dy[((is * T + t) * H + ih) * S_V + x];
++        sea[x] = exp(KDA != 0 ? data_g[gi * S_V + x] : data_g[gi]);
++        ska[x] = sea[x] * sk[x];
 +    }
-+}
-+
-+// Sums r1, r2 and r3 over the workgroup into element 0.
-+void reduce3() {
-+    for (uint s = S_V / 2; s > 0; s >>= 1) {
-+        if (tid < s) {
-+            r1[tid] += r1[tid + s];
-+            r2[tid] += r2[tid + s];
-+            r3[tid] += r3[tid + s];
-+        }
-+        barrier();
++    if (tid == 0) {
++        sbeta = data_beta[gi];
 +    }
++    barrier();
 +}
 +
 +void main() {
 +    ih  = gl_WorkGroupID.x;
 +    is  = gl_WorkGroupID.y;
 +    ik  = ih % Hk;
-+    tid = gl_LocalInvocationID.x;
++    tid = gl_LocalInvocationIndex;
++    const uint tr = tid / NB, tc = tid % NB;
++    j0  = tr * TB;
++    i0  = tc * TB;
 +
 +    const uint SS  = S_V * S_V;
 +    const uint ck  = off_scr + (is * H + ih) * (nck + C + 1) * SS;
 +    const uint buf = ck + nck * SS;
-+    const uint GM  = buf + C * SS;
++
++    float M[TB * TB];
++    float G[TB * TB];
++
++#define LOAD_TILE(dst, src_base, arr) \
++    [[unroll]] for (uint a = 0; a < TB; a++) [[unroll]] for (uint b = 0; b < TB; b++) \
++        dst[a * TB + b] = arr[(src_base) + (j0 + a) * S_V + i0 + b];
++#define STORE_TILE(src, dst_base) \
++    [[unroll]] for (uint a = 0; a < TB; a++) [[unroll]] for (uint b = 0; b < TB; b++) \
++        data_dst[(dst_base) + (j0 + a) * S_V + i0 + b] = src[a * TB + b];
++
++// One forward step on the tile M, for the token in shared memory:
++// M = exp(g) * M; d = beta (v - M^T k); M += d k^T
++#define STEP_M() { \
++    [[unroll]] for (uint a = 0; a < TB; a++) { \
++        float p = 0.0; \
++        [[unroll]] for (uint b = 0; b < TB; b++) { \
++            M[a * TB + b] *= sea[i0 + b]; \
++            p += M[a * TB + b] * sk[i0 + b]; \
++        } \
++        red0[tc * S_V + j0 + a] = p; \
++    } \
++    barrier(); \
++    for (uint x = tid; x < S_V; x += NT) { \
++        float u = 0.0; \
++        for (uint c = 0; c < NB; c++) u += red0[c * S_V + x]; \
++        sd[x] = sbeta * (sv[x] - u); \
++    } \
++    barrier(); \
++    [[unroll]] for (uint a = 0; a < TB; a++) [[unroll]] for (uint b = 0; b < TB; b++) \
++        M[a * TB + b] += sd[j0 + a] * sk[i0 + b]; \
++}
 +
 +    // states at the chunk starts
-+    for (uint i = 0; i < S_V; i++) {
-+        data_dst[ck + tid * S_V + i] = data_state[(is * H + ih) * SS + tid * S_V + i];
-+    }
++    LOAD_TILE(M, (is * H + ih) * SS, data_state)
++    STORE_TILE(M, ck)
 +    for (uint c = 0; c + 1 < nck; c++) {
-+        copy_row(ck + c * SS, ck + (c + 1) * SS);
 +        for (uint t = c * C; t < (c + 1) * C; t++) {
-+            const float beta = load_token(t);
-+            step_row(ck + (c + 1) * SS, beta);
++            load_token(t);
++            STEP_M()
 +        }
++        STORE_TILE(M, ck + (c + 1) * SS)
 +    }
 +
-+    for (uint i = 0; i < S_V; i++) {
-+        data_dst[GM + tid * S_V + i] = data_dy[dy_st + (is * H + ih) * SS + tid * S_V + i];
-+    }
++    LOAD_TILE(G, dy_st + (is * H + ih) * SS, data_dy)
 +
 +    for (int c = int(nck) - 1; c >= 0; c--) {
 +        const uint t0 = uint(c) * C;
 +        const uint t1 = min(T, t0 + C);
-+        copy_row(ck + uint(c) * SS, buf);
-+        for (uint t = t0; t + 1 < t1; t++) {
-+            copy_row(buf + (t - t0) * SS, buf + (t - t0 + 1) * SS);
-+            const float beta = load_token(t);
-+            step_row(buf + (t - t0 + 1) * SS, beta);
++        // the states before each token of the chunk; each invocation
++        // reads back only its own tile, so no barrier is needed
++        LOAD_TILE(M, ck + uint(c) * SS, data_dst)
++        for (uint t = t0; t < t1; t++) {
++            STORE_TILE(M, buf + (t - t0) * SS)
++            if (t + 1 < t1) {
++                load_token(t);
++                STEP_M()
++            }
 +        }
-+        memoryBarrierBuffer();
-+        barrier();
 +
 +        for (int ti = int(t1) - 1; ti >= int(t0); ti--) {
 +            const uint t = uint(ti);
-+            const float beta = load_token(t);
-+            const uint Mp = buf + (t - t0) * SS;  // state before token t
++            load_token(t);
++            LOAD_TILE(M, buf + (t - t0) * SS, data_dst)   // the state before token t
 +            const uint o  = ((is * T + t) * H + ih) * S_V;
 +            const uint gi = (is * T + t) * H + ih;
++            const float beta = sbeta;
 +
-+            // rows: u = M'^T k, d = beta (v - u), then the state gradient
-+            // takes the output and the delta update
-+            const uint row = tid * S_V;
-+            float u = 0.0;
-+            for (uint i = 0; i < S_V; i++) {
-+                u += data_dst[Mp + row + i] * ska[i];
++            // the output: G += scale dO q^T; row sums of M' k and G k
++            [[unroll]] for (uint a = 0; a < TB; a++) {
++                float pu = 0.0, pd = 0.0;
++                [[unroll]] for (uint b = 0; b < TB; b++) {
++                    G[a * TB + b] += scale * sdo[j0 + a] * sq[i0 + b];
++                    pu += M[a * TB + b] * ska[i0 + b];
++                    pd += G[a * TB + b] * sk[i0 + b];
++                }
++                red0[tc * S_V + j0 + a] = pu;
++                red1[tc * S_V + j0 + a] = pd;
 +            }
-+            const float d = beta * (sv[tid] - u);
-+            float dd = 0.0;
-+            for (uint i = 0; i < S_V; i++) {
-+                const float gm = data_dst[GM + row + i] + scale * sdo[tid] * sq[i];
-+                data_dst[GM + row + i] = gm;
-+                dd += gm * sk[i];
-+            }
-+            const float du = -beta * dd;
-+            for (uint i = 0; i < S_V; i++) {
-+                data_dst[GM + row + i] += du * sk[i];
-+            }
-+            data_dst[off_dv + o + tid] = beta * dd;
-+            sd[tid]  = d;
-+            sdu[tid] = du;
-+            r1[tid]  = dd * (sv[tid] - u);
-+            r2[tid]  = sdo[tid] * d;
-+            r3[tid]  = du * d;
-+            memoryBarrierBuffer();
 +            barrier();
-+            reduce3();
-+            const float dOd = r2[0];
-+            const float dud = r3[0];
++            float pb = 0.0, pod = 0.0, pud = 0.0;
++            for (uint x = tid; x < S_V; x += NT) {
++                float u = 0.0, dd = 0.0;
++                for (uint r = 0; r < NB; r++) {
++                    u  += red0[r * S_V + x];
++                    dd += red1[r * S_V + x];
++                }
++                const float d  = beta * (sv[x] - u);
++                const float du = -beta * dd;
++                sd[x]  = d;
++                sdu[x] = du;
++                data_dst[off_dv + o + x] = beta * dd;
++                pb  += dd * (sv[x] - u);
++                pod += sdo[x] * d;
++                pud += du * d;
++            }
++            barrier();
++            const float db  = wg_sum(pb);
++            const float dOd = wg_sum(pod);
++            const float dud = wg_sum(pud);
 +            if (tid == 0) {
-+                data_dst[off_db + gi] = r1[0];
++                data_dst[off_db + gi] = db;
 +            }
 +
-+            // columns: dq, dk and the gate
-+            const uint i = tid;
-+            float a1 = 0.0, a2 = 0.0, a3 = 0.0, da = 0.0;
-+            for (uint j = 0; j < S_V; j++) {
-+                const float gm = data_dst[GM + j * S_V + i];
-+                const float mp = data_dst[Mp + j * S_V + i];
-+                a1 += gm * sd[j];
-+                a2 += mp * sdu[j];
-+                a3 += mp * sdo[j];
-+                da += gm * mp;
++            // u = M'^T k: G += du k^T; column sums
++            [[unroll]] for (uint b = 0; b < TB; b++) {
++                float a1 = 0.0, a2 = 0.0, a3 = 0.0, da = 0.0;
++                [[unroll]] for (uint a = 0; a < TB; a++) {
++                    G[a * TB + b] += sdu[j0 + a] * sk[i0 + b];
++                    a1 += G[a * TB + b] * sd[j0 + a];
++                    a2 += M[a * TB + b] * sdu[j0 + a];
++                    a3 += M[a * TB + b] * sdo[j0 + a];
++                    da += G[a * TB + b] * M[a * TB + b];
++                }
++                red0[tr * S_V + i0 + b] = a1;
++                red1[tr * S_V + i0 + b] = a2;
++                red2[tr * S_V + i0 + b] = a3;
++                red3[tr * S_V + i0 + b] = da;
 +            }
-+            data_dst[off_dk + o + i] = a1 - sk[i] * dud + sea[i] * a2;
-+            data_dst[o + i] = scale * (sea[i] * a3 + sk[i] * dOd);
 +            barrier();
-+            if (KDA != 0) {
-+                data_dst[off_dg + gi * S_V + i] = da * sea[i];
-+            } else {
-+                r1[tid] = da;
-+                r2[tid] = 0.0;
-+                r3[tid] = 0.0;
-+                barrier();
-+                reduce3();
-+                if (tid == 0) {
-+                    data_dst[off_dg + gi] = r1[0] * sea[0];
++            float pda = 0.0;
++            for (uint x = tid; x < S_V; x += NT) {
++                float a1 = 0.0, a2 = 0.0, a3 = 0.0, da = 0.0;
++                for (uint r = 0; r < NB; r++) {
++                    a1 += red0[r * S_V + x];
++                    a2 += red1[r * S_V + x];
++                    a3 += red2[r * S_V + x];
++                    da += red3[r * S_V + x];
++                }
++                data_dst[off_dk + o + x] = a1 - sk[x] * dud + sea[x] * a2;
++                data_dst[o + x] = scale * (sea[x] * a3 + sk[x] * dOd);
++                if (KDA != 0) {
++                    data_dst[off_dg + gi * S_V + x] = da * sea[x];
++                } else {
++                    pda += da;
 +                }
 +            }
-+            for (uint j = 0; j < S_V; j++) {
-+                data_dst[GM + j * S_V + i] *= sea[i];
++            if (KDA == 0) {
++                const float das = wg_sum(pda);
++                if (tid == 0) {
++                    data_dst[off_dg + gi] = das * sea[0];
++                }
 +            }
-+            memoryBarrierBuffer();
-+            barrier();
++            // M' = exp(g) * M
++            [[unroll]] for (uint a = 0; a < TB; a++) [[unroll]] for (uint b = 0; b < TB; b++)
++                G[a * TB + b] *= sea[i0 + b];
 +        }
 +    }
 +
-+    for (uint i = 0; i < S_V; i++) {
-+        data_dst[off_ds + (is * H + ih) * SS + tid * S_V + i] = data_dst[GM + tid * S_V + i];
-+    }
++    STORE_TILE(G, off_ds + (is * H + ih) * SS)
 +}
 diff --git a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
 index 7597b3d..6bb1bc7 100644
