@@ -329,6 +329,26 @@ do
 	ok(s == ("int add(int a, int b) { return a + b; }\n"):sub(1, #s) and #s >= 8,
 	    ("the adapter completes the file: %q"):format(s))
 	m:close()
+
+	-- --layers adapts only the blocks it names, numbered from 0.
+	local out1 = tmp(".gguf")
+	p = assert(io.popen(("%s %s/../bin/lgml-finetune -m %s -d %s -o %s -b CPU --format text -c 32 " ..
+	    "-e 1 --layers 0 2>&1"):format(arg[-1] or "lua5.4", here, path, data, out1)))
+	log = p:read("a")
+	closed = p:close()
+	local blocks = {}
+	for _, t in ipairs(closed and assert(lgml.gguf(out1)).tensors or {}) do
+		blocks[t.name:match("^blk%.(%d+)%.") or "other"] = true
+	end
+	ok(closed and blocks["0"] and not blocks["1"] and not blocks.other, "--layers 0 adapts block 0 only")
+	if not closed then
+		io.stderr:write(log)
+	end
+	p = assert(io.popen(("%s %s/../bin/lgml-finetune -m %s -d %s -o %s -b CPU --format text " ..
+	    "--layers 0-99 2>&1"):format(arg[-1] or "lua5.4", here, path, data, out1)))
+	log = p:read("a")
+	ok(not p:close() and log:find("bad layers", 1, true), "--layers past the last block fails")
+	os.remove(out1)
 end
 
 for _, p in ipairs(files) do

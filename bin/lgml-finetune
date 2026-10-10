@@ -19,8 +19,8 @@ local placement = require("lgml.placement")
 
 local USAGE = [[
 usage: lgml-finetune [-h] -m model -d data [-o out] [-b backend] [-t n] [-r rank]
-                     [--alpha a] [--targets list] [--lr x] [--warmup n]
-                     [--wd x] [--optimizer name] [-e epochs] [-c ctx]
+                     [--alpha a] [--targets list] [--layers list] [--lr x]
+                     [--warmup n] [--wd x] [--optimizer name] [-e epochs] [-c ctx]
                      [--schedule name] [--min-lr x]
                      [--batch n] [--grad-accum n] [--eval file]
                      [--eval-split f] [--eval-every n] [--save-every n]
@@ -51,6 +51,9 @@ usage: lgml-finetune [-h] -m model -d data [-o out] [-b backend] [-t n] [-r rank
                        attn_gate,ssm_in,ssm_out,ffn_gate,ffn_up,
                        ffn_down); "output" adds the output
                        projection
+      --layers list    blocks to adapt, as gguf numbers them from 0:
+                       comma-separated numbers and ranges, such as 0-59
+                       (default all)
       --lr x           learning rate (default 1e-4)
       --warmup n       steps of linear learning rate warmup (default 0)
       --schedule name  constant, or cosine: after the warmup the rate
@@ -107,7 +110,7 @@ end
 local function main(args)
 	local opts, rest = getopt.parse(args, "hm:d:o:b:t:r:e:c:", {
 		help = "h", model = "m", data = "d", out = "o", backend = "b", threads = "t", rank = "r",
-		epochs = "e", ctx = "c", ["alpha="] = false, ["targets="] = false, ["lr="] = false,
+		epochs = "e", ctx = "c", ["alpha="] = false, ["targets="] = false, ["layers="] = false, ["lr="] = false,
 		["warmup="] = false, ["wd="] = false, ["optimizer="] = false, ["batch="] = false,
 		["schedule="] = false, ["min-lr="] = false,
 		["grad-accum="] = false, ["eval="] = false, ["eval-split="] = false,
@@ -238,8 +241,23 @@ local function main(args)
 				targets[#targets + 1] = t
 			end
 		end
+		local layers
+		if opts.layers then
+			layers = {}
+			for part in opts.layers:gmatch("[^,%s]+") do
+				local lo, hi = part:match("^(%d+)%-(%d+)$")
+				lo, hi = tonumber(lo or part), tonumber(hi or part)
+				if not (lo and hi and math.tointeger(lo) and math.tointeger(hi)) or lo > hi or
+				    lo < 0 or hi >= #model.layers then
+					die(("bad layers: %s; blocks run from 0 to %d"):format(part, #model.layers - 1))
+				end
+				for il = lo, hi do
+					layers[#layers + 1] = il + 1
+				end
+			end
+		end
 		ad = lora.new(model, { rank = rank, alpha = num(opts, "alpha", 2 * rank), targets = targets,
-		    seed = seed })
+		    layers = layers, seed = seed })
 	end
 	local m = 0
 	for _, mb in ipairs(tmb) do
