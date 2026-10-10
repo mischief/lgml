@@ -23,8 +23,9 @@ usage: lgml-finetune [-h] -m model -d data [-o out] [-b backend] [-t n] [-r rank
                      [--batch n] [--grad-accum n] [--eval file]
                      [--eval-split f] [--eval-every n] [--save-every n]
                      [--init adapter] [--seed n] [--think] [--format name]
-  -m, --model file     base gguf model: a dense llama or qwen3; its
-                       weights may be quantized
+                     [--recompute]
+  -m, --model file     base gguf model: a dense llama or qwen3, or a
+                       qwen35 hybrid; its weights may be quantized
   -d, --data file      JSONL training data, one object per line:
                        {"messages": [...]} in OpenAI chat form, with the
                        loss on the assistant turns only, or {"text": "..."}
@@ -66,6 +67,8 @@ usage: lgml-finetune [-h] -m model -d data [-o out] [-b backend] [-t n] [-r rank
       --init adapter   start from this adapter (gguf or PEFT)
       --seed n         seed for the adapter and the order (default 1)
       --think          render the chat template with thinking on
+      --recompute      backward pass one layer at a time: a third more
+                       time, a fraction of the device memory
   -h, --help           show this help
 ]]
 
@@ -93,7 +96,7 @@ local function main(args)
 		["warmup="] = false, ["wd="] = false, ["optimizer="] = false, ["batch="] = false,
 		["grad-accum="] = false, ["eval="] = false, ["eval-split="] = false,
 		["eval-every="] = false, ["save-every="] = false, ["init="] = false,
-		["seed="] = false, think = false, ["format="] = false,
+		["seed="] = false, think = false, ["format="] = false, recompute = false,
 	})
 	if not opts then
 		io.stderr:write("lgml-finetune: ", rest, "\n", USAGE)
@@ -222,7 +225,7 @@ local function main(args)
 		epochs = num(opts, "e", 1, true), accum = num(opts, "grad-accum", 1, true),
 		lr = num(opts, "lr", 1e-4), warmup = num(opts, "warmup", 0, true),
 		weight_decay = num(opts, "wd", 0), optimizer = optimizer, seed = seed,
-		eval_every = num(opts, "eval-every", nil, true),
+		eval_every = num(opts, "eval-every", nil, true), recompute = opts.recompute,
 		save_every = num(opts, "save-every", 0, true),
 		save = function(step)
 			save(("%s-step%d.gguf"):format(base, step))

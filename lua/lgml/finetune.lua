@@ -243,6 +243,67 @@ local function inputs(model, mb)
 	return inp, rows, targets
 end
 
+-- The loss of the head on hidden state x, times weight for the gradients.
+local function head_loss(g, model, x, sel, labels, weight)
+	local hp = model.hp
+	local logits = transformer.head(g, hp, model.output_norm, model.output, g:get_rows(x, sel),
+	    model.lora_out)
+	local loss = g:cross_entropy_loss(logits, labels)
+	return weight ~= 1 and g:scale(loss, weight) or loss, loss, logits
+end
+
+-- With its outputs closed, a graph frees its compute buffers when it
+-- closes, not when the collector finds the nodes.
+local function close_all(list)
+	for _, t in pairs(list) do
+		t:close()
+	end
+end
+
+-- The backward pass one layer at a time. A forward pass keeps the
+-- input of each layer; then the head and each layer, last first, run
+-- again in a graph of their own and pass the gradient of their input
+-- down. Device memory holds the activations of one layer.
+local function loss_recompute(model, inp, sel, labels, weight)
+	local be, hp = model.be, model.hp
+	local NL, H = #model.layers, {}
+	do
+		local g <close> = be:graph(4096 + 2048 * NL)
+		local x, taps = model:forward(g, inp)
+		local outs = {}
+		for il = 1, NL + 1 do
+			H[il] = be:tensor("f32", { inp.n, hp.n_embd })
+			outs[il] = g:cpy(il == 1 and taps.embd or taps["l_out-" .. (il - 2)], H[il])
+		end
+		g:compute(table.unpack(outs))
+		outs[#outs + 1] = x
+		close_all(outs)
+	end
+	local v
+	do
+		H[NL + 1]:requires_grad()
+		local g <close> = be:graph(4096)
+		local obj, loss, logits = head_loss(g, model, H[NL + 1], sel, labels, weight)
+		obj:backward()
+		g:compute(obj, loss)
+		v = loss:get()[1]
+		close_all({ obj, loss, logits })
+	end
+	for il = NL, 1, -1 do
+		H[il]:requires_grad()
+		local g <close> = be:graph(4096 + 2048)
+		local li = setmetatable({ embd = H[il], deepstack = 0, from = il, hidden = il }, { __index = inp })
+		local x = model:forward(g, li)
+		local obj = g:sum(g:mul(x, H[il + 1]:grad()))
+		obj:backward()
+		g:compute(obj)
+		close_all({ obj, x })
+		H[il + 1]:close()
+	end
+	H[1]:close()
+	return v
+end
+
 --- Compute the loss of one micro-batch.
 -- With backward, the gradients of the loss times weight add to the
 -- gradients of the trainable leaves.
@@ -250,9 +311,12 @@ end
 -- @tparam table mb a micro-batch from `pack`
 -- @tparam[opt=1] number weight the factor on the loss for the gradients
 -- @tparam[opt] boolean backward true to run the backward pass
+-- @tparam[opt] boolean recompute true to run the backward pass one layer
+-- at a time, recomputing each layer: more time, much less device memory
 -- @treturn number the mean loss over the loss tokens
-function M.loss(model, mb, weight, backward)
+function M.loss(model, mb, weight, backward, recompute)
 	local be, hp = model.be, model.hp
+	weight = weight or 1
 	-- The recurrent state would carry from one sample to the next.
 	assert(not model.recurrent or #mb.samples == 1,
 	    "a recurrent model takes one sample per micro-batch")
@@ -260,22 +324,21 @@ function M.loss(model, mb, weight, backward)
 	local sel = be:tensor("i32", { #rows }, rows)
 	local labels = be:tensor("f32", { #rows, hp.n_vocab })
 	labels:fill_onehot(targets)
-	local g <close> = be:graph(4096 + 2048 * hp.n_layer)
-	local x = model:forward(g, inp)
-	local logits = transformer.head(g, hp, model.output_norm, model.output, g:get_rows(x, sel),
-	    model.lora_out)
-	local loss = g:cross_entropy_loss(logits, labels)
-	local obj = (weight or 1) ~= 1 and g:scale(loss, weight) or loss
-	if backward then
-		obj:backward()
+	local v
+	if backward and recompute then
+		v = loss_recompute(model, inp, sel, labels, weight)
+	else
+		local g <close> = be:graph(4096 + 2048 * hp.n_layer)
+		local x = model:forward(g, inp)
+		local obj, loss, logits = head_loss(g, model, x, sel, labels, weight)
+		if backward then
+			obj:backward()
+		end
+		g:compute(obj, loss)
+		v = loss:get()[1]
+		close_all({ obj, loss, x, logits })
 	end
-	g:compute(obj, loss)
-	local v = loss:get()[1]
-	-- With its outputs closed, the graph frees its compute buffers when
-	-- it closes, not when the collector finds the nodes.
-	for _, t in ipairs({ obj, loss, x, logits, inp.ids, inp.pos, inp.mask, sel, labels }) do
-		t:close()
-	end
+	close_all({ inp.ids, inp.pos, inp.mask, sel, labels })
 	if inp.rs then
 		transformer.close_states(inp.rs)
 	end
@@ -315,6 +378,7 @@ end
 -- - `train`, `eval`: micro-batches from `pack` (eval may be empty)
 -- - `epochs` (1), `accum` (1), `lr` (1e-4), `warmup` (0), `weight_decay`
 --   (0), `optimizer` ("adamw" or "sgd"), `seed` (1)
+-- - `recompute`: run the backward pass one layer at a time (see `loss`)
 -- - `eval_every`: steps between evals (default: at the end of each epoch)
 -- - `save_every`, `save`: `save(step)` runs every save_every steps
 -- - `log`: `log(event)` gets { kind = "step", step, epoch, loss, lr,
@@ -350,7 +414,7 @@ function M.train(opts)
 			opt:zero_grad()
 			local sum = 0
 			for _, mb in ipairs(group) do
-				sum = sum + M.loss(model, mb, mb.m / m, true) * mb.m
+				sum = sum + M.loss(model, mb, mb.m / m, true, opts.recompute) * mb.m
 			end
 			step = step + 1
 			opt.lr = warmup > 0 and step <= warmup and lr * step / warmup or lr

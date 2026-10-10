@@ -111,6 +111,48 @@ do
 	m:close()
 end
 
+-- The backward pass one layer at a time gives the loss and gradients of
+-- the whole graph, on a dense model and a hybrid.
+for _, case in ipairs({ { "qwen3", {} }, { "qwen35", { hybrid = true } } }) do
+	local mp = tmp(".gguf")
+	tiny.write(mp, case[1], case[2])
+	local mtk = assert(tokenizer.open(mp))
+	local be <close> = assert(lgml.backend("CPU"))
+	local m = transformer.load(be, mp)
+	local ad = lora.new(m, { rank = 4 })
+	-- B starts at zero, which would leave the gradients of A at zero.
+	for i, p in ipairs(ad:params()) do
+		if i % 2 == 0 then
+			p:fill("uniform", -0.1, 0.1, i)
+		end
+	end
+	m:set_adapters({ ad })
+	local mb = finetune.pack(finetune.encode_text(mtk, "mi cmila .i do cmila .i ko cmila\n", 32), 32, 1)[1]
+	local function grads(recompute)
+		for _, p in ipairs(ad:params()) do
+			p:grad():zero()
+		end
+		local l = finetune.loss(m, mb, 0.5, true, recompute)
+		local all = {}
+		for _, p in ipairs(ad:params()) do
+			for _, x in ipairs(p:grad():get()) do
+				all[#all + 1] = x
+			end
+		end
+		return l, all
+	end
+	local la, ga = grads(false)
+	local lb, gb = grads(true)
+	local worst, big = 0, 0
+	for i = 1, #ga do
+		worst = math.max(worst, math.abs(ga[i] - gb[i]))
+		big = math.max(big, math.abs(ga[i]))
+	end
+	ok(math.abs(la - lb) < 1e-5 and big > 0 and worst < 1e-4 * big, ("%s recompute: loss %.6f %.6f, " ..
+	    "gradient error %.2e of %.2e"):format(case[1], la, lb, worst, big))
+	m:close()
+end
+
 -- A gated delta net hybrid trains, with its delta net projections in
 -- the adapter, one sample per micro-batch.
 do

@@ -2212,6 +2212,7 @@ end
 -- @return logits (n, n_vocab), or (1, n_vocab) when inp.logits is "last",
 -- or one row per entry of the i32 leaf inp.logit_rows when it is "rows";
 -- with inp.hidden, the hidden state (n, n_embd) after that many layers;
+-- inp.from with inp.embd starts at that layer, with inp.embd as its input;
 -- with inp.pool "last", the normed hidden state (1, n_embd) of the last
 -- token; with inp.pool "rows", the normed hidden states (m, n_embd) of
 -- the rows that inp.pool_rows lists
@@ -2242,8 +2243,13 @@ function M:forward(g, inp)
 	end
 	taps.embd = x
 	local ple = self.ple_embd and per_layer_inputs(self, g, inp, x)
+	local from = inp.from or 1
+	assert(from == 1 or (inp.embd and not ple and not ds), "forward: from needs embd")
 	for il, L in ipairs(self.layers) do
 		local sfx = "-" .. (il - 1)
+		if il < from then
+			goto next_layer
+		end
 		if L.recr then
 			local cur = g:mul(g:rms_norm(x, hp.eps), L.attn_norm)
 			local la = inp.batch and M.linear_attention_batch or linear_attention
@@ -2271,6 +2277,7 @@ function M:forward(g, inp)
 		if il == inp.hidden then
 			return x, taps
 		end
+		::next_layer::
 	end
 	if self.mtp and not inp.pool and (inp.cache or inp.batch) then
 		mtp_rows(self, g, inp, x)
