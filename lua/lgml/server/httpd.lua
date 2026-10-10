@@ -165,6 +165,13 @@ local function log_request(req)
 	    "bytes", #req.body, "body", body)
 end
 
+-- Clients poll these paths every few seconds. A good reply logs at
+-- debug, not info.
+local POLL = {
+	["/models"] = true, ["/v1/models"] = true, ["/health"] = true,
+	["/v1/health"] = true, ["/metrics"] = true, ["/props"] = true,
+}
+
 -- One info line per request: the request, the reply and the notes.
 local function log_access(req, res, t0)
 	local notes = log.notes()
@@ -191,7 +198,11 @@ local function log_access(req, res, t0)
 		add(k, notes[k])
 	end
 	add("err", res.err)
-	L:info("access", table.unpack(f, 1, n))
+	if req and req.method == "GET" and POLL[req.path] and res.status < 400 then
+		L:debug("access", table.unpack(f, 1, n))
+	else
+		L:info("access", table.unpack(f, 1, n))
+	end
 end
 
 -- Runs one request on conn. Returns true to keep the connection. Each

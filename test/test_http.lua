@@ -693,6 +693,9 @@ local function test_logging(port)
 	access = find_line(lines_of(r.headers["x-lgml-request-id"]), "msg=access ")
 	ok(access and access:find(' status=400 ', 1, true) and
 	    access:find('err="messages must be a non-empty array"', 1, true), "an error reply logs its message")
+	r = roundtrip(port, request("GET", "/v1/models"))
+	ok(r.status == 200 and not find_line(lines_of(r.headers["x-lgml-request-id"]), "msg=access "),
+	    "a model list poll logs no access line at info")
 
 	log.set_level("debug")
 	local png = base64.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
