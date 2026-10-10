@@ -383,6 +383,8 @@ end
 -- - `epochs` (1), `accum` (1), `lr` (1e-4), `warmup` (0), `weight_decay`
 --   (0), `optimizer` ("adamw" or "sgd"), `seed` (1), `schedule`
 --   ("constant" or "cosine"), `min_lr` (0)
+-- - `steps`: the most optimizer steps; the run stops there, and the
+--   schedule ends there (default: every micro-batch of every epoch)
 -- - `recompute`: run the backward pass one layer at a time (see `loss`)
 -- - `clip`: the largest global gradient norm (default: no clipping)
 -- - `eval_every`: steps between evals, and one before the first step
@@ -401,6 +403,9 @@ function M.train(opts)
 	local opt = make(ad:params(), { lr = opts.lr or 1e-4, weight_decay = opts.weight_decay or 0 })
 	local lr, warmup, accum = opt.lr, opts.warmup or 0, opts.accum or 1
 	local total = ((#opts.train + accum - 1) // accum) * (opts.epochs or 1)
+	if opts.steps then
+		total = math.min(total, opts.steps)
+	end
 	local min_lr = opts.min_lr or 0
 	-- Linear warmup, then constant or a cosine down to min_lr at the end.
 	local function lr_at(step)
@@ -427,6 +432,9 @@ function M.train(opts)
 		local order = table.move(opts.train, 1, #opts.train, 1, {})
 		shuffle(order, (opts.seed or 1) + epoch)
 		for i = 1, #order, accum do
+			if step >= total then
+				break
+			end
 			local group = table.move(order, i, math.min(#order, i + accum - 1), 1, {})
 			local m, tokens = 0, 0
 			for _, mb in ipairs(group) do
@@ -455,6 +463,9 @@ function M.train(opts)
 		end
 		if not opts.eval_every then
 			eval()
+		end
+		if step >= total then
+			break
 		end
 	end
 	opt:close()

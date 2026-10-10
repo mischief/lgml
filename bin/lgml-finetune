@@ -21,7 +21,7 @@ local USAGE = [[
 usage: lgml-finetune [-h] -m model -d data [-o out] [-b backend] [-t n] [-r rank]
                      [--alpha a] [--targets list] [--layers list] [--lr x]
                      [--warmup n] [--wd x] [--optimizer name] [-e epochs] [-c ctx]
-                     [--schedule name] [--min-lr x]
+                     [--schedule name] [--min-lr x] [--steps n]
                      [--batch n] [--grad-accum n] [--eval file]
                      [--eval-split f] [--eval-every n] [--save-every n]
                      [--init adapter] [--seed n] [--think] [--format name]
@@ -60,6 +60,8 @@ usage: lgml-finetune [-h] -m model -d data [-o out] [-b backend] [-t n] [-r rank
                        falls to --min-lr at the last step (default
                        constant)
       --min-lr x       the last rate of cosine (default 0)
+      --steps n        stop after n optimizer steps; cosine ends there
+                       (default: all the epochs)
       --wd x           weight decay (default 0)
       --clip x         clip the global gradient norm to x; 0 for none
                        (default 1)
@@ -112,7 +114,7 @@ local function main(args)
 		help = "h", model = "m", data = "d", out = "o", backend = "b", threads = "t", rank = "r",
 		epochs = "e", ctx = "c", ["alpha="] = false, ["targets="] = false, ["layers="] = false, ["lr="] = false,
 		["warmup="] = false, ["wd="] = false, ["optimizer="] = false, ["batch="] = false,
-		["schedule="] = false, ["min-lr="] = false,
+		["schedule="] = false, ["min-lr="] = false, ["steps="] = false,
 		["grad-accum="] = false, ["eval="] = false, ["eval-split="] = false,
 		["eval-every="] = false, ["save-every="] = false, ["init="] = false,
 		["seed="] = false, think = false, ["format="] = false, recompute = false,
@@ -279,7 +281,7 @@ local function main(args)
 		model = model, adapter = ad, train = tmb, eval = emb,
 		epochs = num(opts, "e", 1, true), accum = num(opts, "grad-accum", 1, true),
 		lr = num(opts, "lr", 1e-4), warmup = num(opts, "warmup", 0, true),
-		schedule = opts.schedule, min_lr = num(opts, "min-lr", 0),
+		schedule = opts.schedule, min_lr = num(opts, "min-lr", 0), steps = num(opts, "steps", nil, true),
 		weight_decay = num(opts, "wd", 0), optimizer = optimizer, seed = seed,
 		eval_every = num(opts, "eval-every", nil, true), recompute = opts.recompute,
 		clip = num(opts, "clip", 1) > 0 and num(opts, "clip", 1) or nil,

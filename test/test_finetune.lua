@@ -172,6 +172,17 @@ do
 	ok(n > 6 and math.abs(lrs[1] - 5e-4) < 1e-12 and math.abs(lrs[2] - 1e-3) < 1e-12 and
 	    math.abs(lrs[n] - 1e-4) < 1e-12 and math.abs(lrs[math.floor(mid)] - want_mid) < 1e-12,
 	    ("cosine schedule: %d steps, %.2e .. %.2e"):format(n, lrs[2] or 0, lrs[n] or 0))
+
+	-- steps stops the run early, and the cosine ends at that step.
+	local lrs2 = {}
+	local res = finetune.train({ model = m, adapter = lora.new(m, { rank = 2 }), train = mbs, epochs = 3,
+	    lr = 1e-3, schedule = "cosine", min_lr = 1e-4, steps = 4, log = function(e)
+		if e.kind == "step" then
+			lrs2[#lrs2 + 1] = e.lr
+		end
+	end })
+	ok(res.steps == 4 and #lrs2 == 4 and math.abs(lrs2[4] - 1e-4) < 1e-12,
+	    ("steps: %d steps, last lr %.2e"):format(#lrs2, lrs2[#lrs2] or 0))
 	m:close()
 end
 
