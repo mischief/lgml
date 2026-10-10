@@ -15,6 +15,7 @@ local tokenizer = require("lgml.tokenizer")
 local transformer = require("lgml.transformer")
 local lora = require("lgml.lora")
 local finetune = require("lgml.finetune")
+local placement = require("lgml.placement")
 
 local USAGE = [[
 usage: lgml-finetune [-h] -m model -d data [-o out] [-b backend] [-t n] [-r rank]
@@ -23,7 +24,7 @@ usage: lgml-finetune [-h] -m model -d data [-o out] [-b backend] [-t n] [-r rank
                      [--batch n] [--grad-accum n] [--eval file]
                      [--eval-split f] [--eval-every n] [--save-every n]
                      [--init adapter] [--seed n] [--think] [--format name]
-                     [--recompute]
+                     [--recompute] [--override-tensor pattern=backend]
   -m, --model file     base gguf model: a dense llama or qwen3, or a
                        qwen35 hybrid; its weights may be quantized
   -d, --data file      JSONL training data, one object per line:
@@ -69,6 +70,12 @@ usage: lgml-finetune [-h] -m model -d data [-o out] [-b backend] [-t n] [-r rank
       --think          render the chat template with thinking on
       --recompute      backward pass one layer at a time: a third more
                        time, a fraction of the device memory
+      --override-tensor pattern=backend
+                       put the weights whose names match a Lua pattern
+                       on backend: CPU, or any other name for the -b
+                       backend; repeat for more (default on a GPU: the
+                       token embeddings in host memory, when the model
+                       has its own output weight)
   -h, --help           show this help
 ]]
 
@@ -97,7 +104,8 @@ local function main(args)
 		["grad-accum="] = false, ["eval="] = false, ["eval-split="] = false,
 		["eval-every="] = false, ["save-every="] = false, ["init="] = false,
 		["seed="] = false, think = false, ["format="] = false, recompute = false,
-	})
+		["override-tensor="] = false,
+	}, { ["override-tensor"] = true })
 	if not opts then
 		io.stderr:write("lgml-finetune: ", rest, "\n", USAGE)
 		os.exit(2)
@@ -128,8 +136,25 @@ local function main(args)
 		die("rank, ctx, threads or eval split out of range")
 	end
 
-	local be = assert(lgml.backend(opts.b, { threads = threads }))
 	local info = assert(lgml.gguf(opts.m))
+	local untied = false
+	for _, t in ipairs(info.tensors) do
+		untied = untied or t.name == "output.weight"
+	end
+	-- Only get_rows reads the token embeddings, so host memory costs
+	-- little time and frees device memory.
+	local ot = opts["override-tensor"]
+	if not ot and untied and (opts.b or ""):upper() ~= "CPU" then
+		ot = { "^token_embd%.weight$=CPU" }
+	end
+	local good_rules, rules = pcall(placement.rules, { override = ot })
+	if not good_rules then
+		die(tostring(rules))
+	end
+	local be = assert(lgml.backend(opts.b, { threads = threads, cpu = rules ~= nil }))
+	if be:name():upper():match("^CPU") then
+		rules = nil
+	end
 	-- Text data needs no chat template.
 	local family
 	local function chat_family()
@@ -143,7 +168,7 @@ local function main(args)
 		return family
 	end
 	local tk = assert(tokenizer.open(opts.m))
-	local model = transformer.load(be, opts.m)
+	local model = transformer.load(be, opts.m, { placement = rules })
 	local ok, err = pcall(finetune.check, model)
 	if not ok then
 		die(tostring(err))
