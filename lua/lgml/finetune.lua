@@ -374,13 +374,15 @@ end
 --- Train an adapter.
 -- Each epoch shuffles the micro-batches and runs them in steps of
 -- `accum`. The learning rate rises linearly over the warmup steps, then
--- stays. opts fields:
+-- stays, or with schedule "cosine" falls to min_lr at the last step.
+-- opts fields:
 --
 -- - `model`: the model, from `lgml.transformer.load`
 -- - `adapter`: the adapter, from `lgml.lora`; it is applied to the model
 -- - `train`, `eval`: micro-batches from `pack` (eval may be empty)
 -- - `epochs` (1), `accum` (1), `lr` (1e-4), `warmup` (0), `weight_decay`
---   (0), `optimizer` ("adamw" or "sgd"), `seed` (1)
+--   (0), `optimizer` ("adamw" or "sgd"), `seed` (1), `schedule`
+--   ("constant" or "cosine"), `min_lr` (0)
 -- - `recompute`: run the backward pass one layer at a time (see `loss`)
 -- - `clip`: the largest global gradient norm (default: no clipping)
 -- - `eval_every`: steps between evals, and one before the first step
@@ -398,6 +400,18 @@ function M.train(opts)
 	local make = opts.optimizer == "sgd" and optim.sgd or optim.adamw
 	local opt = make(ad:params(), { lr = opts.lr or 1e-4, weight_decay = opts.weight_decay or 0 })
 	local lr, warmup, accum = opt.lr, opts.warmup or 0, opts.accum or 1
+	local total = ((#opts.train + accum - 1) // accum) * (opts.epochs or 1)
+	local min_lr = opts.min_lr or 0
+	-- Linear warmup, then constant or a cosine down to min_lr at the end.
+	local function lr_at(step)
+		if warmup > 0 and step <= warmup then
+			return lr * step / warmup
+		elseif opts.schedule ~= "cosine" or total <= warmup then
+			return lr
+		end
+		local f = (step - warmup) / (total - warmup)
+		return min_lr + (lr - min_lr) * 0.5 * (1 + math.cos(math.pi * f))
+	end
 	local log = opts.log or function() end
 	local step, last, ev = 0, nil, nil
 	local function eval()
@@ -425,7 +439,7 @@ function M.train(opts)
 				sum = sum + M.loss(model, mb, mb.m / m, true, opts.recompute) * mb.m
 			end
 			step = step + 1
-			opt.lr = warmup > 0 and step <= warmup and lr * step / warmup or lr
+			opt.lr = lr_at(step)
 			local gnorm = opts.clip and opt:clip(opts.clip) or nil
 			opt:step()
 			last = sum / m

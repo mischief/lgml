@@ -153,6 +153,28 @@ for _, case in ipairs({ { "qwen3", {} }, { "qwen35", { hybrid = true } } }) do
 	m:close()
 end
 
+-- The cosine schedule: linear warmup to lr, then down to min_lr at the
+-- last step, through the midpoint halfway.
+do
+	local be <close> = assert(lgml.backend("CPU"))
+	local m = transformer.load(be, path)
+	local ss = finetune.encode_text(tk, ("mi cmila .i "):rep(40), 16)
+	local mbs = finetune.pack(ss, 16, 1)
+	local lrs = {}
+	finetune.train({ model = m, adapter = lora.new(m, { rank = 2 }), train = mbs, epochs = 1, lr = 1e-3,
+	    warmup = 2, schedule = "cosine", min_lr = 1e-4, log = function(e)
+		if e.kind == "step" then
+			lrs[#lrs + 1] = e.lr
+		end
+	end })
+	local n, mid = #lrs, 2 + (#lrs - 2) / 2
+	local want_mid = 1e-4 + 0.9e-3 * 0.5 * (1 + math.cos(math.pi * (math.floor(mid) - 2) / (n - 2)))
+	ok(n > 6 and math.abs(lrs[1] - 5e-4) < 1e-12 and math.abs(lrs[2] - 1e-3) < 1e-12 and
+	    math.abs(lrs[n] - 1e-4) < 1e-12 and math.abs(lrs[math.floor(mid)] - want_mid) < 1e-12,
+	    ("cosine schedule: %d steps, %.2e .. %.2e"):format(n, lrs[2] or 0, lrs[n] or 0))
+	m:close()
+end
+
 -- A gated delta net hybrid trains, with its delta net projections in
 -- the adapter, one sample per micro-batch.
 do

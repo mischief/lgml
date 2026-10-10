@@ -21,6 +21,7 @@ local USAGE = [[
 usage: lgml-finetune [-h] -m model -d data [-o out] [-b backend] [-t n] [-r rank]
                      [--alpha a] [--targets list] [--lr x] [--warmup n]
                      [--wd x] [--optimizer name] [-e epochs] [-c ctx]
+                     [--schedule name] [--min-lr x]
                      [--batch n] [--grad-accum n] [--eval file]
                      [--eval-split f] [--eval-every n] [--save-every n]
                      [--init adapter] [--seed n] [--think] [--format name]
@@ -52,6 +53,10 @@ usage: lgml-finetune [-h] -m model -d data [-o out] [-b backend] [-t n] [-r rank
                        projection
       --lr x           learning rate (default 1e-4)
       --warmup n       steps of linear learning rate warmup (default 0)
+      --schedule name  constant, or cosine: after the warmup the rate
+                       falls to --min-lr at the last step (default
+                       constant)
+      --min-lr x       the last rate of cosine (default 0)
       --wd x           weight decay (default 0)
       --clip x         clip the global gradient norm to x; 0 for none
                        (default 1)
@@ -104,6 +109,7 @@ local function main(args)
 		help = "h", model = "m", data = "d", out = "o", backend = "b", threads = "t", rank = "r",
 		epochs = "e", ctx = "c", ["alpha="] = false, ["targets="] = false, ["lr="] = false,
 		["warmup="] = false, ["wd="] = false, ["optimizer="] = false, ["batch="] = false,
+		["schedule="] = false, ["min-lr="] = false,
 		["grad-accum="] = false, ["eval="] = false, ["eval-split="] = false,
 		["eval-every="] = false, ["save-every="] = false, ["init="] = false,
 		["seed="] = false, think = false, ["format="] = false, recompute = false,
@@ -131,6 +137,9 @@ local function main(args)
 	local format = opts.format or "chat"
 	if format ~= "chat" and format ~= "text" then
 		die("format must be chat or text")
+	end
+	if opts.schedule and opts.schedule ~= "constant" and opts.schedule ~= "cosine" then
+		die("schedule must be constant or cosine")
 	end
 	if optimizer ~= "adamw" and optimizer ~= "sgd" then
 		die("optimizer must be adamw or sgd")
@@ -252,6 +261,7 @@ local function main(args)
 		model = model, adapter = ad, train = tmb, eval = emb,
 		epochs = num(opts, "e", 1, true), accum = num(opts, "grad-accum", 1, true),
 		lr = num(opts, "lr", 1e-4), warmup = num(opts, "warmup", 0, true),
+		schedule = opts.schedule, min_lr = num(opts, "min-lr", 0),
 		weight_decay = num(opts, "wd", 0), optimizer = optimizer, seed = seed,
 		eval_every = num(opts, "eval-every", nil, true), recompute = opts.recompute,
 		clip = num(opts, "clip", 1) > 0 and num(opts, "clip", 1) or nil,
