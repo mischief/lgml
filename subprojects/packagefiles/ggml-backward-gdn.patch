@@ -366,7 +366,7 @@ index 4158ff7..526c9a5 100644
      vk_pipeline pipeline_ssm_scan_f32_d256;
      vk_pipeline pipeline_ssm_conv_f32;
 diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
-index c9e1cec..9df4989 100644
+index c9e1cec..95b4d94 100644
 --- a/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -3743,6 +3743,18 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
@@ -479,6 +479,15 @@ index c9e1cec..9df4989 100644
      case GGML_OP_SSM_SCAN:
          ggml_vk_ssm_scan(ctx, compute_ctx, node);
  
+@@ -15789,7 +15871,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                    op->type == GGML_TYPE_F32;
+         case GGML_OP_SILU_BACK:
+         case GGML_OP_RMS_NORM_BACK:
+-            return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
++            return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && op->src[0]->type == GGML_TYPE_F32;
+         case GGML_OP_SQR:
+         case GGML_OP_SQRT:
+         case GGML_OP_SIN:
 @@ -16014,6 +16096,20 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                  }
                  return op->type == GGML_TYPE_F32;
@@ -721,7 +730,7 @@ index 7597b3d..6bb1bc7 100644
      string_to_spv("opt_step_adamw_f32", "opt_step_adamw.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
      string_to_spv("opt_step_sgd_f32", "opt_step_sgd.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
 diff --git a/src/ggml.c b/src/ggml.c
-index 9bcabdb..174de64 100644
+index 9bcabdb..23c7da4 100644
 --- a/src/ggml.c
 +++ b/src/ggml.c
 @@ -1080,6 +1080,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -815,7 +824,19 @@ index 9bcabdb..174de64 100644
  // ggml_lightning_indexer
  
  struct ggml_tensor * ggml_lightning_indexer(
-@@ -6962,7 +7014,9 @@ static void ggml_compute_backward(
+@@ -6902,7 +6954,10 @@ static void ggml_compute_backward(
+             if (src0_needs_grads) {
+                 float eps;
+                 memcpy(&eps, tensor->op_params, sizeof(float));
+-                ggml_add_or_set(ctx, cgraph, isrc0, ggml_rms_norm_back(ctx, grad, src0, eps));
++                // backends read the operands of rms_norm_back as contiguous rows
++                struct ggml_tensor * dy = ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad);
++                struct ggml_tensor * x  = ggml_is_contiguous(src0) ? src0 : ggml_cont(ctx, src0);
++                ggml_add_or_set(ctx, cgraph, isrc0, ggml_rms_norm_back(ctx, dy, x, eps));
+             }
+         } break;
+         case GGML_OP_MUL_MAT: {
+@@ -6962,7 +7017,9 @@ static void ggml_compute_backward(
              if (src0_needs_grads) {
                  float s;
                  memcpy(&s, tensor->op_params, sizeof(float));
@@ -826,7 +847,7 @@ index 9bcabdb..174de64 100644
              }
          } break;
          case GGML_OP_SET: {
-@@ -7199,6 +7253,13 @@ static void ggml_compute_backward(
+@@ -7199,6 +7256,13 @@ static void ggml_compute_backward(
                          ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, ggml_sigmoid(ctx, src0)));
                      }
                  } break;
@@ -840,7 +861,7 @@ index 9bcabdb..174de64 100644
                  default: {
                      fprintf(stderr, "%s: unsupported unary op for backward pass: %s\n",
                          __func__, ggml_unary_op_name(ggml_get_unary_op(tensor)));
-@@ -7206,6 +7267,94 @@ static void ggml_compute_backward(
+@@ -7206,6 +7270,94 @@ static void ggml_compute_backward(
                  } //break;
              }
          } break;
