@@ -321,6 +321,13 @@ local function test_sampling()
 	ok(e2.sampling.temperature == 0 and e2.sampling.top_k == 7 and texts[1] == texts[2] and texts[2] == texts[3],
 	    ("sampling: the gguf temperature applies (%q)"):format(texts[1]))
 	ok(e.sampling == nil, "sampling: a gguf without the keys keeps the preset")
+	-- The sampling option goes over the gguf values.
+	local e3 = engine.new({ model = p2, backend = "CPU", n_ctx = 1024, id = "tiny",
+		sampling = { top_k = 3, presence_penalty = 1.5 } })
+	ok(e3.sampling.temperature == 0 and e3.sampling.top_k == 3 and e3.sampling.presence_penalty == 1.5,
+	    "sampling: the option goes over the gguf values")
+	ok(not pcall(engine.new, { model = p2, backend = "CPU", n_ctx = 1024, sampling = { nope = 1 } }),
+	    "sampling: an unknown key raises")
 	os.remove(p2)
 end
 

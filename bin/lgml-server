@@ -91,6 +91,11 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       moe_cache_zerocopy = true: fixed slots, and the
                       device reads the other experts from pinned host
                       memory over PCIe (needs the lgml ggml patch),
+                      sampling = sampler defaults of a chat model, such
+                      as { presence_penalty = 1.5 }: temperature, top_k,
+                      top_p, min_p, repeat_penalty, repeat_last_n,
+                      presence_penalty, frequency_penalty; a request
+                      value replaces them,
                       diffusion = sampler defaults of a block diffusion
                       model such as LLaDA-MoE-v2: { steps, block_length,
                       threshold (false: scheduled), minimal_topk,
@@ -346,6 +351,13 @@ local function model_engine(spec, managed)
 	if spec.diffusion ~= nil and (type(spec.diffusion) ~= "table" or not diff) then
 		die("diffusion needs a table and a block diffusion model")
 	end
+	if spec.sampling ~= nil and (stt or embed or diff or spec.engine) then
+		die("sampling needs a chat model")
+	end
+	local oks, serr = pcall(require("lgml.engine").check_sampling, spec.sampling)
+	if not oks then
+		die(serr)
+	end
 	local imin, imax = spec.image_min_tokens and math.tointeger(tonumber(spec.image_min_tokens)),
 	    spec.image_max_tokens and math.tointeger(tonumber(spec.image_max_tokens))
 	if (spec.image_min_tokens and not (imin and imin > 0)) or
@@ -392,6 +404,7 @@ local function model_engine(spec, managed)
 			flash_attn = spec.flash_attn ~= false, id = spec.id,
 			cache_type_k = spec.cache_type_k, cache_type_v = spec.cache_type_v,
 			recipe = spec.recipe, cache_ram = ram, ctx_checkpoints = ckpt, lora = lora,
+			sampling = spec.sampling,
 			kv_initial = kvi, slots = nslots, repeat_stop_tokens = rst,
 			reasoning_budget_tokens = rbt, ubatch = ub,
 			speculative = sp and sp > 0 and { max = sp, mtp = spec.spec_mtp, draft = spec.spec_draft,
@@ -455,6 +468,9 @@ local function model_engine(spec, managed)
 	end
 	if spec.engine then
 		table.move({ "--engine", spec.engine }, 1, 2, #wargs + 1, wargs)
+	end
+	if spec.sampling then
+		table.move({ "--sampling", require("lgml.json").encode(spec.sampling) }, 1, 2, #wargs + 1, wargs)
 	end
 	if spec.diffusion then
 		table.move({ "--diffusion", require("lgml.json").encode(spec.diffusion) }, 1, 2, #wargs + 1, wargs)

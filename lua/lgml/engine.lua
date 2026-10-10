@@ -331,6 +331,48 @@ local function model_sampling(meta)
 	return o
 end
 
+-- The gguf sampler options g with the options s over them.
+local function with_sampling(g, s)
+	if not s then
+		return g
+	end
+	local o = {}
+	for k, v in pairs(g or {}) do
+		o[k] = v
+	end
+	for k, v in pairs(s) do
+		o[k] = v
+	end
+	return o
+end
+
+--- The sampler options that the `sampling` option of `new` takes.
+M.SAMPLING = {
+	temperature = true, top_k = true, top_p = true, min_p = true, repeat_penalty = true,
+	repeat_last_n = true, presence_penalty = true, frequency_penalty = true,
+}
+
+--- Checks the `sampling` option of `new`.
+-- @tparam ?table s the options
+-- @treturn ?table s
+-- @raise on an unknown key or a value that is not a number
+function M.check_sampling(s)
+	if s == nil then
+		return nil
+	end
+	if type(s) ~= "table" then
+		error("sampling must be a table", 0)
+	end
+	for k, v in pairs(s) do
+		if not M.SAMPLING[k] then
+			error("sampling: unknown option " .. tostring(k), 0)
+		elseif type(v) ~= "number" then
+			error(("sampling: %s must be a number"):format(k), 0)
+		end
+	end
+	return s
+end
+
 --- Loads a model and makes an engine.
 -- @tparam table opts the options:
 --
@@ -368,6 +410,9 @@ end
 -- - `lora`: LoRA adapters, a list of { path, scale } (scale default 1);
 --   see `lgml.lora.load`. A request can change the scales with
 --   `lora = { { id, scale }, ... }`, ids from 0, as llama-server takes.
+-- - `sampling`: sampler defaults over the gguf general.sampling values,
+--   such as `{ presence_penalty = 1.5 }`; keys from `M.SAMPLING`. A
+--   request value replaces them.
 -- - `mmproj`: a vision mmproj gguf for image input (default none); see
 --   `lgml.vision`
 -- - `image_min_tokens`, `image_max_tokens`: the token range of one
@@ -419,6 +464,7 @@ end
 -- when no chat template fits the model, an adapter does not fit it, the
 -- mmproj does not fit it, or a placement key is bad
 function M.new(opts)
+	local sampling = M.check_sampling(opts.sampling)
 	local info = assert(lgml.gguf(opts.model))
 	local family, family_name = chat.load(info.meta)
 	local arch = info.meta["general.architecture"]
@@ -507,7 +553,7 @@ function M.new(opts)
 		-- shared blocks.
 		fixed = model.recurrent or (cache.ring ~= nil and cache.ring < n_ctx),
 		id = opts.id or info.meta["general.name"] or "lgml",
-		sampling = model_sampling(info.meta),
+		sampling = with_sampling(model_sampling(info.meta), sampling),
 		cache = cache, tokens = {},
 		busy = false, waiting = {}, adapters = adapters, acts = {}, queued = 0,
 		repeat_stop = opts.repeat_stop_tokens or REPEAT_STOP,
