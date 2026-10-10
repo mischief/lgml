@@ -183,6 +183,26 @@ do
 	end })
 	ok(res.steps == 4 and #lrs2 == 4 and math.abs(lrs2[4] - 1e-4) < 1e-12,
 	    ("steps: %d steps, last lr %.2e"):format(#lrs2, lrs2[#lrs2] or 0))
+
+	-- shuffle = false trains in the order of the data.
+	local list = {}
+	for n = 3, 8 do
+		local s = finetune.encode_text(tk, ("mi cmila "):rep(n), 64)
+		list[#list + 1] = s[1]
+	end
+	local seq = finetune.pack(list, 64, 1)
+	local want, got = {}, {}
+	for i, mb in ipairs(seq) do
+		want[i] = mb.n
+	end
+	finetune.train({ model = m, adapter = lora.new(m, { rank = 2 }), train = seq, lr = 1e-3,
+	    shuffle = false, log = function(e)
+		if e.kind == "step" then
+			got[#got + 1] = e.tokens
+		end
+	end })
+	ok(table.concat(got, ",") == table.concat(want, ","),
+	    ("shuffle = false keeps the order: %s"):format(table.concat(got, ",")))
 	m:close()
 end
 

@@ -26,7 +26,7 @@ usage: lgml-finetune [-h] -m model -d data [-o out] [-b backend] [-t n] [-r rank
                      [--eval-split f] [--eval-every n] [--save-every n]
                      [--init adapter] [--seed n] [--think] [--format name]
                      [--recompute] [--override-tensor pattern=backend]
-                     [--clip x]
+                     [--clip x] [--no-shuffle]
   -m, --model file     base gguf model: a dense llama or qwen3, or a
                        qwen35 hybrid; its weights may be quantized
   -d, --data file      JSONL training data, one object per line:
@@ -66,6 +66,9 @@ usage: lgml-finetune [-h] -m model -d data [-o out] [-b backend] [-t n] [-r rank
       --clip x         clip the global gradient norm to x; 0 for none
                        (default 1)
       --optimizer name adamw or sgd (default adamw)
+      --no-shuffle     train in the order of the data file, for a
+                       curriculum; --eval-split still takes the last
+                       samples
   -e, --epochs n       passes over the data (default 1)
   -c, --ctx n          the most tokens in one micro-batch; longer
                        samples lose their end (default 512)
@@ -119,6 +122,7 @@ local function main(args)
 		["eval-every="] = false, ["save-every="] = false, ["init="] = false,
 		["seed="] = false, think = false, ["format="] = false, recompute = false,
 		["override-tensor="] = false, ["clip="] = false,
+		["no-shuffle"] = false,
 	}, { ["override-tensor"] = true })
 	if not opts then
 		io.stderr:write("lgml-finetune: ", rest, "\n", USAGE)
@@ -284,6 +288,7 @@ local function main(args)
 		schedule = opts.schedule, min_lr = num(opts, "min-lr", 0), steps = num(opts, "steps", nil, true),
 		weight_decay = num(opts, "wd", 0), optimizer = optimizer, seed = seed,
 		eval_every = num(opts, "eval-every", nil, true), recompute = opts.recompute,
+		shuffle = not opts["no-shuffle"],
 		clip = num(opts, "clip", 1) > 0 and num(opts, "clip", 1) or nil,
 		save_every = num(opts, "save-every", 0, true),
 		save = function(step)

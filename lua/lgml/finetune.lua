@@ -383,6 +383,8 @@ end
 -- - `epochs` (1), `accum` (1), `lr` (1e-4), `warmup` (0), `weight_decay`
 --   (0), `optimizer` ("adamw" or "sgd"), `seed` (1), `schedule`
 --   ("constant" or "cosine"), `min_lr` (0)
+-- - `shuffle`: false keeps the order of train in every epoch, for a
+--   curriculum (default true: a new order each epoch)
 -- - `steps`: the most optimizer steps; the run stops there, and the
 --   schedule ends there (default: every micro-batch of every epoch)
 -- - `recompute`: run the backward pass one layer at a time (see `loss`)
@@ -430,7 +432,9 @@ function M.train(opts)
 	end
 	for epoch = 1, opts.epochs or 1 do
 		local order = table.move(opts.train, 1, #opts.train, 1, {})
-		shuffle(order, (opts.seed or 1) + epoch)
+		if opts.shuffle ~= false then
+			shuffle(order, (opts.seed or 1) + epoch)
+		end
 		for i = 1, #order, accum do
 			if step >= total then
 				break
