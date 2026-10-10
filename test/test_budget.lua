@@ -162,6 +162,23 @@ do
 	    ("the compute peak (%d) stays within the reserved compute (%d)"):format(cpu().peak_compute, r.compute))
 end
 
+-- A pool at the limit shrinks: each old tensor closes before its new
+-- one opens.
+do
+	collectgarbage()
+	collectgarbage()
+	local e = engine.new({ model = path, backend = "CPU", n_ctx = 4096, slots = 1, kv_initial = 256,
+		cache_ram = 0 })
+	e.model:pool_resize(e.pool, 1024)
+	collectgarbage()
+	collectgarbage()
+	local old = lgml.memory_guard({ limit = cpu().weights + cpu().tensors + cpu().compute })
+	local good, err = pcall(e.model.pool_resize, e.model, e.pool, 256)
+	lgml.memory_guard(old)
+	ok(good and e.pool.cap == 256, "a full pool shrinks: " .. tostring(err))
+	ok(chats(e, { words(100, 4) })[1].res == true, "the shrunk pool serves a prompt")
+end
+
 -- A prompt whose KV growth passes the guard fails with 507; the engine
 -- then serves a short prompt. The limit must not count the tensors of
 -- earlier engines that the collector has not freed yet.

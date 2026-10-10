@@ -739,7 +739,7 @@ end
 -- The plans of `reserve` at the context of the engine now.
 function E:reserve_ctx()
 	local pool, model = self.pool, self.model
-	local cells = pool.cap
+	local cells = math.min(pool.cap, pool.n_ctx)
 	local name = self.be:name()
 	local before = budget_mod.free(name)
 	local list = { self.ubatch }

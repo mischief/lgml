@@ -809,7 +809,9 @@ local function check_grow(list, cap, what)
 end
 
 -- Give pool p cap cells, or twice its cells up to p.n_ctx. The new
--- tensors get the old cells that fit, when a block holds cells.
+-- tensors get the old cells that fit, when a block holds cells. Each
+-- old tensor goes to host memory and closes before its new tensor
+-- opens, so a shrink fits in any budget.
 local function pool_grow(self, p, cap)
 	cap = cap or math.min(p.n_ctx, p.cap * 2)
 	local list = {}
@@ -827,8 +829,7 @@ local function pool_grow(self, p, cap)
 	for _, part in ipairs({ p.k, p.v, p.x or {} }) do
 		for il, old in pairs(part) do
 			local bytes = math.min(old:nbytes(), cap * (old:nbytes() // old:shape()[1]))
-			local new = old:backend():tensor(old:type(), { cap, old:shape()[2] })
-			new:zero()
+			local be, ty, w = old:backend(), old:type(), old:shape()[2]
 			if not empty then
 				if not buf or #buf < bytes then
 					if buf then
@@ -837,9 +838,13 @@ local function pool_grow(self, p, cap)
 					buf = lgml.hostbuf(bytes)
 				end
 				old:to_host(buf, 0, 0, bytes)
-				new:from_host(buf, 0, 0, bytes)
 			end
 			old:close()
+			local new = be:tensor(ty, { cap, w })
+			new:zero()
+			if not empty then
+				new:from_host(buf, 0, 0, bytes)
+			end
 			part[il] = new
 		end
 	end
