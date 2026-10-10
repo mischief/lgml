@@ -417,10 +417,11 @@ out_prod_as_mul_mat(struct graph *g, struct ggml_tensor *t, struct ggml_tensor *
 	int64_t k = a->ne[1], rows, r0, n;
 
 	y = ggml_transpose(ctx, b);
+	y = ggml_is_contiguous(y) ? y : ggml_cont(ctx, y);
 	if (!ggml_is_quantized(a->type)) {
 		x = ggml_transpose(ctx, a);
 		x = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
-		set_op(t, GGML_OP_MUL_MAT, x, ggml_is_contiguous(y) ? y : ggml_cont(ctx, y));
+		set_op(t, GGML_OP_MUL_MAT, x, y);
 		return 1;
 	}
 	if (ids == NULL || a->ne[2] != 1 || a->ne[3] != 1 || k > ids->ne[0])
@@ -435,8 +436,9 @@ out_prod_as_mul_mat(struct graph *g, struct ggml_tensor *t, struct ggml_tensor *
 		 * transpose keeps one type: Vulkan has a fast copy for that.
 		 */
 		x = ggml_cont(ctx, ggml_transpose(ctx, ggml_cast(ctx, x, GGML_TYPE_F16)));
-		yb = ggml_cont(ctx, ggml_view_4d(ctx, y, n, y->ne[1], y->ne[2], y->ne[3],
-		    y->nb[1], y->nb[2], y->nb[3], r0 * y->nb[0]));
+		/* y is contiguous, so a block of its columns has rows in order. */
+		yb = n == k ? y : ggml_cont(ctx, ggml_view_4d(ctx, y, n, y->ne[1], y->ne[2], y->ne[3],
+		    y->nb[1], y->nb[2], y->nb[3], r0 * ggml_element_size(y)));
 		if (r0 + n < k) {
 			part = ggml_mul_mat(ctx, x, yb);
 			sum = sum ? ggml_add(ctx, sum, part) : part;

@@ -150,6 +150,10 @@ do
 	check("rms_norm * weight", { x, w }, function(g, p)
 		return g:mul(g:rms_norm(p[1], 1e-6), p[2])
 	end)
+	-- Every other row of 8, as attention takes q from [q | gate].
+	check("rms_norm of a strided view", { x }, function(g, p)
+		return g:rms_norm(g:view(p[1], { 4, 2, 4 }, { 64, 32 }), 1e-6)
+	end)
 	check("sum_rows", { x }, function(g, p) return g:sum_rows(p[1]) end)
 	check("sum", { x }, function(g, p) return g:sum(p[1]) end, { scalar = true })
 end
@@ -298,25 +302,29 @@ do
 	g:compute(g:cpy(randn({ 6, 32 }), wq))
 	local g1 <close> = be:graph()
 	g1:compute(g1:cpy(wq, wf))
-	local x, r = randn({ 3, 32 }), randn({ 3, 6 })
+	local x, r, rt = randn({ 3, 32 }), randn({ 3, 6 }), randn({ 6, 3 })
 	x:requires_grad()
-	local function grad_through(w, lower)
+	-- With transposed, the output gradient reaches the weight as a
+	-- transposed view, as in a gated delta net layer.
+	local function grad_through(w, lower, transposed)
 		x:grad():zero()
 		local g2 <close> = be:graph()
-		local loss = weighted(g2, g2:mul_mat(w, x), r)
+		local y = g2:mul_mat(w, x)
+		local loss = transposed and weighted(g2, g2:transpose(y), rt) or weighted(g2, y, r)
 		loss:backward({ lower = lower })
 		g2:compute(loss)
 		return x:grad():get()
 	end
-	local want = grad_through(wf)
-	for _, lower in ipairs({ false, true }) do
-		local got, worst = grad_through(wq, lower), 0
-		for i = 1, #want do
-			worst = math.max(worst, math.abs(got[i] - want[i]))
+	for _, transposed in ipairs({ false, true }) do
+		local want = grad_through(wf, false, transposed)
+		for _, lower in ipairs({ false, true }) do
+			local got, worst = grad_through(wq, lower, transposed), 0
+			for i = 1, #want do
+				worst = math.max(worst, math.abs(got[i] - want[i]))
+			end
+			ok(worst < (GPU and 5e-3 or 1e-4), ("mul_mat q8_0 weight%s%s: max error %.2e"):format(
+			    lower and " lowered" or "", transposed and ", transposed gradient" or "", worst))
 		end
-		ok(worst < (GPU and 5e-3 or 1e-4), ("mul_mat q8_0 weight%s: max error %.2e"):format(
-		    lower and " lowered" or "",
-		    worst))
 	end
 	x:requires_grad(false)
 end
