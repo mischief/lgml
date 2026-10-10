@@ -76,7 +76,8 @@ function Opt:clip(max_norm)
 		local g = be:graph(4 * #self.params + 64)
 		local total
 		for _, p in ipairs(self.params) do
-			local s = g:sum(g:sqr(p:grad()))
+			-- Rows first: a GPU sums a whole tensor in one workgroup.
+			local s = g:sum(g:sum_rows(g:sqr(p:grad())))
 			total = total and g:add(total, s) or s
 		end
 		self.gnorm, self.gnorm_out = g, total
