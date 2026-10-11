@@ -96,6 +96,8 @@ usage: lgml-server [-h] [-l addr] [-p port] [--fake] [-C config] [-m model] [-b 
                       top_p, min_p, repeat_penalty, repeat_last_n,
                       presence_penalty, frequency_penalty; a request
                       value replaces them,
+                      max_tokens = the most tokens of a reply when the
+                      request sets none,
                       diffusion = sampler defaults of a block diffusion
                       model such as LLaDA-MoE-v2: { steps, block_length,
                       threshold (false: scheduled), minimal_topk,
@@ -354,6 +356,10 @@ local function model_engine(spec, managed)
 	if spec.sampling ~= nil and (stt or embed or diff or spec.engine) then
 		die("sampling needs a chat model")
 	end
+	if spec.max_tokens ~= nil and (not math.tointeger(spec.max_tokens) or spec.max_tokens < 1 or
+	    stt or embed or diff or spec.engine) then
+		die("max_tokens needs a chat model and a count above 0")
+	end
 	local oks, serr = pcall(require("lgml.engine").check_sampling, spec.sampling)
 	if not oks then
 		die(serr)
@@ -404,7 +410,7 @@ local function model_engine(spec, managed)
 			flash_attn = spec.flash_attn ~= false, id = spec.id,
 			cache_type_k = spec.cache_type_k, cache_type_v = spec.cache_type_v,
 			recipe = spec.recipe, cache_ram = ram, ctx_checkpoints = ckpt, lora = lora,
-			sampling = spec.sampling,
+			sampling = spec.sampling, max_tokens = spec.max_tokens,
 			kv_initial = kvi, slots = nslots, repeat_stop_tokens = rst,
 			reasoning_budget_tokens = rbt, ubatch = ub,
 			speculative = sp and sp > 0 and { max = sp, mtp = spec.spec_mtp, draft = spec.spec_draft,
@@ -425,7 +431,7 @@ local function model_engine(spec, managed)
 		["--recipe"] = spec.recipe, ["--cache-ram"] = spec.cache_ram,
 		["--ctx-checkpoints"] = spec.ctx_checkpoints, ["--mmproj"] = spec.mmproj,
 		["--kv-initial"] = kvi, ["--slots"] = nslots, ["--repeat-stop"] = rst,
-		["--reasoning-budget"] = rbt, ["--ubatch"] = ub,
+		["--reasoning-budget"] = rbt, ["--ubatch"] = ub, ["--max-tokens"] = spec.max_tokens,
 		["--spec"] = sp and sp > 0 and sp or nil,
 		["--spec-mtp"] = sp and sp > 0 and spec.spec_mtp or nil,
 		["--image-min-tokens"] = imin, ["--image-max-tokens"] = imax,

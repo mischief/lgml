@@ -410,6 +410,8 @@ end
 -- - `lora`: LoRA adapters, a list of { path, scale } (scale default 1);
 --   see `lgml.lora.load`. A request can change the scales with
 --   `lora = { { id, scale }, ... }`, ids from 0, as llama-server takes.
+-- - `max_tokens`: the most tokens of a reply when the request sets no
+--   max_tokens (default: the free context)
 -- - `sampling`: sampler defaults over the gguf general.sampling values,
 --   such as `{ presence_penalty = 1.5 }`; keys from `M.SAMPLING`. A
 --   request value replaces them.
@@ -554,6 +556,7 @@ function M.new(opts)
 		fixed = model.recurrent or (cache.ring ~= nil and cache.ring < n_ctx),
 		id = opts.id or info.meta["general.name"] or "lgml",
 		sampling = with_sampling(model_sampling(info.meta), sampling),
+		max_tokens = opts.max_tokens,
 		cache = cache, tokens = {},
 		busy = false, waiting = {}, adapters = adapters, acts = {}, queued = 0,
 		repeat_stop = opts.repeat_stop_tokens or REPEAT_STOP,
@@ -2958,7 +2961,7 @@ function E:run_prompt(req, sink, st)
 	if #prompt >= self.n_ctx then
 		return nil, ("prompt has %d tokens; context is %d"):format(#prompt, self.n_ctx), 400
 	end
-	local max = req.max_completion_tokens or req.max_tokens
+	local max = req.max_completion_tokens or req.max_tokens or self.max_tokens
 	max = math.min(max or self.n_ctx, self.n_ctx - #prompt)
 	local gopts, gerr = self:grammar_opts(req, think, text)
 	if not gopts then

@@ -19,6 +19,7 @@ local USAGE = "usage: lgml-worker --fd n (-m model | --fake) [-b backend] [-t th
     "                   [--kv-initial n] [--slots n] [--repeat-stop n]\n" ..
     "                   [--reasoning-budget n] [--ubatch n|auto] [--spec n] [--spec-mtp file]\n" ..
     "                   [--lora file[:scale]]... [--diffusion json] [--sampling json]\n" ..
+    "                   [--max-tokens n]\n" ..
     "                   [--mmproj file] [--image-min-tokens n] [--image-max-tokens n]\n" ..
     "                   [--cpu-moe] [--n-cpu-moe n|auto] [--n-gpu-layers n]\n" ..
     "                   [--override-tensor pattern=backend]...\n" ..
@@ -39,7 +40,7 @@ local opts, rest = getopt.parse(arg, "m:b:t:c:", {
 	["recipe="] = false, ["cache-ram="] = false, ["ctx-checkpoints="] = false, ["lora="] = false,
 	["kv-initial="] = false, ["slots="] = false, ["repeat-stop="] = false,
 	["reasoning-budget="] = false, ["ubatch="] = false,
-	["spec="] = false, ["spec-mtp="] = false, ["diffusion="] = false, ["sampling="] = false,
+	["spec="] = false, ["spec-mtp="] = false, ["diffusion="] = false, ["sampling="] = false, ["max-tokens="] = false,
 	["mmproj="] = false, ["image-min-tokens="] = false, ["image-max-tokens="] = false,
 	["fake-size="] = false, ["fake-load-ms="] = false, ["fake-delay="] = false,
 	["fake-delta="] = false, ["mem-margin="] = false, ["mem-limit="] = false,
@@ -157,6 +158,7 @@ local function load()
 		lora = lora,
 		-- --sampling is a JSON object of sampler option defaults.
 		sampling = opts.sampling and require("lgml.json").decode(opts.sampling),
+		max_tokens = math.tointeger(tonumber(opts["max-tokens"])),
 		mmproj = opts.mmproj,
 		image_min_tokens = math.tointeger(tonumber(opts["image-min-tokens"])),
 		image_max_tokens = math.tointeger(tonumber(opts["image-max-tokens"])),

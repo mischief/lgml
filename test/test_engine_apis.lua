@@ -328,6 +328,17 @@ local function test_sampling()
 	    "sampling: the option goes over the gguf values")
 	ok(not pcall(engine.new, { model = p2, backend = "CPU", n_ctx = 1024, sampling = { nope = 1 } }),
 	    "sampling: an unknown key raises")
+	-- max_tokens caps a reply when the request sets no max_tokens.
+	local e4 = engine.new({ model = p2, backend = "CPU", n_ctx = 1024, id = "tiny", max_tokens = 3 })
+	local s4 = httpd.new()
+	openai.install(s4, e4, { key = ("t"):rep(32) })
+	local _, c4 = inproc.json(s4, "POST", "/v1/chat/completions", { model = "tiny",
+		reasoning_effort = "none", messages = { { role = "user", content = "Hi there" } } })
+	local _, c5 = inproc.json(s4, "POST", "/v1/chat/completions", { model = "tiny", max_tokens = 6,
+		reasoning_effort = "none", messages = { { role = "user", content = "Hi there" } } })
+	ok(c4.usage.completion_tokens <= 3 and c5.usage.completion_tokens > 3,
+	    ("max_tokens: the default caps a reply (%d), a request value replaces it (%d)"):format(
+	    c4.usage.completion_tokens, c5.usage.completion_tokens))
 	os.remove(p2)
 end
 
