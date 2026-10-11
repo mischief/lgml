@@ -32,7 +32,8 @@ usage: lgml-finetune [-h] -m model -d data [-o out] [-b backend] [-t n] [-r rank
   -d, --data file      JSONL training data, one object per line:
                        {"messages": [...]} in OpenAI chat form, with the
                        loss on the assistant turns only, or {"text": "..."}
-                       with the loss on every token
+                       with the loss on every token; an optional
+                       "source" string groups the eval loss by source
       --format name    chat: lines hold messages or text (default);
                        text: every line holds text, such as a source
                        file with a "/* file: path */" first line; text
@@ -205,6 +206,7 @@ local function main(args)
 			local ss = r.text and finetune.encode_text(tk, r.text, ctx) or
 			    finetune.encode(tk, chat_family(), r.messages, { enable_thinking = opts.think })
 			for _, s in ipairs(ss) do
+				s.source = r.source
 				list[#list + 1] = s
 			end
 		end
@@ -301,7 +303,13 @@ local function main(args)
 				    ev.grad_norm and (" gnorm %.3f"):format(ev.grad_norm) or "",
 				    ev.skipped and " skipped" or ""))
 			else
-				io.stdout:write(("eval step %d loss %.4f\n"):format(ev.step, ev.loss))
+				local parts = {}
+				for k, l in pairs(ev.sources or {}) do
+					parts[#parts + 1] = ("%s %.4f"):format(k, l)
+				end
+				table.sort(parts)
+				io.stdout:write(("eval step %d loss %.4f%s\n"):format(ev.step, ev.loss,
+				    #parts > 0 and " (" .. table.concat(parts, ", ") .. ")" or ""))
 			end
 			io.stdout:flush()
 		end,

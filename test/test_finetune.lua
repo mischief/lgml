@@ -353,6 +353,33 @@ do
 	local good, err = pcall(finetune.read_jsonl, mixed, "text")
 	ok(not good and tostring(err):find(":3:", 1, true), "text format needs text on every line")
 
+	-- A record source groups the eval loss.
+	local srcf = tmp(".jsonl")
+	f = assert(io.open(srcf, "w"))
+	f:write(json.encode({ text = text, source = "a" }), "\n")
+	f:write(json.encode({ text = text:upper(), source = "b" }), "\n")
+	f:close()
+	local list = {}
+	for _, r in ipairs(finetune.read_jsonl(srcf)) do
+		for _, s in ipairs(finetune.encode_text(tk, r.text, 64)) do
+			s.source = r.source
+			list[#list + 1] = s
+		end
+	end
+	local smbs = finetune.pack(list, 64, 1)
+	do
+		local be <close> = assert(lgml.backend("CPU"))
+		local m = transformer.load(be, path)
+		local total, by = finetune.evaluate(m, smbs)
+		local ma, mb_ = 0, 0
+		for _, mb in ipairs(smbs) do
+			if mb.source == "a" then ma = ma + mb.m else mb_ = mb_ + mb.m end
+		end
+		ok(by and by.a and by.b and math.abs((by.a * ma + by.b * mb_) / (ma + mb_) - total) < 1e-9,
+		    ("eval by source: a %.4f, b %.4f, all %.4f"):format(by and by.a or 0, by and by.b or 0, total))
+		m:close()
+	end
+
 	-- The tool learns to complete a source file from its header.
 	local data = tmp(".jsonl")
 	f = assert(io.open(data, "w"))

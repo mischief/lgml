@@ -56,7 +56,11 @@ function M.read_jsonl(path, format)
 				error(("%s:%d: need an object with %s (%s)"):format(path, ln,
 				    text_only and "text" or "messages or text", err or "none found"))
 			end
-			out[#out + 1] = text_ok and { text = v.text } or { messages = v.messages }
+			local rec = text_ok and { text = v.text } or { messages = v.messages }
+			if type(v.source) == "string" then
+				rec.source = v.source
+			end
+			out[#out + 1] = rec
 		end
 	end
 	f:close()
@@ -210,6 +214,12 @@ function M.pack(samples, ctx, batch)
 			end
 			cur.samples[#cur.samples + 1] = s
 			cur.n, cur.m = cur.n + #s.ids, cur.m + m
+			-- A micro-batch has a source when all its samples share it.
+			if #cur.samples == 1 then
+				cur.source = s.source
+			elseif cur.source ~= s.source then
+				cur.source = nil
+			end
 		end
 	end
 	return out, trimmed
@@ -352,13 +362,25 @@ end
 -- @param model the model
 -- @tparam {table,...} mbs micro-batches from `pack`
 -- @treturn number the loss, or nil with no micro-batches
+-- @treturn ?table the loss of each source, for micro-batches whose
+-- samples share a `source`; nil when none has one
 function M.evaluate(model, mbs)
-	local sum, m = 0, 0
+	local sum, m, by = 0, 0, {}
 	for _, mb in ipairs(mbs) do
-		sum = sum + M.loss(model, mb) * mb.m
+		local l = M.loss(model, mb)
+		sum = sum + l * mb.m
 		m = m + mb.m
+		if mb.source then
+			local e = by[mb.source] or { sum = 0, m = 0 }
+			e.sum, e.m = e.sum + l * mb.m, e.m + mb.m
+			by[mb.source] = e
+		end
 	end
-	return m > 0 and sum / m or nil
+	local sources = {}
+	for k, e in pairs(by) do
+		sources[k] = e.sum / e.m
+	end
+	return m > 0 and sum / m or nil, next(sources) and sources or nil
 end
 
 -- Deterministic shuffle.
@@ -393,7 +415,8 @@ end
 --   (default: at the end of each epoch)
 -- - `save_every`, `save`: `save(step)` runs every save_every steps
 -- - `log`: `log(event)` gets { kind = "step", step, epoch, loss, lr,
---   tokens, seconds, grad_norm, skipped } and { kind = "eval", step, loss }
+--   tokens, seconds, grad_norm, skipped } and { kind = "eval", step, loss,
+--   sources }; sources maps each record source to its loss
 --
 -- A step whose loss or gradient norm is not finite makes no update, and
 -- its event has skipped = true. MAX_SKIPS skips in a row raise an error.
@@ -432,8 +455,9 @@ function M.train(opts)
 	local step, last, ev, skips = 0, nil, nil, 0
 	local function eval()
 		if opts.eval and #opts.eval > 0 then
-			ev = M.evaluate(model, opts.eval)
-			log({ kind = "eval", step = step, loss = ev })
+			local sources
+			ev, sources = M.evaluate(model, opts.eval)
+			log({ kind = "eval", step = step, loss = ev, sources = sources })
 		end
 	end
 	if opts.eval_every and opts.eval_every > 0 then
