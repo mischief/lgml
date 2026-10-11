@@ -1,0 +1,184 @@
+#!/usr/bin/env lua5.4
+-- lgml-grpo: train a LoRA adapter with GRPO against a reward written in Lua.
+
+local root = ((arg and arg[0] or ""):match("^(.*)/[^/]*$") or ".") .. "/.."
+package.path = root .. "/lua/?.lua;" .. root .. "/lua/?/init.lua;" ..
+    root .. "/lua_modules/share/lua/5.4/?.lua;" .. package.path
+package.cpath = root .. "/" .. (os.getenv("LGML_BUILD") or "build") .. "/?.so;" .. root .. "/lua_modules/lib/lua/5.4/?.so;" ..
+    package.cpath
+require("lgml.strict").on()
+
+local lgml = require("lgml")
+local getopt = require("lgml.getopt")
+local chat = require("lgml.chat")
+local json = require("lgml.json")
+local tokenizer = require("lgml.tokenizer")
+local transformer = require("lgml.transformer")
+local lora = require("lgml.lora")
+local grpo = require("lgml.grpo")
+local placement = require("lgml.placement")
+
+local USAGE = [[
+usage: lgml-grpo [-h] -m model -d prompts --init adapter --reward file
+                 [-o out] [-b backend] [-t n] [--samples k] [--per-step p]
+                 [--kl x] [--temperature x] [--max-new n] [--steps n]
+                 [--lr x] [--warmup n] [--wd x] [--clip x] [--seed n]
+                 [--save-every n] [--dump file] [--recompute]
+                 [--override-tensor pattern=backend]
+  -m, --model file     base gguf model
+  -d, --data file      JSONL prompts: {"messages": [...]} and any fields
+                       the reward reads, one object per line
+      --init adapter   the adapter to start from; a frozen copy of it is
+                       the reference of the KL penalty
+      --reward file    a Lua file that returns a function, or a table
+                       with score, called as score(answer, record, ids)
+                       and returning the reward and a table of parts
+                       (parts.parse counts toward the parse share)
+  -o, --out file       adapter gguf to write (default adapter.gguf)
+  -b, --backend name   ggml backend (default best)
+  -t, --threads n      CPU threads
+      --samples k      answers per prompt (default 8)
+      --per-step p     prompts per step (default 4)
+      --kl x           weight of the KL penalty (default 0.05)
+      --temperature x  sampling temperature (default 0.8)
+      --max-new n      the most answer tokens (default 40)
+      --steps n        steps (default: the prompts once)
+      --lr x           learning rate (default 2e-6)
+      --warmup n       steps of linear warmup (default 0)
+      --wd x           weight decay (default 0)
+      --clip x         clip the gradient norm to x; 0 for none (default 1)
+      --seed n         sampling seed (default 1)
+      --save-every n   write a checkpoint every n steps (default 0: off)
+      --dump file      write every answer with its reward parts, log-probs
+                       and advantage as JSONL
+      --recompute      backward pass one layer at a time
+      --override-tensor pattern=backend
+                       weights to place, as lgml-finetune takes them
+  -h, --help           show this help
+]]
+
+local function die(msg)
+	io.stderr:write("lgml-grpo: ", msg, "\n")
+	os.exit(1)
+end
+
+local function num(opts, k, def, int)
+	local v = opts[k]
+	if v == nil then
+		return def
+	end
+	local n = tonumber(v)
+	if not n or (int and not math.tointeger(n)) then
+		die(("bad value for %s: %s"):format(k, v))
+	end
+	return int and math.tointeger(n) or n
+end
+
+local function main(args)
+	local opts, rest = getopt.parse(args, "hm:d:o:b:t:", {
+		help = "h", model = "m", data = "d", out = "o", backend = "b", threads = "t",
+		["init="] = false, ["reward="] = false, ["samples="] = false, ["per-step="] = false,
+		["kl="] = false, ["temperature="] = false, ["max-new="] = false, ["steps="] = false,
+		["lr="] = false, ["warmup="] = false, ["wd="] = false, ["clip="] = false, ["seed="] = false,
+		["save-every="] = false, ["dump="] = false, recompute = false, ["override-tensor="] = false,
+	}, { ["override-tensor"] = true })
+	if not opts then
+		io.stderr:write("lgml-grpo: ", rest, "\n", USAGE)
+		os.exit(2)
+	end
+	if opts.h then
+		io.stdout:write(USAGE)
+		return
+	end
+	if #rest > 0 or not opts.m or not opts.d or not opts.init or not opts.reward then
+		io.stderr:write(USAGE)
+		os.exit(2)
+	end
+	local good_r, rmod = pcall(dofile, opts.reward)
+	if not good_r then
+		die(tostring(rmod))
+	end
+	local reward = type(rmod) == "table" and rmod.score or rmod
+	if type(reward) ~= "function" then
+		die(opts.reward .. ": need a function or a table with score")
+	end
+
+	local info = assert(lgml.gguf(opts.m))
+	local untied = false
+	for _, t in ipairs(info.tensors) do
+		untied = untied or t.name == "output.weight"
+	end
+	local ot = opts["override-tensor"]
+	if not ot and untied and (opts.b or ""):upper() ~= "CPU" then
+		ot = { "^token_embd%.weight$=CPU" }
+	end
+	local good_rules, rules = pcall(placement.rules, { override = ot })
+	if not good_rules then
+		die(tostring(rules))
+	end
+	local be = assert(lgml.backend(opts.b, { threads = num(opts, "t", nil, true), cpu = rules ~= nil }))
+	if be:name():upper():match("^CPU") then
+		rules = nil
+	end
+	local family = chat.load(info.meta)
+	local tk = assert(tokenizer.open(opts.m))
+	local model = transformer.load(be, opts.m, { placement = rules })
+	local ad = lora.load(model, opts.init)
+	for _, p in ipairs(ad:params()) do
+		p:requires_grad()
+	end
+	local ref = lora.load(model, opts.init)
+
+	local prompts = {}
+	for line in io.lines(opts.d) do
+		if line:match("%S") then
+			local r = json.decode(line)
+			if type(r) ~= "table" or type(r.messages) ~= "table" then
+				die(opts.d .. ": need an object with messages on every line")
+			end
+			prompts[#prompts + 1] = r
+		end
+	end
+	local out = opts.o or "adapter.gguf"
+	local base = out:gsub("%.gguf$", "")
+	local function save(path)
+		local good, serr = ad:save(path, { ["general.name"] = info.meta["general.name"] or "lgml" })
+		if not good then
+			die(path .. ": " .. tostring(serr))
+		end
+	end
+	local dumpf = opts.dump and assert(io.open(opts.dump, "w"))
+	io.stderr:write(("lgml-grpo: %s on %s; %d prompts\n"):format(model.hp.arch, be:name(), #prompts))
+	local clip = num(opts, "clip", 1)
+	local t0 = lgml.clock()
+	local res = grpo.train({
+		model = model, tk = tk, family = family, adapter = ad, ref = ref, prompts = prompts,
+		reward = reward, samples = num(opts, "samples", 8, true), per_step = num(opts, "per-step", 4, true),
+		kl = num(opts, "kl", 0.05), temperature = num(opts, "temperature", 0.8),
+		max_new = num(opts, "max-new", 40, true), steps = num(opts, "steps", nil, true),
+		lr = num(opts, "lr", 2e-6), warmup = num(opts, "warmup", 0, true), weight_decay = num(opts, "wd", 0),
+		clip = clip > 0 and clip or nil, seed = num(opts, "seed", 1, true), recompute = opts.recompute,
+		save_every = num(opts, "save-every", 0, true),
+		save = function(step)
+			save(("%s-step%d.gguf"):format(base, step))
+		end,
+		dump = dumpf and function(r)
+			r.mb = nil
+			dumpf:write(json.encode(r), "\n")
+			dumpf:flush()
+		end,
+		log = function(e)
+			io.stdout:write(("step %d reward %.4f kl %.4f parse %.3f length %.1f spread %.4f lr %.3g %.1fs%s%s\n")
+			    :format(e.step, e.reward, e.kl, e.parse, e.length, e.spread, e.lr, e.seconds,
+			    e.grad_norm and (" gnorm %.3f"):format(e.grad_norm) or "", e.skipped and " skipped" or ""))
+			io.stdout:flush()
+		end,
+	})
+	if dumpf then
+		dumpf:close()
+	end
+	save(out)
+	io.stderr:write(("lgml-grpo: %d steps in %.1fs; wrote %s\n"):format(res.steps, lgml.clock() - t0, out))
+end
+
+main(arg)
