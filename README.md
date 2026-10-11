@@ -269,8 +269,9 @@ prompt. `--log-file path` appends to a file; SIGHUP opens it again.
 
 ## Tools
 
-- `bin/lgml-finetune`: train a LoRA adapter on JSONL chat or text data.
-  The adapter loads in lgml-server and llama.cpp with `--lora`.
+- `bin/lgml-finetune`: train a LoRA adapter on JSONL chat or text data,
+  or with `--dpo` on preference pairs (chosen and rejected answers). The
+  adapter loads in lgml-server and llama.cpp with `--lora`.
 - `bin/lgml-repl`: a Lua REPL with lgml on the path.
 - `bin/lgml-convert`: convert a Hugging Face safetensors model to gguf
   as bf16, q8_0 or a llama.cpp K-quant mix (`-t q4_K_M`). The

@@ -13,6 +13,10 @@
 -- models (llama, qwen3) with soft_max attention, and gated delta net
 -- hybrids (qwen3next, qwen35). A hybrid takes one sample per
 -- micro-batch. `bin/lgml-finetune` is the command line front end.
+--
+-- Direct Preference Optimization (DPO) trains on pairs of answers to one
+-- prompt, a chosen and a rejected one. The reference policy is the model
+-- with the adapter as it is before the first step.
 -- @module lgml.finetune
 local lgml = require("lgml")
 local json = require("lgml.json")
@@ -36,10 +40,11 @@ end
 --- Read a JSONL dataset.
 -- Each line is an object: { messages = OpenAI chat messages } or
 -- { text = a string }. Blank lines are skipped. With format "chat" a
--- file may mix both kinds; with "text" every line holds text.
+-- file may mix both kinds; with "text" every line holds text; with
+-- "dpo" every line holds { messages, chosen, rejected }.
 -- @tparam string path the file
--- @tparam[opt="chat"] string format "chat" or "text"
--- @treturn {table,...} the records: { messages } or { text }
+-- @tparam[opt="chat"] string format "chat", "text" or "dpo"
+-- @treturn {table,...} the records, as the lines hold them
 -- @raise on a file error or a bad line
 function M.read_jsonl(path, format)
 	local text_only = format == "text"
@@ -47,7 +52,17 @@ function M.read_jsonl(path, format)
 	local out, ln = {}, 0
 	for line in f:lines() do
 		ln = ln + 1
-		if line:match("%S") then
+		if line:match("%S") and format == "dpo" then
+			local v, err = json.decode(line)
+			if type(v) ~= "table" or type(v.messages) ~= "table" or #v.messages == 0 or
+			    type(v.chosen) ~= "string" or type(v.rejected) ~= "string" then
+				f:close()
+				error(("%s:%d: need an object with messages, chosen and rejected (%s)"):format(path,
+				    ln, err or "none found"))
+			end
+			out[#out + 1] = { messages = v.messages, chosen = v.chosen, rejected = v.rejected,
+			    source = type(v.source) == "string" and v.source or nil }
+		elseif line:match("%S") then
 			local v, err = json.decode(line)
 			local chat_ok = type(v) == "table" and type(v.messages) == "table" and #v.messages > 0
 			local text_ok = type(v) == "table" and type(v.text) == "string" and v.text ~= ""
@@ -118,7 +133,8 @@ end
 -- @param family the chat family module, from `lgml.chat.load`
 -- @tparam {table,...} messages the conversation
 -- @tparam[opt] table opts options: enable_thinking (default false),
--- tools (OpenAI tools list)
+-- tools (OpenAI tools list), last (true: only the last message trains,
+-- in one sample that ends with it)
 -- @treturn {table,...} the samples: each has ids and train (a boolean
 -- for each id)
 function M.encode(tk, family, messages, opts)
@@ -168,6 +184,9 @@ function M.encode(tk, family, messages, opts)
 		end
 		push(full:sub(pos), false)
 		return #spans > 0 and s or nil, rest
+	end
+	if opts.last then
+		return { (sample(#messages, #messages)) }
 	end
 	local out = {}
 	local s, rest = sample(#messages)
@@ -383,6 +402,127 @@ function M.evaluate(model, mbs)
 	return m > 0 and sum / m or nil, next(sources) and sources or nil
 end
 
+--- Tokenize a preference pair.
+-- Each side is the prompt plus an assistant turn with its answer; only
+-- the answer and its end of turn train.
+-- @param tk the tokenizer
+-- @param family the chat family module
+-- @tparam table rec a record from `read_jsonl` with format "dpo"
+-- @tparam[opt] table opts options of `encode`
+-- @treturn ?table { chosen, rejected, source }, with samples as `encode`
+-- makes them; nil when a side has no answer tokens
+function M.encode_pair(tk, family, rec, opts)
+	opts = opts or {}
+	local function side(answer)
+		local msgs = table.move(rec.messages, 1, #rec.messages, 1, {})
+		msgs[#msgs + 1] = { role = "assistant", content = answer }
+		return M.encode(tk, family, msgs, { enable_thinking = opts.enable_thinking, tools = opts.tools,
+		    last = true })[1]
+	end
+	local c, r = side(rec.chosen), side(rec.rejected)
+	return c and r and { chosen = c, rejected = r, source = rec.source } or nil
+end
+
+--- Pack preference pairs: one micro-batch for each side.
+-- A side longer than ctx loses its end; a pair with a side that keeps
+-- no loss tokens is dropped.
+-- @tparam {table,...} list pairs from `encode_pair`
+-- @tparam integer ctx the most tokens in a side
+-- @treturn {table,...} pairs: { c, r (micro-batches), n (tokens), source }
+-- @treturn integer the count of sides that lost their end
+function M.pack_pairs(list, ctx)
+	local out, trimmed = {}, 0
+	for _, p in ipairs(list) do
+		local c, tc = M.pack({ p.chosen }, ctx)
+		local r, tr = M.pack({ p.rejected }, ctx)
+		trimmed = trimmed + tc + tr
+		if c[1] and r[1] then
+			out[#out + 1] = { c = c[1], r = r[1], n = c[1].n + r[1].n, source = p.source }
+		end
+	end
+	return out, trimmed
+end
+
+-- The summed log-prob of the loss tokens of a micro-batch: `loss`
+-- returns the mean cross-entropy over its mb.m tokens.
+local function logp(model, mb)
+	return -M.loss(model, mb) * mb.m
+end
+
+--- Compute the reference log-probs of pairs, forward only.
+-- Sets ref_c and ref_r of each pair under the model as it is now.
+-- @param model the model, with its adapters set
+-- @tparam {table,...} list pairs from `pack_pairs`
+function M.reference(model, list)
+	for _, p in ipairs(list) do
+		p.ref_c, p.ref_r = logp(model, p.c), logp(model, p.r)
+	end
+end
+
+-- -log sigmoid(z) and 1 - sigmoid(z), without overflow.
+local function neg_log_sigmoid(z)
+	return math.max(-z, 0) + math.log(1 + math.exp(-math.abs(z)))
+end
+
+local function one_minus_sigmoid(z)
+	local e = math.exp(-math.abs(z))
+	return z >= 0 and e / (1 + e) or 1 / (1 + e)
+end
+
+--- Compute the DPO loss of one pair.
+-- z = beta ((logp_c - ref_c) - (logp_r - ref_r)), and the loss is
+-- -log sigmoid(z). The backward pass runs `loss` on each side with a
+-- weight that makes its gradient the gradient of the DPO loss.
+-- @param model the model, with its adapters set
+-- @tparam table pair a pair from `pack_pairs`, after `reference`
+-- @tparam number beta the DPO beta
+-- @tparam[opt=1] number weight the factor on the loss for the gradients
+-- @tparam[opt] boolean backward true to run the backward pass
+-- @tparam[opt] boolean recompute see `loss`
+-- @treturn number the loss
+-- @treturn number z
+function M.dpo_loss(model, pair, beta, weight, backward, recompute)
+	local z = beta * ((logp(model, pair.c) - pair.ref_c) - (logp(model, pair.r) - pair.ref_r))
+	if backward then
+		-- d loss / d logp_c = -beta (1 - sigmoid z), and logp_c is -m_c
+		-- times the mean cross-entropy of the chosen side. The rejected
+		-- side has the opposite sign.
+		local f = beta * one_minus_sigmoid(z) * (weight or 1)
+		M.loss(model, pair.c, f * pair.c.m, true, recompute)
+		M.loss(model, pair.r, -f * pair.r.m, true, recompute)
+	end
+	return neg_log_sigmoid(z), z
+end
+
+--- The mean DPO loss, reward margin and accuracy over pairs.
+-- @param model the model
+-- @tparam {table,...} list pairs from `pack_pairs`, after `reference`
+-- @tparam number beta the DPO beta
+-- @treturn number the loss, or nil with no pairs
+-- @treturn number the mean reward margin z / beta
+-- @treturn number the share of pairs with z > 0
+-- @treturn ?table the loss of each source; nil when no pair has one
+function M.dpo_evaluate(model, list, beta)
+	if #list == 0 then
+		return nil
+	end
+	local loss, margin, acc, by = 0, 0, 0, {}
+	for _, p in ipairs(list) do
+		local l, z = M.dpo_loss(model, p, beta)
+		loss, margin, acc = loss + l, margin + z / beta, acc + (z > 0 and 1 or 0)
+		if p.source then
+			local e = by[p.source] or { sum = 0, m = 0 }
+			e.sum, e.m = e.sum + l, e.m + 1
+			by[p.source] = e
+		end
+	end
+	local sources = {}
+	for k, e in pairs(by) do
+		sources[k] = e.sum / e.m
+	end
+	return loss / #list, margin / #list, acc / #list, next(sources) and sources or nil
+end
+
 -- Deterministic shuffle.
 local function shuffle(list, seed)
 	local x = seed
@@ -401,7 +541,11 @@ end
 --
 -- - `model`: the model, from `lgml.transformer.load`
 -- - `adapter`: the adapter, from `lgml.lora`; it is applied to the model
--- - `train`, `eval`: micro-batches from `pack` (eval may be empty)
+-- - `train`, `eval`: micro-batches from `pack` (eval may be empty), or
+--   pairs from `pack_pairs` with dpo
+-- - `dpo`: true to train on pairs with the DPO loss, `beta` (0.1) its
+--   beta; the reference log-probs come from the model before the first
+--   step, and a step averages the loss over its pairs
 -- - `epochs` (1), `accum` (1), `lr` (1e-4), `warmup` (0), `weight_decay`
 --   (0), `optimizer` ("adamw" or "sgd"), `seed` (1), `schedule`
 --   ("constant" or "cosine"), `min_lr` (0)
@@ -416,7 +560,9 @@ end
 -- - `save_every`, `save`: `save(step)` runs every save_every steps
 -- - `log`: `log(event)` gets { kind = "step", step, epoch, loss, lr,
 --   tokens, seconds, grad_norm, skipped } and { kind = "eval", step, loss,
---   sources }; sources maps each record source to its loss
+--   sources }; sources maps each record source to its loss; with dpo
+--   both also have margin (the mean of z / beta) and accuracy (the share
+--   of pairs with z > 0)
 --
 -- A step whose loss or gradient norm is not finite makes no update, and
 -- its event has skipped = true. MAX_SKIPS skips in a row raise an error.
@@ -453,11 +599,21 @@ function M.train(opts)
 	end
 	local log = opts.log or function() end
 	local step, last, ev, skips = 0, nil, nil, 0
+	local beta = opts.beta or 0.1
+	if opts.dpo then
+		M.reference(model, opts.train)
+		M.reference(model, opts.eval or {})
+	end
 	local function eval()
 		if opts.eval and #opts.eval > 0 then
-			local sources
-			ev, sources = M.evaluate(model, opts.eval)
-			log({ kind = "eval", step = step, loss = ev, sources = sources })
+			local margin, acc, sources
+			if opts.dpo then
+				ev, margin, acc, sources = M.dpo_evaluate(model, opts.eval, beta)
+			else
+				ev, sources = M.evaluate(model, opts.eval)
+			end
+			log({ kind = "eval", step = step, loss = ev, margin = margin, accuracy = acc,
+			    sources = sources })
 		end
 	end
 	if opts.eval_every and opts.eval_every > 0 then
@@ -475,13 +631,21 @@ function M.train(opts)
 			local group = table.move(order, i, math.min(#order, i + accum - 1), 1, {})
 			local m, tokens = 0, 0
 			for _, mb in ipairs(group) do
-				m, tokens = m + mb.m, tokens + mb.n
+				m, tokens = m + (opts.dpo and 1 or mb.m), tokens + mb.n
 			end
 			local t0 = lgml.clock()
 			opt:zero_grad()
-			local sum = 0
-			for _, mb in ipairs(group) do
-				sum = sum + M.loss(model, mb, mb.m / m, true, opts.recompute) * mb.m
+			local sum, margin, acc = 0, nil, nil
+			if opts.dpo then
+				margin, acc = 0, 0
+				for _, p in ipairs(group) do
+					local l, z = M.dpo_loss(model, p, beta, 1 / m, true, opts.recompute)
+					sum, margin, acc = sum + l, margin + z / beta / m, acc + (z > 0 and 1 or 0) / m
+				end
+			else
+				for _, mb in ipairs(group) do
+					sum = sum + M.loss(model, mb, mb.m / m, true, opts.recompute) * mb.m
+				end
 			end
 			step = step + 1
 			opt.lr = lr_at(step)
@@ -498,7 +662,8 @@ function M.train(opts)
 				last = sum / m
 			end
 			log({ kind = "step", step = step, epoch = epoch, loss = sum / m, lr = opt.lr,
-			    tokens = tokens, seconds = lgml.clock() - t0, grad_norm = gnorm, skipped = skip })
+			    tokens = tokens, seconds = lgml.clock() - t0, grad_norm = gnorm, skipped = skip,
+			    margin = margin, accuracy = acc })
 			if opts.eval_every and opts.eval_every > 0 and step % opts.eval_every == 0 then
 				eval()
 			end

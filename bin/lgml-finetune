@@ -26,7 +26,7 @@ usage: lgml-finetune [-h] -m model -d data [-o out] [-b backend] [-t n] [-r rank
                      [--eval-split f] [--eval-every n] [--save-every n]
                      [--init adapter] [--seed n] [--think] [--format name]
                      [--recompute] [--override-tensor pattern=backend]
-                     [--clip x] [--no-shuffle]
+                     [--clip x] [--no-shuffle] [--dpo] [--beta x]
   -m, --model file     base gguf model: a dense llama or qwen3, or a
                        qwen35 hybrid; its weights may be quantized
   -d, --data file      JSONL training data, one object per line:
@@ -38,6 +38,14 @@ usage: lgml-finetune [-h] -m model -d data [-o out] [-b backend] [-t n] [-r rank
                        text: every line holds text, such as a source
                        file with a "/* file: path */" first line; text
                        longer than the context splits into chunks
+      --dpo            Direct Preference Optimization: each line is
+                       {"messages": [...prompt...], "chosen": "text",
+                       "rejected": "text"}; the loss raises the chosen
+                       answer over the rejected one, relative to the
+                       model before training (the --init adapter, or
+                       the base); --grad-accum counts pairs
+      --beta x         DPO beta: how far the policy may move from the
+                       reference (default 0.1)
   -o, --out file       adapter gguf to write (default adapter.gguf); it
                        loads in llama.cpp with --lora
   -b, --backend name   ggml backend, for example Vulkan0 or CPU (default
@@ -123,7 +131,7 @@ local function main(args)
 		["eval-every="] = false, ["save-every="] = false, ["init="] = false,
 		["seed="] = false, think = false, ["format="] = false, recompute = false,
 		["override-tensor="] = false, ["clip="] = false,
-		["no-shuffle"] = false,
+		["no-shuffle"] = false, dpo = false, ["beta="] = false,
 	}, { ["override-tensor"] = true })
 	if not opts then
 		io.stderr:write("lgml-finetune: ", rest, "\n", USAGE)
@@ -147,6 +155,13 @@ local function main(args)
 	local format = opts.format or "chat"
 	if format ~= "chat" and format ~= "text" then
 		die("format must be chat or text")
+	end
+	local dpo, beta = opts.dpo, num(opts, "beta", 0.1)
+	if dpo and format ~= "chat" then
+		die("--dpo takes chat data")
+	end
+	if not (beta > 0) then
+		die("beta must be above 0")
 	end
 	if opts.schedule and opts.schedule ~= "constant" and opts.schedule ~= "cosine" then
 		die("schedule must be constant or cosine")
@@ -196,15 +211,18 @@ local function main(args)
 		die(tostring(err))
 	end
 
+	-- With --dpo the samples are pairs from finetune.encode_pair.
 	local function samples(path)
 		local list = {}
-		local good, recs = pcall(finetune.read_jsonl, path, format)
+		local good, recs = pcall(finetune.read_jsonl, path, dpo and "dpo" or format)
 		if not good then
 			die(tostring(recs))
 		end
+		local eopts = { enable_thinking = opts.think }
 		for _, r in ipairs(recs) do
-			local ss = r.text and finetune.encode_text(tk, r.text, ctx) or
-			    finetune.encode(tk, chat_family(), r.messages, { enable_thinking = opts.think })
+			local ss = dpo and { finetune.encode_pair(tk, chat_family(), r, eopts) } or
+			    r.text and finetune.encode_text(tk, r.text, ctx) or
+			    finetune.encode(tk, chat_family(), r.messages, eopts)
 			for _, s in ipairs(ss) do
 				s.source = r.source
 				list[#list + 1] = s
@@ -225,8 +243,14 @@ local function main(args)
 		-- The recurrent state would carry from one sample to the next.
 		batch = 1
 	end
-	local tmb, trimmed = finetune.pack(train, ctx, batch)
-	local emb = finetune.pack(eval, ctx, batch)
+	local tmb, emb, trimmed
+	if dpo then
+		tmb, trimmed = finetune.pack_pairs(train, ctx)
+		emb = finetune.pack_pairs(eval, ctx)
+	else
+		tmb, trimmed = finetune.pack(train, ctx, batch)
+		emb = finetune.pack(eval, ctx, batch)
+	end
 	if trimmed > 0 then
 		io.stderr:write(("lgml-finetune: %d samples longer than %d tokens lose their end\n"):format(
 		    trimmed, ctx))
@@ -269,11 +293,12 @@ local function main(args)
 	end
 	local m = 0
 	for _, mb in ipairs(tmb) do
-		m = m + mb.m
+		m = m + (dpo and mb.c.m + mb.r.m or mb.m)
 	end
-	io.stderr:write(("lgml-finetune: %s on %s; %d adapter weights, %d values; %d micro-batches, " ..
-	    "%d loss tokens; eval %d micro-batches\n"):format(model.hp.arch, be:name(), #ad.names,
-	    ad:numel(), #tmb, m, #emb))
+	local unit = dpo and "pairs" or "micro-batches"
+	io.stderr:write(("lgml-finetune: %s on %s; %d adapter weights, %d values; %d %s, " ..
+	    "%d loss tokens; eval %d %s\n"):format(model.hp.arch, be:name(), #ad.names,
+	    ad:numel(), #tmb, unit, m, #emb, unit))
 
 	local base = out:gsub("%.gguf$", "")
 	local function save(path)
@@ -290,16 +315,17 @@ local function main(args)
 		schedule = opts.schedule, min_lr = num(opts, "min-lr", 0), steps = num(opts, "steps", nil, true),
 		weight_decay = num(opts, "wd", 0), optimizer = optimizer, seed = seed,
 		eval_every = num(opts, "eval-every", nil, true), recompute = opts.recompute,
-		shuffle = not opts["no-shuffle"],
+		shuffle = not opts["no-shuffle"], dpo = dpo, beta = beta,
 		clip = num(opts, "clip", 1) > 0 and num(opts, "clip", 1) or nil,
 		save_every = num(opts, "save-every", 0, true),
 		save = function(step)
 			save(("%s-step%d.gguf"):format(base, step))
 		end,
 		log = function(ev)
+			local pref = ev.margin and (" margin %.4f acc %.3f"):format(ev.margin, ev.accuracy) or ""
 			if ev.kind == "step" then
-				io.stdout:write(("step %d epoch %d loss %.4f lr %.3g tokens %d %.1fs%s%s\n"):format(
-				    ev.step, ev.epoch, ev.loss, ev.lr, ev.tokens, ev.seconds,
+				io.stdout:write(("step %d epoch %d loss %.4f%s lr %.3g tokens %d %.1fs%s%s\n"):format(
+				    ev.step, ev.epoch, ev.loss, pref, ev.lr, ev.tokens, ev.seconds,
 				    ev.grad_norm and (" gnorm %.3f"):format(ev.grad_norm) or "",
 				    ev.skipped and " skipped" or ""))
 			else
@@ -308,7 +334,7 @@ local function main(args)
 					parts[#parts + 1] = ("%s %.4f"):format(k, l)
 				end
 				table.sort(parts)
-				io.stdout:write(("eval step %d loss %.4f%s\n"):format(ev.step, ev.loss,
+				io.stdout:write(("eval step %d loss %.4f%s%s\n"):format(ev.step, ev.loss, pref,
 				    #parts > 0 and " (" .. table.concat(parts, ", ") .. ")" or ""))
 			end
 			io.stdout:flush()

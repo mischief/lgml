@@ -438,6 +438,127 @@ do
 	os.remove(out1)
 end
 
+-- DPO: pairs train only the answer tokens, the first step has z = 0,
+-- training raises the margin, and the gradient matches the loss.
+do
+	local recs = {
+		{ q = "Name a color.", c = "Blue.", r = "Seven." },
+		{ q = "Name a fruit.", c = "Pear.", r = "Rocks." },
+		{ q = "Name an animal.", c = "A cat.", r = "Monday." },
+		{ q = "Name a number.", c = "Three.", r = "Green." },
+	}
+	local data = tmp(".jsonl")
+	local f = assert(io.open(data, "w"))
+	for _, r in ipairs(recs) do
+		f:write(json.encode({ messages = { { role = "system", content = "Be brief." },
+		    { role = "user", content = r.q } }, chosen = r.c, rejected = r.r }), "\n")
+	end
+	f:close()
+	local read = finetune.read_jsonl(data, "dpo")
+	local pairs_ = {}
+	for _, r in ipairs(read) do
+		pairs_[#pairs_ + 1] = finetune.encode_pair(tk, family, r)
+	end
+	ok(#pairs_ == 4 and trained(pairs_[1].chosen) == "Blue.<|im_end|>\n" and
+	    trained(pairs_[1].rejected) == "Seven.<|im_end|>\n", "a pair trains its two answers only")
+	local bad = tmp(".jsonl")
+	f = assert(io.open(bad, "w"))
+	f:write(json.encode({ messages = { { role = "user", content = "x" } }, chosen = "y" }), "\n")
+	f:close()
+	local good = pcall(finetune.read_jsonl, bad, "dpo")
+	ok(not good, "a pair without rejected fails")
+
+	local be <close> = assert(lgml.backend("CPU"))
+	local m = transformer.load(be, path)
+	local train = finetune.pack_pairs(pairs_, 256)
+	local held = finetune.pack_pairs(pairs_, 256)
+	local steps, evals = {}, {}
+	finetune.train({ model = m, adapter = lora.new(m, { rank = 4, seed = 3 }), train = train,
+	    eval = held, dpo = true, beta = 0.5, lr = 1e-2, epochs = 10, accum = 2, eval_every = 5,
+	    shuffle = false, log = function(e)
+		local t = e.kind == "step" and steps or evals
+		t[#t + 1] = e
+	end })
+	local first, last = steps[1], steps[#steps]
+	ok(#steps == 20 and math.abs(first.loss - math.log(2)) < 1e-6 and math.abs(first.margin) < 1e-6,
+	    ("first DPO step: loss %.7f, log 2 %.7f, margin %.2e"):format(first.loss, math.log(2),
+	    first.margin))
+	local e0, en = evals[1], evals[#evals]
+	ok(#evals == 5 and e0.accuracy == 0 and en.margin > e0.margin + 1 and en.accuracy == 1 and
+	    en.loss < e0.loss / 2, ("DPO eval: margin %.3f -> %.3f, accuracy %.2f -> %.2f, loss %.3f " ..
+	    "-> %.3f"):format(e0.margin, en.margin, e0.accuracy, en.accuracy, e0.loss, en.loss))
+	ok(last.margin > 0 and last.accuracy == 1 and last.loss < first.loss,
+	    ("DPO train: last step margin %.3f, accuracy %.2f, loss %.3f"):format(last.margin,
+	    last.accuracy, last.loss))
+
+	-- Finite differences of the DPO loss along the gradient and along a
+	-- fixed direction. The reference comes from the base, then B is
+	-- random, so z is not 0.
+	local ad = lora.new(m, { rank = 4 })
+	local params = ad:params()
+	m:set_adapters({ ad })
+	local pair = finetune.pack_pairs({ pairs_[2] }, 256)[1]
+	finetune.reference(m, { pair })
+	for i, p in ipairs(params) do
+		if i % 2 == 0 then
+			p:fill("uniform", -0.2, 0.2, i)
+		end
+	end
+	local beta = 0.5
+	for _, p in ipairs(params) do
+		p:grad():zero()
+	end
+	local l0, z0 = finetune.dpo_loss(m, pair, beta, 1, true)
+	local x0, g, d = {}, {}, {}
+	local norm, dnorm, gd, k = 0, 0, 0, 0
+	for i, p in ipairs(params) do
+		x0[i], g[i], d[i] = p:get(), p:grad():get(), {}
+		for j, v in ipairs(g[i]) do
+			k = k + 1
+			d[i][j] = math.sin(k * 12.9898) -- a fixed direction
+			norm, dnorm, gd = norm + v * v, dnorm + d[i][j] ^ 2, gd + v * d[i][j]
+		end
+	end
+	norm, dnorm = math.sqrt(norm), math.sqrt(dnorm)
+	-- The loss at x0 + t dir / |dir|.
+	local function at(dir, len, t)
+		for i, p in ipairs(params) do
+			local x = {}
+			for j, v in ipairs(x0[i]) do
+				x[j] = v + t * dir[i][j] / len
+			end
+			p:set(x)
+		end
+		return (finetune.dpo_loss(m, pair, beta))
+	end
+	local h = 1e-2
+	local fd = (at(g, norm, h) - at(g, norm, -h)) / (2 * h)
+	local fdd = (at(d, dnorm, h) - at(d, dnorm, -h)) / (2 * h)
+	at(g, norm, 0)
+	local want = gd / dnorm
+	ok(norm > 0 and math.abs(fd - norm) < 0.01 * norm and math.abs(fdd - want) < 0.01 * norm,
+	    ("DPO gradient: z %.3f, loss %.4f; along it %.5f, finite difference %.5f; along a fixed " ..
+	    "direction %.5f, finite difference %.5f"):format(z0, l0, norm, fd, want, fdd))
+	m:close()
+
+	-- The command line tool with --dpo.
+	local out = tmp(".gguf")
+	local cmd = ("%s %s/../bin/lgml-finetune -m %s -d %s -o %s -b CPU --dpo --beta 0.5 --lr 1e-2 " ..
+	    "-e 5 --eval-split 0.25 --eval-every 3 2>&1"):format(arg[-1] or "lua5.4", here, path, data, out)
+	local p = assert(io.popen(cmd))
+	local log = p:read("a")
+	local closed = p:close()
+	local accs = {}
+	for a in log:gmatch("step %d+ epoch %d+ loss [%d.]+ margin %-?[%d.]+ acc ([%d.]+)") do
+		accs[#accs + 1] = tonumber(a)
+	end
+	ok(closed and #accs == 15 and log:find("eval step 0 loss 0.6931 margin", 1, true),
+	    ("--dpo runs %d steps"):format(#accs))
+	if not closed then
+		io.stderr:write(log)
+	end
+end
+
 for _, p in ipairs(files) do
 	os.remove(p)
 end
