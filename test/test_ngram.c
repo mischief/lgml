@@ -303,7 +303,9 @@ test_modes(const char *path)
 	ngram_close(r);
 	r = ngram_open(path, NULL, "per_layer_token_embd.weight", NGRAM_DIRECT, 0, 2, err,
 	    sizeof(err));
-	ok(r != NULL && (r->align == 512 || r->align == 4096), "open direct with a found unit");
+	/* A system without direct reads, such as OpenBSD, falls back. */
+	ok(r != NULL && (r->fell_back || r->align == 512 || r->align == 4096),
+	    "open direct with a found unit");
 	printf("# found unit %d, mode %d\n", (int)r->align, (int)r->mode);
 	ok(ngram_read(r, rows, nr, got2) == 0 &&
 	    memcmp(got2, out[0], nr * T_DIM * sizeof(float)) == 0, "found unit gives the same rows");
