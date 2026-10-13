@@ -72,6 +72,11 @@ do
 	    "each turn trains once")
 	local none = finetune.encode(tk, family, { { role = "user", content = "x" } })
 	ok(#none == 0, "a conversation without an answer gives no sample")
+
+	multi[2] = { role = "assistant", content = "3", weight = 0 }
+	ss = finetune.encode(tk, family, multi)
+	ok(#ss == 1 and trained(ss[1]) == "2<|im_end|>\n", "a turn with weight 0 does not train")
+	ok(tk:decode(ss[1].ids):find("3", 1, true), "a turn with weight 0 stays in the context")
 end
 
 do

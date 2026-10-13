@@ -128,7 +128,8 @@ end
 -- end of turn. Some templates render an earlier turn in another form
 -- than a final one (Qwen3 drops its think block); such a turn gets a
 -- sample of its own that ends with it, as the model sees it when it
--- writes that turn.
+-- writes that turn. An assistant turn with weight 0 (as in the OpenAI
+-- fine-tuning format) is context only and does not train.
 -- @param tk the tokenizer, from `lgml.tokenizer.open`
 -- @param family the chat family module, from `lgml.chat.load`
 -- @tparam {table,...} messages the conversation
@@ -152,7 +153,7 @@ function M.encode(tk, family, messages, opts)
 		local full = render(n, false)
 		local spans, rest = {}, {}
 		for i = 1, n do
-			if messages[i].role == "assistant" and (not want or want == i) then
+			if messages[i].role == "assistant" and messages[i].weight ~= 0 and (not want or want == i) then
 				local upto = render(i, false)
 				local start = common(render(i - 1, true), upto) + 1
 				if full:sub(1, #upto) == upto and start <= #upto and
