@@ -472,6 +472,142 @@ function P:plan(prompt, from)
 	return stops
 end
 
+-- The format of `dump`. Raise it when a snapshot or entry changes shape.
+M.FORMAT = 1
+
+local MAGIC = "lgml-pc\n"
+-- Snapshot bytes start on a page boundary after the header.
+local ALIGN = 4096
+
+--- Write the store entries to a file, for `undump` in a later process.
+-- The file has a header line, a JSON header and the snapshot bytes.
+-- The state index and spilled blocks stay out: they refer to KV pool
+-- blocks of this process.
+-- @tparam int fd the file, such as an `lgml.memfd`
+-- @tparam string fp the fingerprint of the model and code; `undump`
+-- takes the file only with the same one
+-- @treturn[1] integer the bytes written
+-- @treturn[2] nil
+-- @treturn[2] string the error
+function P:dump(fd, fp)
+	local uv = require("luv")
+	local json = require("lgml.json")
+	local snaps, index, entries = {}, {}, {}
+	local function ref(s)
+		if not index[s] then
+			snaps[#snaps + 1] = s
+			index[s] = #snaps
+		end
+		return index[s]
+	end
+	for _, e in ipairs(self.store) do
+		local ck = {}
+		for i, c in ipairs(e.ckpts) do
+			ck[i] = ref(c)
+		end
+		entries[#entries + 1] = { tokens = json.array(e.tokens), key = e.key, prio = e.prio,
+			used = e.used, snap = ref(e.snap), ckpts = json.array(ck) }
+	end
+	local list, off = {}, 0
+	for i, s in ipairs(snaps) do
+		list[i] = { n = s.n, hi = s.hi, full = s.full, bytes = s.bytes, off = off }
+		off = off + s.bytes
+	end
+	local head = json.encode({ format = M.FORMAT, fp = fp, entries = json.array(entries),
+		snaps = json.array(list) })
+	local base = (#MAGIC + 16 + #head + ALIGN - 1) // ALIGN * ALIGN
+	local pre = MAGIC .. ("%016x"):format(#head) .. head
+	local n, err = uv.fs_write(fd, pre, 0)
+	if n ~= #pre then
+		return nil, "write header: " .. tostring(err)
+	end
+	for i, s in ipairs(snaps) do
+		local ok, werr = s.buf:pwrite(fd, base + list[i].off)
+		if not ok then
+			return nil, werr
+		end
+	end
+	return base + off
+end
+
+--- Read store entries that `dump` wrote.
+-- Entries go in under the byte budget, the most recently used first;
+-- the ones that do not fit stay out.
+-- @tparam int fd the file
+-- @tparam string fp the fingerprint; a file with another one is refused
+-- @treturn[1] integer the entries read
+-- @treturn[2] nil
+-- @treturn[2] string why the file was refused
+function P:undump(fd, fp)
+	local uv = require("luv")
+	local json = require("lgml.json")
+	local pre = uv.fs_read(fd, #MAGIC + 16, 0)
+	if not pre or pre:sub(1, #MAGIC) ~= MAGIC then
+		return nil, "not a prompt cache file"
+	end
+	local len = tonumber(pre:sub(#MAGIC + 1), 16)
+	local text = len and uv.fs_read(fd, len, #pre)
+	local h = text and #text == len and json.decode(text)
+	if type(h) ~= "table" then
+		return nil, "bad header"
+	elseif h.format ~= M.FORMAT then
+		return nil, ("format %s, not %d"):format(tostring(h.format), M.FORMAT)
+	elseif h.fp ~= fp then
+		return nil, "another model, setting or code"
+	end
+	local base = (#pre + len + ALIGN - 1) // ALIGN * ALIGN
+	table.sort(h.entries, function(a, b)
+		return a.used > b.used
+	end)
+	local snaps, got = {}, {}
+	local function snap(i)
+		if not snaps[i] then
+			local s = h.snaps[i]
+			local buf = lgml.hostbuf(s.bytes)
+			local ok, err = buf:pread(fd, base + s.off)
+			if not ok then
+				buf:close()
+				error(err, 0)
+			end
+			snaps[i] = { n = s.n, hi = s.hi, full = s.full, bytes = s.bytes, buf = buf }
+		end
+		return hold(snaps[i])
+	end
+	local ok, err = pcall(function()
+		for _, e in ipairs(h.entries) do
+			local bytes = h.snaps[e.snap].bytes
+			for _, i in ipairs(e.ckpts) do
+				bytes = bytes + h.snaps[i].bytes
+			end
+			if self.bytes + bytes <= self.ram then
+				local ckpts = {}
+				for k, i in ipairs(e.ckpts) do
+					ckpts[k] = snap(i)
+				end
+				got[#got + 1] = { tokens = e.tokens, ckpts = ckpts, bytes = bytes, snap = snap(e.snap),
+					key = e.key, prio = e.prio }
+				self.bytes = self.bytes + bytes
+			end
+		end
+	end)
+	if not ok then
+		for _, s in pairs(snaps) do
+			s.buf:close()
+		end
+		for _, e in ipairs(got) do
+			self.bytes = self.bytes - e.bytes
+		end
+		return nil, err
+	end
+	-- The oldest entry gets the lowest tick.
+	for i = #got, 1, -1 do
+		self.tick = self.tick + 1
+		got[i].used = self.tick
+		self.store[#self.store + 1] = got[i]
+	end
+	return #got
+end
+
 --- Free the store, the state index, the spilled blocks and the
 -- checkpoints.
 function P:clear()

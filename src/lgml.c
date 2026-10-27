@@ -3735,6 +3735,69 @@ hostbuf_set(lua_State *L)
 	return 0;
 }
 
+/* Copy the whole buffer to or from fd at file offset off. */
+static int
+hostbuf_io(lua_State *L, int out)
+{
+	struct hostbuf *hb = check_hostbuf(L, 1);
+	lua_Integer fd = luaL_checkinteger(L, 2), off = luaL_optinteger(L, 3, 0);
+	size_t done = 0;
+	ssize_t n;
+
+	luaL_argcheck(L, fd >= 0 && fd <= INT_MAX, 2, "bad fd");
+	luaL_argcheck(L, off >= 0, 3, "offset out of range");
+	while (done < hb->size) {
+		if (out)
+			n = pwrite((int)fd, hb->p + done, hb->size - done, (off_t)off + (off_t)done);
+		else
+			n = pread((int)fd, hb->p + done, hb->size - done, (off_t)off + (off_t)done);
+		if (n == -1 && errno == EINTR)
+			continue;
+		if (n == -1) {
+			lua_pushnil(L);
+			lua_pushfstring(L, "%s: %s", out ? "pwrite" : "pread", strerror(errno));
+			return 2;
+		}
+		if (n == 0) {
+			lua_pushnil(L);
+			lua_pushliteral(L, "pread: end of file");
+			return 2;
+		}
+		done += (size_t)n;
+	}
+	lua_pushboolean(L, 1);
+	return 1;
+}
+
+/*** Write the whole buffer to a file.
+ * @tparam int fd the file descriptor
+ * @tparam[opt=0] int off the file offset
+ * @treturn[1] boolean true
+ * @treturn[2] nil
+ * @treturn[2] string the error
+ * @function hostbuf:pwrite
+ */
+static int
+hostbuf_pwrite(lua_State *L)
+{
+	return hostbuf_io(L, 1);
+}
+
+/*** Fill the whole buffer from a file.
+ * A file that ends first is an error.
+ * @tparam int fd the file descriptor
+ * @tparam[opt=0] int off the file offset
+ * @treturn[1] boolean true
+ * @treturn[2] nil
+ * @treturn[2] string the error
+ * @function hostbuf:pread
+ */
+static int
+hostbuf_pread(lua_State *L)
+{
+	return hostbuf_io(L, 0);
+}
+
 static const luaL_Reg backend_meta[] = {
 	{ "__gc", backend_close },
 	{ "__close", backend_close },
@@ -3867,6 +3930,8 @@ static const luaL_Reg hostbuf_methods[] = {
 	{ "len", hostbuf_len },
 	{ "bytes", hostbuf_bytes },
 	{ "set", hostbuf_set },
+	{ "pread", hostbuf_pread },
+	{ "pwrite", hostbuf_pwrite },
 	{ NULL, NULL }
 };
 
@@ -3974,6 +4039,9 @@ luaopen_lgml(lua_State *L)
 	lgml_open_ops_vibevoice(L);
 	lgml_open_ops_nn(L);
 	lgml_open_proctitle(L);
+#ifdef LGML_HAVE_SD
+	lgml_open_sd(L);
+#endif
 	lgml_open_ops_fused(L);
 	lgml_open_xcache(L);
 	lgml_open_train(L);

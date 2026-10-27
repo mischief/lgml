@@ -47,6 +47,11 @@ local CRASH_WINDOW_MS = 5 * 60 * 1000
 --   (default true)
 -- - `on_exit`: a function called with the exit code and signal each
 --   time the worker exits
+-- - `take_state`: a function that returns a file with the saved prompt
+--   store for a new worker (see `lgml.ipc.STATE`), or nil; the worker
+--   gets it as `--state-fd 4`, and this process closes it
+-- - `on_state`: a function(fd, bytes) for the file of a worker's
+--   `STATE` message; it owns fd. Without it the file is closed.
 -- @treturn Remote the engine
 -- @raise when the worker does not start
 function M.new(opts)
@@ -59,6 +64,30 @@ end
 
 -- The engines with a worker, for signal.
 local live = setmetatable({}, { __mode = "k" })
+
+--- Waits until each running worker has exited, for at most ms.
+-- It yields the calling coroutine.
+-- @tparam int ms the most milliseconds to wait
+-- @treturn boolean true when all exited
+function M.wait_all(ms)
+	local deadline = uv.now() + ms
+	for r in pairs(live) do
+		if r.proc then
+			local t = uv.new_timer()
+			stream.await(function(done)
+				r.exit_waiting[#r.exit_waiting + 1] = done
+				t:start(math.max(0, deadline - uv.now()), 0, done)
+			end)
+			t:close()
+		end
+	end
+	for r in pairs(live) do
+		if r.proc then
+			return false
+		end
+	end
+	return true
+end
 
 --- Sends a signal to each running worker.
 -- @tparam string sig the signal name, such as `"sighup"`
@@ -94,15 +123,24 @@ function R:start()
 	self.failed = nil
 	local pair = assert(uv.socketpair("stream", 0, { nonblock = true }, {}))
 	local args = { o.script, "--fd", "3" }
+	local stdio = { 0, 1, 2, pair[2] }
+	local state = o.take_state and o.take_state()
+	if state then
+		table.move({ "--state-fd", "4" }, 1, 2, #args + 1, args)
+		stdio[5] = state
+	end
 	local la = log.args()
 	table.move(la, 1, #la, #args + 1, args)
 	table.move(o.args, 1, #o.args, #args + 1, args)
 	local proc, pid = uv.spawn(o.lua, {
-		args = args, stdio = { 0, 1, 2, pair[2] },
+		args = args, stdio = stdio,
 		env = environ({ LUA_PATH = package.path, LUA_CPATH = package.cpath }),
 	}, function(code, sig)
 		self:exited(code, sig)
 	end)
+	if state then
+		uv.fs_close(state)
+	end
 	if not proc then
 		error("spawn worker: " .. tostring(pid))
 	end
@@ -111,8 +149,8 @@ function R:start()
 	L:debug("worker started", "model", o.id, "pid", pid, "args", table.concat(args, " ", 2))
 	-- The child has its end now.
 	uv.fs_close(pair[2])
-	self.ch = ipc.channel(pair[1], function(t, id, v)
-		self:message(t, id, v)
+	self.ch = ipc.channel(pair[1], function(t, id, v, fd)
+		self:message(t, id, v, fd)
 	end, function(err)
 		self:lost(err)
 	end)
@@ -134,8 +172,9 @@ function R:exited(code, sig)
 	self.proc = nil
 	local level = ((code == 0 and sig == 0) or self.stopping) and log.INFO or log.WARN
 	log.write(level, "remote", "worker exited", "model", self.opts.id, "code", code, "signal", sig)
+	-- The last messages, such as STATE, may still be in the socket.
 	if self.ch then
-		self.ch:close("exit")
+		self.ch:finish()
 	end
 	local restart = self.opts.restart ~= false and not self.stopping
 	if (code ~= 0 or sig ~= 0) and not self.stopping then
@@ -197,7 +236,14 @@ function R:note_stats(s)
 	end
 end
 
-function R:message(t, id, v)
+function R:message(t, id, v, fd)
+	if t == ipc.STATE and fd and self.opts.on_state then
+		L:info("prompt store saved", "model", self.opts.id, "mib", (tonumber(v.bytes) or 0) // 1048576)
+		self.opts.on_state(fd, tonumber(v.bytes) or 0)
+		return
+	elseif fd then
+		uv.fs_close(fd)
+	end
 	if t == ipc.HELLO then
 		self.hello = v
 		wake(self.waiting)
@@ -339,14 +385,15 @@ end
 -- It sends SIGTERM, and SIGKILL when the worker still runs after
 -- kill_ms. The process exit frees the device memory of the worker.
 -- It yields the calling coroutine. No new worker starts.
--- @tparam[opt] int kill_ms the time before SIGKILL (default 5000)
+-- @tparam[opt] int kill_ms the time before SIGKILL (default 15000; a
+-- worker saves its prompt store first)
 function R:shutdown(kill_ms)
 	self:stop()
 	if not self.proc then
 		return
 	end
 	local t = uv.new_timer()
-	t:start(kill_ms or 5000, 0, function()
+	t:start(kill_ms or 15000, 0, function()
 		if self.proc then
 			L:warn("worker did not exit; sending SIGKILL", "model", self.opts.id)
 			self.proc:kill("sigkill")

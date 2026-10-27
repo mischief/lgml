@@ -71,6 +71,15 @@ if uring.found()
   uring = declare_dependency(dependencies : uring, compile_args : '-DLGML_HAVE_URING')
 endif
 
+# The systemd service protocol (src/sd.c): Linux only.
+sd_srcs = []
+sd_args = []
+linux = host_machine.system() == 'linux'
+if get_option('systemd').disable_auto_if(not linux).require(linux).allowed()
+  sd_srcs = files('src/sd.c')
+  sd_args = ['-DLGML_HAVE_SD']
+endif
+
 lua_dir = get_option('lua_dir')
 if lua_dir == ''
   lua_dir = get_option('prefix') / 'share' / 'lua' / '5.4'
@@ -104,6 +113,7 @@ lgml = shared_module('lgml',
   'src/ops_vibevoice.c',
   'src/ops_nn.c',
   'src/proctitle.c',
+  sd_srcs,
   'src/xcache.c',
   'src/train.c',
   'src/sample.c',
@@ -123,7 +133,7 @@ lgml = shared_module('lgml',
   'src/lngram.c',
   'src/gload.c',
   dependencies : [ggml, lua, m, threads, png, jpeg, utf8proc, uring],
-  c_args : spv_args,
+  c_args : spv_args + sd_args,
   name_prefix : '',
   install : true,
   install_dir : lua_cdir,
@@ -220,6 +230,7 @@ if lua_bin.found()
   test('pool', lua_bin, args : [files('test/test_pool.lua')], timeout : 120)
   test('budget', lua_bin, args : [files('test/test_budget.lua')], timeout : 120)
   test('prompt_cache', lua_bin, args : [files('test/test_prompt_cache.lua')], timeout : 30)
+  test('fdstore', lua_bin, args : [files('test/test_fdstore.lua')], timeout : 30)
   test('placement', lua_bin, args : [files('test/test_placement.lua')],
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
     timeout : 60)

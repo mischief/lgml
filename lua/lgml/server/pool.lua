@@ -513,7 +513,9 @@ function Model:exited(eng, code, sig)
 	if self.engine ~= eng or self.state ~= "loaded" then
 		return
 	end
-	if (code or 0) ~= 0 or (sig or 0) ~= 0 then
+	if self.stopping then
+		L:info("worker stopped", "model", self.id)
+	elseif (code or 0) ~= 0 or (sig or 0) ~= 0 then
 		-- A crash, such as a GPU out of memory, would repeat on the next
 		-- request: requests fail until a load on purpose.
 		self.failed = ("the worker of model %s crashed (code %s, signal %s); see the log, then POST /models/load to load it again")
@@ -748,6 +750,7 @@ end
 
 --- Stops the worker without waiting.
 function Model:stop()
+	self.stopping = true
 	if self.idle_timer then
 		self.idle_timer:stop()
 		self.idle_timer:close()

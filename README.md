@@ -210,6 +210,30 @@ queued ones; they only progress together. On a GPU, a batched pass can
 round differently from a single one, so a greedy reply can change at a
 near tie, as in llama.cpp. A prompt with images prefills alone.
 
+A chat worker that gets SIGTERM, as on an idle unload, a swap for
+another model or a server stop, copies its idle slots to the prompt
+store and sends the store to the server in a memory file. The next
+worker of the model reads it back, so its first prompt restores the
+prefixes from host memory. A worker reads only a store that a worker
+with the same options, model files and KV code wrote. The server holds
+at most `state_ram` MiB of such stores (default 4096), the oldest out
+first.
+
+Under systemd, a restart keeps the stores and the listening socket:
+clients wait in the backlog while the server starts again. The unit
+needs these lines (Linux; the meson option `-Dsystemd=disabled` builds
+without it):
+
+```ini
+[Service]
+Type=notify
+FileDescriptorStoreMax=64
+KillMode=control-group
+TimeoutStopSec=20
+```
+
+The stores outlive `systemctl restart`, not a stop and start.
+
 ### Memory
 
 With a config, each model counts against the budget of its backend.

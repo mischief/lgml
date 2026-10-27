@@ -281,17 +281,35 @@ function Srv:on_connection(err)
 	end
 end
 
+-- A bound socket from fd, when it has the address host and port.
+local function reuse(fd, host, port)
+	local tcp = uv.new_tcp()
+	local addr = tcp:open(fd) and tcp:getsockname()
+	if addr and addr.ip == host and (port == 0 or addr.port == port) then
+		return tcp
+	end
+	tcp:close()
+end
+
 --- Listens on host and port.
 -- It also ignores SIGPIPE, so a write to a reset socket fails with EPIPE.
 -- @tparam string host the address
 -- @tparam int port the port; 0 picks a free port
+-- @tparam[opt] int fd a bound socket to listen on, such as one from the
+-- service manager; one with another address is closed, and a new socket
+-- binds
 -- @treturn[1] int the port
+-- @treturn[1] boolean true when the socket of fd listens
 -- @treturn[2] nil
 -- @treturn[2] string an error message
-function Srv:listen(host, port)
+function Srv:listen(host, port, fd)
 	ignore_sigpipe()
-	local tcp = uv.new_tcp()
-	local ok, err = tcp:bind(host, port)
+	local tcp = fd and reuse(fd, host, port)
+	local reused, ok, err = tcp ~= nil, true, nil
+	if not tcp then
+		tcp = uv.new_tcp()
+		ok, err = tcp:bind(host, port)
+	end
 	if ok then
 		ok, err = tcp:listen(128, function(e)
 			self:on_connection(e)
@@ -304,7 +322,13 @@ function Srv:listen(host, port)
 	self.tcp = tcp
 	local addr = tcp:getsockname()
 	self.host, self.port = addr.ip, addr.port
-	return addr.port
+	return addr.port, reused
+end
+
+--- The fd of the listening socket, or nil.
+-- @treturn ?int the fd
+function Srv:fileno()
+	return self.tcp and self.tcp:fileno()
 end
 
 --- Stops accepting.

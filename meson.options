@@ -22,3 +22,5 @@ option('ngram', type : 'string', value : '',
   description : 'gguf file with a PLE n-gram table (per_layer_token_embd.weight) for the ngram test; empty skips that check')
 option('ngram_meta', type : 'string', value : '',
   description : 'gguf file with the ple keys of the ngram table, when another file holds them')
+option('systemd', type : 'feature', value : 'auto',
+  description : 'systemd notify and file descriptor store (lgml.sd_notify, lgml.memfd); auto: on Linux')

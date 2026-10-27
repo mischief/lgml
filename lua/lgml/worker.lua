@@ -199,6 +199,109 @@ function M.fits(r, name)
 	return require("lgml.budget").check(r, "model " .. tostring(name))
 end
 
+-- Options that do not change the KV cells of a prompt.
+local NOT_STATE = { fd = true, ["state-fd"] = true, ["log-level"] = true, ["log-file"] = true,
+	["dump-prompts"] = true, ["mem-margin"] = true, ["mem-limit"] = true }
+-- Modules whose code computes the KV cells. A change in them, or in
+-- the C module, makes a saved prompt store invalid.
+local FORWARD = { "^lgml%.transformer$", "^lgml%.kv$", "^lgml%.kvpool$", "^lgml%.qwen4exp$",
+	"^lgml%.replay$", "^lgml%.lora$", "^lgml%.spec$", "^lgml%.prompt_cache$", "^lgml%.xcache$",
+	"^lgml%.vision" }
+
+local function file_id(path)
+	local st = path and uv.fs_stat(path)
+	return st and ("%s %d %d.%09d"):format(path, st.size, st.mtime.sec, st.mtime.nsec) or tostring(path)
+end
+
+local function read_file(path)
+	local f = path and io.open(path, "rb")
+	if not f then
+		return ""
+	end
+	local s = f:read("a")
+	f:close()
+	return s
+end
+
+--- The fingerprint of a saved prompt store (see `lgml.ipc.STATE`).
+-- It covers the worker options, the size and time of the model files,
+-- and the code that computes the KV cells. Call it after the engine
+-- loads, so its modules are loaded.
+-- @tparam table opts the options of `lgml-worker`, from `lgml.getopt`
+-- @treturn string the fingerprint
+function M.fingerprint(opts)
+	local lgml = require("lgml")
+	local parts, keys = {}, {}
+	for k in pairs(opts) do
+		if not NOT_STATE[k] then
+			keys[#keys + 1] = k
+		end
+	end
+	table.sort(keys)
+	for _, k in ipairs(keys) do
+		local v = opts[k]
+		parts[#parts + 1] = k .. "=" .. (type(v) == "table" and table.concat(v, "\0") or tostring(v))
+	end
+	local files = { opts.m, opts.mmproj, opts["spec-mtp"] }
+	for _, spec in ipairs(opts.lora or {}) do
+		files[#files + 1] = spec:match("^(.*):[%d.eE+-]+$") or spec
+	end
+	for _, p in ipairs(files) do
+		parts[#parts + 1] = file_id(p)
+	end
+	local mods = {}
+	for name in pairs(package.loaded) do
+		for _, pat in ipairs(FORWARD) do
+			if type(name) == "string" and name:match(pat) then
+				mods[#mods + 1] = name
+				break
+			end
+		end
+	end
+	table.sort(mods)
+	for _, name in ipairs(mods) do
+		parts[#parts + 1] = name .. " " .. lgml.sha256(read_file(package.searchpath(name, package.path)))
+	end
+	parts[#parts + 1] = "lgml " .. lgml.sha256(read_file(package.searchpath("lgml", package.cpath)))
+	return lgml.sha256(table.concat(parts, "\n"))
+end
+
+-- On SIGTERM: save the prompt store to a memory file, send it to the
+-- front, and end by the signal once the message is out.
+local function on_term(ch, engine, state, sig)
+	local ok, lgml = pcall(require, "lgml")
+	if state and engine.save_state and ok and lgml.memfd and ch.buf then
+		local t0 = uv.hrtime()
+		local fd, err = lgml.memfd("lgml-pc-" .. state.name)
+		local bytes
+		if fd then
+			local good, n, e = pcall(engine.save_state, engine, fd, state.fp)
+			if good and n then
+				bytes = n
+			else
+				err = good and e or n
+				uv.fs_close(fd)
+				fd = nil
+			end
+		end
+		if fd then
+			ch:send(ipc.STATE, 0, { bytes = bytes }, fd)
+			L:info("prompt store saved", "mib", bytes // 1048576, "ms", (uv.hrtime() - t0) // 1000000)
+		elseif err ~= "no prompt cache" then
+			L:warn("prompt store not saved", "err", err)
+		end
+	end
+	local t, left = uv.new_timer(), 300
+	t:start(0, 10, function()
+		left = left - 1
+		if not ch.buf or ch.buf:queuelen() == 0 or left <= 0 then
+			t:stop()
+			sig:stop()
+			uv.kill(uv.os_getpid(), "sigterm")
+		end
+	end)
+end
+
 --- Serves the engine on fd until the front closes it.
 -- It sends `HELLO`, then runs the luv loop. It returns when the channel
 -- closes. SIGHUP opens the log file again (see `lgml.log.reopen`). A job for a method that the engine does not have ends with
@@ -206,7 +309,10 @@ end
 -- @tparam int fd the imsg socket to the front
 -- @tparam lgml.server.engine.Engine engine the engine
 -- @tparam[opt] table mem the `mem` field of `HELLO` (see `lgml.ipc`)
-function M.serve(fd, engine, mem)
+-- @tparam[opt] table state `{ fp, name }`: on SIGTERM, the worker saves
+-- the prompt store with fingerprint fp and sends it to the front (see
+-- `lgml.ipc.STATE`), then ends
+function M.serve(fd, engine, mem, state)
 	local jobs, pending, deciding = {}, {}, {}
 	local ch
 	local function done(id, v)
@@ -401,6 +507,14 @@ function M.serve(fd, engine, mem)
 		log.reopen()
 	end)
 	hup:unref()
+	local term, saving = uv.new_signal(), false
+	term:start("sigterm", function()
+		if not saving then
+			saving = true
+			on_term(ch, engine, state, term)
+		end
+	end)
+	term:unref()
 	ch:send(ipc.HELLO, 0, {
 		models = engine:models(), props = engine:props(), caps = caps(engine), mem = mem,
 	})

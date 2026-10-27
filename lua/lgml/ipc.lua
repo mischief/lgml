@@ -83,6 +83,11 @@ M.FAIL = 12
 --- Front to worker: start an embedding job.
 -- Payload: the request for `Engine:embed`. The worker sends `DONE`.
 M.EMBED = 13
+--- Worker to front: the saved prompt store, as it exits.
+-- The message carries a file (see `lgml.prompt_cache.dump`). Payload:
+-- `{ bytes }`, the file size. The front gives the file to the next
+-- worker of the model.
+M.STATE = 14
 
 -- These types carry raw bytes, not JSON.
 local RAW = { [M.AUDIO] = true, [M.IMAGE] = true }
@@ -94,9 +99,10 @@ local C = {}
 C.__index = C
 
 --- Opens a channel on a socket.
--- on_message(type, id, value) runs for each message. value is a string
--- for `AUDIO` and `IMAGE` and the decoded JSON for the other types. on_close(err)
--- runs once, at EOF or error.
+-- on_message(type, id, value, fd) runs for each message. value is a
+-- string for `AUDIO` and `IMAGE` and the decoded JSON for the other
+-- types. fd is the file that came with the message, or nil; the callback
+-- owns it. on_close(err) runs once, at EOF or error.
 -- @tparam int fd the socket file descriptor; the channel owns it
 -- @tparam function on_message the message callback
 -- @tparam[opt] function on_close the close callback
@@ -107,6 +113,7 @@ function M.channel(fd, on_message, on_close)
 		on_close = on_close, poll = uv.new_poll(fd), events = "",
 	}, C)
 	ch.buf:set_maxsize(M.MAXSIZE)
+	ch.buf:allow_fdpass()
 	ch:watch("r")
 	return ch
 end
@@ -156,9 +163,9 @@ function C:drain()
 		elseif not m then
 			return
 		end
-		local t = m:type()
+		local t, fd = m:type(), m:fd()
 		local v = RAW[t] and m:data() or json.decode(m:data())
-		self.on_message(t, m:id(), v)
+		self.on_message(t, m:id(), v, fd >= 0 and fd or nil)
 	end
 end
 
@@ -168,19 +175,26 @@ end
 -- @tparam int t the message type
 -- @tparam int id the job id
 -- @tparam[opt] any value the payload; nil sends an empty object
+-- @tparam[opt] int fd a file to send; the channel closes it once sent
 -- @treturn[1] boolean true
 -- @treturn[2] nil
 -- @treturn[2] string `"closed"`, `"message too large"` or an error
 -- @raise when value cannot be encoded as JSON
-function C:send(t, id, value)
+function C:send(t, id, value, fd)
 	if not self.buf then
+		if fd then
+			uv.fs_close(fd)
+		end
 		return nil, "closed"
 	end
 	local s = RAW[t] and value or assert(json.encode(value or json.object()))
 	if #s > M.MAXSIZE - 64 then
+		if fd then
+			uv.fs_close(fd)
+		end
 		return nil, "message too large"
 	end
-	self.buf:compose(t, id, 0, -1, s)
+	self.buf:compose(t, id, 0, fd or -1, s)
 	local ok, e = pcall(self.buf.write, self.buf)
 	if not ok then
 		self:close(e)
@@ -188,6 +202,27 @@ function C:send(t, id, value)
 	end
 	self:watch(self.buf:queuelen() > 0 and "rw" or "r")
 	return true
+end
+
+--- Reads what the peer sent before it closed, then closes the channel.
+-- Call it when the peer process has exited, so its last messages still
+-- arrive.
+function C:finish()
+	-- The peer is gone: each read gets data or EOF.
+	for _ = 1, 4096 do
+		if not self.buf then
+			return
+		end
+		local ok, r = pcall(self.buf.read, self.buf)
+		if not ok then
+			return self:close(r)
+		end
+		self:drain()
+		if r == nil then
+			break
+		end
+	end
+	self:close("eof")
 end
 
 --- Closes the channel and its fd.

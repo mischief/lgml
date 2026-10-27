@@ -76,5 +76,43 @@ do
 	pc:clear()
 end
 
+-- dump and undump through a file, with real host buffers: a
+-- checkpoint that two entries share is written once.
+do
+	local lgml = require("lgml")
+	local uv = require("luv")
+	local function snap(n, byte, size)
+		local buf = lgml.hostbuf(size)
+		buf:set(0, string.char(byte):rep(size))
+		return { n = n, bytes = size, full = true, buf = buf }
+	end
+	local path = os.tmpname()
+	local fd = assert(lgml.memfd and lgml.memfd("test") or uv.fs_open(path, "w+", 384))
+	local pc = prompt_cache.new(fake(0), { n_past = 0 }, { ram = 1 << 20 })
+	local ck = snap(10, 7, 100)
+	ck.refs = 2
+	pc.store = {
+		{ tokens = tokens(40), ckpts = { ck }, bytes = 400, snap = snap(40, 1, 300), used = 1, key = "a", refs = 1 },
+		{ tokens = tokens(50), ckpts = { ck }, bytes = 600, snap = snap(50, 2, 500), used = 2, key = "a" },
+	}
+	local n = pc:dump(fd, "fp1")
+	ok(n and n == 4096 + 900, "dump writes the shared checkpoint once")
+	local q = prompt_cache.new(fake(0), { n_past = 0 }, { ram = 1 << 20 })
+	ok(select(2, q:undump(fd, "fp2")) == "another model, setting or code", "undump refuses another fingerprint")
+	ok(q:undump(fd, "fp1") == 2 and #q.store == 2, "undump reads the entries")
+	local e1, e2 = q.store[1], q.store[2]
+	ok(#e1.tokens == 40 and e1.snap.buf:bytes(299, 1) == "\1" and e2.snap.buf:bytes(0, 1) == "\2",
+		"entries keep their tokens and bytes")
+	ok(e1.ckpts[1] == e2.ckpts[1] and e1.ckpts[1].refs == 2 and e1.ckpts[1].buf:bytes(0, 1) == "\7",
+		"the shared checkpoint stays shared")
+	ok(e1.used < e2.used and q.bytes == 1000, "the order of use and the byte count")
+	local small = prompt_cache.new(fake(0), { n_past = 0 }, { ram = 700 })
+	ok(small:undump(fd, "fp1") == 1 and #small.store[1].tokens == 50, "the newest entry that fits goes in")
+	q:clear()
+	small:clear()
+	uv.fs_close(fd)
+	os.remove(path)
+end
+
 print("1.." .. n)
 os.exit(failed == 0 and 0 or 1)

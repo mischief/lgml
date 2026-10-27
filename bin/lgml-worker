@@ -13,6 +13,7 @@ local getopt = require("lgml.getopt")
 local log = require("lgml.log")
 
 local USAGE = "usage: lgml-worker --fd n (-m model | --fake) [-b backend] [-t threads] [-c n_ctx]\n" ..
+    "                   [--state-fd n]\n" ..
     "                   [--no-fa] [--ctk type] [--ctv type] [--alias id] [--stt]\n" ..
     "                   [--engine module] [--text-backend name] [--image-max-side n]\n" ..
     "                   [--recipe file] [--cache-ram MiB] [--ctx-checkpoints n]\n" ..
@@ -33,7 +34,7 @@ local USAGE = "usage: lgml-worker --fd n (-m model | --fake) [-b backend] [-t th
     "       lgml-worker --devices\n"
 
 local opts, rest = getopt.parse(arg, "m:b:t:c:", {
-	model = "m", backend = "b", threads = "t", ctx = "c", ["fd="] = false,
+	model = "m", backend = "b", threads = "t", ctx = "c", ["fd="] = false, ["state-fd="] = false,
 	["no-fa"] = false, ["alias="] = false, fake = false, stt = false,
 	["engine="] = false, ["text-backend="] = false, ["ctk="] = false, ["ctv="] = false,
 	["image-max-side="] = false,
@@ -216,4 +217,18 @@ L:info("ready", "file", opts.m, "used_mib", mem and mem.used // MiB,
     "compute_mib", mem and mem.compute and mem.compute // MiB,
     "overhead_mib", mem and mem.overhead and mem.overhead // MiB,
     "delta_mib", mem and mem.delta and mem.delta // MiB)
-worker.serve(fd, engine, mem)
+-- --state-fd: a prompt store that the last worker of this model saved.
+local state = engine.save_state and { fp = worker.fingerprint(opts), name = name } or nil
+local sfd = math.tointeger(tonumber(opts["state-fd"]))
+if sfd then
+	if state and engine.load_state then
+		local n, err = engine:load_state(sfd, state.fp)
+		if n then
+			L:info("prompt store loaded", "entries", n)
+		else
+			L:info("prompt store not loaded", "why", err)
+		end
+	end
+	require("luv").fs_close(sfd)
+end
+worker.serve(fd, engine, mem, state)

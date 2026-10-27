@@ -1069,6 +1069,52 @@ function E:evict_slot(s)
 	self.evictions = (self.evictions or 0) + 1
 end
 
+--- Write the prompt store to a file, for `load_state` in a later process.
+-- The idle slots of the current adapter scales go to the store first,
+-- the most recently used last; slots that requests own stay out.
+-- @tparam int fd the file (see `lgml.prompt_cache.dump`)
+-- @tparam string fp the fingerprint of the model, its settings and code
+-- @treturn[1] integer the bytes written
+-- @treturn[2] nil
+-- @treturn[2] string the error, or "no prompt cache"
+function E:save_state(fd, fp)
+	local pc = self.pc
+	if not pc or pc.ram <= 0 then
+		return nil, "no prompt cache"
+	end
+	self.slot.tokens = self.tokens
+	self.slot.ckpts = pc.ckpts
+	local list = {}
+	for _, s in ipairs(self.slots) do
+		if not s.owner and #s.tokens > 0 and s.key == self.lora_key then
+			list[#list + 1] = s
+		end
+	end
+	table.sort(list, function(a, b)
+		return a.used < b.used
+	end)
+	local cache, ckpts = pc.cache, pc.ckpts
+	for _, s in ipairs(list) do
+		pc.cache, pc.ckpts = s.cache, s.ckpts
+		pc:save({ tokens = s.tokens, prio = s.prio })
+	end
+	pc.cache, pc.ckpts = cache, ckpts
+	return pc:dump(fd, fp)
+end
+
+--- Read a prompt store that `save_state` wrote.
+-- @tparam int fd the file
+-- @tparam string fp the fingerprint; a file with another one is refused
+-- @treturn[1] integer the entries read
+-- @treturn[2] nil
+-- @treturn[2] string why the file was refused
+function E:load_state(fd, fp)
+	if not self.pc or self.pc.ram <= 0 then
+		return nil, "no prompt cache"
+	end
+	return self.pc:undump(fd, fp)
+end
+
 -- The pool has no free block for want (a sequence that runs now):
 -- empty idle slots, the lowest priority and then the least recently
 -- used first, until a block is free. Slots that requests use keep
