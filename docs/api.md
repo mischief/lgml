@@ -1913,6 +1913,25 @@ its first event.
 | `lgml_model_cache_bytes` | gauge | KV cache part of `lgml.memory`, 0 when unloaded. |
 | `lgml_model_compute_bytes` | gauge | Compute part of `lgml.memory`, 0 when unloaded. |
 | `lgml_model_overhead_bytes` | gauge | Overhead part of `lgml.memory`, 0 when unloaded. |
+| `lgml_prompt_progress_tokens_total` | counter | Prompt tokens computed, counted as they run (a model in a worker). |
+| `lgml_predicted_progress_tokens_total` | counter | Tokens made, counted as they run (a model in a worker). |
+| `lgml_model_state` | gauge | 1 for the load state of the model, else 0; label `state`: `unloaded`, `loading`, `loaded`, `unloading`, `failed`. |
+| `lgml_slots` | gauge | Slots of the model by label `state`: `idle`, `prompt`, `answer`. |
+| `lgml_requests_queued` | gauge | Chat requests that wait for a slot or for the load. |
+
+The `_progress_` counters come from the progress that a worker sends
+about once a second (see [Status](#status)), and the end of each
+request adds the rest. So their rates move during a long request,
+while `lgml_prompt_tokens_total` and `lgml_predicted_tokens_total` move
+only when a request ends. Prompt and generation speed:
+
+```promql
+rate(lgml_prompt_progress_tokens_total[1m])
+rate(lgml_predicted_progress_tokens_total[1m])
+```
+
+The last three gauges are the numbers of [Status](#status) at each
+scrape, so they are there from the start.
 
 ## CORS
 

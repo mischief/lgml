@@ -236,6 +236,26 @@ function R:note_stats(s)
 	end
 end
 
+-- Count the tokens of a chat job as its progress comes, so token
+-- rates move during a long request. At DONE, the timings settle the
+-- rest. prompt counts the tokens computed, without the cached ones.
+function R:count(job, prompt, made)
+	local id = self.opts.id
+	if not id then
+		return
+	end
+	if prompt and prompt > (job.pt or 0) then
+		metrics.add("prompt_progress_tokens_total", "prompt tokens computed, counted as they run", id,
+		    prompt - (job.pt or 0))
+		job.pt = prompt
+	end
+	if made and made > (job.mt or 0) then
+		metrics.add("predicted_progress_tokens_total", "tokens generated, counted as they run", id,
+		    made - (job.mt or 0))
+		job.mt = made
+	end
+end
+
 function R:message(t, id, v, fd)
 	if t == ipc.STATE and fd and self.opts.on_state then
 		L:info("prompt store saved", "model", self.opts.id, "mib", (tonumber(v.bytes) or 0) // 1048576)
@@ -257,10 +277,18 @@ function R:message(t, id, v, fd)
 		-- Progress is for status only; the job does not wake.
 		if t == ipc.DELTA and type(v) == "table" and v.k == "progress" then
 			job.progress = v.p
+			if type(v.p) == "table" and tonumber(v.p.prompt_done) then
+				self:count(job, math.max(0, v.p.prompt_done - (tonumber(v.p.cached_tokens) or 0)),
+				    tonumber(v.p.tokens))
+			end
 			return
 		elseif t == ipc.DONE then
 			self.jobs[id] = nil
 			self:note_stats(v and v.stats)
+			local tm = type(v) == "table" and type(v.finish) == "table" and v.finish.timings
+			if type(tm) == "table" then
+				self:count(job, tonumber(tm.prompt_n), tonumber(tm.predicted_n))
+			end
 		end
 		job:push({ t = t, v = v })
 	end

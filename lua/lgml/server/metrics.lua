@@ -98,6 +98,55 @@ local function label(s)
 	return (tostring(s):gsub("[\\\"\n]", { ["\\"] = "\\\\", ['"'] = '\\"', ["\n"] = "\\n" }))
 end
 
+-- name -> function, and the names in order of first use
+local collectors, corder = {}, {}
+
+--- Set a function that gives gauges at each render, such as the state
+-- of the slots now. A second call with the same key replaces it.
+-- @tparam string key the name of the collector
+-- @tparam function fn returns a list of samples: `{ name, help, model,
+-- labels, value }`; name has no `lgml_` prefix, and labels is an
+-- optional table of more label names and values
+function M.collect(key, fn)
+	if not collectors[key] then
+		corder[#corder + 1] = key
+	end
+	collectors[key] = fn
+end
+
+-- The labels of a sample: model first, then the others by name.
+local function labels(model, more)
+	local t = { ('model="%s"'):format(label(model)) }
+	local keys = {}
+	for k in pairs(more or {}) do
+		keys[#keys + 1] = k
+	end
+	table.sort(keys)
+	for _, k in ipairs(keys) do
+		t[#t + 1] = ('%s="%s"'):format(k, label(more[k]))
+	end
+	return table.concat(t, ",")
+end
+
+-- The samples of the collectors, by family in order of first use.
+local function collected(out)
+	local names, by = {}, {}
+	for _, key in ipairs(corder) do
+		for _, x in ipairs(collectors[key]()) do
+			if not by[x.name] then
+				names[#names + 1] = x.name
+				by[x.name] = { help = x.help, rows = {} }
+			end
+			local rows = by[x.name].rows
+			rows[#rows + 1] = ("lgml_%s{%s} %s\n"):format(x.name, labels(x.model, x.labels), fmt(x.value))
+		end
+	end
+	for _, name in ipairs(names) do
+		out[#out + 1] = ("# HELP lgml_%s %s\n# TYPE lgml_%s gauge\n"):format(name, by[name].help, name)
+		table.move(by[name].rows, 1, #by[name].rows, #out + 1, out)
+	end
+end
+
 --- The metrics in the Prometheus text format.
 -- @treturn string the text
 function M.render()
@@ -115,12 +164,13 @@ function M.render()
 			out[#out + 1] = ('%s{model="%s"} %s\n'):format(full, label(m), fmt(f.values[m]))
 		end
 	end
+	collected(out)
 	return table.concat(out)
 end
 
---- Forget every counter (for tests).
+--- Forget every counter and collector (for tests).
 function M.reset()
-	families, order = {}, {}
+	families, order, collectors, corder = {}, {}, {}, {}
 end
 
 return M

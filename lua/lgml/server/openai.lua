@@ -529,6 +529,33 @@ local function status(eng, res)
 	return res:json(200, { models = models })
 end
 
+local MODEL_STATES = { "unloaded", "loading", "loaded", "unloading", "failed" }
+local SLOT_STATES = { "idle", "prompt", "answer" }
+
+-- Gauges of /status for /metrics: the load state of each model (1 for
+-- the state it is in), its slots by state, and its queued requests.
+local function status_gauges(eng)
+	local out = {}
+	local function add(name, help, model, value, labels)
+		out[#out + 1] = { name = name, help = help, model = model, value = value, labels = labels }
+	end
+	local list = eng.status and eng:status() or engine_api.plain_status(eng)
+	for _, m in ipairs(list) do
+		for _, st in ipairs(MODEL_STATES) do
+			add("model_state", "1 for the load state of the model", m.id, m.status == st and 1 or 0, { state = st })
+		end
+		local n = {}
+		for _, sl in ipairs(m.slots or {}) do
+			n[sl.state] = (n[sl.state] or 0) + 1
+		end
+		for _, st in ipairs(SLOT_STATES) do
+			add("slots", "slots by what they do: idle, prompt or answer", m.id, n[st] or 0, { state = st })
+		end
+		add("requests_queued", "chat requests that wait for a slot or a load", m.id, m.queued or 0)
+	end
+	return out
+end
+
 local function props(eng, res)
 	local p = eng:props()
 	return res:json(200, {
@@ -1145,6 +1172,9 @@ function M.install(srv, eng, opts)
 	local function completions(req, res)
 		return chat(eng, req, res)
 	end
+	metrics.collect("status", function()
+		return status_gauges(eng)
+	end)
 	srv:route("GET", "/metrics", function(_, res)
 		return res:send(200, metrics.render(),
 		    { ["Content-Type"] = "text/plain; version=0.0.4; charset=utf-8" })

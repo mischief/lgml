@@ -63,7 +63,7 @@ local function add(pool, id, o)
 			m.starts = (m.starts or 0) + 1
 			return remote.new({
 				lua = "lua5.4", script = src .. "/bin/lgml-worker", args = args,
-				restart = false, on_exit = on_exit,
+				restart = false, on_exit = on_exit, id = id,
 			})
 		end,
 	})
@@ -426,6 +426,15 @@ local function test_http()
 	status, b = roundtrip(port, "GET", "/metrics")
 	ok(type(b) == "string" and b:find('lgml_model_loaded_bytes{model="a"} 41943040', 1, true) and
 	    b:find('lgml_model_load_seconds_total{model="a"}', 1, true), "metrics show loaded bytes and load time")
+	ok(type(b) == "string" and b:find('lgml_model_state{model="a",state="loaded"} 1', 1, true) and
+	    b:find('lgml_model_state{model="a",state="unloaded"} 0', 1, true) and
+	    b:find('lgml_model_state{model="w",state="unloaded"} 1', 1, true), "metrics show the load states")
+	ok(type(b) == "string" and b:find('lgml_slots{model="a",state="answer"} 0', 1, true) and
+	    b:find('lgml_requests_queued{model="a"} 0', 1, true), "metrics show slots and the queue")
+	local pt = type(b) == "string" and b:match('lgml_prompt_progress_tokens_total{model="a"} (%d+)')
+	local ct = type(b) == "string" and b:match('lgml_prompt_tokens_total{model="a"} (%d+)')
+	-- Chats of the other tests go to the engines and count here too.
+	ok(pt and ct and tonumber(pt) >= tonumber(ct), "progress counts the prompt tokens")
 	srv:close()
 	cleanup(p)
 end
