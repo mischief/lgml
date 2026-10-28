@@ -1,8 +1,8 @@
 [wrap-git]
 url = https://github.com/mischief/ggml.git
-revision = 9b4c9e8f557c5c1dfbd2dd514d9e23c18b0c6dc2
+revision = 0f1fa6109ad6f11d51dc0ab6f8e599258a393e1c
 depth = 1
 method = cmake
-# Branch lgml of the fork: ggml master ffa4e8b with the Vulkan release
-# build, a llama.cpp Vulkan fix ggml has not synced yet, lgml's custom op
-# shaders and host read buffers, and the training backward passes.
+# Branch lgml of the fork: ggml master da8e2a5 with the Vulkan release
+# build, lgml's custom op shaders and host read buffers, and the
+# training backward passes.
