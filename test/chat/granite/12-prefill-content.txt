@@ -1,0 +1,9 @@
+<|im_start|>system
+<|im_end|>
+<|im_start|>user
+Write<|im_end|>
+<|im_start|>assistant
+<think>
+ plan 
+</think>
+ Once upon 

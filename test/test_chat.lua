@@ -203,6 +203,31 @@ local function test_qwen35_fixtures(sub, variant)
 	end
 end
 
+-- Fixtures in granite/: the qwen35 requests, rendered by llama-server
+-- with the Granite 4.2 template.
+local function test_granite_fixtures()
+	local granite = require("lgml.chat.granite")
+	local names = fixtures("chat/granite")
+	ok(#names >= 30, "at least 30 granite fixtures")
+	for _, name in ipairs(names) do
+		local req = decode(slurp(dir .. "/chat/granite/" .. name .. ".json"))
+		local kw = req.chat_template_kwargs or {}
+		local last = req.messages[#req.messages]
+		local got = granite.render(req.messages, {
+			tools = req.tools,
+			add_generation_prompt = req.add_generation_prompt ~= false,
+			enable_thinking = kw.enable_thinking,
+			reasoning_effort = kw.reasoning_effort,
+			truncate_history_thinking = kw.truncate_history_thinking,
+			continue_final_message = req.continue_final_message or last.role == "assistant",
+		})
+		local want = slurp(dir .. "/chat/granite/" .. name .. ".txt")
+		if not ok(got == want, "granite render " .. name) then
+			diff(name, got, want)
+		end
+	end
+end
+
 -- Fixtures in llada/: tools-* and plain-* come from
 -- llama-debug-template-parser on the LLaDA-MoE-v2-Instruct template;
 -- custom-* are written by hand from that template.
@@ -783,6 +808,7 @@ test_gemma4_fixtures()
 test_qwen35_fixtures("chat/qwen35", nil)
 test_qwen35_fixtures("chat/qwen35/effort", "effort")
 test_llada_fixtures()
+test_granite_fixtures()
 test_parser()
 test_gemma4_parser()
 test_qwen35_parser()

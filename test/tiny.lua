@@ -172,7 +172,7 @@ function M.write(path, arch, opts)
 			w(p .. "attn_k.weight", { HKV * D, E })
 			w(p .. "attn_v.weight", { HKV * D, E })
 			w(p .. "attn_output.weight", { E, H * D })
-			if arch ~= "llama" then
+			if arch ~= "llama" and arch ~= "granite" then
 				norm(p .. "attn_q_norm.weight", D)
 				norm(p .. "attn_k_norm.weight", D)
 			end

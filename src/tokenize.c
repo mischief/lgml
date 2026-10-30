@@ -1197,10 +1197,11 @@ tok_load(struct tokenizer *t, const struct tok_src *src)
 	else if (pre != NULL && (strcmp(pre, "llama-bpe") == 0 ||
 	    strcmp(pre, "llama3") == 0))
 		t->max_digits = 3;
-	else if (pre != NULL && (strcmp(pre, "gpt2") == 0 || strcmp(pre, "gpt-2") == 0))
+	else if (pre != NULL && (strcmp(pre, "gpt2") == 0 || strcmp(pre, "gpt-2") == 0 ||
+	    strcmp(pre, "granite-docling") == 0))
 		t->gpt2 = 1;
 	else
-		return "unsupported tokenizer.ggml.pre (need gpt2, qwen2, qwen35 or llama-bpe)";
+		return "unsupported tokenizer.ggml.pre (need gpt2, granite-docling, qwen2, qwen35 or llama-bpe)";
 	t->letters = UF_LETTER;
 	if (pre != NULL && strcmp(pre, "qwen35") == 0)
 		t->letters |= UF_MARK;

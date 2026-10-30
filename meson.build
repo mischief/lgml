@@ -248,6 +248,9 @@ if lua_bin.found()
   test('train', lua_bin, args : [files('test/test_train.lua')],
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
     timeout : 120)
+  test('granite', lua_bin, args : [files('test/test_granite.lua')],
+    env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
+    timeout : 60)
   test('lora', lua_bin, args : [files('test/test_lora.lua')],
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
     timeout : 120)

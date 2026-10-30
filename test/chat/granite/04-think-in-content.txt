@@ -1,0 +1,18 @@
+<|im_start|>system
+<|im_end|>
+<|im_start|>user
+q1<|im_end|>
+<|im_start|>assistant
+<think></think>
+
+answer one<|im_end|>
+<|im_start|>user
+q2<|im_end|>
+<|im_start|>assistant
+<think></think>
+
+last<|im_end|>
+<|im_start|>user
+q3<|im_end|>
+<|im_start|>assistant
+<think>

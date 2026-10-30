@@ -596,4 +596,12 @@ M.new_parser = require("lgml.chat.qwen35_parser").new_parser
 -- @treturn string the start rule
 M.tool_grammar = require("lgml.chat.tool_grammar").qwen35
 
+-- Helpers that `lgml.chat.granite` shares: the llama.cpp message and
+-- tool fixes, JSON as the template prints it, and argument values.
+M.shared = {
+	fix_messages = fix_messages, tools_list = tools_list, json = json, trim = trim, text = text,
+	split_first = split_first, split_last = split_last, arg_value = arg_value, kind = kind,
+	continuation = continuation, TOOLS_HEAD = TOOLS_HEAD, TOOLS_TAIL = TOOLS_TAIL,
+}
+
 return M

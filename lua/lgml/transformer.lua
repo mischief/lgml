@@ -1,5 +1,5 @@
 --- Config-driven decoder for the gguf text models.
--- One module builds llama, qwen3, qwen3moe, qwen3next, qwen35,
+-- One module builds llama, granite, qwen3, qwen3moe, qwen3next, qwen35,
 -- qwen35moe, qwen4exp (see `lgml.qwen4exp`) and gemma4 graphs.
 -- `config` reads the gguf metadata into a table; the blocks read that
 -- table and the weights that exist.
@@ -60,6 +60,9 @@ end
 -- Settings that the metadata does not hold, per architecture.
 local family = {
 	llama = { rope_mode = "normal", rope_ctx = true },
+	-- Granite: llama with scales on the embeddings, residual branches,
+	-- attention and logits.
+	granite = { rope_mode = "normal", rope_ctx = true, granite = true },
 	qwen3 = { qk_norm = true, rope_ctx = true },
 	qwen3moe = { qk_norm = true, rope_ctx = true },
 	qwen3next = { qk_norm = true, rope_ctx = true, hybrid = true, ssm_tile = true },
@@ -91,8 +94,8 @@ end
 
 --- Tell if the transformer handles a gguf architecture.
 -- @tparam string arch the `general.architecture` value
--- @treturn boolean true for llama, qwen3, qwen3moe, qwen3next, qwen35,
--- qwen35moe, clef, qwen4exp and gemma4
+-- @treturn boolean true for llama, granite, qwen3, qwen3moe, qwen3next,
+-- qwen35, qwen35moe, clef, qwen4exp and gemma4
 function M.supports(arch)
 	return family[arch] ~= nil
 end
@@ -105,7 +108,9 @@ end
 -- MoE models add n_expert, n_used, gating, norm_topk and expert_scale
 -- (the factor on the routed weights). Gemma adds
 -- head_dim_swa, n_rot_swa, rope_base_swa, n_swa, swa, softcap,
--- n_kv_shared and n_embd_per_layer. Hybrid models add recr, d_conv,
+-- n_kv_shared and n_embd_per_layer. Granite adds embd_scale, res_scale
+-- (on each residual branch), attn_scale and logit_scale (logits are
+-- divided by it), each nil when it is 1. Hybrid models add recr, d_conv,
 -- head_k, n_k_heads, n_v_heads and head_v; with rope sections, also
 -- sections (4 integers) and rope_multi (the rope mode of image tokens).
 -- `layers[i]` describes layer i: recr, swa, D, Hkv, n_rot, base,
@@ -176,6 +181,16 @@ function M.config(meta)
 		hp.n_embd_per_layer = k("embedding_length_per_layer_input", 0)
 		hp.embd_scale = math.sqrt(n_embd)
 		hp.attn_scale = 1.0
+	end
+	if fam.granite then
+		local function scale(key)
+			local v = k(key, 1)
+			return v ~= 1 and v ~= 0 and v or nil
+		end
+		hp.embd_scale = scale("embedding_scale")
+		hp.res_scale = scale("residual_scale")
+		hp.attn_scale = scale("attention.scale")
+		hp.logit_scale = scale("logit_scale")
 	end
 	if fam.hybrid then
 		hp.d_conv = k("ssm.conv_kernel")
@@ -1815,6 +1830,9 @@ function M.attn_out(g, hp, L, o, gate, x)
 	if L.post_attn_norm then
 		o = g:mul(g:rms_norm(o, hp.eps), L.post_attn_norm)
 	end
+	if hp.res_scale then
+		o = g:scale(o, hp.res_scale)
+	end
 	return g:add(o, x)
 end
 
@@ -2020,6 +2038,9 @@ function M.ffn(g, hp, L, x, taps, sfx)
 	if taps then
 		taps["ffn_out" .. sfx] = out
 	end
+	if hp.res_scale then
+		out = g:scale(out, hp.res_scale)
+	end
 	return g:add(out, x)
 end
 
@@ -2040,6 +2061,9 @@ function M.head(g, hp, output_norm, output, x, lora)
 	local logits = mm(g, { output = output, lora = lora and { output = lora } }, "output", x)
 	if (hp.softcap or 0) > 0 then
 		logits = g:scale(g:tanh(g:scale(logits, 1 / hp.softcap)), hp.softcap)
+	end
+	if hp.logit_scale then
+		logits = g:scale(logits, 1 / hp.logit_scale)
 	end
 	return logits, x
 end

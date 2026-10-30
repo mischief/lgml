@@ -1,0 +1,8 @@
+<|im_start|>system
+sys1
+sys2<|im_end|>
+<|im_start|>user
+part one
+part two<|im_end|>
+<|im_start|>assistant
+<think>

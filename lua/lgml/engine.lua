@@ -2986,6 +2986,7 @@ function E:run_prompt(req, sink, st)
 		tools = req.tools, add_generation_prompt = true, enable_thinking = think,
 		reasoning_effort = type(effort) == "string" and effort or nil,
 		preserve_thinking = keep == false and false or nil,
+		truncate_history_thinking = kw.truncate_history_thinking == false and false or nil,
 	})
 	local prompt = self.tk:encode(text)
 	if self.vision then

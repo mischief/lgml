@@ -12,7 +12,7 @@ local M = {}
 --- Family module names by family name.
 M.families = {
 	qwen3 = "lgml.chat.qwen3", qwen35 = "lgml.chat.qwen35", gemma4 = "lgml.chat.gemma4",
-	llada = "lgml.chat.llada",
+	llada = "lgml.chat.llada", granite = "lgml.chat.granite",
 }
 
 local GEMMA4_ARCH = { gemma4 = true, ["diffusion-gemma"] = true }
@@ -25,13 +25,17 @@ end
 --- Finds the chat family for gguf metadata.
 -- @tparam table meta the gguf metadata
 -- @treturn[1] string the family name: `"qwen3"`, `"qwen35"`,
--- `"gemma4"` or `"llada"`
+-- `"gemma4"`, `"llada"` or `"granite"`
 -- @treturn[2] nil
 -- @treturn[2] string an error message
 function M.detect(meta)
 	local arch = meta["general.architecture"]
 	local tpl = meta["tokenizer.chat_template"] or ""
 	local chatml = has(tpl, "<tool_call>") and has(tpl, "<|im_start|>")
+	-- Granite 4 writes the Qwen3.5 calls with its own tool JSON macro.
+	if (arch == "granite" and (tpl == "" or chatml)) or (chatml and has(tpl, "macro tool_to_json")) then
+		return "granite"
+	end
 	-- Qwen3.5 templates write XML <function=...> calls and think blocks.
 	-- Qwen3-Coder templates also use <function=...> but differ.
 	if chatml and has(tpl, "<function=") and has(tpl, "<think>") and has(tpl, "tool | tojson") then

@@ -1,0 +1,1 @@
+{"messages":[{"role":"system","content":"sys"},{"role":"user","content":"2+2?"},{"role":"assistant","content":"4","reasoning_content":"Add them."},{"role":"user","content":"And 3+3?"},{"role":"assistant","content":"6"},{"role":"user","content":"Thanks"}]}
