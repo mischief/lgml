@@ -443,6 +443,8 @@ local function model_engine(spec, managed)
 		["--reasoning-budget"] = rbt, ["--ubatch"] = ub, ["--max-tokens"] = spec.max_tokens,
 		["--spec"] = sp and sp > 0 and sp or nil,
 		["--spec-mtp"] = sp and sp > 0 and spec.spec_mtp or nil,
+		["--spec-draft"] = sp and sp > 0 and spec.spec_draft or nil,
+		["--spec-min-p"] = sp and sp > 0 and spec.spec_min_p or nil,
 		["--image-min-tokens"] = imin, ["--image-max-tokens"] = imax,
 		["--image-max-side"] = side, ["--mem-margin"] = spec.mem_margin,
 		["--moe-cache-max"] = spec.moe_cache_max, ["--moe-cache-profile"] = spec.moe_cache_profile,
