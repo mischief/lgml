@@ -105,7 +105,7 @@ local function fake()
 		error("fake load failure", 0)
 	end
 	return require("lgml.server.fake_engine").new({
-		delay = tonumber(opts["fake-delay"]) or 5, model = opts.alias,
+		delay = tonumber(opts["fake-delay"]) or 5, model = opts.alias, n_ctx = opts.c and tonumber(opts.c),
 	})
 end
 

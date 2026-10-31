@@ -359,7 +359,7 @@ end
 -- against the budget, and memory the parts that the worker measured:
 -- `{ weights, cache, compute, overhead }` in bytes, while loaded
 function Model:models()
-	local ctx = self.context_length
+	local ctx = self.loaded_ctx or self.context_length
 	local h = self.state == "loaded" and self.engine and self.engine.hello
 	local p = self.parts
 	local vision
@@ -410,6 +410,13 @@ function Model:props()
 		p = self.engine.hello.props
 	else
 		p = self.static_props or { n_ctx = self.context_length or 0, total_slots = 1 }
+		if self.loaded_ctx then
+			local t = {}
+			for k, v in pairs(p) do
+				t[k] = v
+			end
+			t.n_ctx, p = self.loaded_ctx, t
+		end
 	end
 	if not self.lora then
 		return p
@@ -698,6 +705,10 @@ function Model:do_load(gone)
 	    "overhead", mem.exact and mib(mem.overhead) or nil)
 	self.engine, self.last = eng, now()
 	self.state = "loaded"
+	-- A load can cut the context to fit free memory. Until the next
+	-- load, report that cut size, not the configured one.
+	local hm = eng.hello.models and eng.hello.models[1]
+	self.loaded_ctx = hm and hm.context_length or self.loaded_ctx
 	metrics.add("model_loads_total", "model loads", self.id, 1)
 	metrics.add("model_load_seconds_total", "time spent loading models", self.id, secs)
 	gauges(self)

@@ -830,6 +830,8 @@ local function operations()
 		} },
 		["/props"] = { GET = {
 			tag = "llama.cpp", summary = "Server properties",
+			parameters = { { name = "model", ["in"] = "query", schema = { type = "string" },
+			    description = "The chat model; without it, the first chat model." } },
 			responses = { ["200"] = reply("Properties.", "application/json", ref("Props")) },
 		} },
 		["/lora-adapters"] = {

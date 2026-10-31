@@ -1711,8 +1711,11 @@ fields. It does not load a model.
       "compute": 553648128, "overhead": 268435456}}}]}
 ```
 
-- `context_length` (lgml) and `meta.n_ctx_train` (llama.cpp): the
-  context size of the model, in tokens.
+- `context_length` (lgml): the context size of the model, in tokens.
+  A load can cut it to fit free memory. After a load, it is the size
+  of that load, also while the model is unloaded.
+- `meta.n_ctx_train` (llama.cpp): the context that the model was
+  trained for.
 - `capabilities` (llama.cpp names where llama-server has them): the
   kinds of request that the model serves.
   - `completion`: chat completions
@@ -1798,8 +1801,11 @@ curl -s localhost:8080/models/unload -d '{"model": "qwen3-14b"}'
 
 `total_slots` is the number of slots of the model (`-np`, config key
 `slots`, default 4 or fewer): the most sequences it keeps. All slots share one
-KV pool of `n_ctx` cells. With several models, the fields come from
-the first chat model.
+KV pool of `n_ctx` cells. With several models, `?model=id` selects
+the chat model; without it, the fields come from the first chat model.
+An unknown id gives 404. `n_ctx` is the context of the last load,
+which can be less than the configured context (see `context_length`
+under [Models](#models)).
 `model_path` is the model id. `modalities` is absent when the engine
 does not give it.
 

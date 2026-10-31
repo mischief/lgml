@@ -627,6 +627,10 @@ local function test_served_model(eng)
 	    "metrics use the serving model, not the request id or the first model")
 	b = body_json(roundtrip(port, request("GET", "/props")))
 	ok(b.model_path == "fake", "props model_path is the chat model")
+	b = body_json(roundtrip(port, request("GET", "/props?model=fake")))
+	ok(b.model_path == "fake" and b.default_generation_settings.n_ctx == 4096, "props takes a model")
+	local r = roundtrip(port, request("GET", "/props?x=1&model=nope"))
+	ok(r.status == 404 and body_json(r).error.message:find("nope", 1, true), "props of an unknown model gives 404")
 	srv:close()
 end
 

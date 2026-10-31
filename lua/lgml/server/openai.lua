@@ -556,8 +556,12 @@ local function status_gauges(eng)
 	return out
 end
 
-local function props(eng, res)
-	local p = eng:props()
+local function props(eng, req, res)
+	local id = http.parse_query(req.query).model
+	local p, err = eng:props(id ~= "" and id or nil)
+	if not p then
+		return res:error(404, err)
+	end
 	return res:json(200, {
 		default_generation_settings = { n_ctx = p.n_ctx,
 		    params = json.object() },
@@ -1188,8 +1192,8 @@ function M.install(srv, eng, opts)
 	srv:route("GET", "/v1/health", health)
 	srv:route("GET", "/v1/models", list)
 	srv:route("GET", "/models", list)
-	local function get_props(_, res)
-		return props(eng, res)
+	local function get_props(req, res)
+		return props(eng, req, res)
 	end
 	srv:route("GET", "/props", get_props)
 	srv:route("GET", "/v1/props", get_props)

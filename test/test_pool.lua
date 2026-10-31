@@ -50,6 +50,9 @@ local function add(pool, id, o)
 	if o.fail then
 		args[#args + 1] = "--fake-fail"
 	end
+	if o.ctx then
+		table.move({ "-c", tostring(o.ctx) }, 1, 2, #args + 1, args)
+	end
 	local extra = {}
 	for kind, mb in pairs(o.extra or {}) do
 		extra[kind] = mb * MiB
@@ -58,7 +61,7 @@ local function add(pool, id, o)
 	m = pool:add({
 		id = id, modes = o.modes or ALL, kind = o.kind or "gpu", size = (o.size or 40) * MiB,
 		idle = o.idle, extra = extra, margin = o.margin and o.margin * MiB,
-		files = o.files and o.files * MiB,
+		files = o.files and o.files * MiB, context_length = o.context_length,
 		start = function(on_exit)
 			m.starts = (m.starts or 0) + 1
 			return remote.new({
@@ -596,6 +599,20 @@ local function test_exact()
 	cleanup(p)
 end
 
+-- A load that cuts the context reports the cut size, also after the unload.
+local function test_loaded_ctx()
+	local p = pool_mod.new()
+	local a = add(p, "a", { ctx = 64, context_length = 100 })
+	ok(a:models()[1].context_length == 100 and a:props().n_ctx == 100,
+	    "an unloaded model reports the configured context")
+	chat(a)
+	ok(a:models()[1].context_length == 64 and a:props().n_ctx == 64, "a loaded model reports its context")
+	a:unload()
+	ok(a.state == "unloaded" and a:models()[1].context_length == 64 and a:props().n_ctx == 64,
+	    "after the unload, the model reports the context of the last load")
+	cleanup(p)
+end
+
 -- A Lua error after main yields ends the coroutine without a report.
 local finished = false
 
@@ -615,6 +632,7 @@ local function main()
 	test_failure()
 	test_http()
 	test_lora()
+	test_loaded_ctx()
 	print("1.." .. n)
 	finished = true
 	uv.stop()

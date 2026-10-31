@@ -256,12 +256,19 @@ local function route(self, id, what, images, none)
 	return e
 end
 
---- Returns the properties of the first chat engine.
--- With no chat engine, it uses the first engine.
--- @treturn table the properties
-function R:props()
-	local e = self:pick(nil, "chat") or self.engines[1]
-	return e:props()
+--- Returns the properties of the chat engine for a model id.
+-- With no id, it uses the first chat engine, else the first engine.
+-- @tparam ?string id the model id
+-- @treturn[1] table the properties
+-- @treturn[2] nil
+-- @treturn[2] string the error when no engine serves id
+function R:props(id)
+	local e, mid = self:pick(id, "chat")
+	if not e and id then
+		return nil, ("unknown chat model: %s"):format(id)
+	end
+	e = e or self.engines[1]
+	return e:props(mid)
 end
 
 --- Sets the global LoRA scales of the first chat engine, whose adapters
