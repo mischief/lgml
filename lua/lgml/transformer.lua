@@ -824,9 +824,10 @@ local function check_grow(list, cap, what)
 end
 
 -- Give pool p cap cells, or twice its cells up to p.n_ctx. The new
--- tensors get the old cells that fit, when a block holds cells. Each
--- old tensor goes to host memory and closes before its new tensor
--- opens, so a shrink fits in any budget.
+-- tensors get the old cells that fit, when a block holds cells. In a
+-- shrink, each old tensor goes to host memory and closes before its new
+-- tensor opens, so a shrink fits in any budget. A grow that fails puts
+-- the tensors back at the old size and raises the budget error.
 local function pool_grow(self, p, cap)
 	cap = cap or math.min(p.n_ctx, p.cap * 2)
 	local list = {}
@@ -841,14 +842,15 @@ local function pool_grow(self, p, cap)
 	drop_pool_graphs(self, p)
 	local empty = p.alloc.used == 0 and p.alloc.cached == 0
 	local buf
-	-- Give part[il] rows rows. When the new tensor does not fit, the
-	-- old one comes back, as its close freed its memory, and the error
-	-- goes up.
+	-- Give part[il] rows rows. A grow opens the new tensor first, so
+	-- a grow that does not fit keeps the old one. A shrink closes the
+	-- old one first and passes the guard: the free memory that a device
+	-- reports can lag behind the close.
 	local function move(part, il, rows)
 		local old = part[il]
-		local per = old:nbytes() // old:shape()[1]
-		local bytes = math.min(old:nbytes(), rows * per)
-		local be, ty, w, had = old:backend(), old:type(), old:shape()[2], old:shape()[1]
+		local had = old:shape()[1]
+		local bytes = math.min(old:nbytes(), rows * (old:nbytes() // had))
+		local be, ty, w = old:backend(), old:type(), old:shape()[2]
 		if not empty then
 			if not buf or #buf < bytes then
 				if buf then
@@ -858,20 +860,25 @@ local function pool_grow(self, p, cap)
 			end
 			old:to_host(buf, 0, 0, bytes)
 		end
-		old:close()
-		local ok, new = pcall(be.tensor, be, ty, { rows, w })
-		local err = not ok and new
-		if err then
-			new = be:tensor(ty, { had, w })
+		local new
+		if rows > had then
+			new = be:tensor(ty, { rows, w })
+			old:close()
+		else
+			old:close()
+			local g = lgml.memory_guard({ off = true })
+			local ok, t = pcall(be.tensor, be, ty, { rows, w })
+			lgml.memory_guard(g)
+			if not ok then
+				error(t, 0)
+			end
+			new = t
 		end
 		new:zero()
 		if not empty then
 			new:from_host(buf, 0, 0, bytes)
 		end
 		part[il] = new
-		if err then
-			error(err, 0)
-		end
 	end
 	local done = {}
 	local ok, err = pcall(function()

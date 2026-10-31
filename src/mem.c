@@ -23,6 +23,7 @@ static struct memkey keys[MEM_KEYS];
 static int nkeys;
 static size_t guard_margin = 256 * MiB;
 static size_t guard_limit;	/* 0: no limit */
+static int guard_off;
 
 static const char *const part_names[MEM_NPART] = { "weights", "tensors", "compute" };
 
@@ -114,7 +115,7 @@ lgml_mem_check(lua_State *L, ggml_backend_buffer_type_t bt, size_t n, const char
 	size_t used = key_total(k), mfree = 0, mtotal = 0;
 	lua_Integer need = (lua_Integer)((n + MiB - 1) / MiB);
 
-	if (n == 0)
+	if (n == 0 || guard_off)
 		return NULL;
 	if (guard_limit > 0 && used + n > guard_limit)
 		return lua_pushfstring(L, "memory budget: %s needs %I MiB more on %s; %I MiB of "
@@ -193,8 +194,8 @@ l_memory_reset(lua_State *L)
  * a graph that runs through the scheduler (weights on a device and CPU).
  * @tparam[opt] table opts `margin`: bytes that stay free on a device
  * (default 256 MiB); `limit`: the most bytes of each memory, 0 for no
- * limit (default 0)
- * @treturn table the settings before the call, `{ margin, limit }`
+ * limit (default 0); `off`: true to pass every allocation (default false)
+ * @treturn table the settings before the call, `{ margin, limit, off }`
  * @function memory_guard
  */
 static int
@@ -202,11 +203,13 @@ l_memory_guard(lua_State *L)
 {
 	lua_Integer v;
 
-	lua_createtable(L, 0, 2);
+	lua_createtable(L, 0, 3);
 	lua_pushinteger(L, (lua_Integer)guard_margin);
 	lua_setfield(L, -2, "margin");
 	lua_pushinteger(L, (lua_Integer)guard_limit);
 	lua_setfield(L, -2, "limit");
+	lua_pushboolean(L, guard_off);
+	lua_setfield(L, -2, "off");
 	if (lua_isnoneornil(L, 1))
 		return 1;
 	luaL_checktype(L, 1, LUA_TTABLE);
@@ -221,6 +224,9 @@ l_memory_guard(lua_State *L)
 		luaL_argcheck(L, v >= 0, 1, "negative limit");
 		guard_limit = (size_t)v;
 	}
+	lua_pop(L, 1);
+	if (lua_getfield(L, 1, "off") != LUA_TNIL)
+		guard_off = lua_toboolean(L, -1);
 	lua_pop(L, 1);
 	return 1;
 }
