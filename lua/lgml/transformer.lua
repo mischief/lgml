@@ -841,30 +841,58 @@ local function pool_grow(self, p, cap)
 	drop_pool_graphs(self, p)
 	local empty = p.alloc.used == 0 and p.alloc.cached == 0
 	local buf
-	for _, part in ipairs({ p.k, p.v, p.x or {} }) do
-		for il, old in pairs(part) do
-			local bytes = math.min(old:nbytes(), cap * (old:nbytes() // old:shape()[1]))
-			local be, ty, w = old:backend(), old:type(), old:shape()[2]
-			if not empty then
-				if not buf or #buf < bytes then
-					if buf then
-						buf:close()
-					end
-					buf = lgml.hostbuf(bytes)
+	-- Give part[il] rows rows. When the new tensor does not fit, the
+	-- old one comes back, as its close freed its memory, and the error
+	-- goes up.
+	local function move(part, il, rows)
+		local old = part[il]
+		local per = old:nbytes() // old:shape()[1]
+		local bytes = math.min(old:nbytes(), rows * per)
+		local be, ty, w, had = old:backend(), old:type(), old:shape()[2], old:shape()[1]
+		if not empty then
+			if not buf or #buf < bytes then
+				if buf then
+					buf:close()
 				end
-				old:to_host(buf, 0, 0, bytes)
+				buf = lgml.hostbuf(bytes)
 			end
-			old:close()
-			local new = be:tensor(ty, { cap, w })
-			new:zero()
-			if not empty then
-				new:from_host(buf, 0, 0, bytes)
+			old:to_host(buf, 0, 0, bytes)
+		end
+		old:close()
+		local ok, new = pcall(be.tensor, be, ty, { rows, w })
+		local err = not ok and new
+		if err then
+			new = be:tensor(ty, { had, w })
+		end
+		new:zero()
+		if not empty then
+			new:from_host(buf, 0, 0, bytes)
+		end
+		part[il] = new
+		if err then
+			error(err, 0)
+		end
+	end
+	local done = {}
+	local ok, err = pcall(function()
+		for _, part in ipairs({ p.k, p.v, p.x or {} }) do
+			for il in pairs(part) do
+				move(part, il, cap)
+				done[#done + 1] = { part, il }
 			end
-			part[il] = new
+		end
+	end)
+	-- A failed grow puts the tensors that grew back to p.cap rows.
+	if not ok then
+		for _, d in ipairs(done) do
+			move(d[1], d[2], p.cap)
 		end
 	end
 	if buf then
 		buf:close()
+	end
+	if not ok then
+		error(err, 0)
 	end
 	LOG:info(cap > p.cap and "pool grew" or "pool shrank", "cells", cap, "from", p.cap, "size", p.n_ctx)
 	p.cap = cap

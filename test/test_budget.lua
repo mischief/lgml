@@ -179,6 +179,39 @@ do
 	ok(chats(e, { words(100, 4) })[1].res == true, "the shrunk pool serves a prompt")
 end
 
+-- A grow that passes its check but fails in the middle puts back the
+-- tensors at the old size, so a later grow and prompts still work.
+do
+	collectgarbage()
+	collectgarbage()
+	local e = engine.new({ model = path, backend = "CPU", n_ctx = 4096, slots = 1, kv_initial = 256,
+		cache_ram = 0 })
+	ok(chats(e, { words(100, 4) })[1].res == true, "the small pool serves a prompt")
+	local one = 0
+	for _, t in pairs(e.pool.k) do
+		one = t:nbytes() // t:shape()[1] * (1024 - 256)
+		break
+	end
+	collectgarbage()
+	collectgarbage()
+	local check = lgml.memory_check
+	lgml.memory_check = function() return true end
+	local old = lgml.memory_guard({ limit = cpu().weights + cpu().tensors + cpu().compute + one + 4096 })
+	local good, err = pcall(e.model.pool_resize, e.model, e.pool, 1024)
+	lgml.memory_guard(old)
+	lgml.memory_check = check
+	local rows = true
+	for _, part in ipairs({ e.pool.k, e.pool.v }) do
+		for _, t in pairs(part) do
+			rows = rows and t:shape()[1] == 256
+		end
+	end
+	ok(not good and budget.is_budget(err) and e.pool.cap == 256 and rows,
+	    "a failed grow keeps every tensor at the old size: " .. tostring(err))
+	ok(chats(e, { words(100, 4) })[1].res == true, "the pool serves a prompt after the failed grow")
+	ok(pcall(e.model.pool_resize, e.model, e.pool, 1024) and e.pool.cap == 1024, "a later grow works")
+end
+
 -- A prompt whose KV growth passes the guard fails with 507; the engine
 -- then serves a short prompt. The limit must not count the tensors of
 -- earlier engines that the collector has not freed yet.
