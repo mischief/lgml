@@ -614,8 +614,12 @@ local function test_served_model(eng)
 	function stt.models() return { { id = "whisper", context_length = 448 } } end
 	function stt.props() return { n_ctx = 448, total_slots = 1 } end
 	function stt.transcribe() return { text = "x" } end
+	local other = {}
+	function other.models() return { { id = "other", context_length = 77 } } end
+	function other.props() return { n_ctx = 77, total_slots = 1 } end
+	function other.chat() return true end
 	local srv = server.new()
-	openai.install(srv, require("lgml.server.router").new({ stt, eng }))
+	openai.install(srv, require("lgml.server.router").new({ stt, eng, other }))
 	local port = assert(srv:listen("127.0.0.1", 0))
 	local b = body_json(roundtrip(port, request("POST", "/v1/chat/completions", chat_body())))
 	ok(b.model == "fake", "chat with no model names the model that served it")
@@ -629,6 +633,8 @@ local function test_served_model(eng)
 	ok(b.model_path == "fake", "props model_path is the chat model")
 	b = body_json(roundtrip(port, request("GET", "/props?model=fake")))
 	ok(b.model_path == "fake" and b.default_generation_settings.n_ctx == 4096, "props takes a model")
+	b = body_json(roundtrip(port, request("GET", "/props?model=other")))
+	ok(b.model_path == "other" and b.default_generation_settings.n_ctx == 77, "props of the second chat model")
 	local r = roundtrip(port, request("GET", "/props?x=1&model=nope"))
 	ok(r.status == 404 and body_json(r).error.message:find("nope", 1, true), "props of an unknown model gives 404")
 	srv:close()

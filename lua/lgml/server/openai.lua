@@ -566,7 +566,7 @@ local function props(eng, req, res)
 		default_generation_settings = { n_ctx = p.n_ctx,
 		    params = json.object() },
 		total_slots = p.total_slots,
-		model_path = p.model_path or served_model(eng, nil, "chat"),
+		model_path = p.model_path or served_model(eng, id ~= "" and id or nil, "chat"),
 		modalities = p.modalities,
 		build_info = "lgml",
 	})
