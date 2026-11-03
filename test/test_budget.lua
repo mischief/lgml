@@ -212,6 +212,50 @@ do
 	ok(pcall(e.model.pool_resize, e.model, e.pool, 1024) and e.pool.cap == 1024, "a later grow works")
 end
 
+-- A reserve past the guard cuts the context by a quarter until the
+-- plans fit. Under 8192 cells it gives up with the budget error. In
+-- both cases the engine still serves.
+do
+	local big = tiny.tmp(".gguf")
+	tiny.write(big, "qwen3", { n_ctx = 32768 })
+	local function new()
+		collectgarbage()
+		collectgarbage()
+		return engine.new({ model = big, backend = "CPU", n_ctx = 32768, slots = 1, kv_initial = 256,
+			cache_ram = 0, ubatch = 512 })
+	end
+	local e = new()
+	local per = transformer.block_bytes(e.pool) // e.pool.block
+	local full = e:reserve()
+	ok(e.n_ctx == 32768 and e.pool.cap == 256, "a reserve that fits keeps the context and the pool size")
+	e = nil
+	e = new()
+	local function use()
+		collectgarbage()
+		collectgarbage()
+		return cpu().weights + cpu().tensors + cpu().compute
+	end
+	local old = lgml.memory_guard({ limit = use() + per * 28000 + full })
+	local good, err = pcall(e.reserve, e)
+	lgml.memory_guard(old)
+	ok(good and e.n_ctx == 24576 and e.pool.n_ctx == 24576 and e.pool.cap == 256 and
+	    e:models()[1].context_length == 24576 and e:props().n_ctx == 24576,
+	    "a reserve past the limit cuts the context to 24576: " .. tostring(err))
+	ok(chats(e, { words(100, 5) })[1].res == true, "the cut engine serves a prompt")
+	ok(pcall(e.model.pool_resize, e.model, e.pool, 24576) and e.pool.cap == 24576,
+	    "the pool grows to the cut context")
+	e = nil
+	e = new()
+	old = lgml.memory_guard({ limit = use() + per * 4096 })
+	good, err = pcall(e.reserve, e)
+	lgml.memory_guard(old)
+	ok(not good and budget.is_budget(err) and e.n_ctx >= 8192 and e.pool.cap == 256,
+	    "a reserve that does not fit 8192 cells raises the budget error: " .. tostring(err))
+	ok(chats(e, { words(100, 6) })[1].res == true, "the engine serves after the failed reserve")
+	e = nil
+	os.remove(big)
+end
+
 -- A prompt whose KV growth passes the guard fails with 507; the engine
 -- then serves a short prompt. The limit must not count the tensors of
 -- earlier engines that the collector has not freed yet.
