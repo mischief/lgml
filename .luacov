@@ -1,0 +1,17 @@
+-- luacov settings for `meson test --setup coverage` (see meson.build).
+-- Each process writes its own stats file: a test and its workers end
+-- at the same time, and one shared file would lose counts.
+local dir = os.getenv("LUACOV_DIR")
+local pid
+local f = io.open("/proc/self/stat")
+if f then
+	pid = f:read("l"):match("^(%d+)")
+	f:close()
+end
+return {
+	statsfile = dir and ("%s/stats.%s.%d"):format(dir, pid or "x", os.time()) or "luacov.stats.out",
+	reportfile = os.getenv("LUACOV_REPORT") or "luacov.report.out",
+	include = { "lua/lgml/", "bin/lgml%-" },
+	exclude = { "test/[^/]*$" },
+	includeuntestedfiles = true,
+}

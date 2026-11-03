@@ -165,6 +165,23 @@ cpu_env = lua_env
 cpu_env.set('VK_DRIVER_FILES', '/nonexistent')
 cpu_env.set('VK_ICD_FILENAMES', '/nonexistent')
 add_test_setup('cpu', env : cpu_env)
+# meson test --setup coverage: luacov (on the luarocks path) counts the
+# lines that the tests run, into one stats file per process in luacov/
+# of the build directory. Then, in the build directory:
+#   lua5.4 ../scripts/luacov_merge.lua luacov.stats.out luacov/stats.*
+#   luacov -c ../.luacov
+# writes luacov.report.out.
+cov_env = lua_env
+luarocks = find_program('luarocks', required : false)
+if luarocks.found()
+  cov_env.append('LUA_PATH', run_command(luarocks, 'path', '--lr-path', check : true).stdout().strip(),
+    separator : ';')
+endif
+cov_env.set('LUACOV_CONFIG', meson.current_source_dir() / '.luacov')
+cov_env.set('LUACOV_DIR', meson.current_build_dir() / 'luacov')
+cov_env.set('LUACOV_REPORT', meson.current_build_dir() / 'luacov.report.out')
+cov_env.set('LUA_INIT_5_4', 'require("luacov.runner").init() require("lgml.strict").on()')
+add_test_setup('coverage', env : cov_env, timeout_multiplier : 4)
 
 test_audio = executable('test_audio',
   'test/test_audio.c',

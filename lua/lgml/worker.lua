@@ -297,6 +297,11 @@ local function on_term(ch, engine, state, sig)
 		if not ch.buf or ch.buf:queuelen() == 0 or left <= 0 then
 			t:stop()
 			sig:stop()
+			-- The end by the signal skips the exit hooks of luacov.
+			local cov = package.loaded["luacov.runner"]
+			if cov and cov.initialized then
+				cov.shutdown()
+			end
 			uv.kill(uv.os_getpid(), "sigterm")
 		end
 	end)
