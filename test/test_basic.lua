@@ -119,6 +119,10 @@ for _, d in ipairs(devs) do
 	local be <close> = assert(lgml.backend(d.name))
 	local a <close> = be:tensor("f32", { 64, 64 })
 	a:fill("uniform", 0, 1, 1)
+	-- Graphs of earlier tests that the collector has not freed yet must
+	-- not leave the count during the test.
+	collectgarbage()
+	collectgarbage()
 	local base = (lgml.memory()[be:name()] or {}).compute or 0
 	local g1 = be:graph()
 	local g2 = be:graph(nil, g1)
