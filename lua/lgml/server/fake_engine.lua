@@ -260,7 +260,8 @@ function F:run(req, sink, a)
 	elseif last_user(req) == "crash" then
 		os.exit(3)
 	elseif last_user(req) == "hang" then
-		os.execute("sleep 30")
+		-- Block in this process: a child would outlive a killed worker.
+		require("luv").sleep(30000)
 	end
 	local max = req.max_completion_tokens or req.max_tokens
 	local usage = { prompt_tokens = prompt_tokens(req),

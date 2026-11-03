@@ -159,6 +159,13 @@ meson.add_devenv(lua_env)
 lua_env.set('LUA_INIT_5_4', 'require("lgml.strict").on()')
 # Tests run in parallel, so each one gets few CPU threads.
 lua_env.set('LGML_THREADS', '2')
+# meson fills each malloc and free with a byte pattern (MALLOC_PERTURB_),
+# which makes the tests that use large buffers about ten times slower.
+# meson test --setup perturb turns it on.
+perturb_env = lua_env
+perturb_env.set('MALLOC_PERTURB_', '165')
+add_test_setup('perturb', env : perturb_env)
+lua_env.set('MALLOC_PERTURB_', '0')
 add_test_setup('default', is_default : true, env : lua_env)
 # meson test --setup cpu: the Vulkan loader finds no driver, so tests use only the CPU.
 cpu_env = lua_env
