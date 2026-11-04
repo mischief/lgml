@@ -306,6 +306,10 @@ prompt. `--log-file path` appends to a file; SIGHUP opens it again.
   architecture table in `lgml.convert` maps names and metadata; it
   knows `llada_moe_v2`. `scripts/convert_check.lua` compares the
   output with its source.
+- `scripts/gguf_info.lua file.gguf [pattern]`: print the metadata of a
+  gguf file and its tensor bytes by type, without reading the weights;
+  with a Lua pattern, list the matching tensors. In Lua, `lgml.gguf(path)`
+  gives the same data as a table.
 
 ## Tests
 
