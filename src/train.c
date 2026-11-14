@@ -227,8 +227,6 @@ no_grad_op(const struct ggml_tensor *t)
 	case GGML_OP_PERMUTE:
 	case GGML_OP_TRANSPOSE:
 	case GGML_OP_GET_ROWS:
-	case GGML_OP_DIAG_MASK_INF:
-	case GGML_OP_DIAG_MASK_ZERO:
 	case GGML_OP_SOFT_MAX:
 	case GGML_OP_ROPE:
 	case GGML_OP_IM2COL:

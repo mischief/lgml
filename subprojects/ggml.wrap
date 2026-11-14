@@ -1,8 +1,8 @@
 [wrap-git]
 url = https://github.com/mischief/ggml.git
-revision = 0f1fa6109ad6f11d51dc0ab6f8e599258a393e1c
+revision = 584a8a8b713b620e4729b07e80008e13a164c44f
 depth = 1
 method = cmake
-# Branch lgml of the fork: ggml master da8e2a5 with the Vulkan release
+# Branch lgml-v1.0 of the fork: ggml v1.0.0 with the Vulkan release
 # build, lgml's custom op shaders and host read buffers, and the
 # training backward passes.
