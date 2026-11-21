@@ -8,7 +8,9 @@ local lgml = require("lgml")
 local M = {}
 
 --- Encoder modules by `clip.vision.projector_type`.
-M.projectors = { gemma4v = "lgml.vision.gemma4", qwen3vl_merger = "lgml.vision.qwen3vl" }
+M.projectors = {
+	gemma4v = "lgml.vision.gemma4", qwen3vl_merger = "lgml.vision.qwen3vl", inkling2v = "lgml.vision.inkling2v",
+}
 
 --- Load a vision encoder.
 -- @param be the lgml backend
