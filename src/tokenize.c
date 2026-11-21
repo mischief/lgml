@@ -227,6 +227,7 @@ struct tokenizer {
 	int		 add_bos;
 	int		 max_digits;	/* digits per number pre-token */
 	int		 gpt2;		/* the GPT-2 pre-tokenizer regex */
+	int		 gpt4o;		/* the GPT-4o pre-tokenizer regex */
 	int		 nfc;		/* normalize text to NFC first */
 	uint8_t		*strip;		/* STRIP_ bits by token, or NULL */
 	uint16_t	 letters;	/* flags that count as \p{L}: qwen35 adds \p{M} */
@@ -1200,8 +1201,11 @@ tok_load(struct tokenizer *t, const struct tok_src *src)
 	else if (pre != NULL && (strcmp(pre, "gpt2") == 0 || strcmp(pre, "gpt-2") == 0 ||
 	    strcmp(pre, "granite-docling") == 0))
 		t->gpt2 = 1;
+	else if (pre != NULL && (strcmp(pre, "gpt-4o") == 0 || strcmp(pre, "inkling2") == 0))
+		t->gpt4o = 1;
 	else
-		return "unsupported tokenizer.ggml.pre (need gpt2, granite-docling, qwen2, qwen35 or llama-bpe)";
+		return "unsupported tokenizer.ggml.pre (need gpt2, granite-docling, qwen2, qwen35, "
+		    "llama-bpe, gpt-4o or inkling2)";
 	t->letters = UF_LETTER;
 	if (pre != NULL && strcmp(pre, "qwen35") == 0)
 		t->letters |= UF_MARK;
@@ -1683,6 +1687,131 @@ encode_gpt2(struct tokenizer *t, const unsigned char *s, size_t n)
 }
 
 /*
+ * The GPT-4o pre-tokenizer, as the llama.cpp GPT4O regex. U is a letter
+ * but a-z, W a letter but A-Z, C the contraction (?i:'s|'t|'re|'ve|'m|'ll|'d):
+ * [^\r\n\p{L}\p{N}]?U*W+C?|[^\r\n\p{L}\p{N}]?U+W*C?|\p{N}{1,3}|
+ * ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+
+ */
+static int
+encode_gpt4o(struct tokenizer *t, const unsigned char *s, size_t n)
+{
+	const uint32_t *cp;
+	const uint16_t *fl;
+	uint32_t c, c1, c2;
+	uint16_t f;
+	size_t pos, prev, np, nws, last, st, ue, k, end;
+	long m;
+
+	if (n > UINT32_MAX / 4)
+		return 0;
+	if ((m = decode_text(t, &s, &n)) < 0)
+		return 0;
+	np = (size_t)m;
+	cp = t->cp;
+	fl = t->fl;
+
+#define CPT(p)	((p) < np ? cp[p] : OOR)
+#define FLG(p)	((p) < np ? fl[p] : 0)
+#define UP(p)	((FLG(p) & UF_LETTER) && !(cp[p] >= 'a' && cp[p] <= 'z'))
+#define LO(p)	((FLG(p) & UF_LETTER) && !(cp[p] >= 'A' && cp[p] <= 'Z'))
+#define EMIT(end) do {							\
+	if ((end) > prev && !bpe_word(t, s + t->co[prev],		\
+	    t->co[end] - t->co[prev]))					\
+		return 0;						\
+	prev = (end);							\
+} while (0)
+
+	pos = prev = 0;
+	while (pos < np) {
+		c = cp[pos];
+		f = fl[pos];
+
+		/* The letter alternatives, with an optional prefix. */
+		st = pos;
+		if (!(f & (UF_LETTER | UF_NUMBER)) && c != '\r' && c != '\n')
+			st = pos + 1;
+		if (FLG(st) & UF_LETTER) {
+			ue = st;
+			while (UP(ue))
+				ue++;
+			end = 0;
+			/* U*W+: back off U* until W+ can start. */
+			for (k = ue + 1; k-- > st;) {
+				if (LO(k)) {
+					end = k + 1;
+					while (LO(end))
+						end++;
+					break;
+				}
+			}
+			/* U+W*: the U run is A-Z and no letter follows it. */
+			if (end == 0 && ue > st)
+				end = ue;
+			if (end > 0) {
+				if (CPT(end) == '\'' && end + 1 < np) {
+					c1 = lower_ascii(cp[end + 1]);
+					c2 = end + 2 < np ? lower_ascii(cp[end + 2]) : 0;
+					if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd')
+						end += 2;
+					else if ((c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') ||
+					    (c1 == 'l' && c2 == 'l'))
+						end += 3;
+				}
+				pos = end;
+				EMIT(pos);
+				continue;
+			}
+		}
+
+		if (f & UF_NUMBER) {
+			last = pos + 3;
+			pos++;
+			while (pos < last && (FLG(pos) & UF_NUMBER))
+				pos++;
+			EMIT(pos);
+			continue;
+		}
+
+		st = pos + (c == ' ');
+		if (st < np && !(FLG(st) & (UF_WS | UF_LETTER | UF_NUMBER)) && FLG(st) != 0) {
+			pos = st;
+			while (pos < np && !(FLG(pos) & (UF_WS | UF_LETTER | UF_NUMBER)) &&
+			    FLG(pos) != 0)
+				pos++;
+			c2 = CPT(pos);
+			while (c2 == '\r' || c2 == '\n' || c2 == '/') {
+				pos++;
+				c2 = CPT(pos);
+			}
+			EMIT(pos);
+			continue;
+		}
+
+		nws = 0;
+		last = 0;
+		while (FLG(pos + nws) & UF_WS) {
+			c2 = cp[pos + nws];
+			if (c2 == '\r' || c2 == '\n')
+				last = pos + nws + 1;
+			nws++;
+		}
+		if (last > 0)
+			pos = last;
+		else if (nws > 1 && pos + nws < np)
+			pos += nws - 1;
+		else
+			pos += nws > 0 ? nws : 1;
+		EMIT(pos);
+	}
+#undef CPT
+#undef FLG
+#undef UP
+#undef LO
+#undef EMIT
+	return 1;
+}
+
+/*
  * The qwen2 and llama3 pre-tokenizers as a scanner, the same as llama.cpp
  * unicode_regex_split_custom_qwen2 and _llama3. llama3 takes \p{N}{1,3}
  * where qwen2 takes \p{N}. qwen35 counts \p{M} as \p{L}. Regex:
@@ -1704,6 +1833,8 @@ encode_text(struct tokenizer *t, const unsigned char *s, size_t n)
 		return encode_gemma4(t, s, n);
 	if (t->gpt2)
 		return encode_gpt2(t, s, n);
+	if (t->gpt4o)
+		return encode_gpt4o(t, s, n);
 	if (n > UINT32_MAX / 4)
 		return 0;
 	if ((m = decode_text(t, &s, &n)) < 0)
