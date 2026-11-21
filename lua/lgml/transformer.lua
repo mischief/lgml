@@ -14,6 +14,7 @@ local replay = require("lgml.replay")
 local budget = require("lgml.budget")
 local log = require("lgml.log")
 local q4 = require("lgml.qwen4exp")
+local ink = require("lgml.inkling2")
 
 local LOG = log.new("kv")
 
@@ -75,6 +76,8 @@ local family = {
 	["diffusion-gemma"] = { qk_norm = true, gemma = true },
 	-- LLaDA-MoE-v2: a masked diffusion model; see `lgml.llada-moe-v2`.
 	["llada-moe-v2"] = { qk_norm = true, rope_ctx = true },
+	-- Inkling 2: looped layers and attention residuals; see `lgml.inkling2`.
+	inkling2 = { ink = true },
 }
 
 -- Check that text tokens can use neox rope. Their t, h and w positions
@@ -95,7 +98,7 @@ end
 --- Tell if the transformer handles a gguf architecture.
 -- @tparam string arch the `general.architecture` value
 -- @treturn boolean true for llama, granite, qwen3, qwen3moe, qwen3next,
--- qwen35, qwen35moe, clef, qwen4exp and gemma4
+-- qwen35, qwen35moe, clef, qwen4exp, gemma4 and inkling2
 function M.supports(arch)
 	return family[arch] ~= nil
 end
@@ -245,6 +248,8 @@ function M.config(meta)
 	end
 	if fam.hc then
 		q4.config(hp, k)
+	elseif fam.ink then
+		ink.config(hp, k)
 	end
 	return hp
 end
@@ -383,6 +388,8 @@ function M.load(be, path, opts)
 	local hp = M.config(info.meta)
 	if hp.hc then
 		return q4.load(be, path, opts, info, hp)
+	elseif hp.ink then
+		return ink.load(be, path, opts, info, hp)
 	end
 	local cpu = opts.placement and placement.plan(opts.placement, info.tensors, hp.n_layer)
 	if cpu and not be:cpu() then
@@ -487,6 +494,9 @@ end
 -- @raise when an adapter names a weight that the model lacks or that
 -- takes no adapter (routed experts, embeddings), or a shape differs
 function M:set_adapters(list)
+	if self.hp.ink then
+		return ink.set_adapters(self, list)
+	end
 	local maps, out, keys = {}, {}, {}
 	for _, ad in ipairs(list or {}) do
 		for _, name in ipairs(ad.names) do
@@ -601,6 +611,8 @@ local function add_layers(self, c, opts, global)
 	end
 	if hp.hc then
 		q4.add_cache(self, c, c.cap, global)
+	elseif hp.ink then
+		ink.add_cache(self, c)
 	elseif self.mtp then
 		add_mtp(self, c, c.cap, global)
 	end
@@ -1216,6 +1228,9 @@ function M:cache_size(opts)
 			end
 		end
 	end
+	if hp.ink then
+		s.dev[2] = s.dev[2] + ink.state_bytes(hp)
+	end
 	-- Token ids of the cells, for the n-gram input.
 	if hp.ple then
 		s.cpu[1] = s.cpu[1] + 4
@@ -1386,6 +1401,11 @@ local function snap_parts(self, cache, rows, state, hi)
 				local row = t:nbytes() // t:shape()[1]
 				add(t, rows * row, row)
 			end
+		end
+	end
+	if state and self.hp.ink and cache.pconv then
+		for _, t in ipairs(cache.pconv) do
+			add(t, t:nbytes())
 		end
 	end
 	local mt = self.mtp
@@ -1653,13 +1673,14 @@ function M:inputs(ids, cache, opts)
 	if cache then
 		check_pass(self, cache, n)
 	end
-	kv.check(cache, opts.flash_attn)
+	local flash = opts.flash_attn
+	kv.check(cache, flash)
 	local n_kv = (cache and cache.n_past or 0) + n
 	local n_attn, n_swa_attn, lo = spans(cache, n_kv)
-	local mt = opts.flash_attn and "f16" or "f32"
+	local mt = flash and "f16" or "f32"
 	local inp = {
 		n = n, n_attn = n_attn, n_swa_attn = n_swa_attn, lo = lo, cache = cache,
-		flash_attn = opts.flash_attn, logits = opts.logits or "all",
+		flash_attn = flash, logits = opts.logits or "all",
 		hidden = opts.hidden, pool = opts.pool, causal = opts.causal ~= false,
 		deepstack = opts.embd and opts.deepstack or 0,
 		ids = be:tensor("i32", { n }, ids),
@@ -1687,10 +1708,14 @@ function M:inputs(ids, cache, opts)
 	if hp.hc then
 		q4.leaves(self, inp, n)
 		q4.seq_leaves(self, inp, n_attn)
+	elseif hp.ink then
+		ink.leaves(self, inp, n)
 	end
 	fill(hp, inp, cache, nil, opts)
 	if hp.hc then
 		q4.pass(self, inp, cache, ids)
+	elseif hp.ink then
+		ink.pass(self, inp, cache)
 	end
 	return inp
 end
@@ -1732,6 +1757,8 @@ function M:refill(inp, ids, cache, opts)
 	fill(self.hp, inp, cache, ids, opts)
 	if self.hp.hc then
 		q4.pass(self, inp, cache, ids)
+	elseif self.hp.ink then
+		ink.pass(self, inp, cache)
 	end
 end
 
@@ -2285,6 +2312,8 @@ end
 function M:forward(g, inp)
 	if self.hp.hc then
 		return q4.forward(self, g, inp)
+	elseif self.hp.ink then
+		return ink.forward(self, g, inp)
 	end
 	local hp, n = self.hp, inp.n
 	local taps, shared = {}, {}
@@ -2486,7 +2515,7 @@ end
 -- and recurrent layers run per sequence on their states.
 -- @treturn boolean
 function M:batchable()
-	return true
+	return not self.hp.ink
 end
 
 --- Make the inputs of a pass over several pool sequences.
