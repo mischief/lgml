@@ -2088,8 +2088,10 @@ graph_rope(lua_State *L)
  * @tparam[opt] tensor mask additive mask
  * @tparam[opt=1] number scale factor on a
  * @tparam[opt=0] number max_bias ALiBi maximum bias
+ * @tparam[opt] tensor sinks f32 sink logit per head: one value per index of
+ * the third dimension from the inside of a; each row adds exp(sink) to its sum
  * @treturn tensor node with the shape of a
- * @raise on a bad mask, or `max_bias` without a mask
+ * @raise on a bad mask or sinks, or `max_bias` without a mask
  * @function graph:soft_max
  */
 static int
@@ -2100,7 +2102,9 @@ graph_soft_max(lua_State *L)
 	struct tensor *m = opt_operand(L, g, 3);
 	float scale = (float)luaL_optnumber(L, 4, 1.0);
 	float max_bias = (float)luaL_optnumber(L, 5, 0.0);
+	struct tensor *sk = opt_operand(L, g, 6);
 	const struct ggml_tensor *ta = a->t;
+	struct ggml_tensor *r;
 
 	if (!ggml_is_contiguous(ta))
 		return luaL_error(L, "tensor not contiguous; use cont");
@@ -2113,15 +2117,21 @@ graph_soft_max(lua_State *L)
 			return luaL_error(L, "mask shape mismatch");
 	} else if (max_bias > 0.0f)
 		return luaL_error(L, "max_bias needs a mask");
+	if (sk != NULL && (sk->t->type != GGML_TYPE_F32 || ggml_n_dims(sk->t) != 1 ||
+	    sk->t->ne[0] != ta->ne[2]))
+		return luaL_error(L, "sinks must be f32 with one value per head");
 	reserve(L, g, 1);
-	return push_node(L, g, ggml_soft_max_ext(g->ctx, a->t, m != NULL ? m->t : NULL,
-	    scale, max_bias), a->rank);
+	r = ggml_soft_max_ext(g->ctx, a->t, m != NULL ? m->t : NULL, scale, max_bias);
+	if (sk != NULL)
+		ggml_soft_max_add_sinks(r, sk->t);
+	return push_node(L, g, r, a->rank);
 }
 
 /*** Fused attention: softmax(q k^T * scale + mask) v.
  * heads is a multiple of `kv_heads`. The mask is contiguous f16 of
- * (rows, kv) with rows >= tokens. `max_bias` needs a mask. softcap > 0
- * applies tanh soft capping to the scores.
+ * (rows, kv) with rows >= tokens, or (h, rows, kv) with h dividing heads.
+ * `max_bias` needs a mask. softcap > 0 applies tanh soft capping to the
+ * scores.
  * @tparam tensor q (heads, tokens, d)
  * @tparam tensor k (`kv_heads`, kv, d)
  * @tparam tensor v (`kv_heads`, kv, d)
@@ -2131,8 +2141,10 @@ graph_soft_max(lua_State *L)
  * @tparam[opt=0] number softcap score cap
  * @tparam[opt=false] boolean f32 ask the backend for f32 precision, for
  * inputs whose scores overflow f16
+ * @tparam[opt] tensor sinks f32 sink logit per head; each row adds
+ * exp(sink) to its sum
  * @treturn tensor (tokens, heads, d) node; note the swap of heads and tokens
- * @raise on a shape mismatch or a bad mask
+ * @raise on a shape mismatch, a bad mask or bad sinks
  * @function graph:flash_attn
  */
 static int
@@ -2147,6 +2159,7 @@ graph_flash_attn(lua_State *L)
 	float max_bias = (float)luaL_optnumber(L, 7, 0.0);
 	float softcap = (float)luaL_optnumber(L, 8, 0.0);
 	int f32 = lua_toboolean(L, 9);
+	struct tensor *sk = opt_operand(L, g, 10);
 	const struct ggml_tensor *tq = q->t;
 	struct ggml_tensor *r;
 
@@ -2161,11 +2174,16 @@ graph_flash_attn(lua_State *L)
 			return luaL_error(L, "mask shape mismatch");
 	} else if (max_bias > 0.0f)
 		return luaL_error(L, "max_bias needs a mask");
+	if (sk != NULL && (sk->t->type != GGML_TYPE_F32 || ggml_n_dims(sk->t) != 1 ||
+	    sk->t->ne[0] != tq->ne[2]))
+		return luaL_error(L, "sinks must be f32 with one value per head");
 	reserve(L, g, 1);
 	r = ggml_flash_attn_ext(g->ctx, q->t, k->t, v->t, m != NULL ? m->t : NULL, scale,
 	    max_bias, softcap);
 	if (f32)
 		ggml_prec_set_acc(r, GGML_PREC_F32);
+	if (sk != NULL)
+		ggml_flash_attn_ext_add_sinks(r, sk->t);
 	return push_node(L, g, r, max_int(q->rank, 3));
 }
 
