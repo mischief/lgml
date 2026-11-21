@@ -36,6 +36,9 @@ static const uint32_t hc_add_spv[] =
 static const uint32_t hc_mean_spv[] =
 #include "hc_mean.spv.h"
 ;
+static const uint32_t rel_mask_spv[] =
+#include "rel_mask.spv.h"
+;
 #endif
 
 /* True when the Vulkan backend runs the fused ops on the device. */
@@ -186,9 +189,92 @@ g_hc_mean(lua_State *L)
 	return lgml_push_node(L, g, t, 2);
 }
 
+/*
+ * rel_mask: d (H, M, S) f16 = mask (M, S) + tab (M, H, R) at the distance
+ * clamp(qpos[i] - kpos[j], 0, R - 1). Rows of d split across the threads.
+ */
+static void
+rel_mask_op(struct ggml_tensor *d, int ith, int nth, void *ud)
+{
+	const struct ggml_tensor *tab = d->src[0], *q = d->src[1], *k = d->src[2], *m = d->src[3];
+	int64_t S = d->ne[0], M = d->ne[1], H = d->ne[2], R = tab->ne[0], rows = M * H, row, j;
+	int64_t per = (rows + nth - 1) / nth, r0 = per * ith, r1 = r0 + per < rows ? r0 + per : rows;
+	const float *qq = q->data, *kk = k->data;
+
+	(void)ud;
+	for (row = r0; row < r1; row++) {
+		int64_t h = row / M, i = row % M;
+		const float *t = (const float *)tab->data + (i * H + h) * R;
+		const ggml_fp16_t *mm = (const ggml_fp16_t *)m->data + i * S;
+		ggml_fp16_t *dd = (ggml_fp16_t *)d->data + row * S;
+
+		for (j = 0; j < S; j++) {
+			float dist = qq[i] - kk[j];
+
+			dist = dist < 0 ? 0 : dist > (float)(R - 1) ? (float)(R - 1) : dist;
+			dd[j] = ggml_fp32_to_fp16(ggml_fp16_to_fp32(mm[j]) + t[(int64_t)dist]);
+		}
+	}
+}
+
+#ifdef LGML_HAVE_SPV
+static void
+rel_mask_setup(const struct ggml_tensor *d, void *push, uint32_t el[3])
+{
+	uint32_t *p = push;
+
+	p[0] = (uint32_t)d->ne[0];
+	p[1] = (uint32_t)d->ne[1];
+	p[2] = (uint32_t)d->ne[2];
+	p[3] = (uint32_t)d->src[0]->ne[0];
+	el[0] = p[0];
+	el[1] = p[1] * p[2];
+	el[2] = 1;
+}
+#endif
+
+/*** Build the per-head attention mask of a bias by distance.
+ * Element (h, i, j) of the result is mask[i][j] + tab[i][h][d], with d the
+ * distance qpos[i] - kpos[j] clamped to [0, R - 1].
+ * @tparam graph g the graph
+ * @tparam tensor tab f32 (M, H, R) contiguous bias by distance
+ * @tparam tensor qpos f32 (M) query positions
+ * @tparam tensor kpos f32 (S) cell positions
+ * @tparam tensor mask f16 (M, S) contiguous mask
+ * @treturn tensor f16 (H, M, S)
+ * @function graph:rel_mask
+ */
+static int
+g_rel_mask(lua_State *L)
+{
+	register_vk();
+	struct graph *g = lgml_check_graph(L, 1);
+	struct tensor *tab = lgml_operand(L, g, 2);
+	struct tensor *q = lgml_operand(L, g, 3);
+	struct tensor *k = lgml_operand(L, g, 4);
+	struct tensor *m = lgml_operand(L, g, 5);
+	struct ggml_tensor *args[4], *t;
+	int64_t M = m->t->ne[1], S = m->t->ne[0], H = tab->t->ne[1];
+
+	if (tab->t->type != GGML_TYPE_F32 || q->t->type != GGML_TYPE_F32 || k->t->type != GGML_TYPE_F32 ||
+	    m->t->type != GGML_TYPE_F16 || !ggml_is_contiguous(tab->t) || !ggml_is_contiguous(q->t) ||
+	    !ggml_is_contiguous(k->t) || !ggml_is_contiguous(m->t) || tab->t->ne[2] != M ||
+	    ggml_nelements(q->t) != M || ggml_nelements(k->t) != S || ggml_nrows(m->t) != M ||
+	    M * H > 65535 || S > INT32_MAX)
+		return luaL_error(L, "rel_mask: shapes do not match");
+	args[0] = tab->t;
+	args[1] = q->t;
+	args[2] = k->t;
+	args[3] = m->t;
+	lgml_reserve(L, g, 1);
+	t = ggml_custom_4d(g->ctx, GGML_TYPE_F16, S, M, H, 1, args, 4, rel_mask_op, GGML_N_TASKS_MAX, NULL);
+	return lgml_push_node(L, g, t, 3);
+}
+
 static const luaL_Reg ops[] = {
 	{ "hc_add", g_hc_add },
 	{ "hc_mean", g_hc_mean },
+	{ "rel_mask", g_rel_mask },
 	{ NULL, NULL }
 };
 
@@ -230,6 +316,11 @@ register_vk(void)
 	op.spv_size = sizeof(hc_mean_spv);
 	op.setup = hc_mean_setup;
 	fn(hc_mean_op, &op);
+	op.push_size = 4 * sizeof(uint32_t);
+	op.spv = rel_mask_spv;
+	op.spv_size = sizeof(rel_mask_spv);
+	op.setup = rel_mask_setup;
+	fn(rel_mask_op, &op);
 	vk_fused = 1;
 #endif
 	return vk_fused;

@@ -95,7 +95,7 @@ glslc = find_program('glslc', required : false)
 spv_srcs = []
 spv_args = []
 if glslc.found()
-  foreach s : ['hc_add', 'hc_mean']
+  foreach s : ['hc_add', 'hc_mean', 'rel_mask']
     spv_srcs += custom_target(s + '.spv.h',
       input : 'src/shaders' / s + '.comp',
       output : s + '.spv.h',

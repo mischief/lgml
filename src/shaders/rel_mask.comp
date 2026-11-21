@@ -1,0 +1,39 @@
+#version 450
+// rel_mask: d[h][i][j] = mask[i][j] + tab[i][h][clamp(qpos[i] - kpos[j], 0, R - 1)].
+// One invocation per element: x is j, y is the row h * M + i.
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Tab { float tab[]; };
+layout(binding = 1) readonly buffer Q { float qpos[]; };
+layout(binding = 2) readonly buffer K { float kpos[]; };
+layout(binding = 3) readonly buffer Mask { float16_t mask[]; };
+layout(binding = 4) writeonly buffer D { float16_t d[]; };
+
+layout(push_constant) uniform P {
+	uint S;
+	uint M;
+	uint H;
+	uint R;
+	uint off_tab;
+	uint off_q;
+	uint off_k;
+	uint off_mask;
+	uint off_d;
+} p;
+
+void main()
+{
+	const uint j = gl_GlobalInvocationID.x;
+	const uint row = gl_GlobalInvocationID.y + gl_GlobalInvocationID.z * 65535;
+	if (j >= p.S || row >= p.H * p.M) {
+		return;
+	}
+	const uint h = row / p.M;
+	const uint i = row % p.M;
+	const float dist = clamp(qpos[p.off_q / 4 + i] - kpos[p.off_k / 4 + j], 0.0, float(p.R - 1));
+	const float b = tab[p.off_tab / 4 + (i * p.H + h) * p.R + uint(dist)];
+	d[p.off_d / 2 + row * p.S + j] = float16_t(float(mask[p.off_mask / 2 + i * p.S + j]) + b);
+}
