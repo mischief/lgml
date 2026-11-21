@@ -154,9 +154,6 @@ local function load_gguf(model, path, ad)
 		if not (p.a and p.b) then
 			error("lora: " .. path .. ": " .. base .. " lacks lora_a or lora_b")
 		end
-		if base:match("token_embd") then
-			error("lora: " .. path .. ": adapters on token_embd are not supported")
-		end
 		add(ad, base, to_f32(model.be, w:get(p.a)), to_f32(model.be, w:get(p.b)))
 	end
 end
@@ -288,10 +285,13 @@ end
 -- @type Adapter
 
 --- The factor s on B (A x) for one weight.
+-- The rank is the last size of B, as llama.cpp reads it; routed experts
+-- have the expert count first.
 -- @tparam string name the weight name
 -- @treturn number scale * alpha / rank, or scale when alpha is 0
 function A:scale_of(name)
-	local rank = self.pairs[name].a:shape()[1]
+	local sh = self.pairs[name].b:shape()
+	local rank = sh[#sh]
 	return (self.alpha ~= 0 and self.alpha / rank or 1) * self.scale
 end
 
