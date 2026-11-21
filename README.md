@@ -3,7 +3,7 @@
 lgml runs models on ggml from Lua 5.4. A C module (`lgml.so`) gives
 tensors, graphs, backends, samplers, tokenizers and codecs. Lua code
 on top of it loads gguf and safetensors models: chat models (llama,
-Granite 4, Qwen3, Qwen3.5 and Gemma 4 with vision), embedding models
+Granite 4, Qwen3, Qwen3.5, Gemma 4 and Inkling 2 with vision), embedding models
 (Qwen3-Embedding), Whisper, text-to-speech models and Z-Image. `lgml-server` serves them over an OpenAI-shaped HTTP API;
 chat models also serve the Anthropic Messages and OpenAI Responses
 APIs, so Claude Code, Codex and the Anthropic and OpenAI SDKs work
@@ -306,6 +306,13 @@ prompt. `--log-file path` appends to a file; SIGHUP opens it again.
   architecture table in `lgml.convert` maps names and metadata; it
   knows `llada_moe_v2`. `scripts/convert_check.lua` compares the
   output with its source.
+- Inkling 2 (`lgml.inkling2`) reads the gguf layout of llama.cpp
+  PR 32695 and the Unsloth root files: arch `inkling2` with one config
+  entry per layer visit and the `loop_*` tensors. Its attention adds a
+  bias by distance to each score as a per-head mask; global layers build
+  it in slices of queries, so the compute buffer stays near 1 GiB at
+  256k context with a q8_0 cache. A LoRA can change the routed experts
+  and the token embedding.
 - `scripts/gguf_info.lua file.gguf [pattern]`: print the metadata of a
   gguf file and its tensor bytes by type, without reading the weights;
   with a Lua pattern, list the matching tensors. In Lua, `lgml.gguf(path)`
