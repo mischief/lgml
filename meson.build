@@ -264,6 +264,7 @@ if lua_bin.found()
     env : { 'VK_DRIVER_FILES' : '/nonexistent', 'VK_ICD_FILENAMES' : '/nonexistent' },
     timeout : 120)
   test('chat', lua_bin, args : [files('test/test_chat.lua')], timeout : 60)
+  test('inkling2_chat', lua_bin, args : [files('test/test_inkling2_chat.lua')], timeout : 30)
   test('sample', lua_bin, args : [files('test/test_sample.lua')], timeout : 120)
   test('grammar', lua_bin, args : [files('test/test_grammar.lua')], timeout : 60)
   test('json_schema', lua_bin, args : [files('test/test_json_schema.lua')], timeout : 60)

@@ -12,7 +12,7 @@ local M = {}
 --- Family module names by family name.
 M.families = {
 	qwen3 = "lgml.chat.qwen3", qwen35 = "lgml.chat.qwen35", gemma4 = "lgml.chat.gemma4",
-	llada = "lgml.chat.llada", granite = "lgml.chat.granite",
+	llada = "lgml.chat.llada", granite = "lgml.chat.granite", inkling2 = "lgml.chat.inkling2",
 }
 
 local GEMMA4_ARCH = { gemma4 = true, ["diffusion-gemma"] = true }
@@ -25,7 +25,7 @@ end
 --- Finds the chat family for gguf metadata.
 -- @tparam table meta the gguf metadata
 -- @treturn[1] string the family name: `"qwen3"`, `"qwen35"`,
--- `"gemma4"`, `"llada"` or `"granite"`
+-- `"gemma4"`, `"llada"`, `"granite"` or `"inkling2"`
 -- @treturn[2] nil
 -- @treturn[2] string an error message
 function M.detect(meta)
@@ -50,6 +50,9 @@ function M.detect(meta)
 	end
 	if has(tpl, "<role>HUMAN</role>") or (tpl == "" and arch == "llada-moe-v2") then
 		return "llada"
+	end
+	if has(tpl, "<|message_model|>") or (tpl == "" and arch == "inkling2") then
+		return "inkling2"
 	end
 	return nil, string.format("chat: no template for architecture %q", tostring(arch))
 end

@@ -171,6 +171,7 @@ local THINK_END = {
 	qwen3 = "\n</think>\n\n",
 	qwen35 = "\n</think>\n\n",
 	gemma4 = "<channel|>",
+	inkling2 = "<|end_message|>",
 }
 
 -- The largest context, in steps of 256, whose cache fits in the free
@@ -2985,6 +2986,7 @@ function E:run_prompt(req, sink, st)
 	local text = self.family.render(messages, {
 		tools = req.tools, add_generation_prompt = true, enable_thinking = think,
 		reasoning_effort = type(effort) == "string" and effort or nil,
+		effort_hint = type(req.reasoning_effort) == "string" and req.reasoning_effort or nil,
 		preserve_thinking = keep == false and false or nil,
 		truncate_history_thinking = kw.truncate_history_thinking == false and false or nil,
 	})
@@ -3041,7 +3043,7 @@ function E:run_prompt(req, sink, st)
 	local calls = req.tool_choice ~= "none" and req.tools or {}
 	local out = output.new(sink, self.family.new_parser({ tools = calls, enable_thinking = think }),
 	    { stop = req.stop, one_call = req.parallel_tool_calls == false })
-	local dec = tokenizer.decoder(self.tk, { special = false })
+	local dec = tokenizer.decoder(self.tk, { special = false, keep = self.family.preserved })
 
 	local t0 = lgml.clock()
 	local cached = self:reuse(prompt)

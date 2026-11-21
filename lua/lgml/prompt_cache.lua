@@ -28,8 +28,10 @@ P.__index = P
 -- A slot shorter than this is not worth a store entry.
 local MIN_SAVE = 32
 
--- Token names that start a chat turn.
-local TURN_NAMES = { "<|im_start|>", "<|turn>", "<start_of_turn>" }
+-- Token names that start a chat turn. Inkling 2 starts each part of a
+-- turn with a role token; the model's own parts are not turn starts.
+local TURN_NAMES = { "<|im_start|>", "<|turn>", "<start_of_turn>", "<|message_user|>", "<|message_system|>",
+	"<|message_tool|>" }
 
 --- Make a prompt cache for one engine slot.
 -- @param model the model, with `snapshot`, `restore` and `snapshot_bytes`
